@@ -1,0 +1,20 @@
+{
+  "name": "pi-extensions",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Reusable extensions for pi",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "scripts": {
+    "check": "echo 'No local checks configured'"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  }
+}
