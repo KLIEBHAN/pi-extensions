@@ -10,7 +10,8 @@ pi-extensions/
 │   ├── hello.ts
 │   ├── notify.ts
 │   ├── permission-gate.ts
-│   └── session-name.ts
+│   ├── session-name.ts
+│   └── terminal-bench.ts
 ├── .gitignore
 ├── LICENSE
 ├── package.json
@@ -23,6 +24,7 @@ pi-extensions/
 - `notify.ts` - adds `/notify` for lightweight in-app notifications
 - `permission-gate.ts` - asks for confirmation before dangerous bash commands
 - `session-name.ts` - adds `/session-name <name>` to label the current session
+- `terminal-bench.ts` - migrated from `feat/terminal-bench-optimizations`; adds Terminal-Bench prompt rules, tmux tools, environment bootstrapping, and completion verification
 
 ## Use directly
 
@@ -33,6 +35,7 @@ pi -e ./extensions/hello.ts
 pi -e ./extensions/notify.ts
 pi -e ./extensions/permission-gate.ts
 pi -e ./extensions/session-name.ts
+pi -e ./extensions/terminal-bench.ts --terminal-bench
 ```
 
 ## Install as a pi package

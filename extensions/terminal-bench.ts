@@ -1,0 +1,560 @@
+/**
+ * Terminal-Bench Extension
+ *
+ * Optimizes pi for Terminal-Bench 2.0 benchmark performance by porting
+ * key strategies from the Meta-Harness agent:
+ *
+ * 1. **Environment Bootstrapping**: Gathers a sandbox snapshot (files,
+ *    languages, package managers, memory) before the first LLM call and
+ *    injects it into the system prompt. Saves 2-5 early exploration turns.
+ *
+ * 2. **Completion Verification**: When the agent signals it is done, injects
+ *    a self-verification checklist as a follow-up to reduce false completions.
+ *
+ * 3. **Prompt Optimizations**: Appends Terminal-Bench-specific instructions
+ *    to the system prompt (no human help, programmatic multimedia handling,
+ *    minimal state changes, cleanup).
+ *
+ * 4. **tmux Tools**: Registers `tmux_send` and `tmux_read` tools for
+ *    keystroke-level terminal interaction. Enables the agent to drive
+ *    interactive programs (vim, gdb, interactive prompts, Ctrl+C, etc.)
+ *    that pi's standard `bash` tool cannot handle. Includes marker-based
+ *    polling for early completion detection.
+ *
+ * 5. **Aggressive Output Truncation**: Reduces bash output from 50KB/2000
+ *    lines to 30KB/1500 lines when active, so more turns fit in the
+ *    context window.
+ *
+ * The extension is gated behind the --terminal-bench flag and does nothing
+ * unless that flag is provided. This avoids side effects during normal usage.
+ *
+ * Usage:
+ *   pi -e ./terminal-bench.ts --terminal-bench
+ *
+ * Works best with:
+ *   pi -e ./terminal-bench.ts --terminal-bench --thinking high
+ */
+
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+
+const TBENCH_MAX_BYTES = 30 * 1024;
+const TBENCH_MAX_LINES = 1500;
+const TMUX_MARKER_PREFIX = "__PI_TBENCH_END__";
+
+const TERMINAL_BENCH_GUIDELINES = `
+## Terminal-Bench Rules
+
+- You must complete the entire task WITHOUT any human intervention. Do not ask
+  clarifying questions or wait for human input. Make reasonable assumptions and
+  proceed.
+- You do NOT have eyes or ears. For multimedia files (images, audio, video),
+  use programmatic or CLI tools to inspect them (e.g. file, identify, ffprobe,
+  exiftool, python scripts). Never guess content from filenames alone.
+- Before finishing, verify minimal state changes: identify the absolute minimum
+  set of files that must be created or modified to satisfy the task. Beyond
+  those required files, the system state must remain identical to its original
+  state. Do not leave behind extra files, modified configurations, temporary
+  artifacts, or side effects that were not explicitly requested.
+- Prefer short, targeted commands. Avoid long-running blocking commands.
+  If a command might take a while, check intermediate output instead of
+  waiting indefinitely.
+- When you believe the task is complete, re-read the original task description
+  and verify your solution meets ALL requirements before confirming.
+- For interactive programs or commands that need special key sequences
+  (Ctrl+C, Ctrl+D, arrow keys, etc.), use the tmux_send tool instead of bash.
+  Use tmux_read to inspect the current terminal state at any time.
+`.trim();
+
+const COMPLETION_CHECKLIST = (taskHint: string, terminalState: string) =>
+  `
+VERIFICATION REQUIRED: You signaled that you are finished. Before moving on,
+review this checklist carefully.
+
+Original task:
+${taskHint}
+
+Last terminal output:
+${terminalState}
+
+Checklist — mark each as DONE or TODO:
+- Does your solution meet ALL requirements in the original task? [TODO/DONE]
+- Does your solution account for variable values (numeric values, array sizes,
+  file contents, configuration parameters)? [TODO/DONE]
+- Have you cleaned up temporary files, scripts, or side effects not required
+  by the task? [TODO/DONE]
+- Verified from the perspective of:
+  - A test engineer? [TODO/DONE]
+  - A QA engineer? [TODO/DONE]
+  - The user who requested this task? [TODO/DONE]
+
+If everything is DONE, proceed. If any item is TODO, fix it first.
+`.trim();
+
+const BOOTSTRAP_COMMAND = [
+  "echo '@@PWD@@'; pwd",
+  "echo '@@LS@@'; ls -la 2>/dev/null || true",
+  "echo '@@LANG@@'",
+  "(python3 --version 2>&1 || echo 'python3: not found')",
+  "(gcc --version 2>&1 | head -1 || echo 'gcc: not found')",
+  "(g++ --version 2>&1 | head -1 || echo 'g++: not found')",
+  "(node --version 2>&1 || echo 'node: not found')",
+  "(java -version 2>&1 | head -1 || echo 'java: not found')",
+  "(rustc --version 2>&1 || echo 'rustc: not found')",
+  "(go version 2>&1 || echo 'go: not found')",
+  "echo '@@PKG@@'",
+  "(pip3 --version 2>&1 || echo 'pip3: not found')",
+  "(pip --version 2>&1 || echo 'pip: not found')",
+  "(apt-get --version 2>&1 | head -1 || echo 'apt-get: not found')",
+  "(npm --version 2>&1 || echo 'npm: not found')",
+  "(cargo --version 2>&1 || echo 'cargo: not found')",
+  "echo '@@MEM@@'; free -h 2>/dev/null | head -2 || true",
+].join("; ");
+
+interface BootstrapSections {
+  [key: string]: string;
+}
+
+function parseBootstrapOutput(stdout: string): BootstrapSections {
+  const sections: BootstrapSections = {};
+  let currentKey: string | null = null;
+  const currentLines: string[] = [];
+
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("@@") && line.endsWith("@@")) {
+      if (currentKey) {
+        sections[currentKey] = currentLines.join("\n");
+        currentLines.length = 0;
+      }
+      currentKey = line.replace(/^@@|@@$/g, "");
+    } else {
+      currentLines.push(line);
+    }
+  }
+  if (currentKey) {
+    sections[currentKey] = currentLines.join("\n");
+  }
+  return sections;
+}
+
+function formatSnapshot(sections: BootstrapSections): string {
+  const parts: string[] = [];
+
+  if (sections.LS) {
+    const lsLines = sections.LS.trim().split("\n");
+    if (lsLines.length <= 1 || (lsLines.length === 2 && lsLines[0].includes("total 0"))) {
+      parts.push("Directory contents: (empty)");
+    } else if (lsLines.length > 30) {
+      parts.push(
+        `Directory contents (${lsLines.length} entries):\n${lsLines.slice(0, 25).join("\n")}\n... (${lsLines.length - 25} more files)`,
+      );
+    } else {
+      parts.push(`Directory contents:\n${sections.LS.trim()}`);
+    }
+  }
+
+  if (sections.LANG) {
+    const langLines = sections.LANG.trim()
+      .split("\n")
+      .filter((line) => line.trim());
+    if (langLines.length > 0) {
+      parts.push(`Available languages/tools: ${langLines.join("; ")}`);
+    }
+  }
+
+  if (sections.PKG) {
+    const pkgLines = sections.PKG.trim()
+      .split("\n")
+      .filter((line) => line.trim());
+    if (pkgLines.length > 0) {
+      parts.push(`Package managers: ${pkgLines.join("; ")}`);
+    }
+  }
+
+  if (sections.MEM) {
+    const mem = sections.MEM.trim();
+    if (mem) {
+      parts.push(`Memory: ${mem}`);
+    }
+  }
+
+  if (parts.length === 0) {
+    return "";
+  }
+
+  return `[Environment Snapshot]\n${parts.join("\n")}`;
+}
+
+function isCompletionStatement(text: string): boolean {
+  const lower = text.toLowerCase();
+
+  const patterns = [
+    /\b(?:the\s+)?task\s+is\s+(?:now\s+)?complete\b/,
+    /\b(?:the\s+)?task\s+is\s+(?:now\s+)?done\b/,
+    /\b(?:the\s+)?task\s+has\s+been\s+completed\b/,
+    /\bi(?:'ve|'ve|\s+have)\s+completed\s+the\s+task\b/,
+    /\b(?:the\s+)?task\s+is\s+(?:now\s+)?finished\b/,
+    /\b(?:the\s+)?solution\s+is\s+(?:now\s+)?complete\b/,
+    /\ball\s+requirements\s+(?:have\s+been|are(?:\s+now)?)\s+met\b/,
+  ];
+
+  const negatingPrefixes = [
+    "check if",
+    "check whether",
+    "verify if",
+    "verify whether",
+    "verify that",
+    "ensure that",
+    "ensure the",
+    "confirm that",
+    "confirm whether",
+    "once the",
+    "when the",
+    "if the",
+    "whether the",
+    "before the",
+    "until the",
+    "not yet",
+  ];
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(lower);
+    if (!match) continue;
+
+    const preContext = lower.slice(Math.max(0, match.index - 40), match.index);
+    const isNegated = negatingPrefixes.some((prefix) => preContext.includes(prefix));
+    if (!isNegated) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function truncateOutput(output: string, maxBytes: number, maxLines: number): string {
+  const lines = output.split("\n");
+
+  if (lines.length <= maxLines && Buffer.byteLength(output, "utf-8") <= maxBytes) {
+    return output;
+  }
+
+  const kept: string[] = [];
+  let bytes = 0;
+
+  for (let i = lines.length - 1; i >= 0 && kept.length < maxLines; i--) {
+    const lineBytes = Buffer.byteLength(lines[i], "utf-8") + (kept.length > 0 ? 1 : 0);
+    if (bytes + lineBytes > maxBytes) break;
+    kept.unshift(lines[i]);
+    bytes += lineBytes;
+  }
+
+  const totalLines = lines.length;
+  const shownLines = kept.length;
+
+  if (shownLines < totalLines) {
+    return `[Showing last ${shownLines} of ${totalLines} lines]\n${kept.join("\n")}`;
+  }
+  return kept.join("\n");
+}
+
+function stripMarkerLines(output: string, markers: Set<string>): string {
+  if (markers.size === 0) return output;
+  return output
+    .split("\n")
+    .filter((line) => {
+      for (const marker of markers) {
+        if (line.includes(marker)) return false;
+      }
+      return true;
+    })
+    .join("\n");
+}
+
+export default function (pi: ExtensionAPI) {
+  pi.registerFlag("terminal-bench", {
+    description: "Enable Terminal-Bench optimizations",
+    type: "boolean",
+    default: false,
+  });
+
+  let enabled = false;
+  let envSnapshot = "";
+  let completionPending = false;
+  let lastBashOutput = "";
+  let tmuxSession = "";
+  let markerSeq = 0;
+
+  pi.on("session_start", async () => {
+    enabled = pi.getFlag("terminal-bench") === true;
+    if (!enabled) return;
+
+    envSnapshot = "";
+    completionPending = false;
+    lastBashOutput = "";
+    tmuxSession = "";
+    markerSeq = 0;
+
+    try {
+      const result = await pi.exec("bash", ["-c", BOOTSTRAP_COMMAND], {
+        timeout: 15000,
+      });
+      if (result.code === 0 && result.stdout) {
+        const sections = parseBootstrapOutput(result.stdout);
+        envSnapshot = formatSnapshot(sections);
+      }
+    } catch {
+    }
+
+    const cwd = process.cwd();
+    const sessionName = `pi-tbench-${process.pid}`;
+    try {
+      await pi.exec("tmux", ["kill-session", "-t", sessionName], {
+        timeout: 3000,
+      }).catch(() => {});
+
+      await pi.exec("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", "-c", cwd], {
+        timeout: 5000,
+      });
+      tmuxSession = sessionName;
+      await sleep(200);
+    } catch {
+    }
+  });
+
+  pi.on("before_agent_start", async (event) => {
+    if (!enabled) return;
+
+    let systemPrompt = event.systemPrompt;
+    systemPrompt += `\n\n${TERMINAL_BENCH_GUIDELINES}`;
+
+    if (envSnapshot) {
+      systemPrompt += `\n\n${envSnapshot}`;
+    }
+
+    if (tmuxSession) {
+      systemPrompt += `\n\n[tmux session "${tmuxSession}" is available. Use tmux_send/tmux_read for interactive programs.]`;
+    }
+
+    return { systemPrompt };
+  });
+
+  pi.registerTool({
+    name: "tmux_send",
+    label: "tmux Send",
+    description:
+      "Send keystrokes to the tmux terminal session and return the resulting output. " +
+      "Use this for interactive programs, special key sequences (Ctrl+C, Ctrl+D, arrow keys), " +
+      "or when you need to observe the terminal state after a command. " +
+      "Most shell commands should end with a newline (\\n) to execute. " +
+      "For special keys, use tmux key names: C-c for Ctrl+C, C-d for Ctrl+D, " +
+      "Enter for Return, Escape for Esc, Up/Down/Left/Right for arrow keys. " +
+      "Set wait_seconds to control how long to wait for output (default: 1). " +
+      "For fast commands (cd, echo) use 0.1. For slow commands (make, compilation) use higher values. " +
+      "Never set wait_seconds above 30; prefer to poll with tmux_read instead.",
+    promptSnippet: "Send keystrokes to tmux and capture terminal output",
+    parameters: Type.Object({
+      keys: Type.String({
+        description:
+          "Keystrokes to send. Text is sent verbatim. " +
+          "End shell commands with \\n. " +
+          "For special keys use tmux names: C-c, C-d, Enter, Escape, Up, Down, Left, Right, Tab, BSpace.",
+      }),
+      wait_seconds: Type.Optional(
+        Type.Number({
+          description: "Seconds to wait for output (default: 1.0, max: 30). Use 0.1 for instant commands.",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      if (!tmuxSession) {
+        throw new Error("No tmux session available. Is tmux installed?");
+      }
+      if (signal?.aborted) {
+        throw new Error("Aborted");
+      }
+
+      const waitSeconds = Math.min(Math.max(params.wait_seconds ?? 1.0, 0.05), 30);
+
+      const sendResult = await pi.exec("tmux", ["send-keys", "-t", tmuxSession, params.keys], {
+        timeout: 10000,
+      });
+      if (sendResult.code !== 0) {
+        throw new Error(`tmux send-keys failed: ${sendResult.stderr || "unknown error"}`);
+      }
+
+      markerSeq++;
+      const marker = `${TMUX_MARKER_PREFIX}${markerSeq}`;
+      await pi.exec("tmux", ["send-keys", "-t", tmuxSession, `echo '${marker}'`, "Enter"], {
+        timeout: 5000,
+      });
+
+      const startTime = Date.now();
+      const deadlineMs = waitSeconds * 1000;
+      let paneContent = "";
+
+      await sleep(Math.min(300, deadlineMs), signal);
+
+      while (Date.now() - startTime < deadlineMs) {
+        if (signal?.aborted) break;
+
+        const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+          timeout: 5000,
+        });
+        paneContent = captureResult.stdout || "";
+
+        if (paneContent.includes(marker)) {
+          break;
+        }
+
+        await sleep(500, signal);
+      }
+
+      const finalCapture = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+        timeout: 5000,
+      });
+      paneContent = finalCapture.stdout || "";
+
+      const markers = new Set<string>();
+      for (let i = 1; i <= markerSeq; i++) {
+        markers.add(`${TMUX_MARKER_PREFIX}${i}`);
+      }
+      const cleanOutput = stripMarkerLines(paneContent, markers).trim();
+      const truncated = truncateOutput(cleanOutput, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);
+
+      return {
+        content: [{ type: "text", text: truncated || "(no output)" }],
+        details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "tmux_read",
+    label: "tmux Read",
+    description:
+      "Capture the current content of the tmux terminal pane without sending any keystrokes. " +
+      "Use this to check the state of a running program, inspect output after waiting, " +
+      "or read the terminal before deciding what to do next.",
+    promptSnippet: "Read current tmux terminal content without sending input",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, signal) {
+      if (!tmuxSession) {
+        throw new Error("No tmux session available. Is tmux installed?");
+      }
+      if (signal?.aborted) {
+        throw new Error("Aborted");
+      }
+
+      const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+        timeout: 5000,
+      });
+
+      if (captureResult.code !== 0) {
+        throw new Error(`tmux capture-pane failed: ${captureResult.stderr || "unknown error"}`);
+      }
+
+      const markers = new Set<string>();
+      for (let i = 1; i <= markerSeq; i++) {
+        markers.add(`${TMUX_MARKER_PREFIX}${i}`);
+      }
+      const cleanOutput = stripMarkerLines(captureResult.stdout || "", markers).trim();
+      const truncated = truncateOutput(cleanOutput, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);
+
+      return {
+        content: [{ type: "text", text: truncated || "(empty terminal)" }],
+        details: {},
+      };
+    },
+  });
+
+  pi.on("tool_result", async (event) => {
+    if (!enabled) return;
+
+    if (event.toolName === "bash" && !event.isError) {
+      const textBlocks = event.content.filter((content): content is { type: "text"; text: string } => content.type === "text");
+
+      const fullText = textBlocks.map((block) => block.text).join("\n");
+      if (fullText) {
+        lastBashOutput = fullText.slice(-2000);
+      }
+
+      for (const block of textBlocks) {
+        const bytes = Buffer.byteLength(block.text, "utf-8");
+        const lines = block.text.split("\n").length;
+
+        if (bytes > TBENCH_MAX_BYTES || lines > TBENCH_MAX_LINES) {
+          block.text = truncateOutput(block.text, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);
+        }
+      }
+
+      return { content: event.content };
+    }
+  });
+
+  pi.on("message_end", async (event, ctx) => {
+    if (!enabled) return;
+    if (event.message.role !== "assistant") return;
+
+    const content = event.message.content;
+    if (!Array.isArray(content)) return;
+
+    const textBlocks = content
+      .filter(
+        (block): block is { type: "text"; text: string } =>
+          typeof block === "object" && block !== null && "type" in block && block.type === "text",
+      )
+      .map((block) => block.text)
+      .join("\n");
+
+    if (!textBlocks) return;
+
+    const isCompletion = isCompletionStatement(textBlocks);
+
+    if (isCompletion && !completionPending) {
+      completionPending = true;
+
+      const entries = ctx.sessionManager.getBranch();
+      let taskHint = "(not available in context)";
+      for (const entry of entries) {
+        if (entry.type === "message" && entry.message.role === "user") {
+          const message = entry.message;
+          if (typeof message.content === "string") {
+            taskHint = message.content.slice(0, 2000);
+          } else if (Array.isArray(message.content)) {
+            const texts = message.content
+              .filter(
+                (block): block is { type: "text"; text: string } =>
+                  typeof block === "object" && block !== null && "type" in block && block.type === "text",
+              )
+              .map((block) => block.text);
+            taskHint = texts.join("\n").slice(0, 2000);
+          }
+          break;
+        }
+      }
+
+      const checklist = COMPLETION_CHECKLIST(taskHint, lastBashOutput.slice(-1000) || "(no recent output)");
+      pi.sendUserMessage(checklist, { deliverAs: "followUp" });
+    } else if (!isCompletion) {
+      completionPending = false;
+    }
+  });
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (signal) {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      if (signal.aborted) {
+        clearTimeout(timer);
+        resolve();
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+  });
+}
