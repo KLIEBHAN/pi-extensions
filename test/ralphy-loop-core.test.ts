@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import {
   extractAssistantText,
   parseLoopArgs,
@@ -8,7 +8,7 @@ import {
   parseVerificationResponse,
   shouldTreatStopReasonAsFailure,
   summarizeTask,
-} from "../extensions/ralphy-loop-core.ts";
+} from "../extensions/ralphy-loop/core.ts";
 
 test("parsePositiveInteger accepts valid positive integers", () => {
   assert.equal(parsePositiveInteger("1"), 1);
@@ -94,8 +94,12 @@ test("summarizeTask truncates long text with ellipsis", () => {
   assert.equal(summarizeTask("a".repeat(11), 10), `${"a".repeat(9)}…`);
 });
 
-test("ralphy-loop.ts stays standalone when symlinked as a single extension file", () => {
-  const source = readFileSync(new URL("../extensions/ralphy-loop.ts", import.meta.url), "utf8");
-  assert.equal(source.includes('from "./ralphy-loop-core.ts"'), false);
-  assert.equal(source.includes("from './ralphy-loop-core.ts'"), false);
+test("ralphy helper is not exposed as a top-level extension entry", () => {
+  const entries = readdirSync(new URL("../extensions", import.meta.url));
+  assert.equal(entries.includes("ralphy-loop-core.ts"), false);
+});
+
+test("ralphy-loop directory entrypoint imports its local core helper", () => {
+  const source = readFileSync(new URL("../extensions/ralphy-loop/index.ts", import.meta.url), "utf8");
+  assert.equal(source.includes('from "./core.ts"'), true);
 });

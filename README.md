@@ -12,7 +12,7 @@ Load an individual extension from the repository:
 pi -e ./extensions/hello.ts
 pi -e ./extensions/notify.ts
 pi -e ./extensions/permission-gate.ts
-pi -e ./extensions/ralphy-loop.ts
+pi -e ./extensions/ralphy-loop
 pi -e ./extensions/session-name.ts
 pi -e ./extensions/terminal-bench.ts --terminal-bench
 ```
@@ -28,11 +28,18 @@ After package installation, enabled extensions are auto-discovered by pi. The `t
 
 ## Permanently enable an extension via the user folder
 
-For a globally enabled extension, copy the file into pi's user extension folder:
+For a globally enabled extension, copy the directory into pi's user extension folder:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
-cp ./extensions/ralphy-loop.ts ~/.pi/agent/extensions/
+cp -R ./extensions/ralphy-loop ~/.pi/agent/extensions/
+```
+
+Or symlink it during development:
+
+```bash
+mkdir -p ~/.pi/agent/extensions
+ln -s "$PWD/extensions/ralphy-loop" ~/.pi/agent/extensions/ralphy-loop
 ```
 
 Then start pi normally:
@@ -47,18 +54,17 @@ If pi is already running, reload extensions without restarting:
 /reload
 ```
 
-To enable all extensions from this repository globally:
+To enable all extensions from this repository globally, prefer package installation:
 
 ```bash
-mkdir -p ~/.pi/agent/extensions
-cp ./extensions/*.ts ~/.pi/agent/extensions/
+pi install ../pi-extensions
 ```
 
 Project-local alternative:
 
 ```bash
 mkdir -p .pi/extensions
-cp ./extensions/ralphy-loop.ts .pi/extensions/
+cp -R ./extensions/ralphy-loop .pi/extensions/
 ```
 
 Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the current project only.
@@ -70,13 +76,13 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 | `hello.ts` | Minimal custom tool example | `pi -e ./extensions/hello.ts` |
 | `notify.ts` | Adds `/notify` for lightweight in-app notifications | `/notify build finished` |
 | `permission-gate.ts` | Asks for confirmation before dangerous bash commands | `pi -e ./extensions/permission-gate.ts` |
-| `ralphy-loop.ts` | Repeats the same task with autonomous prompts, AI completion verification, and per-iteration context pruning | `/ralphy-loop 5 harden edge cases` |
+| `ralphy-loop/` | Repeats the same task with autonomous prompts, AI completion verification, and per-iteration context pruning | `/ralphy-loop 5 harden edge cases` |
 | `session-name.ts` | Adds `/session-name <name>` to label the current session | `/session-name auth-refactor` |
 | `terminal-bench.ts` | Migrated from `feat/terminal-bench-optimizations`; adds Terminal-Bench prompt rules, tmux tools, environment bootstrapping, and completion verification | `pi -e ./extensions/terminal-bench.ts --terminal-bench` |
 
 ## Ralphy loop extension
 
-`extensions/ralphy-loop.ts` is inspired by the repeat loop in Ralphy, but implemented with pi extension APIs.
+`extensions/ralphy-loop/` is inspired by the repeat loop in Ralphy, but implemented with pi extension APIs.
 
 The main goal is brownfield-style repetition: run the same task multiple times while clearing prior iterations out of the model context so each pass starts fresh, verifies completion conservatively, and keeps working without user interaction until the task is actually done.
 
@@ -106,7 +112,7 @@ The main goal is brownfield-style repetition: run the same task multiple times w
 Interactive command:
 
 ```bash
-pi -e ./extensions/ralphy-loop.ts
+pi -e ./extensions/ralphy-loop
 ```
 
 Then inside pi:
@@ -121,7 +127,7 @@ Then inside pi:
 Auto-start from CLI:
 
 ```bash
-pi -e ./extensions/ralphy-loop.ts \
+pi -e ./extensions/ralphy-loop \
   --ralphy-task "find and fix bugs" \
   --ralphy-repeat 3
 ```
@@ -129,11 +135,13 @@ pi -e ./extensions/ralphy-loop.ts \
 Optional separate verifier model:
 
 ```bash
-pi -e ./extensions/ralphy-loop.ts \
+pi -e ./extensions/ralphy-loop \
   --ralphy-task "find and fix bugs" \
   --ralphy-repeat 3 \
   --ralphy-verifier-model openai/gpt-5.4
 ```
+
+If you enabled `ralphy-loop` globally via `~/.pi/agent/extensions/` or `pi install`, do not also pass `-e ./extensions/ralphy-loop` in the same session, or pi will load it twice and flag/tool registration will conflict.
 
 ### How context reset works
 
@@ -223,7 +231,9 @@ pi-extensions/
 │   ├── hello.ts
 │   ├── notify.ts
 │   ├── permission-gate.ts
-│   ├── ralphy-loop.ts
+│   ├── ralphy-loop/
+│   │   ├── core.ts
+│   │   └── index.ts
 │   ├── session-name.ts
 │   └── terminal-bench.ts
 ├── .gitignore
