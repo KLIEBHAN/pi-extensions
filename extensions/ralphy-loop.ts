@@ -19,6 +19,15 @@ interface ParsedLoopArgs {
 const STATUS_KEY = "ralphy-loop";
 const DEFAULT_REPEAT = 1;
 const MAX_REPEAT = 10_000;
+const RALPHY_LOOP_SYSTEM_PROMPT = `You are running in autonomous execution mode.
+
+Rules:
+- No human interaction is available. Do not ask clarifying questions, do not ask for confirmation, and do not wait for user input.
+- Work until the task is actually fulfilled.
+- If information is missing, inspect the repository, files, logs, configs, tests, and available tools yourself.
+- Do not stop with a partial plan or with “I need more information” when that information can be obtained from the workspace or tools.
+- Do not defer unresolved work. Treat this run as responsible for completing the task.
+- Before finishing, verify that the task requirements have been satisfied.`;
 
 function parsePositiveInteger(value: string): number | undefined {
   if (!/^[1-9][0-9]*$/.test(value)) return undefined;
@@ -265,6 +274,15 @@ export default function (pi: ExtensionAPI) {
       repeat,
       continueOnFailure: continueOnFailureFlag === true,
     });
+  });
+
+  pi.on("before_agent_start", async (event) => {
+    const state = stateRef.current;
+    if (!state?.active) return;
+
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${RALPHY_LOOP_SYSTEM_PROMPT}`,
+    };
   });
 
   pi.on("context", async (event) => {
