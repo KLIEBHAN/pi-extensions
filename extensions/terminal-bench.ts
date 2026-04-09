@@ -41,6 +41,8 @@ import { Type } from "@sinclair/typebox";
 const TBENCH_MAX_BYTES = 30 * 1024;
 const TBENCH_MAX_LINES = 1500;
 const TMUX_MARKER_PREFIX = "__PI_TBENCH_END__";
+const MAX_CONTRACT_ITEMS = 10;
+const MAX_RECENT_TOOL_ACTIONS = 8;
 
 const TERMINAL_BENCH_GUIDELINES = `
 ## Terminal-Bench Rules
@@ -61,24 +63,52 @@ const TERMINAL_BENCH_GUIDELINES = `
   waiting indefinitely.
 - When you believe the task is complete, re-read the original task description
   and verify your solution meets ALL requirements before confirming.
+- Extract an exact contract checklist from the task text: required file paths,
+  filenames, ports, URLs, versions, numeric thresholds, modes (CPU/GPU),
+  iteration counts, and any commands the user says they will run or outputs
+  they will observe. Satisfy that exact contract, not an approximate equivalent.
+- If the task describes an externally observable workflow (for example: I will
+  run ..., git clone ..., git push ..., curl http://..., or exact compile and
+  run commands), verify from that same external perspective before you finish
+  whenever it is safe to do so.
 - For interactive programs or commands that need special key sequences
   (Ctrl+C, Ctrl+D, arrow keys, etc.), use the tmux_send tool instead of bash.
   Use tmux_read to inspect the current terminal state at any time.
 `.trim();
 
-const COMPLETION_CHECKLIST = (taskHint: string, terminalState: string) =>
-  `
+const COMPLETION_CHECKLIST = (
+  taskHint: string,
+  terminalState: string,
+  contractItems: string[],
+  recentToolActions: string[],
+) => {
+  const contractSection =
+    contractItems.length > 0
+      ? `\n\nExplicit contract items detected from the task:\n${contractItems.map((item) => `- ${item}`).join("\n")}`
+      : "";
+
+  const recentActionsSection =
+    recentToolActions.length > 0
+      ? `\n\nRecent tool activity:\n${recentToolActions.map((item) => `- ${item}`).join("\n")}`
+      : "";
+
+  return `
 VERIFICATION REQUIRED: You signaled that you are finished. Before moving on,
 review this checklist carefully.
 
 Original task:
-${taskHint}
+${taskHint}${contractSection}${recentActionsSection}
 
 Last terminal output:
 ${terminalState}
 
 Checklist — mark each as DONE or TODO:
 - Does your solution meet ALL requirements in the original task? [TODO/DONE]
+- Did you satisfy every exact contract item above (paths, filenames, ports,
+  URLs, versions, thresholds, modes, counts, commands)? [TODO/DONE]
+- If the user described commands they will run or outputs they will observe,
+  did you verify from that same external perspective (or as close as safely
+  possible)? [TODO/DONE]
 - Does your solution account for variable values (numeric values, array sizes,
   file contents, configuration parameters)? [TODO/DONE]
 - Have you cleaned up temporary files, scripts, or side effects not required
@@ -90,6 +120,7 @@ Checklist — mark each as DONE or TODO:
 
 If everything is DONE, proceed. If any item is TODO, fix it first.
 `.trim();
+};
 
 const BOOTSTRAP_COMMAND = [
   "echo '@@PWD@@'; pwd",
@@ -187,6 +218,7 @@ function formatSnapshot(sections: BootstrapSections): string {
 
 function isCompletionStatement(text: string): boolean {
   const lower = text.toLowerCase();
+  const trimmed = lower.trim();
 
   const patterns = [
     /\b(?:the\s+)?task\s+is\s+(?:now\s+)?complete\b/,
@@ -228,7 +260,97 @@ function isCompletionStatement(text: string): boolean {
     }
   }
 
+  if (/^(done|completed|configured|fixed|implemented)\b/.test(trimmed)) {
+    const continuationHints = ["next", "remaining", "still need", "need to", "then i", "continue"];
+    const looksIncomplete = continuationHints.some((hint) => trimmed.includes(hint));
+    if (!looksIncomplete) {
+      return true;
+    }
+  }
+
   return false;
+}
+
+function normalizeLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function pushUnique(items: string[], value: string): void {
+  const normalized = normalizeLine(value);
+  if (!normalized) return;
+  if (items.some((item) => normalizeLine(item).toLowerCase() === normalized.toLowerCase())) {
+    return;
+  }
+  items.push(normalized);
+}
+
+function extractContractItems(taskText: string): string[] {
+  const items: string[] = [];
+  const cleanText = taskText
+    .replace(/<file name="[^"]+">/g, "")
+    .replace(/<\/file>/g, "")
+    .trim();
+
+  let inFence = false;
+  for (const rawLine of cleanText.split("\n")) {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith("```")) {
+      inFence = !inFence;
+      continue;
+    }
+
+    if (inFence || rawLine.startsWith("    ") || rawLine.startsWith("\t")) {
+      pushUnique(items, `User-visible command/workflow: ${trimmed}`);
+    }
+  }
+
+  for (const match of cleanText.matchAll(/https?:\/\/[^\s"'`<>]+/g)) {
+    pushUnique(items, `Required URL: ${match[0]}`);
+  }
+
+  for (const match of cleanText.matchAll(/\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+/g)) {
+    pushUnique(items, `Required path/file: ${match[0]}`);
+  }
+
+  for (const match of cleanText.matchAll(/\bport\s+(\d{2,5})\b/gi)) {
+    pushUnique(items, `Required port/service: port ${match[1]}`);
+  }
+
+  const clauses = cleanText
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((part) => normalizeLine(part))
+    .filter(Boolean);
+  const clausePattern =
+    /\b(i(?:'ll| will)|if i run|you should|exactly|at least|at most|no more than|greater than|less than|under|over|cpu|gpu|version|named|called|compile|curl|git clone|git push|solver_mode|cpu_only|iterations?)\b/i;
+
+  for (const clause of clauses) {
+    if (clausePattern.test(clause) && clause.length <= 200) {
+      pushUnique(items, clause);
+    }
+  }
+
+  return items.slice(0, MAX_CONTRACT_ITEMS);
+}
+
+function summarizeToolAction(toolName: string, args: unknown): string {
+  if (toolName === "bash" && args && typeof args === "object" && "command" in args) {
+    const command = typeof args.command === "string" ? args.command : "";
+    const firstLine = command
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+    return `bash: ${(firstLine ?? command).slice(0, 140)}`;
+  }
+
+  if ((toolName === "read" || toolName === "write" || toolName === "edit") && args && typeof args === "object" && "path" in args) {
+    const path = typeof args.path === "string" ? args.path : "(unknown path)";
+    return `${toolName}: ${path}`;
+  }
+
+  return `${toolName}`;
 }
 
 function truncateOutput(output: string, maxBytes: number, maxLines: number): string {
@@ -283,6 +405,7 @@ export default function (pi: ExtensionAPI) {
   let lastBashOutput = "";
   let tmuxSession = "";
   let markerSeq = 0;
+  let recentToolActions: string[] = [];
 
   pi.on("session_start", async () => {
     enabled = pi.getFlag("terminal-bench") === true;
@@ -293,6 +416,7 @@ export default function (pi: ExtensionAPI) {
     lastBashOutput = "";
     tmuxSession = "";
     markerSeq = 0;
+    recentToolActions = [];
 
     try {
       const result = await pi.exec("bash", ["-c", BOOTSTRAP_COMMAND], {
@@ -467,6 +591,15 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.on("tool_execution_start", async (event) => {
+    if (!enabled) return;
+
+    recentToolActions.push(summarizeToolAction(event.toolName, event.args));
+    if (recentToolActions.length > MAX_RECENT_TOOL_ACTIONS) {
+      recentToolActions = recentToolActions.slice(-MAX_RECENT_TOOL_ACTIONS);
+    }
+  });
+
   pi.on("tool_result", async (event) => {
     if (!enabled) return;
 
@@ -507,6 +640,7 @@ export default function (pi: ExtensionAPI) {
       .join("\n");
 
     if (!textBlocks) return;
+    if (event.message.stopReason && event.message.stopReason !== "stop") return;
 
     const isCompletion = isCompletionStatement(textBlocks);
 
@@ -533,7 +667,13 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      const checklist = COMPLETION_CHECKLIST(taskHint, lastBashOutput.slice(-1000) || "(no recent output)");
+      const contractItems = extractContractItems(taskHint);
+      const checklist = COMPLETION_CHECKLIST(
+        taskHint,
+        lastBashOutput.slice(-1000) || "(no recent output)",
+        contractItems,
+        recentToolActions,
+      );
       pi.sendUserMessage(checklist, { deliverAs: "followUp" });
     } else if (!isCompletion) {
       completionPending = false;
