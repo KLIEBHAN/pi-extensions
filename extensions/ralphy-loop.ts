@@ -1,3 +1,4 @@
+import { complete, type UserMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 interface LoopState {
@@ -8,6 +9,7 @@ interface LoopState {
   continueOnFailure: boolean;
   iterationStartAt: number;
   iterationHadError: boolean;
+  verificationNudges: number;
 }
 
 interface ParsedLoopArgs {
@@ -16,9 +18,31 @@ interface ParsedLoopArgs {
   continueOnFailure: boolean;
 }
 
+interface CompletionVerificationResult {
+  done: boolean;
+  reason: string;
+  continuePrompt: string;
+}
+
+interface TextBlock {
+  type: string;
+  text?: string;
+}
+
+interface ParsedVerificationPayload {
+  done?: unknown;
+  reason?: unknown;
+  continuePrompt?: unknown;
+}
+
+interface GitSummary {
+  status: string;
+}
+
 const STATUS_KEY = "ralphy-loop";
 const DEFAULT_REPEAT = 1;
 const MAX_REPEAT = 10_000;
+const MAX_VERIFICATION_NUDGES = 3;
 const RALPHY_LOOP_SYSTEM_PROMPT = `You are running in autonomous execution mode.
 
 Rules:
@@ -29,6 +53,21 @@ Rules:
 - Do not defer unresolved work. Treat this run as responsible for completing the task.
 - Before finishing, verify that the task requirements have been satisfied.
 - If the workspace is a git repository, finish by creating a commit for the completed work and pushing the current branch. Do not treat the task as complete before commit and push have succeeded, unless git or the remote is unavailable and you have verified that programmatically.`;
+const RALPHY_VERIFIER_SYSTEM_PROMPT = `You are a strict completion verifier for an autonomous coding agent.
+
+Determine whether the task is fully complete right now.
+
+Rules:
+- No human interaction is possible.
+- If the assistant asks the user a question, asks for confirmation, requests manual follow-up, or waits for input, the task is not complete.
+- If the assistant leaves TODOs, unresolved follow-up work, or says something still needs to be checked, the task is not complete.
+- If commit and push are required but clearly not done yet, the task is not complete.
+- Be conservative. Only return done=true when the task appears fully completed.
+
+Return JSON only in this shape:
+{"done":boolean,"reason":string,"continuePrompt":string}
+
+When done=false, continuePrompt must be a direct instruction telling the agent to continue the same task autonomously now, without asking the user anything.`;
 
 function parsePositiveInteger(value: string): number | undefined {
   if (!/^[1-9][0-9]*$/.test(value)) return undefined;
@@ -97,6 +136,112 @@ function parseLoopArgs(args: string): ParsedLoopArgs | { error: string } {
   return { task, repeat, continueOnFailure };
 }
 
+function extractAssistantText(content: unknown): string {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .filter((block): block is TextBlock => typeof block === "object" && block !== null && "type" in block)
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text ?? "")
+    .join("\n")
+    .trim();
+}
+
+function parseVerificationResponse(text: string): CompletionVerificationResult | undefined {
+  const normalized = text.trim();
+  const candidates = [normalized];
+
+  const firstBrace = normalized.indexOf("{");
+  const lastBrace = normalized.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(normalized.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as ParsedVerificationPayload;
+      if (typeof parsed.done !== "boolean") continue;
+      if (typeof parsed.reason !== "string") continue;
+      if (typeof parsed.continuePrompt !== "string") continue;
+      return {
+        done: parsed.done,
+        reason: parsed.reason.trim(),
+        continuePrompt: parsed.continuePrompt.trim(),
+      };
+    } catch {
+      continue;
+    }
+  }
+
+  return undefined;
+}
+
+async function getGitSummary(pi: ExtensionAPI, cwd: string): Promise<GitSummary | undefined> {
+  const isGitRepo = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd });
+  if (isGitRepo.code !== 0 || !isGitRepo.stdout.includes("true")) {
+    return undefined;
+  }
+
+  const status = await pi.exec("git", ["status", "--short", "--branch"], { cwd });
+  if (status.code !== 0) {
+    return { status: "git status unavailable" };
+  }
+
+  const text = status.stdout.trim();
+  return { status: text.length > 0 ? text : "working tree clean" };
+}
+
+async function verifyIterationCompletion(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  task: string,
+  assistantText: string,
+): Promise<CompletionVerificationResult | undefined> {
+  if (!ctx.model) {
+    return undefined;
+  }
+
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+  if (!auth.ok || !auth.apiKey) {
+    return undefined;
+  }
+
+  const gitSummary = await getGitSummary(pi, ctx.cwd);
+  const promptSections = [
+    `Task:\n${task}`,
+    `Final assistant response:\n${assistantText || "(no assistant text)"}`,
+  ];
+
+  if (gitSummary) {
+    promptSections.push(`Git status:\n${gitSummary.status}`);
+  }
+
+  const userMessage: UserMessage = {
+    role: "user",
+    content: [{ type: "text", text: promptSections.join("\n\n") }],
+    timestamp: Date.now(),
+  };
+
+  const response = await complete(
+    ctx.model,
+    { systemPrompt: RALPHY_VERIFIER_SYSTEM_PROMPT, messages: [userMessage] },
+    { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal, reasoningEffort: "minimal" },
+  );
+
+  if (response.stopReason !== "stop") {
+    return undefined;
+  }
+
+  const text = response.content
+    .filter((block): block is { type: "text"; text: string } => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  return parseVerificationResponse(text);
+}
+
 function setStatus(ctx: ExtensionContext | ExtensionCommandContext, state: LoopState | undefined): void {
   if (!state?.active) {
     ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -117,6 +262,7 @@ function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: {
 
 function startIteration(state: LoopState, pi: ExtensionAPI, deliverAs: "followUp" | undefined): void {
   state.iterationHadError = false;
+  state.verificationNudges = 0;
   state.iterationStartAt = Date.now();
   if (deliverAs) {
     pi.sendUserMessage(state.task, { deliverAs });
@@ -139,6 +285,7 @@ function startLoop(
     continueOnFailure: config.continueOnFailure,
     iterationStartAt: 0,
     iterationHadError: false,
+    verificationNudges: 0,
   };
 
   stateRef.current = state;
@@ -296,6 +443,25 @@ export default function (pi: ExtensionAPI) {
     }
 
     state.iterationHadError = stopReason === "error" || stopReason === "aborted" || stopReason === "length";
+
+    if (!state.iterationHadError && stopReason === "stop") {
+      const assistantText = extractAssistantText(event.message.content);
+      const verification = await verifyIterationCompletion(pi, ctx, state.task, assistantText);
+
+      if (verification && !verification.done) {
+        state.verificationNudges += 1;
+
+        if (state.verificationNudges >= MAX_VERIFICATION_NUDGES) {
+          state.iterationHadError = true;
+          ctx.ui.notify(`Ralphy verifier could not confirm completion: ${verification.reason}`, "warning");
+        } else {
+          ctx.ui.notify(`Ralphy verifier requested more work: ${verification.reason}`, "warning");
+          const continuePrompt = verification.continuePrompt || "Continue working on the same task now. Do not ask the user anything. Verify completion before stopping.";
+          pi.sendUserMessage(continuePrompt, { deliverAs: "followUp" });
+          return;
+        }
+      }
+    }
 
     if (state.iterationHadError && !state.continueOnFailure) {
       clearState(ctx, stateRef);
