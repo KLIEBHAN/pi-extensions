@@ -26,6 +26,43 @@ pi install git:github.com/KLIEBHAN/pi-extensions
 
 After package installation, enabled extensions are auto-discovered by pi. The `terminal-bench` extension is safe to keep installed because it only activates when `--terminal-bench` is passed.
 
+## Permanently enable an extension via the user folder
+
+For a globally enabled extension, copy the file into pi's user extension folder:
+
+```bash
+mkdir -p ~/.pi/agent/extensions
+cp ./extensions/ralphy-loop.ts ~/.pi/agent/extensions/
+```
+
+Then start pi normally:
+
+```bash
+pi
+```
+
+If pi is already running, reload extensions without restarting:
+
+```text
+/reload
+```
+
+To enable all extensions from this repository globally:
+
+```bash
+mkdir -p ~/.pi/agent/extensions
+cp ./extensions/*.ts ~/.pi/agent/extensions/
+```
+
+Project-local alternative:
+
+```bash
+mkdir -p .pi/extensions
+cp ./extensions/ralphy-loop.ts .pi/extensions/
+```
+
+Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the current project only.
+
 ## Included extensions
 
 | Extension | Purpose | Example |
@@ -80,11 +117,30 @@ pi -e ./extensions/ralphy-loop.ts \
   --ralphy-repeat 3
 ```
 
-### Important note
+### How context reset works
 
-This clears the **LLM context** between iterations by pruning older iterations during provider requests.
+This extension does **not** create a brand new pi session for every repeat.
 
-It does **not** create a brand new pi session file for every iteration. Session history is still preserved locally; only the model context is reset between loop iterations.
+Instead, it keeps one pi session and uses the `context` hook to filter the messages sent to the model on each new iteration.
+
+Concretely:
+
+- when an iteration starts, the extension records a new `iterationStartAt` timestamp
+- before each provider request, it removes messages older than that timestamp from the LLM context
+- the model therefore sees only the current iteration's messages, tool calls, and tool results
+
+What still remains:
+
+- the full session history is still stored locally and remains visible in pi
+- file changes from earlier iterations remain on disk
+- git state, working directory, active tools, model selection, and loaded extensions all remain unchanged
+
+So the behavior is:
+
+- **fresh model context per iteration**
+- **same pi session and same workspace state across iterations**
+
+That makes the loop safer and simpler than forcing session switches from extension events, while still avoiding accumulation of earlier iterations in the model context.
 
 ## Terminal-Bench extension
 
