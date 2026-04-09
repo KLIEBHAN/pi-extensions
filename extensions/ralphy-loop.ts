@@ -115,6 +115,15 @@ function startIteration(state: LoopState, pi: ExtensionAPI, deliverAs: "followUp
   }
 }
 
+function getFinalAssistantFailed(messages: Array<{ role: string; stopReason?: string }>): boolean | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== "assistant") continue;
+    return message.stopReason === "error" || message.stopReason === "aborted";
+  }
+  return undefined;
+}
+
 function startLoop(
   pi: ExtensionAPI,
   ctx: ExtensionContext | ExtensionCommandContext,
@@ -158,7 +167,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerFlag("ralphy-continue-on-failure", {
-    description: "Continue the Ralphy loop after obvious tool/assistant failures",
+    description: "Continue the Ralphy loop after assistant/runtime failures",
     type: "boolean",
     default: false,
   });
@@ -266,15 +275,6 @@ export default function (pi: ExtensionAPI) {
     return { messages: filteredMessages };
   });
 
-  pi.on("tool_result", async (event) => {
-    const state = stateRef.current;
-    if (!state?.active) return;
-
-    if (event.isError) {
-      state.iterationHadError = true;
-    }
-  });
-
   pi.on("message_end", async (event) => {
     const state = stateRef.current;
     if (!state?.active) return;
@@ -282,12 +282,26 @@ export default function (pi: ExtensionAPI) {
 
     if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
       state.iterationHadError = true;
+      return;
     }
+
+    state.iterationHadError = false;
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     const state = stateRef.current;
     if (!state?.active) return;
+
+    const finalAssistantFailed = getFinalAssistantFailed(
+      event.messages.filter(
+        (message): message is { role: string; stopReason?: string } =>
+          typeof message === "object" && message !== null && "role" in message,
+      ),
+    );
+
+    if (finalAssistantFailed !== undefined) {
+      state.iterationHadError = finalAssistantFailed;
+    }
 
     if (state.iterationHadError && !state.continueOnFailure) {
       clearState(ctx, stateRef);
