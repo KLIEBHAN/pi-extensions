@@ -12,6 +12,7 @@ Load an individual extension from the repository:
 pi -e ./extensions/hello.ts
 pi -e ./extensions/notify.ts
 pi -e ./extensions/permission-gate.ts
+pi -e ./extensions/ralphy-loop.ts
 pi -e ./extensions/session-name.ts
 pi -e ./extensions/terminal-bench.ts --terminal-bench
 ```
@@ -32,8 +33,58 @@ After package installation, enabled extensions are auto-discovered by pi. The `t
 | `hello.ts` | Minimal custom tool example | `pi -e ./extensions/hello.ts` |
 | `notify.ts` | Adds `/notify` for lightweight in-app notifications | `/notify build finished` |
 | `permission-gate.ts` | Asks for confirmation before dangerous bash commands | `pi -e ./extensions/permission-gate.ts` |
+| `ralphy-loop.ts` | Repeats the same task multiple times and prunes previous iterations from the LLM context between runs | `/ralphy-loop 5 harden edge cases` |
 | `session-name.ts` | Adds `/session-name <name>` to label the current session | `/session-name auth-refactor` |
 | `terminal-bench.ts` | Migrated from `feat/terminal-bench-optimizations`; adds Terminal-Bench prompt rules, tmux tools, environment bootstrapping, and completion verification | `pi -e ./extensions/terminal-bench.ts --terminal-bench` |
+
+## Ralphy loop extension
+
+`extensions/ralphy-loop.ts` is inspired by the repeat loop in Ralphy, but implemented with pi extension APIs.
+
+The main goal is brownfield-style repetition: run the same task multiple times while clearing prior iterations out of the model context so each pass starts fresh.
+
+### What it adds
+
+- `/ralphy-loop <repeat> <task>` to run the same task multiple times
+- optional `/ralphy-loop --repeat <n> --continue-on-failure <task>` syntax
+- `/ralphy-status` to inspect the active loop
+- `/ralphy-stop` to stop the loop and abort the current run
+- optional CLI auto-start flags:
+  - `--ralphy-task "..."`
+  - `--ralphy-repeat <n>`
+  - `--ralphy-continue-on-failure`
+- per-iteration context pruning via the `context` hook
+
+### Usage
+
+Interactive command:
+
+```bash
+pi -e ./extensions/ralphy-loop.ts
+```
+
+Then inside pi:
+
+```text
+/ralphy-loop 3 find and fix bugs
+/ralphy-loop --repeat 5 --continue-on-failure harden edge cases
+/ralphy-status
+/ralphy-stop
+```
+
+Auto-start from CLI:
+
+```bash
+pi -e ./extensions/ralphy-loop.ts \
+  --ralphy-task "find and fix bugs" \
+  --ralphy-repeat 3
+```
+
+### Important note
+
+This clears the **LLM context** between iterations by pruning older iterations during provider requests.
+
+It does **not** create a brand new pi session file for every iteration. Session history is still preserved locally; only the model context is reset between loop iterations.
 
 ## Terminal-Bench extension
 
@@ -84,6 +135,7 @@ pi-extensions/
 │   ├── hello.ts
 │   ├── notify.ts
 │   ├── permission-gate.ts
+│   ├── ralphy-loop.ts
 │   ├── session-name.ts
 │   └── terminal-bench.ts
 ├── .gitignore
