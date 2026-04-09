@@ -43,6 +43,7 @@ const STATUS_KEY = "ralphy-loop";
 const DEFAULT_REPEAT = 1;
 const MAX_REPEAT = 10_000;
 const MAX_VERIFICATION_NUDGES = 3;
+const RALPHY_VERIFIER_FALLBACK_CONTINUE_PROMPT = "Completion verification was inconclusive. Continue working on the same task now. Re-check requirements, repository state, tests, git status, commit, and push. Do not ask the user anything. Only stop when the task is fully complete.";
 const RALPHY_LOOP_SYSTEM_PROMPT = `You are running in autonomous execution mode.
 
 Rules:
@@ -448,7 +449,18 @@ export default function (pi: ExtensionAPI) {
       const assistantText = extractAssistantText(event.message.content);
       const verification = await verifyIterationCompletion(pi, ctx, state.task, assistantText);
 
-      if (verification && !verification.done) {
+      if (!verification) {
+        state.verificationNudges += 1;
+
+        if (state.verificationNudges >= MAX_VERIFICATION_NUDGES) {
+          state.iterationHadError = true;
+          ctx.ui.notify("Ralphy verifier could not determine completion reliably", "warning");
+        } else {
+          ctx.ui.notify("Ralphy verifier was inconclusive. Requesting another completion pass.", "warning");
+          pi.sendUserMessage(RALPHY_VERIFIER_FALLBACK_CONTINUE_PROMPT, { deliverAs: "followUp" });
+          return;
+        }
+      } else if (!verification.done) {
         state.verificationNudges += 1;
 
         if (state.verificationNudges >= MAX_VERIFICATION_NUDGES) {
@@ -456,7 +468,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`Ralphy verifier could not confirm completion: ${verification.reason}`, "warning");
         } else {
           ctx.ui.notify(`Ralphy verifier requested more work: ${verification.reason}`, "warning");
-          const continuePrompt = verification.continuePrompt || "Continue working on the same task now. Do not ask the user anything. Verify completion before stopping.";
+          const continuePrompt = verification.continuePrompt || RALPHY_VERIFIER_FALLBACK_CONTINUE_PROMPT;
           pi.sendUserMessage(continuePrompt, { deliverAs: "followUp" });
           return;
         }
