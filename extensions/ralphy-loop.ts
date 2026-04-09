@@ -295,7 +295,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    state.iterationHadError = stopReason === "error" || stopReason === "aborted";
+    state.iterationHadError = stopReason === "error" || stopReason === "aborted" || stopReason === "length";
 
     if (state.iterationHadError && !state.continueOnFailure) {
       clearState(ctx, stateRef);
