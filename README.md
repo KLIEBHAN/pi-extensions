@@ -203,10 +203,22 @@ pi --terminal-bench
 - It creates and uses a dedicated `tmux` session for interactive terminal control.
 - `tmux` should be installed and available on `PATH` if you want to use `tmux_send` and `tmux_read`.
 
+## Harbor wrapper example
+
+For Harbor-based Terminal-Bench runs, see `examples/harbor-wrapper/README.md`.
+
+The wrapper uploads the bundled `extensions/terminal-bench.ts` file into the
+sandbox automatically. By default it installs the published npm `pi` package,
+and it can optionally run a local `pi-mono` checkout for unreleased testing.
+
 ## Repository structure
 
 ```text
 pi-extensions/
+├── examples/
+│   └── harbor-wrapper/
+│       ├── agent.py
+│       └── README.md
 ├── extensions/
 │   ├── hello.ts
 │   ├── notify.ts

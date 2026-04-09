@@ -71,6 +71,13 @@ const TERMINAL_BENCH_GUIDELINES = `
   run ..., git clone ..., git push ..., curl http://..., or exact compile and
   run commands), verify from that same external perspective before you finish
   whenever it is safe to do so.
+- Do not undo required final state after verification. If the user describes a
+  workflow they will run after you finish, leave the system in the state that
+  makes that workflow succeed now unless the task explicitly asks you to reset
+  or clean it up.
+- If the task names a specific required output artifact or file, the required
+  evidence must be present in that artifact itself. Extra summaries, helper
+  files, or proxy checks do not replace the required artifact.
 - For interactive programs or commands that need special key sequences
   (Ctrl+C, Ctrl+D, arrow keys, etc.), use the tmux_send tool instead of bash.
   Use tmux_read to inspect the current terminal state at any time.
@@ -109,6 +116,11 @@ Checklist — mark each as DONE or TODO:
 - If the user described commands they will run or outputs they will observe,
   did you verify from that same external perspective (or as close as safely
   possible)? [TODO/DONE]
+- If you tested by temporarily changing state, did you leave the final required
+  state in place so the user's described workflow works now? [TODO/DONE]
+- If the task names a required output artifact or file, is the required
+  evidence present in that artifact itself rather than only in helper output,
+  side summaries, or separate logs? [TODO/DONE]
 - Does your solution account for variable values (numeric values, array sizes,
   file contents, configuration parameters)? [TODO/DONE]
 - Have you cleaned up temporary files, scripts, or side effects not required
@@ -261,8 +273,9 @@ function isCompletionStatement(text: string): boolean {
   }
 
   if (/^(done|completed|configured|fixed|implemented)\b/.test(trimmed)) {
+    const completionLead = trimmed.slice(0, 160);
     const continuationHints = ["next", "remaining", "still need", "need to", "then i", "continue"];
-    const looksIncomplete = continuationHints.some((hint) => trimmed.includes(hint));
+    const looksIncomplete = continuationHints.some((hint) => completionLead.includes(hint));
     if (!looksIncomplete) {
       return true;
     }
@@ -311,8 +324,8 @@ function extractContractItems(taskText: string): string[] {
     pushUnique(items, `Required URL: ${match[0]}`);
   }
 
-  for (const match of cleanText.matchAll(/\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+/g)) {
-    pushUnique(items, `Required path/file: ${match[0]}`);
+  for (const match of cleanText.matchAll(/(^|[\s"'`(])((?:\/[A-Za-z0-9._-]+)+)/g)) {
+    pushUnique(items, `Required path/file: ${match[2]}`);
   }
 
   for (const match of cleanText.matchAll(/\bport\s+(\d{2,5})\b/gi)) {
@@ -674,7 +687,11 @@ export default function (pi: ExtensionAPI) {
         contractItems,
         recentToolActions,
       );
-      pi.sendUserMessage(checklist, { deliverAs: "followUp" });
+      if (ctx.isIdle()) {
+        pi.sendUserMessage(checklist);
+      } else {
+        pi.sendUserMessage(checklist, { deliverAs: "steer" });
+      }
     } else if (!isCompletion) {
       completionPending = false;
     }
