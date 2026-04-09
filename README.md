@@ -70,7 +70,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 | `hello.ts` | Minimal custom tool example | `pi -e ./extensions/hello.ts` |
 | `notify.ts` | Adds `/notify` for lightweight in-app notifications | `/notify build finished` |
 | `permission-gate.ts` | Asks for confirmation before dangerous bash commands | `pi -e ./extensions/permission-gate.ts` |
-| `ralphy-loop.ts` | Repeats the same task multiple times and prunes previous iterations from the LLM context between runs | `/ralphy-loop 5 harden edge cases` |
+| `ralphy-loop.ts` | Repeats the same task with autonomous prompts, AI completion verification, and per-iteration context pruning | `/ralphy-loop 5 harden edge cases` |
 | `session-name.ts` | Adds `/session-name <name>` to label the current session | `/session-name auth-refactor` |
 | `terminal-bench.ts` | Migrated from `feat/terminal-bench-optimizations`; adds Terminal-Bench prompt rules, tmux tools, environment bootstrapping, and completion verification | `pi -e ./extensions/terminal-bench.ts --terminal-bench` |
 
@@ -78,7 +78,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 
 `extensions/ralphy-loop.ts` is inspired by the repeat loop in Ralphy, but implemented with pi extension APIs.
 
-The main goal is brownfield-style repetition: run the same task multiple times while clearing prior iterations out of the model context so each pass starts fresh.
+The main goal is brownfield-style repetition: run the same task multiple times while clearing prior iterations out of the model context so each pass starts fresh, verifies completion conservatively, and keeps working without user interaction until the task is actually done.
 
 ### What it adds
 
@@ -90,7 +90,16 @@ The main goal is brownfield-style repetition: run the same task multiple times w
   - `--ralphy-task "..."`
   - `--ralphy-repeat <n>`
   - `--ralphy-continue-on-failure`
+  - `--ralphy-verifier-model <provider/model>` to run completion verification on a different model when desired
+- autonomous system prompt that explicitly forbids user interaction and requires commit/push in git repos
 - per-iteration context pruning via the `context` hook
+- loop termination is based on the assistant finishing with `stopReason: error|aborted|length`; recoverable tool errors do not automatically stop the loop if the assistant still completes successfully
+- deterministic git verification before an iteration is considered done:
+  - working tree must be clean
+  - an upstream branch must be configured
+  - the local branch must be in sync with upstream
+- AI completion verification after technically successful turns, with up to 3 automatic "keep working" nudges when completion is unclear or not yet confirmed
+- lightweight automated tests for the parser and verifier helper logic (`npm run test`)
 
 ### Usage
 
@@ -117,6 +126,15 @@ pi -e ./extensions/ralphy-loop.ts \
   --ralphy-repeat 3
 ```
 
+Optional separate verifier model:
+
+```bash
+pi -e ./extensions/ralphy-loop.ts \
+  --ralphy-task "find and fix bugs" \
+  --ralphy-repeat 3 \
+  --ralphy-verifier-model openai/gpt-5.4
+```
+
 ### How context reset works
 
 This extension does **not** create a brand new pi session for every repeat.
@@ -128,6 +146,8 @@ Concretely:
 - when an iteration starts, the extension records a new `iterationStartAt` timestamp
 - before each provider request, it removes messages older than that timestamp from the LLM context
 - the model therefore sees only the current iteration's messages, tool calls, and tool results
+
+Today this boundary is timestamp-based because the extension `context` hook gets `AgentMessage[]` without stable per-iteration message ids. So this is the safest implementation available purely at extension level.
 
 What still remains:
 
