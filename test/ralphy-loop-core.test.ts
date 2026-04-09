@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   extractAssistantText,
   parseLoopArgs,
@@ -91,4 +92,10 @@ test("shouldTreatStopReasonAsFailure matches expected reasons", () => {
 test("summarizeTask truncates long text with ellipsis", () => {
   assert.equal(summarizeTask("a".repeat(10), 10), "a".repeat(10));
   assert.equal(summarizeTask("a".repeat(11), 10), `${"a".repeat(9)}…`);
+});
+
+test("ralphy-loop.ts stays standalone when symlinked as a single extension file", () => {
+  const source = readFileSync(new URL("../extensions/ralphy-loop.ts", import.meta.url), "utf8");
+  assert.equal(source.includes('from "./ralphy-loop-core.ts"'), false);
+  assert.equal(source.includes("from './ralphy-loop-core.ts'"), false);
 });
