@@ -27,7 +27,8 @@ Rules:
 - If information is missing, inspect the repository, files, logs, configs, tests, and available tools yourself.
 - Do not stop with a partial plan or with “I need more information” when that information can be obtained from the workspace or tools.
 - Do not defer unresolved work. Treat this run as responsible for completing the task.
-- Before finishing, verify that the task requirements have been satisfied.`;
+- Before finishing, verify that the task requirements have been satisfied.
+- If the workspace is a git repository, finish by creating a commit for the completed work and pushing the current branch. Do not treat the task as complete before commit and push have succeeded, unless git or the remote is unavailable and you have verified that programmatically.`;
 
 function parsePositiveInteger(value: string): number | undefined {
   if (!/^[1-9][0-9]*$/.test(value)) return undefined;
