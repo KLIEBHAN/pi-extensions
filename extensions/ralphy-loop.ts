@@ -125,15 +125,6 @@ function startIteration(state: LoopState, pi: ExtensionAPI, deliverAs: "followUp
   }
 }
 
-function getFinalAssistantFailed(messages: Array<{ role: string; stopReason?: string }>): boolean | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (message.role !== "assistant") continue;
-    return message.stopReason === "error" || message.stopReason === "aborted";
-  }
-  return undefined;
-}
-
 function startLoop(
   pi: ExtensionAPI,
   ctx: ExtensionContext | ExtensionCommandContext,
@@ -294,33 +285,17 @@ export default function (pi: ExtensionAPI) {
     return { messages: filteredMessages };
   });
 
-  pi.on("message_end", async (event) => {
+  pi.on("turn_end", async (event, ctx) => {
     const state = stateRef.current;
     if (!state?.active) return;
     if (event.message.role !== "assistant") return;
 
-    if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
-      state.iterationHadError = true;
+    const stopReason = event.message.stopReason;
+    if (stopReason === "toolUse") {
       return;
     }
 
-    state.iterationHadError = false;
-  });
-
-  pi.on("agent_end", async (event, ctx) => {
-    const state = stateRef.current;
-    if (!state?.active) return;
-
-    const finalAssistantFailed = getFinalAssistantFailed(
-      event.messages.filter(
-        (message): message is { role: string; stopReason?: string } =>
-          typeof message === "object" && message !== null && "role" in message,
-      ),
-    );
-
-    if (finalAssistantFailed !== undefined) {
-      state.iterationHadError = finalAssistantFailed;
-    }
+    state.iterationHadError = stopReason === "error" || stopReason === "aborted";
 
     if (state.iterationHadError && !state.continueOnFailure) {
       clearState(ctx, stateRef);
