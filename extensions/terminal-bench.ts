@@ -53,31 +53,24 @@ const TERMINAL_BENCH_GUIDELINES = `
 - You do NOT have eyes or ears. For multimedia files (images, audio, video),
   use programmatic or CLI tools to inspect them (e.g. file, identify, ffprobe,
   exiftool, python scripts). Never guess content from filenames alone.
-- Before finishing, verify minimal state changes: identify the absolute minimum
-  set of files that must be created or modified to satisfy the task. Beyond
-  those required files, the system state must remain identical to its original
-  state. Do not leave behind extra files, modified configurations, temporary
-  artifacts, or side effects that were not explicitly requested.
-- Prefer short, targeted commands. Avoid long-running blocking commands.
-  If a command might take a while, check intermediate output instead of
-  waiting indefinitely.
-- When you believe the task is complete, re-read the original task description
-  and verify your solution meets ALL requirements before confirming.
-- Extract an exact contract checklist from the task text: required file paths,
-  filenames, ports, URLs, versions, numeric thresholds, modes (CPU/GPU),
-  iteration counts, and any commands the user says they will run or outputs
-  they will observe. Satisfy that exact contract, not an approximate equivalent.
-- If the task describes an externally observable workflow (for example: I will
-  run ..., git clone ..., git push ..., curl http://..., or exact compile and
-  run commands), verify from that same external perspective before you finish
-  whenever it is safe to do so.
-- Do not undo required final state after verification. If the user describes a
-  workflow they will run after you finish, leave the system in the state that
-  makes that workflow succeed now unless the task explicitly asks you to reset
-  or clean it up.
-- If the task names a specific required output artifact or file, the required
-  evidence must be present in that artifact itself. Extra summaries, helper
-  files, or proxy checks do not replace the required artifact.
+- Keep state changes minimal. Beyond the files and state required by the task,
+  do not leave extra files, modified configurations, temporary artifacts, or
+  other side effects.
+- Prefer short, targeted commands. Avoid long blocking commands; if something
+  may take a while, inspect intermediate output instead of waiting blindly.
+- Before finishing, re-read the task and verify that your solution meets all
+  requirements.
+- Extract the exact contract from the task: required paths, filenames, ports,
+  URLs, versions, thresholds, modes, counts, and any commands or outputs the
+  user specifies. Satisfy that exact contract, not an approximate equivalent.
+- If the task describes an externally observable workflow (for example: exact
+  clone/push/curl/compile/run commands), verify from that same external
+  perspective before you finish whenever it is safe.
+- Leave the exact required final state in place when you finish. If you use
+  destructive verification or cleanup, do it only on temporary copies.
+- If the task names a required output artifact, the required evidence must be
+  present in that artifact itself. Helper files, summaries, or proxy checks do
+  not replace it.
 - For interactive programs or commands that need special key sequences
   (Ctrl+C, Ctrl+D, arrow keys, etc.), use the tmux_send tool instead of bash.
   Use tmux_read to inspect the current terminal state at any time.
@@ -110,25 +103,16 @@ Last terminal output:
 ${terminalState}
 
 Checklist — mark each as DONE or TODO:
-- Does your solution meet ALL requirements in the original task? [TODO/DONE]
-- Did you satisfy every exact contract item above (paths, filenames, ports,
-  URLs, versions, thresholds, modes, counts, commands)? [TODO/DONE]
-- If the user described commands they will run or outputs they will observe,
-  did you verify from that same external perspective (or as close as safely
-  possible)? [TODO/DONE]
-- If you tested by temporarily changing state, did you leave the final required
-  state in place so the user's described workflow works now? [TODO/DONE]
-- If the task names a required output artifact or file, is the required
-  evidence present in that artifact itself rather than only in helper output,
-  side summaries, or separate logs? [TODO/DONE]
-- Does your solution account for variable values (numeric values, array sizes,
-  file contents, configuration parameters)? [TODO/DONE]
-- Have you cleaned up temporary files, scripts, or side effects not required
-  by the task? [TODO/DONE]
-- Verified from the perspective of:
-  - A test engineer? [TODO/DONE]
-  - A QA engineer? [TODO/DONE]
-  - The user who requested this task? [TODO/DONE]
+- Does your solution meet all original requirements and exact contract items
+  above? [TODO/DONE]
+- If the task describes commands, outputs, or another user-visible workflow,
+  did you verify from that same external perspective? [TODO/DONE]
+- Did you leave the exact required final state in place now, and do any
+  destructive verification or cleanup only on temporary copies? [TODO/DONE]
+- If the task names a required output artifact, is the required evidence
+  present in that artifact itself? [TODO/DONE]
+- Did you verify against the actual values involved and remove only temporary
+  side effects? [TODO/DONE]
 
 If everything is DONE, proceed. If any item is TODO, fix it first.
 `.trim();
