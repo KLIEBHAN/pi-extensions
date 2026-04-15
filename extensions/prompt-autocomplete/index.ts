@@ -51,6 +51,11 @@ interface PromptAutocompleteCacheEntry {
   expiresAt: number;
 }
 
+interface SuggestionRefreshOptions {
+  clearExisting?: boolean;
+  immediate?: boolean;
+}
+
 interface PromptAutocompleteSharedState {
   enabled: boolean;
   activationId: number;
@@ -64,6 +69,7 @@ interface PromptAutocompleteSharedState {
   lastRawResponse?: string;
   requestCache: Map<string, PromptAutocompleteCacheEntry>;
   inFlightRequests: Map<string, Promise<PromptAutocompleteCacheEntry>>;
+  refreshEditor?: (options?: SuggestionRefreshOptions) => void;
   setStatusText?: (text: string | undefined) => void;
 }
 
@@ -364,6 +370,13 @@ class PromptAutocompleteEditor extends CustomEditor {
     return lines;
   }
 
+  refreshFromExternalChange(options: SuggestionRefreshOptions = {}): void {
+    this.refreshSuggestion({
+      clearExisting: options.clearExisting ?? true,
+      immediate: options.immediate ?? true,
+    });
+  }
+
   private getActiveSuggestion(): string | undefined {
     return this.suggestions[this.suggestionIndex];
   }
@@ -495,7 +508,12 @@ class PromptAutocompleteEditor extends CustomEditor {
     return undefined;
   }
 
-  private refreshSuggestion(): void {
+  private refreshSuggestion(options: SuggestionRefreshOptions = {}): void {
+    if (options.clearExisting) {
+      this.cancelPendingRequest();
+      this.setSuggestions([]);
+    }
+
     if (!this.shared.enabled || this.activationId !== this.shared.activationId) {
       this.cancelPendingRequest();
       updateDebugState(this.shared, "inactive");
@@ -564,7 +582,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.cancelPendingRequest();
     this.pendingRequestKey = request.cacheKey;
 
-    const debounceMs = this.shared.config.debounceMs;
+    const debounceMs = options.immediate ? 0 : this.shared.config.debounceMs;
     if (debounceMs <= 0) {
       updateDebugState(this.shared, "requesting", `Immediate request to ${request.modelLabel}`);
       void this.fetchSuggestion(request, ++this.requestSeq);
@@ -794,7 +812,12 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
     );
   };
   ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-    return new PromptAutocompleteEditor(tui, theme, keybindings, shared, activationId);
+    const editor = new PromptAutocompleteEditor(tui, theme, keybindings, shared, activationId);
+    shared.refreshEditor = (options) => {
+      if (activationId !== shared.activationId) return;
+      editor.refreshFromExternalChange(options);
+    };
+    return editor;
   });
   updateDebugState(shared, "mounted", "Editor extension attached");
 }
@@ -803,6 +826,7 @@ function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedSt
   shared.activationId += 1;
   ctx.ui.setEditorComponent(undefined);
   clearDebugUi(shared);
+  shared.refreshEditor = undefined;
   shared.setStatusText = undefined;
 }
 
@@ -885,6 +909,7 @@ export default function (pi: ExtensionAPI) {
     shared.modelRegistry = ctx.modelRegistry;
     if (shared.enabled) {
       updateDebugState(shared, "model-changed", formatModelLabel(event.model as Model<Api>));
+      shared.refreshEditor?.({ clearExisting: true, immediate: true });
     }
   });
 
@@ -892,6 +917,7 @@ export default function (pi: ExtensionAPI) {
     shared.streaming = true;
     if (shared.enabled && !shared.config.allowWhileStreaming) {
       updateDebugState(shared, "waiting", "Main agent is still working");
+      shared.refreshEditor?.({ clearExisting: true, immediate: true });
     }
   });
 
@@ -899,6 +925,7 @@ export default function (pi: ExtensionAPI) {
     shared.streaming = false;
     if (shared.enabled) {
       updateDebugState(shared, "ready", "Agent finished; autocomplete can request suggestions again");
+      shared.refreshEditor?.({ clearExisting: true, immediate: true });
     }
   });
 
