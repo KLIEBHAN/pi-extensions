@@ -1,0 +1,430 @@
+import type { Api, Model } from "@mariozechner/pi-ai";
+
+export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT = `You generate inline prompt suggestions for a coding-agent user.
+
+Return ONLY valid JSON with exactly this shape:
+{"completions":["suggestion 1","suggestion 2"]}
+
+Interpretation rules:
+- If the current draft is non-empty, each item must be the exact continuation to insert at the cursor.
+- If the current draft is empty, each item must be a complete next prompt the user could send now.
+
+Quality rules:
+- Return 0 to the requested number of ranked alternatives.
+- Match the language, tone, and level of specificity of the draft and conversation.
+- Strongly use the latest assistant message as primary context.
+- Prefer concrete, useful follow-up prompts for a coding workflow.
+- Follow-up prompts should be very short, high-signal, and sharp.
+- Prefer 3-10 words when possible.
+- Prefer direct imperative phrasing when natural.
+- Prefer commands over questions for follow-up prompts when both would work.
+- Avoid filler, politeness padding, hedging, meta-commentary, and unnecessary setup.
+- Avoid vague meta-prompts like "can you help?" when a more specific next step is possible.
+- Do not repeat the full draft unless it is necessary for a natural continuation.
+- Do not explain your choices.
+- Do not wrap output in code fences.
+- If there is no strong suggestion, return {"completions":[]}.`;
+
+export const DEFAULT_PREFERRED_MODEL = "openai/gpt-5.4-mini";
+export const DEFAULT_DEBOUNCE_MS = 350;
+export const DEFAULT_MIN_PROMPT_CHARS = 0;
+export const DEFAULT_MAX_SUGGESTION_CHARS = 160;
+export const DEFAULT_MAX_ALTERNATIVES = 2;
+export const MAX_DRAFT_CONTEXT_CHARS = 2_000;
+export const MAX_CONTEXT_MESSAGES = 6;
+export const MAX_CONTEXT_MESSAGE_CHARS = 600;
+export const MAX_LATEST_ASSISTANT_MESSAGE_CHARS = 3_000;
+export const MAX_LATEST_USER_MESSAGE_CHARS = 1_200;
+
+export interface ModelRef {
+  provider: string;
+  id: string;
+}
+
+interface SuggestionPayload {
+  completions?: unknown;
+  suggestions?: unknown;
+  alternatives?: unknown;
+  items?: unknown;
+  completion?: unknown;
+  suggestion?: unknown;
+  text?: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function trimAndCollapse(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+function truncateWithEllipsis(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 1) return "…";
+  return `${text.slice(0, maxChars - 1)}…`;
+}
+
+function truncateMiddle(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 5) return truncateWithEllipsis(text, maxChars);
+
+  const separator = "\n…\n";
+  const remaining = maxChars - separator.length;
+  const head = Math.ceil(remaining / 2);
+  const tail = Math.floor(remaining / 2);
+  return `${text.slice(0, head)}${separator}${text.slice(-tail)}`;
+}
+
+function stripCodeFences(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("```")) {
+    return text;
+  }
+
+  const withoutOpening = trimmed.replace(/^```[^\n]*\n?/, "");
+  return withoutOpening.replace(/\n?```\s*$/, "");
+}
+
+function stripWrappingQuotes(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.length < 2) return text;
+
+  const pairs: Array<[string, string]> = [
+    ['"', '"'],
+    ["'", "'"],
+    ["`", "`"],
+  ];
+
+  for (const [start, end] of pairs) {
+    if (trimmed.startsWith(start) && trimmed.endsWith(end)) {
+      return trimmed.slice(1, -1);
+    }
+  }
+
+  return text;
+}
+
+function stripRepeatedDraftPrefix(draft: string, suggestion: string): string {
+  if (!draft) return suggestion;
+
+  if (suggestion.startsWith(draft)) {
+    return suggestion.slice(draft.length);
+  }
+
+  const trimmedSuggestion = suggestion.trimStart();
+  if (trimmedSuggestion.startsWith(draft)) {
+    return trimmedSuggestion.slice(draft.length);
+  }
+
+  return suggestion;
+}
+
+function normalizeLeadingBoundarySpacing(draft: string, suggestion: string): string {
+  if (!suggestion) return suggestion;
+
+  const lastChar = draft.slice(-1);
+  if (!lastChar) return suggestion.replace(/^[ \t]+/, "");
+
+  // If the draft already ends with a horizontal whitespace, do not keep another
+  // leading horizontal whitespace from the suggestion.
+  if (/[ \t]/.test(lastChar)) {
+    return suggestion.replace(/^[ \t]+/, "");
+  }
+
+  // If the model starts with multiple spaces/tabs even though the draft does not
+  // end with whitespace, collapse them to a single separating space.
+  if (/^[ \t]+/.test(suggestion)) {
+    return ` ${suggestion.trimStart()}`;
+  }
+
+  return suggestion;
+}
+
+function maybePrefixSpace(draft: string, suggestion: string): string {
+  if (!suggestion) return suggestion;
+  if (/^\s/.test(suggestion)) return suggestion;
+
+  const lastChar = draft.slice(-1);
+  if (!lastChar) return suggestion;
+
+  if (/\s/.test(lastChar)) return suggestion;
+  if (/[({\["'`/\\-]/.test(lastChar)) return suggestion;
+  if (/^[,.;:!?)}\]]/.test(suggestion)) return suggestion;
+
+  if (/[A-Za-z0-9\])]/.test(lastChar) && /^[A-Za-z0-9([{"']/.test(suggestion)) {
+    return ` ${suggestion}`;
+  }
+
+  if (/[,:;]/.test(lastChar) && !/^\s/.test(suggestion)) {
+    return ` ${suggestion}`;
+  }
+
+  return suggestion;
+}
+
+function getJsonCandidates(text: string): string[] {
+  const stripped = stripCodeFences(text).trim();
+  const candidates = new Set<string>();
+
+  if (stripped) {
+    candidates.add(stripped);
+  }
+
+  const objectStart = stripped.indexOf("{");
+  const objectEnd = stripped.lastIndexOf("}");
+  if (objectStart !== -1 && objectEnd !== -1 && objectEnd > objectStart) {
+    candidates.add(stripped.slice(objectStart, objectEnd + 1));
+  }
+
+  const arrayStart = stripped.indexOf("[");
+  const arrayEnd = stripped.lastIndexOf("]");
+  if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
+    candidates.add(stripped.slice(arrayStart, arrayEnd + 1));
+  }
+
+  return [...candidates];
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function extractJsonSuggestions(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return toStringArray(value);
+  }
+
+  if (!isRecord(value)) {
+    return [];
+  }
+
+  const payload = value as SuggestionPayload;
+  const arrayKeys = [payload.completions, payload.suggestions, payload.alternatives, payload.items];
+  for (const candidate of arrayKeys) {
+    const strings = toStringArray(candidate);
+    if (strings.length > 0) return strings;
+  }
+
+  const scalarKeys = [payload.completion, payload.suggestion, payload.text];
+  for (const candidate of scalarKeys) {
+    if (typeof candidate === "string") {
+      return [candidate];
+    }
+  }
+
+  return [];
+}
+
+function parseSuggestionResponse(rawResponse: string): string[] {
+  for (const candidate of getJsonCandidates(rawResponse)) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      const suggestions = extractJsonSuggestions(parsed);
+      if (suggestions.length > 0) {
+        return suggestions;
+      }
+
+      if (Array.isArray(parsed) && parsed.length === 0) {
+        return [];
+      }
+
+      if (isRecord(parsed) && Array.isArray((parsed as SuggestionPayload).completions)) {
+        return [];
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return rawResponse.trim() ? [rawResponse] : [];
+}
+
+export function parseModelRef(value: boolean | string | undefined): ModelRef | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  const slashIndex = trimmed.indexOf("/");
+  if (slashIndex <= 0 || slashIndex === trimmed.length - 1) {
+    return undefined;
+  }
+
+  return {
+    provider: trimmed.slice(0, slashIndex),
+    id: trimmed.slice(slashIndex + 1),
+  };
+}
+
+export function parseBoundedIntFlag(
+  value: boolean | string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (typeof value !== "string") return fallback;
+  const parsed = Number.parseInt(value.trim(), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+export function extractMessageText(content: unknown): string {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .filter((block): block is { type?: unknown; text?: unknown } => isRecord(block))
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+}
+
+export function buildRecentConversationContext(
+  branch: unknown[],
+  maxMessages = MAX_CONTEXT_MESSAGES,
+  maxCharsPerMessage = MAX_CONTEXT_MESSAGE_CHARS,
+): string {
+  const collected: string[] = [];
+
+  for (let i = branch.length - 1; i >= 0 && collected.length < maxMessages; i -= 1) {
+    const entry = branch[i];
+    if (!isRecord(entry) || entry.type !== "message") continue;
+
+    const message = entry.message;
+    if (!isRecord(message)) continue;
+
+    const role = message.role;
+    if (role !== "user" && role !== "assistant") continue;
+
+    const text = extractMessageText(message.content);
+    if (!text) continue;
+
+    const prefix = role === "user" ? "User" : "Assistant";
+    const normalized = truncateWithEllipsis(trimAndCollapse(text), maxCharsPerMessage);
+    collected.push(`${prefix}: ${normalized}`);
+  }
+
+  return collected.reverse().join("\n\n");
+}
+
+function buildLatestRoleMessageContext(
+  branch: unknown[],
+  role: "user" | "assistant",
+  maxChars: number,
+): string {
+  for (let i = branch.length - 1; i >= 0; i -= 1) {
+    const entry = branch[i];
+    if (!isRecord(entry) || entry.type !== "message") continue;
+
+    const message = entry.message;
+    if (!isRecord(message) || message.role !== role) continue;
+
+    const text = extractMessageText(message.content);
+    if (!text) continue;
+
+    return truncateMiddle(text.trim(), maxChars);
+  }
+
+  return "";
+}
+
+export function buildLatestAssistantMessageContext(
+  branch: unknown[],
+  maxChars = MAX_LATEST_ASSISTANT_MESSAGE_CHARS,
+): string {
+  return buildLatestRoleMessageContext(branch, "assistant", maxChars);
+}
+
+export function buildLatestUserMessageContext(
+  branch: unknown[],
+  maxChars = MAX_LATEST_USER_MESSAGE_CHARS,
+): string {
+  return buildLatestRoleMessageContext(branch, "user", maxChars);
+}
+
+export function truncateDraftTail(draft: string, maxChars = MAX_DRAFT_CONTEXT_CHARS): string {
+  if (draft.length <= maxChars) return draft;
+  return draft.slice(-maxChars);
+}
+
+export function normalizePromptSuggestion(
+  draft: string,
+  rawSuggestion: string,
+  maxChars = DEFAULT_MAX_SUGGESTION_CHARS,
+): string | undefined {
+  let suggestion = rawSuggestion.replace(/\r/g, "");
+  if (!suggestion.trim()) return undefined;
+  if (/^<NO_COMPLETION>$/i.test(suggestion.trim())) return undefined;
+
+  suggestion = stripCodeFences(suggestion);
+  suggestion = suggestion.replace(/^(?:continuation|completion|suggestion)\s*:\s*/i, "");
+  suggestion = stripWrappingQuotes(suggestion);
+  suggestion = stripRepeatedDraftPrefix(draft, suggestion);
+  suggestion = suggestion.replace(/^\u200b+/, "");
+  suggestion = suggestion.replace(/\t/g, "    ");
+  suggestion = suggestion.trimEnd();
+
+  if (!suggestion.trim()) return undefined;
+
+  suggestion = normalizeLeadingBoundarySpacing(draft, suggestion);
+  suggestion = maybePrefixSpace(draft, suggestion);
+  suggestion = truncateWithEllipsis(suggestion, maxChars);
+
+  if (!suggestion.trim()) return undefined;
+  return suggestion;
+}
+
+export function normalizePromptSuggestions(
+  draft: string,
+  rawResponse: string,
+  maxChars = DEFAULT_MAX_SUGGESTION_CHARS,
+  maxAlternatives = DEFAULT_MAX_ALTERNATIVES,
+): string[] {
+  const rawSuggestions = parseSuggestionResponse(rawResponse);
+  const normalized: string[] = [];
+
+  for (const rawSuggestion of rawSuggestions) {
+    const suggestion = normalizePromptSuggestion(draft, rawSuggestion, maxChars);
+    if (!suggestion) continue;
+    if (normalized.includes(suggestion)) continue;
+    normalized.push(suggestion);
+    if (normalized.length >= maxAlternatives) break;
+  }
+
+  return normalized;
+}
+
+export function extractNextSuggestionChunk(suggestion: string): string | undefined {
+  if (!suggestion) return undefined;
+
+  const match = /^(\s*)(\S+)(\s*)/s.exec(suggestion);
+  if (!match) {
+    return suggestion;
+  }
+
+  const leading = match[1] ?? "";
+  const token = match[2] ?? "";
+  const trailing = match[3] ?? "";
+
+  let keptTrailing = "";
+  if (trailing.startsWith("\n")) {
+    const indent = /^\n([ \t]*)/.exec(trailing)?.[1] ?? "";
+    keptTrailing = `\n${indent}`;
+  } else if (/^[ \t]+/.test(trailing)) {
+    keptTrailing = /^[ \t]+/.exec(trailing)?.[0] ?? "";
+  }
+
+  return `${leading}${token}${keptTrailing}`;
+}
+
+export function formatModelLabel(model: Model<Api> | undefined): string {
+  if (!model) return "none";
+  return `${model.provider}/${model.id}`;
+}

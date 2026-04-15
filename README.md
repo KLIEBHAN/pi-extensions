@@ -12,6 +12,7 @@ Load an individual extension from the repository:
 pi -e ./extensions/hello.ts
 pi -e ./extensions/notify.ts
 pi -e ./extensions/permission-gate.ts
+pi -e ./extensions/prompt-autocomplete --prompt-autocomplete
 pi -e ./extensions/ralphy-loop
 pi -e ./extensions/session-name.ts
 pi -e ./extensions/terminal-bench.ts --terminal-bench
@@ -24,7 +25,7 @@ pi install ../pi-extensions
 pi install git:github.com/KLIEBHAN/pi-extensions
 ```
 
-After package installation, enabled extensions are auto-discovered by pi. The `terminal-bench` extension is safe to keep installed because it only activates when `--terminal-bench` is passed.
+After package installation, enabled extensions are auto-discovered by pi. The `terminal-bench` and `prompt-autocomplete` extensions are safe to keep installed because they only activate when their flags are passed (or, for prompt autocomplete, when enabled via its slash command).
 
 ## Permanently enable an extension via the user folder
 
@@ -76,9 +77,73 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 | `hello.ts` | Minimal custom tool example | `pi -e ./extensions/hello.ts` |
 | `notify.ts` | Adds `/notify` for lightweight in-app notifications | `/notify build finished` |
 | `permission-gate.ts` | Asks for confirmation before dangerous bash commands | `pi -e ./extensions/permission-gate.ts` |
+| `prompt-autocomplete/` | Copilot/Cursor-style inline AI autocomplete for the prompt editor with Tab accept and Escape dismiss | `pi -e ./extensions/prompt-autocomplete --prompt-autocomplete` |
 | `ralphy-loop/` | Repeats the same task with autonomous prompts, AI completion verification, and per-iteration context pruning | `/ralphy-loop 5 harden edge cases` |
 | `session-name.ts` | Adds `/session-name <name>` to label the current session | `/session-name auth-refactor` |
 | `terminal-bench.ts` | Migrated from `feat/terminal-bench-optimizations`; adds Terminal-Bench prompt rules, tmux tools, environment bootstrapping, and completion verification | `pi -e ./extensions/terminal-bench.ts --terminal-bench` |
+
+## Prompt autocomplete extension
+
+`extensions/prompt-autocomplete/` adds inline AI autocomplete while you type your next prompt.
+
+### What it adds
+
+- ghost-text style prompt suggestions directly in the editor, including when the draft is still empty
+- shows 2 alternatives by default, with configurable limit via flag
+- `Tab` accepts the whole current suggestion
+- `Ctrl+Space` accepts the next word/chunk from the current suggestion
+- `Ctrl+,` and `Ctrl+.` cycle through alternative suggestions
+- legacy fallbacks remain supported when your terminal forwards them: `Ctrl+Tab`, `Alt+[`, `Alt+]`
+- `Escape` dismisses the current suggestion for the current draft
+- repeated acceptance can keep extending the prompt step by step
+- defaults to `openai/gpt-5.4-mini` for autocomplete when available, with fallback to the current active model
+- optional dedicated autocomplete model via `--prompt-autocomplete-model provider/model`
+- configurable alternative count via `--prompt-autocomplete-max-alternatives <1-5>`
+- clean default UI: debug/status lines stay hidden unless you opt into debug mode
+- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle`
+
+### Usage
+
+Directly from this repository:
+
+```bash
+pi -e ./extensions/prompt-autocomplete --prompt-autocomplete
+```
+
+After package installation:
+
+```bash
+pi --prompt-autocomplete
+```
+
+Or enable it for the current session from inside pi:
+
+```text
+/prompt-autocomplete on
+/prompt-autocomplete status
+/prompt-autocomplete debug-on
+/prompt-autocomplete debug-off
+/prompt-autocomplete off
+```
+
+Optional dedicated fast model:
+
+```bash
+pi -e ./extensions/prompt-autocomplete \
+  --prompt-autocomplete \
+  --prompt-autocomplete-model openai/gpt-5.4-mini \
+  --prompt-autocomplete-max-alternatives 2
+```
+
+### Notes
+
+- The extension suggests as soon as the cursor is at the end of the current draft, even if the draft is still empty.
+- Built-in slash-command and file/path autocomplete keep working.
+- By default it pauses while the main agent is streaming so it can use the finished conversation context. Override with `--prompt-autocomplete-while-streaming` if you really want live suggestions while the agent is still working.
+- Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling.
+- The default suggestion count is 2. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
+- Legacy `Ctrl+Tab` and `Alt+[` / `Alt+]` remain supported as fallbacks when your terminal forwards them.
+- For troubleshooting, start with `--prompt-autocomplete-debug` or run `/prompt-autocomplete debug-on` temporarily.
 
 ## Ralphy loop extension
 
@@ -231,6 +296,9 @@ pi-extensions/
 │   ├── hello.ts
 │   ├── notify.ts
 │   ├── permission-gate.ts
+│   ├── prompt-autocomplete/
+│   │   ├── core.ts
+│   │   └── index.ts
 │   ├── ralphy-loop/
 │   │   ├── core.ts
 │   │   └── index.ts
