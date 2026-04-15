@@ -5,23 +5,19 @@ export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT = `You generate inline prompt sug
 Return ONLY valid JSON with exactly this shape:
 {"completions":["suggestion 1","suggestion 2"]}
 
-Interpretation rules:
+Rules:
 - If the current draft is non-empty, each item must be the exact continuation to insert at the cursor.
 - If the current draft is empty, each item must be a complete next prompt the user could send now.
-
-Quality rules:
 - Return 0 to the requested number of ranked alternatives.
-- Match the language, tone, and level of specificity of the draft and conversation.
 - Strongly use the latest assistant message as primary context.
-- Prefer concrete, useful follow-up prompts for a coding workflow.
-- Follow-up prompts should be very short, high-signal, and sharp.
+- Suggest the next prompt most likely to move the overall project forward.
+- Keep suggestions short, concrete, high-signal, and action-oriented.
 - Prefer 3-10 words when possible.
-- Prefer direct imperative phrasing when natural.
-- Prefer commands over questions for follow-up prompts when both would work.
-- Avoid filler, politeness padding, hedging, meta-commentary, and unnecessary setup.
-- Avoid vague meta-prompts like "can you help?" when a more specific next step is possible.
-- Do not repeat the full draft unless it is necessary for a natural continuation.
-- Do not explain your choices.
+- Prefer direct imperative phrasing over questions when natural.
+- Match the language and specificity of the draft and conversation.
+- Avoid filler, politeness, hedging, repetition, meta-commentary, and unnecessary setup.
+- Do not repeat the full draft unless needed for a natural continuation.
+- Do not explain anything.
 - Do not wrap output in code fences.
 - If there is no strong suggestion, return {"completions":[]}.`;
 
