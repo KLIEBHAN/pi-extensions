@@ -96,7 +96,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
   - quality-goal stop prompt via `--until "..."`
   - hybrid mode when both are set
 - `/auto status`, `/auto summary`, `/auto pause`, `/auto resume`, `/auto off`, `/auto nudge <instruction>`
-- separate controller model support via `--controller-model provider/model` or `--auto-controller-model provider/model`
+- separate controller model support via `--controller-model provider/model` or `--auto-controller-model provider/model` (defaults to the active worker model)
 - transparent follow-up prompts via real user messages, so autonomous iterations stay visible in the transcript
 - rolling controller summary with restore-on-start behavior (restored paused by default, or auto-resumed on startup when `--auto-resume` is set)
 - optional verification command for candidate-stop checks via `--verify "..."` / `--auto-verify "..."`, including proactive pre-stop verification when the worker looks close to done

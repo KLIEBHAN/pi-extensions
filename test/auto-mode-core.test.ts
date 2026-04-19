@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   applyControllerStopOverrideRefinement,
   AUTO_MODE_STATE_TYPE,
@@ -13,6 +14,7 @@ import {
   buildStartPrompt,
   decideAutoModeSessionStart,
   DEFAULT_AUTO_ITERATIONS,
+  DEFAULT_CONTROLLER_MODEL,
   DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS,
   DEFAULT_STAGNATION_LIMIT,
   deriveAutoContinueProgressState,
@@ -49,7 +51,19 @@ test("parseModelRef parses provider/model strings", () => {
   assert.equal(parseModelRef("invalid"), undefined);
 });
 
-test("parseAutoCommandArgs parses /auto on with defaults", () => {
+test("default controller model now follows the active worker model", () => {
+  assert.equal(DEFAULT_CONTROLLER_MODEL, "active worker model");
+});
+
+test("auto-mode index no longer hardcodes a provider/model fallback for the controller", () => {
+  const source = readFileSync(new URL("../extensions/auto-mode/index.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /parseModelRef\(DEFAULT_CONTROLLER_MODEL\)/);
+  assert.match(source, /if \(ctx\.model && registry\.hasConfiguredAuth\(ctx\.model\)\) \{/);
+  assert.match(source, /defaults to the \$\{DEFAULT_CONTROLLER_MODEL\}/);
+  assert.match(source, /controller-model=\$\{DEFAULT_CONTROLLER_MODEL\} \(default\)/);
+});
+
+test("parseAutoCommandArgs parses \/auto on with defaults", () => {
   const parsed = parseAutoCommandArgs("on improve onboarding flow");
   assert.equal(parsed.kind, "on");
   if (parsed.kind !== "on") return;

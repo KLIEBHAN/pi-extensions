@@ -31,7 +31,6 @@ import {
   shouldAttemptAutoAdjacentContinuation,
   parseAutoCommandArgs,
   parseControllerDecision,
-  parseModelRef,
   planAutoFollowUp,
   shouldAutoResumeOnSessionStart,
   shouldPreRunVerifyCommand,
@@ -404,14 +403,6 @@ function resolveControllerModel(snapshot: AutoModeStateV1, ctx: ExtensionContext
   const explicit = snapshot.controllerModel;
   if (explicit) {
     const found = registry.find(explicit.provider, explicit.id);
-    if (found && registry.hasConfiguredAuth(found)) {
-      return found as Model<Api>;
-    }
-  }
-
-  const fallbackDefault = parseModelRef(DEFAULT_CONTROLLER_MODEL);
-  if (fallbackDefault) {
-    const found = registry.find(fallbackDefault.provider, fallbackDefault.id);
     if (found && registry.hasConfiguredAuth(found)) {
       return found as Model<Api>;
     }
@@ -960,7 +951,7 @@ function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 
     `iteration=${snapshot.currentIteration}/${snapshot.maxIterations}`,
     `goal=${snapshot.goal}`,
     snapshot.untilPrompt ? `until=${snapshot.untilPrompt}` : undefined,
-    snapshot.controllerModel ? `controller-model=${snapshot.controllerModel.provider}/${snapshot.controllerModel.id}` : `controller-model=${DEFAULT_CONTROLLER_MODEL} (fallback to active model if unavailable)`,
+    snapshot.controllerModel ? `controller-model=${snapshot.controllerModel.provider}/${snapshot.controllerModel.id}` : `controller-model=${DEFAULT_CONTROLLER_MODEL} (default)`,
     snapshot.verifyCommand ? `verify=${snapshot.verifyCommand}` : undefined,
     `commit-policy=${snapshot.commitPolicy}`,
     `push-policy=${snapshot.pushPolicy}`,
@@ -1021,7 +1012,7 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
   pi.registerFlag("auto-controller-model", {
-    description: `Optional controller model in provider/model form (defaults to ${DEFAULT_CONTROLLER_MODEL} when available)`,
+    description: `Optional controller model in provider/model form (defaults to the ${DEFAULT_CONTROLLER_MODEL})`,
     type: "string",
   });
   pi.registerFlag("auto-verify", {

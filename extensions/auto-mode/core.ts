@@ -1,5 +1,5 @@
 export const AUTO_MODE_STATE_TYPE = "auto-mode-state";
-export const DEFAULT_CONTROLLER_MODEL = "openai/gpt-5.4-mini";
+export const DEFAULT_CONTROLLER_MODEL = "active worker model";
 export const DEFAULT_AUTO_ITERATIONS = 8;
 export const DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS = 12;
 export const DEFAULT_MAX_ITERATIONS_LIMIT = 1_000;
