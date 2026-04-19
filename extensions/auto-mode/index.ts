@@ -2,7 +2,9 @@ import { complete, type Api, type Model, type UserMessage } from "@mariozechner/
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
   appendDecisionHistory,
+  applyControllerStopOverrideRefinement,
   AUTO_MODE_STATE_TYPE,
+  buildAutoControllerStopOverrideSystemPrompt,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
   buildAutoStopOverrideDecision,
@@ -20,6 +22,7 @@ import {
   DEFAULT_MAX_WALL_CLOCK_MINUTES,
   DEFAULT_STATUS_GOAL_MAX_CHARS,
   DEFAULT_WORKER_FAILURE_LIMIT,
+  describeAutoStopBlocker,
   evaluateAutoStopGuard,
   extractLatestAutoModeState,
   extractMessageText,
@@ -33,6 +36,7 @@ import {
   truncateControllerSummary,
   type AutoModeStateV1,
   type AutoStartConfig,
+  type AutoStopGuardResult,
   type ContinueDecision,
   type ControllerDecision,
   type ProbeKind,
@@ -44,6 +48,7 @@ const COMMAND_USAGE =
   "Usage: /auto on [--iterations N] [--until \"goal\"] [--controller-model provider/model] [--verify \"cmd\"] <goal>";
 
 const AUTO_CONTROLLER_SYSTEM_PROMPT = buildAutoControllerSystemPrompt();
+const AUTO_CONTROLLER_STOP_OVERRIDE_SYSTEM_PROMPT = buildAutoControllerStopOverrideSystemPrompt();
 
 interface GitSnapshot {
   isGitRepo: boolean;
@@ -407,14 +412,11 @@ function resolveControllerModel(snapshot: AutoModeStateV1, ctx: ExtensionContext
   return undefined;
 }
 
-async function callController(
-  pi: ExtensionAPI,
+async function completeControllerDecision(
   ctx: ExtensionContext,
   snapshot: AutoModeStateV1,
-  workerTurn: WorkerTurnSnapshot,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult: VerifyCommandResult | undefined,
-  probeResult?: ProbeResult,
+  systemPrompt: string,
+  userPrompt: string,
 ): Promise<ControllerDecision | undefined> {
   const model = resolveControllerModel(snapshot, ctx);
   if (!model) {
@@ -428,14 +430,14 @@ async function callController(
 
   const userMessage: UserMessage = {
     role: "user",
-    content: [{ type: "text", text: buildControllerUserPrompt(snapshot, workerTurn, gitSnapshot, verifyResult, probeResult) }],
+    content: [{ type: "text", text: userPrompt }],
     timestamp: now(),
   };
 
   const response = await complete(
     model,
     {
-      systemPrompt: AUTO_CONTROLLER_SYSTEM_PROMPT,
+      systemPrompt,
       messages: [userMessage],
     },
     {
@@ -458,6 +460,22 @@ async function callController(
   return parseControllerDecision(text);
 }
 
+async function callController(
+  ctx: ExtensionContext,
+  snapshot: AutoModeStateV1,
+  workerTurn: WorkerTurnSnapshot,
+  gitSnapshot: GitSnapshot | undefined,
+  verifyResult: VerifyCommandResult | undefined,
+  probeResult?: ProbeResult,
+): Promise<ControllerDecision | undefined> {
+  return completeControllerDecision(
+    ctx,
+    snapshot,
+    AUTO_CONTROLLER_SYSTEM_PROMPT,
+    buildControllerUserPrompt(snapshot, workerTurn, gitSnapshot, verifyResult, probeResult),
+  );
+}
+
 async function decideControllerAction(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -466,7 +484,7 @@ async function decideControllerAction(
   gitSnapshot: GitSnapshot | undefined,
   verifyResult: VerifyCommandResult | undefined,
 ): Promise<ControllerDecision | undefined> {
-  let decision = await callController(pi, ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
+  let decision = await callController(ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
   if (!decision) {
     return undefined;
   }
@@ -491,7 +509,7 @@ async function decideControllerAction(
   while (decision.action === "probe" && probeRounds < PROBE_LIMIT_PER_CYCLE) {
     const probeResult = await executeProbe(pi, ctx, snapshot, decision.probe.kind);
     probeRounds += 1;
-    decision = await callController(pi, ctx, snapshot, workerTurn, gitSnapshot, verifyResult, probeResult);
+    decision = await callController(ctx, snapshot, workerTurn, gitSnapshot, verifyResult, probeResult);
     if (!decision) {
       return undefined;
     }
@@ -568,6 +586,32 @@ function augmentContinuePrompt(
   return `${decision.nextPrompt}\n\n${additions.join(" ")}`;
 }
 
+function buildStopOverrideControllerUserPrompt(
+  snapshot: AutoModeStateV1,
+  workerTurn: WorkerTurnSnapshot,
+  blockedStop: Extract<ControllerDecision, { action: "stop" }>,
+  stopGuard: AutoStopGuardResult,
+  fallbackDecision: ContinueDecision,
+  gitSnapshot: GitSnapshot | undefined,
+  verifyResult: VerifyCommandResult | undefined,
+): string {
+  const blockerLines = stopGuard.blockers.map((blocker) => `- ${describeAutoStopBlocker(blocker, snapshot.verifyCommand)}`).join("\n");
+  const sections = [
+    "A runtime guard rejected the proposed stop decision.",
+    `Blocked stop reason:\n${blockedStop.reason}`,
+    `Blocked stop summary:\n${blockedStop.updatedSummary}`,
+    `Runtime stop blockers:\n${blockerLines}`,
+    snapshot.lastAutoPrompt ? `Previous auto prompt sent to the worker:\n${snapshot.lastAutoPrompt}` : undefined,
+    `Fallback follow-up prompt if you cannot improve it:\n${fallbackDecision.nextPrompt}`,
+    `Current controller summary:\n${snapshot.controllerSummary || "(empty)"}`,
+    `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
+    `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
+    verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
+  ].filter((value): value is string => !!value);
+
+  return sections.join("\n\n");
+}
+
 async function getStopOverrideDecision(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -576,7 +620,7 @@ async function getStopOverrideDecision(
   workerTurn: WorkerTurnSnapshot,
   gitSnapshot: GitSnapshot | undefined,
   verifyResult?: VerifyCommandResult,
-): Promise<ContinueDecision | undefined> {
+): Promise<Exclude<ControllerDecision, Extract<ControllerDecision, { action: "stop" | "probe" }>> | undefined> {
   const resolvedVerifyResult = verifyResult ?? (
     snapshot.verifyCommand
       ? await runVerifyCommand(pi, ctx.cwd, snapshot.verifyCommand)
@@ -601,10 +645,25 @@ async function getStopOverrideDecision(
       : undefined,
   });
 
-  return buildAutoStopOverrideDecision({
+  const fallbackDecision = buildAutoStopOverrideDecision({
     decision,
     stopGuard,
     verifyCommand: snapshot.verifyCommand,
+  });
+  if (!fallbackDecision) {
+    return undefined;
+  }
+
+  const controllerRefinement = await completeControllerDecision(
+    ctx,
+    snapshot,
+    AUTO_CONTROLLER_STOP_OVERRIDE_SYSTEM_PROMPT,
+    buildStopOverrideControllerUserPrompt(snapshot, workerTurn, decision, stopGuard, fallbackDecision, gitSnapshot, resolvedVerifyResult),
+  );
+
+  return applyControllerStopOverrideRefinement({
+    fallbackDecision,
+    controllerDecision: controllerRefinement,
   });
 }
 
@@ -631,15 +690,13 @@ function queueContinueLikeFollowUp(
   });
 
   snapshot.consecutiveStagnationCount = followUpPlan.nextStagnationCount;
-  if (snapshot.currentIteration < snapshot.maxIterations) {
-    snapshot.lastAutoPrompt = decision.nextPrompt;
-  }
 
   if (followUpPlan.action === "pause") {
     pauseSnapshot(pi, ctx, runtime, followUpPlan.reason, options.notifyLevel ?? "warning");
     return;
   }
 
+  snapshot.lastAutoPrompt = followUpPlan.nextPrompt;
   snapshot.currentIteration = followUpPlan.nextIteration;
   persistSnapshot(pi, snapshot);
   setStatus(ctx, snapshot);
@@ -1108,7 +1165,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (decision.action === "pause") {
-        persistSnapshot(pi, snapshot);
+        recordControllerDecision(snapshot, decision);
         pauseSnapshot(pi, ctx, runtime, decision.reason);
         return;
       }
@@ -1117,6 +1174,11 @@ export default function (pi: ExtensionAPI) {
         const overrideDecision = await getStopOverrideDecision(pi, ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
         if (overrideDecision) {
           recordControllerDecision(snapshot, overrideDecision);
+          if (overrideDecision.action === "pause") {
+            pauseSnapshot(pi, ctx, runtime, overrideDecision.reason, "warning");
+            return;
+          }
+
           queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, overrideDecision, {
             budgetPauseReason: `iteration budget exhausted before verified completion: ${decision.reason}`,
             notifyMessage: `Auto-mode finalization pass requested: ${overrideDecision.reason}`,

@@ -115,6 +115,13 @@ export interface AutoStopOverrideDecisionInput {
   verifyCommand?: string;
 }
 
+export interface AutoStopOverrideRefinementInput {
+  fallbackDecision: ContinueDecision;
+  controllerDecision?: ControllerDecision;
+}
+
+export type AutoStopOverrideFollowUpDecision = ContinueDecision | PauseDecision;
+
 export interface AutoDecisionLogEntry {
   iteration: number;
   action: ControllerAction;
@@ -539,6 +546,39 @@ export function buildAutoControllerSystemPrompt(): string {
   ].join("\n");
 }
 
+export function buildAutoControllerStopOverrideSystemPrompt(): string {
+  return [
+    "You are revising a blocked stop decision in an autonomous coding loop.",
+    "",
+    "A runtime guard has already determined that the worker must not stop yet.",
+    "",
+    "Output requirements:",
+    "- Return ONLY valid JSON.",
+    "- Use exactly one of these actions: continue, pause.",
+    "- Do NOT use stop or probe.",
+    "- If action=continue, include nextPrompt with the single best next step to clear the listed blockers.",
+    "- Keep reason and updatedSummary concise but specific.",
+    "",
+    "Decision policy:",
+    "- Prefer continue when you can name a concrete, high-value next step that directly addresses the blockers.",
+    "- Use the listed blockers, repository evidence, and previous auto prompt to make the nextPrompt materially more specific than the fallback prompt when possible.",
+    "- If the best next step would still be nearly identical to the previous or fallback prompt, prefer pause over repetition.",
+    "- Do not ask the user anything.",
+    "",
+    "JSON shape:",
+    "{",
+    '  "action":"continue|pause",',
+    '  "reason":"...",',
+    '  "updatedSummary":"...",',
+    '  "goalStatus":"in_progress|likely_met|blocked|stalled",',
+    '  "qualityGoalMet":true,',
+    '  "progressPercent":0,',
+    '  "commitRecommendation":"none|milestone|finalize",',
+    '  "nextPrompt":"..."',
+    "}",
+  ].join("\n");
+}
+
 export function hasConcreteVerificationEvidence(text: string): boolean {
   const normalized = normalizeComparableText(text);
   if (!normalized) return false;
@@ -603,7 +643,7 @@ export function evaluateAutoStopGuard(input: AutoStopGuardInput): AutoStopGuardR
   };
 }
 
-function describeStopBlocker(blocker: AutoStopBlocker, verifyCommand: string | undefined): string {
+export function describeAutoStopBlocker(blocker: AutoStopBlocker, verifyCommand: string | undefined): string {
   switch (blocker) {
     case "goal-not-met":
       return "the active goal is not yet verified as met";
@@ -661,7 +701,7 @@ export function buildAutoStopOverrideDecision(input: AutoStopOverrideDecisionInp
     return undefined;
   }
 
-  const blockerSummary = input.stopGuard.blockers.map((blocker) => describeStopBlocker(blocker, input.verifyCommand)).join("; ");
+  const blockerSummary = input.stopGuard.blockers.map((blocker) => describeAutoStopBlocker(blocker, input.verifyCommand)).join("; ");
   const hasGoalGap = input.stopGuard.blockers.includes("goal-not-met") || input.stopGuard.blockers.includes("quality-goal-not-met");
   const hasFinalizationOnlyBlockers = input.stopGuard.blockers.every(
     (blocker) => blocker === "verification-missing" || blocker === "commit-required" || blocker === "push-required" || blocker === "sync-required",
@@ -680,6 +720,44 @@ export function buildAutoStopOverrideDecision(input: AutoStopOverrideDecisionInp
       ? "finalize"
       : input.decision.commitRecommendation,
     nextPrompt: buildStopOverridePrompt(input.stopGuard.blockers, input.verifyCommand),
+  };
+}
+
+export function applyControllerStopOverrideRefinement(input: AutoStopOverrideRefinementInput): AutoStopOverrideFollowUpDecision {
+  const decision = input.controllerDecision;
+  if (!decision) {
+    return input.fallbackDecision;
+  }
+
+  if (decision.action === "pause") {
+    return {
+      action: "pause",
+      reason: `${input.fallbackDecision.reason} Controller requested pause instead of another repeated follow-up: ${decision.reason}`,
+      updatedSummary: truncateControllerSummary(
+        `${input.fallbackDecision.updatedSummary}\n\nController refinement requested a pause: ${decision.updatedSummary}`,
+      ),
+      goalStatus: decision.goalStatus === "blocked" || decision.goalStatus === "stalled" ? decision.goalStatus : input.fallbackDecision.goalStatus,
+      qualityGoalMet: input.fallbackDecision.qualityGoalMet && decision.qualityGoalMet,
+      progressPercent: Math.min(input.fallbackDecision.progressPercent, decision.progressPercent),
+      commitRecommendation: input.fallbackDecision.commitRecommendation,
+    };
+  }
+
+  if (decision.action !== "continue") {
+    return input.fallbackDecision;
+  }
+
+  const nextPrompt = decision.nextPrompt.trim();
+  if (!nextPrompt) {
+    return input.fallbackDecision;
+  }
+
+  return {
+    ...input.fallbackDecision,
+    updatedSummary: truncateControllerSummary(
+      `${input.fallbackDecision.updatedSummary}\n\nController refinement: ${decision.updatedSummary}`,
+    ),
+    nextPrompt,
   };
 }
 

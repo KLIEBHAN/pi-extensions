@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyControllerStopOverrideRefinement,
   AUTO_MODE_STATE_TYPE,
+  buildAutoControllerStopOverrideSystemPrompt,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
   buildAutoStopOverrideDecision,
@@ -352,6 +354,17 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
 });
 
 
+test("buildAutoControllerStopOverrideSystemPrompt asks for a specific continue or pause", () => {
+  const prompt = buildAutoControllerStopOverrideSystemPrompt();
+
+  assert.match(prompt, /^You are revising a blocked stop decision in an autonomous coding loop\./);
+  assert.match(prompt, /Use exactly one of these actions: continue, pause\./);
+  assert.match(prompt, /Do NOT use stop or probe\./);
+  assert.match(prompt, /make the nextPrompt materially more specific than the fallback prompt when possible\./);
+  assert.match(prompt, /If the best next step would still be nearly identical to the previous or fallback prompt, prefer pause over repetition\./);
+});
+
+
 test("hasConcreteVerificationEvidence requires real validation signals", () => {
   assert.equal(hasConcreteVerificationEvidence("Ran npm test, all tests pass, and verified the fix manually."), true);
   assert.equal(hasConcreteVerificationEvidence("Verified with npm test, but tests failed."), false);
@@ -521,6 +534,66 @@ test("buildAutoStopOverrideDecision returns undefined when stop is actually allo
     }),
     undefined,
   );
+});
+
+test("applyControllerStopOverrideRefinement adopts a controller-specific continue prompt", () => {
+  const refined = applyControllerStopOverrideRefinement({
+    fallbackDecision: {
+      action: "continue",
+      reason: "Stop overridden: verification evidence is still missing.",
+      updatedSummary: "Stop overridden. Remaining blockers: verification evidence is still missing.",
+      goalStatus: "likely_met",
+      qualityGoalMet: true,
+      progressPercent: 99,
+      commitRecommendation: "finalize",
+      nextPrompt: "Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete. Do not ask the user anything.",
+    },
+    controllerDecision: {
+      action: "continue",
+      reason: "Run one concrete final verification step",
+      updatedSummary: "The remaining gap is specific verification evidence.",
+      goalStatus: "likely_met",
+      qualityGoalMet: true,
+      progressPercent: 99,
+      commitRecommendation: "finalize",
+      nextPrompt: "Run npm test, summarize the passing result in one sentence, and then check git status before concluding.",
+    },
+  });
+
+  assert.equal(refined.action, "continue");
+  assert.equal(refined.reason, "Stop overridden: verification evidence is still missing.");
+  assert.match(refined.updatedSummary, /Controller refinement:/);
+  assert.equal(refined.nextPrompt, "Run npm test, summarize the passing result in one sentence, and then check git status before concluding.");
+});
+
+test("applyControllerStopOverrideRefinement can pause instead of repeating a low-value prompt", () => {
+  const refined = applyControllerStopOverrideRefinement({
+    fallbackDecision: {
+      action: "continue",
+      reason: "Stop overridden: verification evidence is still missing.",
+      updatedSummary: "Stop overridden. Remaining blockers: verification evidence is still missing.",
+      goalStatus: "likely_met",
+      qualityGoalMet: true,
+      progressPercent: 99,
+      commitRecommendation: "finalize",
+      nextPrompt: "Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete. Do not ask the user anything.",
+    },
+    controllerDecision: {
+      action: "pause",
+      reason: "No materially more specific verification step is available without repeating the same instruction.",
+      updatedSummary: "The loop is close to completion but would just restate the same verification request.",
+      goalStatus: "stalled",
+      qualityGoalMet: true,
+      progressPercent: 99,
+      commitRecommendation: "finalize",
+    },
+  });
+
+  assert.equal(refined.action, "pause");
+  assert.match(refined.reason, /Stop overridden: verification evidence is still missing\./);
+  assert.match(refined.reason, /Controller requested pause instead of another repeated follow-up/);
+  assert.match(refined.updatedSummary, /Controller refinement requested a pause:/);
+  assert.equal(refined.goalStatus, "stalled");
 });
 
 test("planAutoFollowUp sends a concrete finalization pass when the prompt is new", () => {
