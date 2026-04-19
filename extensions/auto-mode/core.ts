@@ -2,6 +2,7 @@ export const AUTO_MODE_STATE_TYPE = "auto-mode-state";
 export const DEFAULT_CONTROLLER_MODEL = "active worker model";
 export const DEFAULT_AUTO_ITERATIONS = 8;
 export const DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS = 12;
+export const DEFAULT_MAX_ADJACENT_CONTINUATIONS = 1;
 export const DEFAULT_MAX_ITERATIONS_LIMIT = 1_000;
 export const DEFAULT_MAX_WALL_CLOCK_MINUTES = 60;
 export const DEFAULT_CONTROLLER_FAILURE_LIMIT = 2;
@@ -34,6 +35,7 @@ export interface AutoStartConfig {
   untilPrompt?: string;
   mode: AutoMode;
   maxIterations: number;
+  maxAdjacentContinuations: number;
   controllerModel?: ModelRef;
   verifyCommand?: string;
   commitPolicy: CommitPolicy;
@@ -130,6 +132,7 @@ export interface AutoContinueProgressInput {
   goalStatus: GoalStatus;
   currentIteration: number;
   updatedSummary: string;
+  adjacentContinuationTriggered: boolean;
   primaryGoalVerifiedAtIteration?: number;
   adjacentContinuationCount: number;
   primaryGoalCompletionSummary?: string;
@@ -171,6 +174,7 @@ export interface AutoModeStateV1 {
   phase: AutoPhase;
   primaryGoalVerifiedAtIteration?: number;
   adjacentContinuationCount: number;
+  maxAdjacentContinuations: number;
   primaryGoalCompletionSummary?: string;
   allowControllerProbes: boolean;
   maxWallClockMinutes: number;
@@ -207,6 +211,7 @@ export interface AutoFlagValues {
   commitPolicy?: boolean | string;
   pushPolicy?: boolean | string;
   completionPolicy?: boolean | string;
+  maxAdjacentContinuations?: boolean | string;
   allowControllerProbes?: boolean | string;
   resume?: boolean | string;
   maxWallClockMinutes?: boolean | string;
@@ -322,6 +327,8 @@ export function hydrateAutoModeState(snapshot: AutoModeStateV1): AutoModeStateV1
     completionPolicy: snapshot.completionPolicy === "continue-similar" ? "continue-similar" : "stop",
     phase: snapshot.phase === "adjacent" ? "adjacent" : "primary",
     adjacentContinuationCount: typeof snapshot.adjacentContinuationCount === "number" ? snapshot.adjacentContinuationCount : 0,
+    maxAdjacentContinuations:
+      typeof snapshot.maxAdjacentContinuations === "number" ? snapshot.maxAdjacentContinuations : DEFAULT_MAX_ADJACENT_CONTINUATIONS,
     primaryGoalVerifiedAtIteration:
       typeof snapshot.primaryGoalVerifiedAtIteration === "number" ? snapshot.primaryGoalVerifiedAtIteration : undefined,
     primaryGoalCompletionSummary:
@@ -553,9 +560,7 @@ export function buildAutoControllerSystemPrompt(): string {
     "- Use stop only when completion is supported by concrete verification evidence from this cycle, such as a passing verification command, passing tests/checks, or explicit validation evidence in the worker result.",
     "- If verification is failing or still missing, the task is not complete.",
     "- If final commit/push expectations are still unmet in a git repo, the task is not complete.",
-    "- If completionPolicy=continue-similar and the primary goal is verified met with iteration budget remaining, prefer continue with one bounded adjacent optimization when a concrete, high-value next step exists.",
-    "- An adjacent optimization must stay close to the same subsystem, changed files, or problem class; do not branch into a new broad project.",
-    "- If no worthwhile bounded adjacent optimization is clear, stop.",
+    "- If the primary goal is verified complete and a normal stop would otherwise be allowed, return stop here even when completionPolicy=continue-similar; any optional adjacent continuation is decided separately after a valid stop.",
     "- If obvious follow-up work remains that is necessary to satisfy the goal or completion gate, do not stop.",
     "- Use pause when the run appears blocked, unstable, unsafe, or repetitively unproductive, or when no fresh high-value next step is available without looping.",
     "- Use probe only if one fresh read-only repository snapshot would materially improve the next decision, and never for information that is already present.",
@@ -582,6 +587,8 @@ export function buildAutoControllerAdjacentContinuationSystemPrompt(): string {
   return [
     "You are deciding whether an autonomous run should continue after the primary goal has already been verified complete.",
     "",
+    "This decision point exists only because a normal stop would already be valid and completionPolicy=continue-similar explicitly asked for nearby follow-up work.",
+    "",
     "Output requirements:",
     "- Return ONLY valid JSON.",
     "- Use exactly one of these actions: continue, stop, pause.",
@@ -590,9 +597,10 @@ export function buildAutoControllerAdjacentContinuationSystemPrompt(): string {
     "",
     "Decision policy:",
     "- goalStatus must still refer to the original primary goal.",
-    "- Use continue only when there is a clear, local, high-value adjacent optimization that stays close to the same subsystem, files, or problem class.",
+    "- Default to continue, not stop, when there is any clear, local, high-value adjacent optimization within the remaining adjacent continuation budget.",
+    "- An adjacent optimization must stay close to the same subsystem, files, or problem class.",
     "- Do not broaden scope into a new major task or unrelated workstream.",
-    "- If there is no worthwhile bounded adjacent optimization left, use stop.",
+    "- Use stop only when no worthwhile bounded adjacent optimization is clear or no adjacent continuation budget remains.",
     "- If the best continuation would mostly restate the previous prompt or otherwise thrash, use pause instead of repeating yourself.",
     "- Do not ask the user anything.",
     "",
@@ -847,34 +855,58 @@ export function shouldAttemptAutoAdjacentContinuation(input: {
   goalStatus: GoalStatus;
   currentIteration: number;
   maxIterations: number;
+  adjacentContinuationCount: number;
+  maxAdjacentContinuations: number;
 }): boolean {
-  return input.completionPolicy === "continue-similar" && input.goalStatus === "met" && input.currentIteration < input.maxIterations;
+  return input.completionPolicy === "continue-similar"
+    && input.goalStatus === "met"
+    && input.currentIteration < input.maxIterations
+    && input.adjacentContinuationCount < input.maxAdjacentContinuations;
 }
 
 export function deriveAutoContinueProgressState(input: AutoContinueProgressInput): AutoContinueProgressState {
+  const preservedState = {
+    primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration,
+    primaryGoalCompletionSummary: input.primaryGoalCompletionSummary,
+  };
+
   if (input.completionPolicy !== "continue-similar") {
     return {
       phase: "primary",
-      primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration,
       adjacentContinuationCount: 0,
-      primaryGoalCompletionSummary: input.primaryGoalCompletionSummary,
+      ...preservedState,
     };
   }
 
-  if (input.goalStatus !== "met") {
+  if (input.adjacentContinuationTriggered) {
+    if (input.goalStatus !== "met") {
+      return {
+        phase: "primary",
+        adjacentContinuationCount: 0,
+        ...preservedState,
+      };
+    }
+
+    return {
+      phase: "adjacent",
+      primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration ?? input.currentIteration,
+      adjacentContinuationCount: input.phase === "adjacent" ? input.adjacentContinuationCount + 1 : 1,
+      primaryGoalCompletionSummary: input.primaryGoalCompletionSummary ?? truncateControllerSummary(input.updatedSummary),
+    };
+  }
+
+  if (input.phase === "adjacent" && input.goalStatus !== "met") {
     return {
       phase: "primary",
-      primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration,
       adjacentContinuationCount: 0,
-      primaryGoalCompletionSummary: input.primaryGoalCompletionSummary,
+      ...preservedState,
     };
   }
 
   return {
-    phase: "adjacent",
-    primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration ?? input.currentIteration,
-    adjacentContinuationCount: input.phase === "adjacent" ? input.adjacentContinuationCount + 1 : 1,
-    primaryGoalCompletionSummary: input.primaryGoalCompletionSummary ?? truncateControllerSummary(input.updatedSummary),
+    phase: input.phase,
+    adjacentContinuationCount: input.phase === "adjacent" ? input.adjacentContinuationCount : 0,
+    ...preservedState,
   };
 }
 
@@ -987,6 +1019,7 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
   let commitPolicy: CommitPolicy = "final-or-milestone";
   let pushPolicy: PushPolicy = "final-or-milestone-if-upstream";
   let completionPolicy: CompletionPolicy = "stop";
+  let maxAdjacentContinuations = DEFAULT_MAX_ADJACENT_CONTINUATIONS;
   let allowControllerProbes = true;
   let maxWallClockMinutes = DEFAULT_MAX_WALL_CLOCK_MINUTES;
   const goalTokens: string[] = [];
@@ -1066,6 +1099,17 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       continue;
     }
 
+    if (token === "--max-adjacent-continuations") {
+      const value = tokens[index + 1];
+      const parsed = value ? parsePositiveInteger(value) : undefined;
+      if (!parsed) {
+        return { error: `--max-adjacent-continuations must be an integer between 1 and ${DEFAULT_MAX_ITERATIONS_LIMIT}` };
+      }
+      maxAdjacentContinuations = parsed;
+      index += 1;
+      continue;
+    }
+
     if (token === "--no-controller-probes") {
       allowControllerProbes = false;
       continue;
@@ -1108,6 +1152,7 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       commitPolicy,
       pushPolicy,
       completionPolicy,
+      maxAdjacentContinuations,
       allowControllerProbes,
       maxWallClockMinutes,
       resumeOnSessionStart: false,
@@ -1164,6 +1209,7 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
   const commitPolicyFlag = parseStringFlag(flags.commitPolicy);
   const pushPolicyFlag = parseStringFlag(flags.pushPolicy);
   const completionPolicyFlag = parseStringFlag(flags.completionPolicy);
+  const maxAdjacentContinuationsFlag = parseStringFlag(flags.maxAdjacentContinuations);
   const maxWallClockFlag = parseStringFlag(flags.maxWallClockMinutes);
 
   const iterations = iterationsFlag ? parsePositiveInteger(iterationsFlag) : undefined;
@@ -1200,6 +1246,15 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
     completionPolicy = completionPolicyFlag;
   }
 
+  let maxAdjacentContinuations = DEFAULT_MAX_ADJACENT_CONTINUATIONS;
+  if (maxAdjacentContinuationsFlag) {
+    const parsed = parsePositiveInteger(maxAdjacentContinuationsFlag);
+    if (!parsed) {
+      return { error: `--auto-max-adjacent-continuations must be an integer between 1 and ${DEFAULT_MAX_ITERATIONS_LIMIT}` };
+    }
+    maxAdjacentContinuations = parsed;
+  }
+
   let maxWallClockMinutes = DEFAULT_MAX_WALL_CLOCK_MINUTES;
   if (maxWallClockFlag) {
     const parsed = parsePositiveInteger(maxWallClockFlag, 24 * 60);
@@ -1220,6 +1275,7 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
     commitPolicy,
     pushPolicy,
     completionPolicy,
+    maxAdjacentContinuations,
     allowControllerProbes: parseBooleanFlag(flags.allowControllerProbes, true),
     maxWallClockMinutes,
     resumeOnSessionStart: parseBooleanFlag(flags.resume, false),

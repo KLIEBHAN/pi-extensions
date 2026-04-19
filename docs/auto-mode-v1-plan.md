@@ -106,6 +106,8 @@ When auto-mode is active and not paused:
    - `continue` → send next user message
    - `pause` → pause run
    - `stop` → verify/finalize and stop, or request one final worker pass
+8. if `completionPolicy=continue-similar` and a normal stop would otherwise be allowed, optionally request one bounded adjacent continuation instead of stopping
+9. adjacent continuations remain controller-controlled and are capped by `maxAdjacentContinuations` (default `1`)
 
 ## `/auto` command surface
 
@@ -138,6 +140,7 @@ When auto-mode is active and not paused:
 
 - default iteration budget: 8
 - until-only safety budget: 12
+- default max adjacent continuations for `continue-similar`: 1
 - wall-clock limit: 60 minutes
 - proactive verify-command preflight when the worker appears to claim completion or iteration budget is exhausted
 - controller failures in a row: 2 → pause

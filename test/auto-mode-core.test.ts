@@ -16,6 +16,7 @@ import {
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_CONTROLLER_MODEL,
   DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS,
+  DEFAULT_MAX_ADJACENT_CONTINUATIONS,
   DEFAULT_STAGNATION_LIMIT,
   deriveAutoContinueProgressState,
   evaluateAutoStopGuard,
@@ -73,6 +74,7 @@ test("parseAutoCommandArgs parses \/auto on with defaults", () => {
   assert.equal(parsed.config.maxIterations, DEFAULT_AUTO_ITERATIONS);
   assert.equal(parsed.config.untilPrompt, undefined);
   assert.equal(parsed.config.completionPolicy, "stop");
+  assert.equal(parsed.config.maxAdjacentContinuations, DEFAULT_MAX_ADJACENT_CONTINUATIONS);
 });
 
 test("parseAutoCommandArgs parses hybrid mode with quoted until prompt and controller model", () => {
@@ -101,11 +103,12 @@ test("parseAutoCommandArgs parses no-controller-probes and max wall clock overri
 });
 
 test("parseAutoCommandArgs parses completion-policy continue-similar", () => {
-  const parsed = parseAutoCommandArgs("on --completion-policy continue-similar improve nearby reliability");
+  const parsed = parseAutoCommandArgs("on --completion-policy continue-similar --max-adjacent-continuations 3 improve nearby reliability");
   assert.equal(parsed.kind, "on");
   if (parsed.kind !== "on") return;
 
   assert.equal(parsed.config.completionPolicy, "continue-similar");
+  assert.equal(parsed.config.maxAdjacentContinuations, 3);
 });
 
 test("parseAutoCommandArgs uses until safety limit when only --until is provided", () => {
@@ -142,6 +145,9 @@ test("parseAutoCommandArgs reports invalid input", () => {
   assert.deepEqual(parseAutoCommandArgs("on --completion-policy nope improve app"), {
     error: "--completion-policy must be one of: stop, continue-similar",
   });
+  assert.deepEqual(parseAutoCommandArgs("on --max-adjacent-continuations 0 improve app"), {
+    error: "--max-adjacent-continuations must be an integer between 1 and 1000",
+  });
   assert.deepEqual(parseAutoCommandArgs("nudge   "), {
     error: "Usage: /auto nudge <instruction>",
   });
@@ -165,6 +171,7 @@ test("buildAutoStartConfigFromFlags applies defaults and parses optional values"
   assert.equal(parsed.maxIterations, DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS);
   assert.equal(parsed.verifyCommand, "npm test");
   assert.equal(parsed.completionPolicy, "stop");
+  assert.equal(parsed.maxAdjacentContinuations, DEFAULT_MAX_ADJACENT_CONTINUATIONS);
   assert.equal(parsed.allowControllerProbes, false);
   assert.equal(parsed.resumeOnSessionStart, true);
   assert.deepEqual(parsed.controllerModel, {
@@ -177,11 +184,13 @@ test("buildAutoStartConfigFromFlags parses completion policy overrides", () => {
   const parsed = buildAutoStartConfigFromFlags({
     goal: "improve settings UX",
     completionPolicy: "continue-similar",
+    maxAdjacentContinuations: "3",
   });
 
   assert.ok(parsed && !("error" in parsed));
   if (!parsed || "error" in parsed) return;
   assert.equal(parsed.completionPolicy, "continue-similar");
+  assert.equal(parsed.maxAdjacentContinuations, 3);
 });
 
 test("buildAutoStartConfigFromFlags returns errors for invalid values", () => {
@@ -196,6 +205,9 @@ test("buildAutoStartConfigFromFlags returns errors for invalid values", () => {
   });
   assert.deepEqual(buildAutoStartConfigFromFlags({ goal: "improve app", completionPolicy: "bad" }), {
     error: "--auto-completion-policy must be one of: stop, continue-similar",
+  });
+  assert.deepEqual(buildAutoStartConfigFromFlags({ goal: "improve app", maxAdjacentContinuations: "0" }), {
+    error: "--auto-max-adjacent-continuations must be an integer between 1 and 1000",
   });
 });
 
@@ -403,9 +415,7 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
   assert.match(prompt, /Use stop only when completion is supported by concrete verification evidence/);
   assert.match(prompt, /If verification is failing or still missing, the task is not complete\./);
   assert.match(prompt, /If final commit\/push expectations are still unmet in a git repo, the task is not complete\./);
-  assert.match(prompt, /If completionPolicy=continue-similar and the primary goal is verified met with iteration budget remaining, prefer continue with one bounded adjacent optimization/);
-  assert.match(prompt, /An adjacent optimization must stay close to the same subsystem, changed files, or problem class/);
-  assert.match(prompt, /If no worthwhile bounded adjacent optimization is clear, stop\./);
+  assert.match(prompt, /If the primary goal is verified complete and a normal stop would otherwise be allowed, return stop here even when completionPolicy=continue-similar/);
   assert.match(prompt, /If the next prompt would be nearly identical to the previous one, make it materially more specific or prefer pause over repetition\./);
 });
 
@@ -414,11 +424,12 @@ test("buildAutoControllerAdjacentContinuationSystemPrompt keeps adjacent work bo
   const prompt = buildAutoControllerAdjacentContinuationSystemPrompt();
 
   assert.match(prompt, /^You are deciding whether an autonomous run should continue after the primary goal has already been verified complete\./);
+  assert.match(prompt, /This decision point exists only because a normal stop would already be valid and completionPolicy=continue-similar explicitly asked for nearby follow-up work\./);
   assert.match(prompt, /Use exactly one of these actions: continue, stop, pause\./);
   assert.match(prompt, /Do NOT use probe\./);
-  assert.match(prompt, /Use continue only when there is a clear, local, high-value adjacent optimization/);
+  assert.match(prompt, /Default to continue, not stop, when there is any clear, local, high-value adjacent optimization within the remaining adjacent continuation budget\./);
   assert.match(prompt, /Do not broaden scope into a new major task or unrelated workstream\./);
-  assert.match(prompt, /If there is no worthwhile bounded adjacent optimization left, use stop\./);
+  assert.match(prompt, /Use stop only when no worthwhile bounded adjacent optimization is clear or no adjacent continuation budget remains\./);
 });
 
 
@@ -692,13 +703,15 @@ test("applyControllerStopOverrideRefinement can pause instead of repeating a low
   assert.equal(refined.goalStatus, "stalled");
 });
 
-test("shouldAttemptAutoAdjacentContinuation only continues similar work when goal is met and budget remains", () => {
+test("shouldAttemptAutoAdjacentContinuation only continues similar work when goal is met, budget remains, and the adjacent limit is not exhausted", () => {
   assert.equal(
     shouldAttemptAutoAdjacentContinuation({
       completionPolicy: "continue-similar",
       goalStatus: "met",
       currentIteration: 3,
       maxIterations: 8,
+      adjacentContinuationCount: 0,
+      maxAdjacentContinuations: 1,
     }),
     true,
   );
@@ -708,6 +721,8 @@ test("shouldAttemptAutoAdjacentContinuation only continues similar work when goa
       goalStatus: "met",
       currentIteration: 3,
       maxIterations: 8,
+      adjacentContinuationCount: 0,
+      maxAdjacentContinuations: 1,
     }),
     false,
   );
@@ -717,6 +732,8 @@ test("shouldAttemptAutoAdjacentContinuation only continues similar work when goa
       goalStatus: "likely_met",
       currentIteration: 3,
       maxIterations: 8,
+      adjacentContinuationCount: 0,
+      maxAdjacentContinuations: 1,
     }),
     false,
   );
@@ -726,12 +743,25 @@ test("shouldAttemptAutoAdjacentContinuation only continues similar work when goa
       goalStatus: "met",
       currentIteration: 8,
       maxIterations: 8,
+      adjacentContinuationCount: 0,
+      maxAdjacentContinuations: 1,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldAttemptAutoAdjacentContinuation({
+      completionPolicy: "continue-similar",
+      goalStatus: "met",
+      currentIteration: 3,
+      maxIterations: 8,
+      adjacentContinuationCount: 1,
+      maxAdjacentContinuations: 1,
     }),
     false,
   );
 });
 
-test("deriveAutoContinueProgressState enters adjacent phase after verified completion", () => {
+test("deriveAutoContinueProgressState enters adjacent phase only when an adjacent continuation is explicitly triggered", () => {
   assert.deepEqual(
     deriveAutoContinueProgressState({
       completionPolicy: "continue-similar",
@@ -739,6 +769,7 @@ test("deriveAutoContinueProgressState enters adjacent phase after verified compl
       goalStatus: "met",
       currentIteration: 4,
       updatedSummary: "Primary goal is verified complete.",
+      adjacentContinuationTriggered: true,
       adjacentContinuationCount: 0,
     }),
     {
@@ -750,7 +781,28 @@ test("deriveAutoContinueProgressState enters adjacent phase after verified compl
   );
 });
 
-test("deriveAutoContinueProgressState keeps adjacent phase and count while primary goal remains met", () => {
+test("deriveAutoContinueProgressState does not auto-enter adjacent on an ordinary continue after verified completion", () => {
+  assert.deepEqual(
+    deriveAutoContinueProgressState({
+      completionPolicy: "continue-similar",
+      phase: "primary",
+      goalStatus: "met",
+      currentIteration: 6,
+      updatedSummary: "Primary goal remains met while a regular continue path is used.",
+      adjacentContinuationTriggered: false,
+      adjacentContinuationCount: 0,
+      primaryGoalCompletionSummary: "Primary goal is verified complete.",
+    }),
+    {
+      phase: "primary",
+      primaryGoalVerifiedAtIteration: undefined,
+      adjacentContinuationCount: 0,
+      primaryGoalCompletionSummary: "Primary goal is verified complete.",
+    },
+  );
+});
+
+test("deriveAutoContinueProgressState increments adjacent count only for explicit adjacent continuation turns and falls back to primary when verified completion is lost", () => {
   assert.deepEqual(
     deriveAutoContinueProgressState({
       completionPolicy: "continue-similar",
@@ -758,6 +810,7 @@ test("deriveAutoContinueProgressState keeps adjacent phase and count while prima
       goalStatus: "met",
       currentIteration: 6,
       updatedSummary: "Primary goal remains met while adjacent work continues.",
+      adjacentContinuationTriggered: true,
       primaryGoalVerifiedAtIteration: 4,
       adjacentContinuationCount: 2,
       primaryGoalCompletionSummary: "Primary goal is verified complete.",
@@ -769,9 +822,7 @@ test("deriveAutoContinueProgressState keeps adjacent phase and count while prima
       primaryGoalCompletionSummary: "Primary goal is verified complete.",
     },
   );
-});
 
-test("deriveAutoContinueProgressState falls back to primary phase when verified completion is lost", () => {
   assert.deepEqual(
     deriveAutoContinueProgressState({
       completionPolicy: "continue-similar",
@@ -779,6 +830,7 @@ test("deriveAutoContinueProgressState falls back to primary phase when verified 
       goalStatus: "in_progress",
       currentIteration: 6,
       updatedSummary: "Adjacent work regressed the original goal.",
+      adjacentContinuationTriggered: false,
       primaryGoalVerifiedAtIteration: 4,
       adjacentContinuationCount: 2,
       primaryGoalCompletionSummary: "Primary goal is verified complete.",
@@ -935,6 +987,7 @@ test("extractLatestAutoModeState returns the latest valid state from the current
     completionPolicy: "stop",
     phase: "primary",
     adjacentContinuationCount: 0,
+    maxAdjacentContinuations: DEFAULT_MAX_ADJACENT_CONTINUATIONS,
     primaryGoalVerifiedAtIteration: undefined,
     primaryGoalCompletionSummary: undefined,
   });

@@ -96,12 +96,16 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
   - controller-only completion gate via `--until "..."`
   - hybrid mode when both are set
 - `/auto status`, `/auto summary`, `/auto pause`, `/auto resume`, `/auto off`, `/auto nudge <instruction>`
+- completion policies:
+  - `stop` = stop once verified completion is allowed
+  - `continue-similar` = only after a normal verified stop would otherwise be allowed, optionally continue with bounded adjacent work still controlled by the controller
+- configurable adjacent continuation cap via `--max-adjacent-continuations <n>` / `--auto-max-adjacent-continuations <n>` (defaults to `1`)
 - separate controller model support via `--controller-model provider/model` or `--auto-controller-model provider/model` (defaults to the active worker model)
 - transparent follow-up prompts via real user messages, so autonomous iterations stay visible in the transcript
 - rolling controller summary with restore-on-start behavior (restored paused by default, or auto-resumed on startup when `--auto-resume` is set)
 - optional verification command for candidate-stop checks via `--verify "..."` / `--auto-verify "..."`, including proactive pre-stop verification when the worker looks close to done
 - limited read-only controller probes for fresh git snapshots when needed
-- pragmatic defaults for V1: 8 iterations by default, 12-iteration safety budget for completion-gate-only `--until` runs, paused restore on restart unless you opt into `--auto-resume`
+- pragmatic defaults for V1: 8 iterations by default, 12-iteration safety budget for completion-gate-only `--until` runs, `1` adjacent continuation by default for `continue-similar`, paused restore on restart unless you opt into `--auto-resume`
 - `--until` is evaluated by the controller only; if the worker should explicitly optimize for that criterion, include it directly in the goal/prompt itself
 
 ### Usage
@@ -117,6 +121,7 @@ Inside pi:
 ```text
 /auto on --iterations 8 improve onboarding robustness
 /auto on --until "Stop when onboarding is robust and tests are green" improve onboarding robustness
+/auto on --completion-policy continue-similar --max-adjacent-continuations 2 improve onboarding robustness
 /auto status
 /auto pause
 /auto resume
@@ -129,6 +134,8 @@ Optional dedicated controller model, completion gate, and verify command:
 pi -e ./extensions/auto-mode \
   --auto-goal "improve onboarding robustness" \
   --auto-until "Stop when onboarding is robust and tests are green" \
+  --auto-completion-policy continue-similar \
+  --auto-max-adjacent-continuations 2 \
   --auto-controller-model openai/gpt-5.4-mini \
   --auto-verify "npm test"
 ```

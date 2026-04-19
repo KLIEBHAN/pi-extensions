@@ -229,6 +229,54 @@ test("agent_end no-change heuristic does not treat changed diffs in the same fil
   assert.equal(harness.sentMessages.at(-1)?.text, "Refine the second gap in the same file and verify it.");
 });
 
+test("agent_end does not auto-enter adjacent phase on a normal continue even when the primary goal is already met", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+    "auto-iterations": "6",
+    "auto-completion-policy": "continue-similar",
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-continue",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "clean-fingerprint",
+    }),
+    decideControllerAction: async () => ({
+      action: "continue",
+      reason: "One concrete verification follow-up remains before stopping",
+      updatedSummary: "The primary goal appears met, but there is still one direct next step before concluding.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 95,
+      commitRecommendation: "none",
+      nextPrompt: "Run one final targeted verification in the same area and summarize the result.",
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "The main fix looks complete.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.phase, "primary");
+  assert.equal(latestState?.adjacentContinuationCount, 0);
+  assert.equal(harness.sentMessages.at(-1)?.text, "Run one final targeted verification in the same area and summarize the result.");
+});
+
 test("agent_end can continue with an adjacent optimization after verified completion", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({
@@ -285,6 +333,7 @@ test("agent_end can continue with an adjacent optimization after verified comple
   const latestState = getLatestAutoState(harness.entries);
   assert.equal(latestState?.phase, "adjacent");
   assert.equal(latestState?.adjacentContinuationCount, 1);
+  assert.equal(latestState?.maxAdjacentContinuations, 1);
   assert.equal(latestState?.primaryGoalVerifiedAtIteration, 1);
   assert.equal(latestState?.primaryGoalCompletionSummary, "Primary goal complete; continuing with one adjacent regression-hardening step.");
   assert.equal(
@@ -292,4 +341,82 @@ test("agent_end can continue with an adjacent optimization after verified comple
     "Add one adjacent regression test in the same onboarding flow and verify it passes.",
   );
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode exploring adjacent optimization")));
+});
+
+test("agent_end stops after the configured adjacent continuation limit is reached", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+    "auto-iterations": "6",
+    "auto-completion-policy": "continue-similar",
+    "auto-max-adjacent-continuations": "1",
+  });
+  let adjacentDecisionCalls = 0;
+  const stopDecisions = [
+    {
+      action: "stop",
+      reason: "Primary goal is verified complete",
+      updatedSummary: "The onboarding robustness goal is complete and verified.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done now.",
+    },
+    {
+      action: "stop",
+      reason: "Primary goal is still verified complete after one adjacent pass",
+      updatedSummary: "The onboarding robustness goal remains complete and verified.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done now.",
+    },
+  ];
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-3",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "clean-fingerprint",
+    }),
+    decideControllerAction: async () => stopDecisions.shift() as never,
+    getStopOverrideDecision: async () => undefined,
+    getAdjacentContinuationDecision: async () => {
+      adjacentDecisionCalls += 1;
+      return {
+        action: "continue",
+        reason: "One adjacent hardening step remains",
+        updatedSummary: "Primary goal complete; continuing with one adjacent regression-hardening step.",
+        goalStatus: "met",
+        completionGateMet: true,
+        progressPercent: 100,
+        commitRecommendation: "milestone",
+        nextPrompt: "Add one adjacent regression test in the same onboarding flow and verify it passes.",
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "Primary goal is verified complete.", stopReason: "stop" }],
+  }, harness.ctx);
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "The adjacent regression test also passes.", stopReason: "stop" }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(adjacentDecisionCalls, 1);
+  assert.equal(latestState?.enabled, false);
+  assert.equal(latestState?.adjacentContinuationCount, 1);
+  assert.equal(harness.sentMessages.filter((entry) => entry.text.includes("adjacent regression test")).length, 1);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode stopped: Done now.")));
 });

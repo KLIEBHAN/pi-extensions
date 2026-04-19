@@ -19,6 +19,7 @@ import {
   decideAutoModeSessionStart,
   deriveAutoContinueProgressState,
   DEFAULT_AUTO_ITERATIONS,
+  DEFAULT_MAX_ADJACENT_CONTINUATIONS,
   DEFAULT_CONTROLLER_FAILURE_LIMIT,
   DEFAULT_CONTROLLER_MODEL,
   DEFAULT_DECISION_HISTORY_LIMIT,
@@ -48,7 +49,7 @@ import {
 const STATUS_KEY = "auto-mode";
 const PROBE_LIMIT_PER_CYCLE = 1;
 const COMMAND_USAGE =
-  "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--completion-policy stop|continue-similar] <goal>";
+  "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--completion-policy stop|continue-similar] [--max-adjacent-continuations N] <goal>";
 
 const AUTO_CONTROLLER_SYSTEM_PROMPT = buildAutoControllerSystemPrompt();
 const AUTO_CONTROLLER_ADJACENT_CONTINUATION_SYSTEM_PROMPT = buildAutoControllerAdjacentContinuationSystemPrompt();
@@ -170,6 +171,7 @@ function buildInitialState(config: AutoStartConfig, summary: string): AutoModeSt
     completionPolicy: config.completionPolicy,
     phase: "primary",
     adjacentContinuationCount: 0,
+    maxAdjacentContinuations: config.maxAdjacentContinuations,
     allowControllerProbes: config.allowControllerProbes,
     maxWallClockMinutes: config.maxWallClockMinutes,
     controllerSummary: summary,
@@ -275,7 +277,7 @@ function buildControllerUserPrompt(
       `Current iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
       `Remaining iterations after this turn: ${remainingIterations}`,
       `Primary goal verified at iteration: ${snapshot.primaryGoalVerifiedAtIteration ?? "no"}`,
-      `Adjacent continuation count: ${snapshot.adjacentContinuationCount}`,
+      `Adjacent continuation count: ${snapshot.adjacentContinuationCount}/${snapshot.maxAdjacentContinuations}`,
       `Commit policy: ${snapshot.commitPolicy}`,
       `Push policy: ${snapshot.pushPolicy}`,
       `Controller probes allowed: ${snapshot.allowControllerProbes ? "yes" : "no"}`,
@@ -567,13 +569,18 @@ function updateNoChangeCounters(snapshot: AutoModeStateV1, gitSnapshot: GitSnaps
   snapshot.lastSeenRepoFingerprint = nextFingerprint;
 }
 
-function applyContinueDecisionProgress(snapshot: AutoModeStateV1, decision: ContinueDecision): void {
+function applyContinueDecisionProgress(
+  snapshot: AutoModeStateV1,
+  decision: ContinueDecision,
+  adjacentContinuationTriggered: boolean,
+): void {
   const nextProgress = deriveAutoContinueProgressState({
     completionPolicy: snapshot.completionPolicy,
     phase: snapshot.phase,
     goalStatus: decision.goalStatus,
     currentIteration: snapshot.currentIteration,
     updatedSummary: decision.updatedSummary,
+    adjacentContinuationTriggered,
     primaryGoalVerifiedAtIteration: snapshot.primaryGoalVerifiedAtIteration,
     adjacentContinuationCount: snapshot.adjacentContinuationCount,
     primaryGoalCompletionSummary: snapshot.primaryGoalCompletionSummary,
@@ -656,13 +663,15 @@ function buildAdjacentContinuationControllerUserPrompt(
   verifyResult: VerifyCommandResult | undefined,
 ): string {
   const remainingIterations = Math.max(0, snapshot.maxIterations - snapshot.currentIteration);
+  const remainingAdjacentBudget = Math.max(0, snapshot.maxAdjacentContinuations - snapshot.adjacentContinuationCount);
   const sections = [
     "The primary goal appears verified complete and a normal stop would be allowed.",
     `Completion policy: ${snapshot.completionPolicy}`,
     `Current phase: ${snapshot.phase}`,
     `Current iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
     `Remaining iterations after this turn: ${remainingIterations}`,
-    `Adjacent continuation count so far: ${snapshot.adjacentContinuationCount}`,
+    `Adjacent continuation count so far: ${snapshot.adjacentContinuationCount}/${snapshot.maxAdjacentContinuations}`,
+    `Remaining adjacent continuation budget: ${remainingAdjacentBudget}`,
     `Proposed stop reason:\n${verifiedStop.reason}`,
     `Proposed stop summary:\n${verifiedStop.updatedSummary}`,
     snapshot.primaryGoalCompletionSummary ? `Primary goal completion summary:\n${snapshot.primaryGoalCompletionSummary}` : undefined,
@@ -670,6 +679,7 @@ function buildAdjacentContinuationControllerUserPrompt(
     `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
     `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
     verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
+    "Because completionPolicy=continue-similar is active and a normal stop would already be valid, prefer continue over stop when one clear bounded adjacent optimization exists within the remaining adjacent continuation budget.",
     "If you continue, choose one bounded adjacent optimization that stays close to the same subsystem, changed files, or problem class.",
   ].filter((value): value is string => !!value);
 
@@ -970,7 +980,7 @@ function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 
     snapshot.verifyCommand ? `verify=${snapshot.verifyCommand}` : undefined,
     `commit-policy=${snapshot.commitPolicy}`,
     `push-policy=${snapshot.pushPolicy}`,
-    `adjacent-count=${snapshot.adjacentContinuationCount}`,
+    `adjacent-count=${snapshot.adjacentContinuationCount}/${snapshot.maxAdjacentContinuations}`,
     snapshot.primaryGoalVerifiedAtIteration !== undefined ? `primary-verified-at=${snapshot.primaryGoalVerifiedAtIteration}` : undefined,
     `controller-failures=${snapshot.consecutiveControllerFailures}`,
     `worker-failures=${snapshot.consecutiveWorkerFailures}`,
@@ -1003,6 +1013,7 @@ function buildFlagsFromPi(pi: ExtensionAPI) {
     commitPolicy: pi.getFlag("auto-commit-policy"),
     pushPolicy: pi.getFlag("auto-push-policy"),
     completionPolicy: pi.getFlag("auto-completion-policy"),
+    maxAdjacentContinuations: pi.getFlag("auto-max-adjacent-continuations"),
     allowControllerProbes: pi.getFlag("auto-allow-controller-probes"),
     resume: pi.getFlag("auto-resume"),
     maxWallClockMinutes: pi.getFlag("auto-max-wall-clock-minutes"),
@@ -1053,6 +1064,11 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
     description: "Completion policy: stop | continue-similar",
     type: "string",
     default: "stop",
+  });
+  pi.registerFlag("auto-max-adjacent-continuations", {
+    description: `Maximum adjacent continuations when completion-policy=continue-similar (default ${DEFAULT_MAX_ADJACENT_CONTINUATIONS})`,
+    type: "string",
+    default: String(DEFAULT_MAX_ADJACENT_CONTINUATIONS),
   });
   pi.registerFlag("auto-allow-controller-probes", {
     description: "Allow the controller to request a limited read-only repository probe",
@@ -1254,7 +1270,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           ...decision,
           nextPrompt,
         };
-        applyContinueDecisionProgress(snapshot, effectiveDecision);
+        applyContinueDecisionProgress(snapshot, effectiveDecision, false);
         recordControllerDecision(snapshot, effectiveDecision);
         queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveDecision, {
           budgetPauseReason: "iteration budget exhausted",
@@ -1283,7 +1299,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
             ...overrideDecision,
             nextPrompt: augmentContinuePrompt(overrideDecision, snapshot, gitSnapshot),
           };
-          applyContinueDecisionProgress(snapshot, effectiveOverrideDecision);
+          applyContinueDecisionProgress(snapshot, effectiveOverrideDecision, false);
           recordControllerDecision(snapshot, effectiveOverrideDecision);
           queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveOverrideDecision, {
             budgetPauseReason: `iteration budget exhausted before verified completion: ${decision.reason}`,
@@ -1298,6 +1314,8 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           goalStatus: decision.goalStatus,
           currentIteration: snapshot.currentIteration,
           maxIterations: snapshot.maxIterations,
+          adjacentContinuationCount: snapshot.adjacentContinuationCount,
+          maxAdjacentContinuations: snapshot.maxAdjacentContinuations,
         })) {
           const adjacentDecision = await getAdjacentContinuationDecisionImpl(ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
           if (adjacentDecision?.action === "continue") {
@@ -1305,7 +1323,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
               ...adjacentDecision,
               nextPrompt: augmentContinuePrompt(adjacentDecision, snapshot, gitSnapshot),
             };
-            applyContinueDecisionProgress(snapshot, effectiveAdjacentDecision);
+            applyContinueDecisionProgress(snapshot, effectiveAdjacentDecision, true);
             recordControllerDecision(snapshot, effectiveAdjacentDecision);
             queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveAdjacentDecision, {
               budgetPauseReason: `iteration budget exhausted after verified completion: ${decision.reason}`,
