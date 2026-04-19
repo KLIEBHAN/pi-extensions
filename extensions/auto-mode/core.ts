@@ -121,6 +121,21 @@ export interface ResumePromptInput {
   maxIterations: number;
 }
 
+export interface SessionStartDecisionInput {
+  reason: AutoSessionStartReason;
+  hasPersistedSnapshot: boolean;
+  autoStartConfigState: "valid" | "invalid" | "none";
+  autoStartError?: string;
+  autoResumeFlag: boolean;
+  persistedResumePolicy?: ResumePolicy;
+}
+
+export interface SessionStartDecision {
+  action: "start-from-flags" | "restore" | "noop";
+  autoResume: boolean;
+  warning?: string;
+}
+
 interface BaseControllerDecision {
   action: ControllerAction;
   reason: string;
@@ -342,6 +357,36 @@ export function buildResumePrompt(input: ResumePromptInput): string {
   ].filter((value): value is string => !!value);
 
   return sections.join("\n\n");
+}
+
+export function decideAutoModeSessionStart(input: SessionStartDecisionInput): SessionStartDecision {
+  const autoResume = shouldAutoResumeOnSessionStart(
+    input.reason,
+    input.autoResumeFlag,
+    input.persistedResumePolicy ?? "restore-paused",
+  );
+
+  if (input.reason === "startup" && input.autoStartConfigState === "valid") {
+    return { action: "start-from-flags", autoResume: false };
+  }
+
+  if (input.hasPersistedSnapshot) {
+    return {
+      action: "restore",
+      autoResume,
+      warning: input.autoStartConfigState === "invalid" ? input.autoStartError : undefined,
+    };
+  }
+
+  if (input.autoStartConfigState === "invalid") {
+    return {
+      action: "noop",
+      autoResume: false,
+      warning: input.autoStartError,
+    };
+  }
+
+  return { action: "noop", autoResume: false };
 }
 
 function isCommitPolicy(value: string): value is CommitPolicy {

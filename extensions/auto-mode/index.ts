@@ -8,6 +8,7 @@ import {
   buildLatestUserMessageContext,
   buildRecentConversationContext,
   buildResumePrompt,
+  decideAutoModeSessionStart,
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_CONTROLLER_FAILURE_LIMIT,
   DEFAULT_CONTROLLER_MODEL,
@@ -1025,28 +1026,41 @@ export default function (pi: ExtensionAPI) {
     runtime.controllerBusy = false;
 
     const flags = buildFlagsFromPi(pi);
+    const persistedSnapshot = restorePersistedSnapshot(ctx);
     const fromFlags = buildAutoStartConfigFromFlags(flags);
-    if (fromFlags && "error" in fromFlags) {
-      ctx.ui.notify(fromFlags.error, "error");
+    const sessionStartDecision = decideAutoModeSessionStart({
+      reason: event.reason,
+      hasPersistedSnapshot: !!persistedSnapshot,
+      autoStartConfigState: !fromFlags ? "none" : "error" in fromFlags ? "invalid" : "valid",
+      autoStartError: fromFlags && "error" in fromFlags ? fromFlags.error : undefined,
+      autoResumeFlag: flags.resume === true,
+      persistedResumePolicy: persistedSnapshot?.resumePolicy,
+    });
+
+    if (sessionStartDecision.warning) {
+      ctx.ui.notify(sessionStartDecision.warning, sessionStartDecision.action === "noop" ? "error" : "warning");
+    }
+
+    if (sessionStartDecision.action === "start-from-flags") {
       runtime.snapshot = undefined;
       setStatus(ctx, undefined);
+      await startAutoMode(pi, ctx, runtime, fromFlags as AutoStartConfig);
       return;
     }
 
-    if (event.reason === "startup" && fromFlags && !("error" in fromFlags)) {
-      runtime.snapshot = undefined;
-      setStatus(ctx, undefined);
-      await startAutoMode(pi, ctx, runtime, fromFlags);
+    if (sessionStartDecision.action === "restore") {
+      const restoreResult = restoreSnapshotOnSessionStart(pi, ctx, runtime, event.reason, sessionStartDecision.autoResume);
+      if (restoreResult.resumed && runtime.snapshot && ctx.isIdle()) {
+        const resumePrompt = getResumePrompt(runtime.snapshot);
+        runtime.snapshot.lastAutoPrompt = resumePrompt;
+        persistSnapshot(pi, runtime.snapshot);
+        pi.sendUserMessage(resumePrompt);
+      }
       return;
     }
 
-    const restoreResult = restoreSnapshotOnSessionStart(pi, ctx, runtime, event.reason, flags.resume === true);
-    if (restoreResult.resumed && runtime.snapshot && ctx.isIdle()) {
-      const resumePrompt = getResumePrompt(runtime.snapshot);
-      runtime.snapshot.lastAutoPrompt = resumePrompt;
-      persistSnapshot(pi, runtime.snapshot);
-      pi.sendUserMessage(resumePrompt);
-    }
+    runtime.snapshot = undefined;
+    setStatus(ctx, undefined);
   });
 
   pi.on("before_agent_start", async (event) => {

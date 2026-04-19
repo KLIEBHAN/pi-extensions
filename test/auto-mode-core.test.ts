@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildAutoStartConfigFromFlags,
   buildResumePrompt,
+  decideAutoModeSessionStart,
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS,
   looksLikeCompletionClaim,
@@ -237,6 +238,54 @@ test("shouldAutoResumeOnSessionStart only resumes on startup", () => {
   assert.equal(shouldAutoResumeOnSessionStart("startup", false, "restore-paused"), false);
   assert.equal(shouldAutoResumeOnSessionStart("reload", true, "restore-running"), false);
   assert.equal(shouldAutoResumeOnSessionStart("resume", true, "restore-running"), false);
+});
+
+test("decideAutoModeSessionStart prefers startup flags but still restores persisted state when flags are invalid", () => {
+  assert.deepEqual(
+    decideAutoModeSessionStart({
+      reason: "startup",
+      hasPersistedSnapshot: true,
+      autoStartConfigState: "valid",
+      autoResumeFlag: true,
+      persistedResumePolicy: "restore-running",
+    }),
+    { action: "start-from-flags", autoResume: false },
+  );
+
+  assert.deepEqual(
+    decideAutoModeSessionStart({
+      reason: "startup",
+      hasPersistedSnapshot: true,
+      autoStartConfigState: "invalid",
+      autoStartError: "--auto-goal is invalid",
+      autoResumeFlag: true,
+      persistedResumePolicy: "restore-running",
+    }),
+    { action: "restore", autoResume: true, warning: "--auto-goal is invalid" },
+  );
+
+  assert.deepEqual(
+    decideAutoModeSessionStart({
+      reason: "reload",
+      hasPersistedSnapshot: true,
+      autoStartConfigState: "invalid",
+      autoStartError: "--auto-goal is invalid",
+      autoResumeFlag: true,
+      persistedResumePolicy: "restore-running",
+    }),
+    { action: "restore", autoResume: false, warning: "--auto-goal is invalid" },
+  );
+
+  assert.deepEqual(
+    decideAutoModeSessionStart({
+      reason: "resume",
+      hasPersistedSnapshot: false,
+      autoStartConfigState: "invalid",
+      autoStartError: "--auto-goal is invalid",
+      autoResumeFlag: true,
+    }),
+    { action: "noop", autoResume: false, warning: "--auto-goal is invalid" },
+  );
 });
 
 test("buildResumePrompt includes summary and verification context", () => {
