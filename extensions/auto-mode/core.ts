@@ -185,6 +185,7 @@ export interface AutoModeStateV1 {
   consecutiveNoChangeCount: number;
   lastSeenHead?: string;
   lastSeenChangedFiles?: string[];
+  lastSeenRepoFingerprint?: string;
   resumePolicy: ResumePolicy;
 }
 

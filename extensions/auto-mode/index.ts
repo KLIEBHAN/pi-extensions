@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { complete, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -62,6 +63,7 @@ interface GitSnapshot {
   hasUpstream: boolean;
   ahead?: number;
   behind?: number;
+  repoFingerprint: string;
 }
 
 interface VerifyCommandResult {
@@ -86,6 +88,13 @@ interface WorkerTurnSnapshot {
 interface AutoRuntimeState {
   snapshot?: AutoModeStateV1;
   controllerBusy: boolean;
+}
+
+interface AutoModeDependencies {
+  getGitSnapshot?: typeof getGitSnapshot;
+  decideControllerAction?: typeof decideControllerAction;
+  getStopOverrideDecision?: typeof getStopOverrideDecision;
+  getAdjacentContinuationDecision?: typeof getAdjacentContinuationDecision;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -299,16 +308,21 @@ function summarizeBashOutput(stdout: string, stderr: string, maxChars = 2_000): 
   return `${combined.slice(0, maxChars - 1)}…`;
 }
 
+function buildGitRepoFingerprint(statusText: string, diffText: string): string {
+  return createHash("sha256").update(statusText).update("\n---\n").update(diffText).digest("hex");
+}
+
 async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapshot | undefined> {
   const isRepo = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd });
   if (isRepo.code !== 0 || !isRepo.stdout.includes("true")) {
     return undefined;
   }
 
-  const [head, status, upstream] = await Promise.all([
+  const [head, status, upstream, diffAgainstHead] = await Promise.all([
     pi.exec("git", ["rev-parse", "HEAD"], { cwd }),
     pi.exec("git", ["status", "--short", "--branch"], { cwd }),
     pi.exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd }),
+    pi.exec("git", ["diff", "--no-ext-diff", "--no-color", "HEAD", "--"], { cwd, timeout: 120 }),
   ]);
 
   let ahead: number | undefined;
@@ -330,6 +344,7 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
     .slice(1)
     .map((line) => line.slice(3).trim())
     .filter(Boolean);
+  const repoFingerprint = buildGitRepoFingerprint(statusText, diffAgainstHead.stdout || "");
 
   return {
     isGitRepo: true,
@@ -340,6 +355,7 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
     hasUpstream,
     ahead,
     behind,
+    repoFingerprint,
   };
 }
 
@@ -536,13 +552,14 @@ async function decideControllerAction(
 function updateNoChangeCounters(snapshot: AutoModeStateV1, gitSnapshot: GitSnapshot | undefined): void {
   const nextHead = gitSnapshot?.head;
   const nextFiles = gitSnapshot?.changedFiles ?? [];
+  const nextFingerprint = gitSnapshot?.repoFingerprint;
   const previousHead = snapshot.lastSeenHead;
-  const previousFiles = snapshot.lastSeenChangedFiles ?? [];
+  const previousFingerprint = snapshot.lastSeenRepoFingerprint;
 
   const sameHead = previousHead !== undefined && previousHead === nextHead;
-  const sameFiles = JSON.stringify(previousFiles) === JSON.stringify(nextFiles);
+  const sameFingerprint = previousFingerprint !== undefined && previousFingerprint === nextFingerprint;
 
-  if (sameHead && sameFiles) {
+  if (sameHead && sameFingerprint) {
     snapshot.consecutiveNoChangeCount += 1;
   } else {
     snapshot.consecutiveNoChangeCount = 0;
@@ -550,6 +567,7 @@ function updateNoChangeCounters(snapshot: AutoModeStateV1, gitSnapshot: GitSnaps
 
   snapshot.lastSeenHead = nextHead;
   snapshot.lastSeenChangedFiles = [...nextFiles];
+  snapshot.lastSeenRepoFingerprint = nextFingerprint;
 }
 
 function applyContinueDecisionProgress(snapshot: AutoModeStateV1, decision: ContinueDecision): void {
@@ -994,10 +1012,15 @@ function buildFlagsFromPi(pi: ExtensionAPI) {
   };
 }
 
-export default function (pi: ExtensionAPI) {
-  const runtime: AutoRuntimeState = {
-    controllerBusy: false,
-  };
+export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
+  return function (pi: ExtensionAPI) {
+    const runtime: AutoRuntimeState = {
+      controllerBusy: false,
+    };
+    const getGitSnapshotImpl = deps.getGitSnapshot ?? getGitSnapshot;
+    const decideControllerActionImpl = deps.decideControllerAction ?? decideControllerAction;
+    const getStopOverrideDecisionImpl = deps.getStopOverrideDecision ?? getStopOverrideDecision;
+    const getAdjacentContinuationDecisionImpl = deps.getAdjacentContinuationDecision ?? getAdjacentContinuationDecision;
 
   pi.registerFlag("auto-goal", {
     description: "Start auto-mode with the given goal",
@@ -1199,7 +1222,7 @@ export default function (pi: ExtensionAPI) {
         snapshot.consecutiveWorkerFailures = 0;
       }
 
-      const gitSnapshot = await getGitSnapshot(pi, ctx.cwd);
+      const gitSnapshot = await getGitSnapshotImpl(pi, ctx.cwd);
       updateNoChangeCounters(snapshot, gitSnapshot);
       persistSnapshot(pi, snapshot);
 
@@ -1213,7 +1236,7 @@ export default function (pi: ExtensionAPI) {
         ? await runVerifyCommand(pi, ctx.cwd, snapshot.verifyCommand)
         : undefined;
 
-      const decision = await decideControllerAction(pi, ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
+      const decision = await decideControllerActionImpl(pi, ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
 
       if (!decision) {
         snapshot.consecutiveControllerFailures += 1;
@@ -1251,7 +1274,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (decision.action === "stop") {
-        const overrideDecision = await getStopOverrideDecision(pi, ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
+        const overrideDecision = await getStopOverrideDecisionImpl(pi, ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
         if (overrideDecision) {
           if (overrideDecision.action === "pause") {
             recordControllerDecision(snapshot, overrideDecision);
@@ -1279,7 +1302,7 @@ export default function (pi: ExtensionAPI) {
           currentIteration: snapshot.currentIteration,
           maxIterations: snapshot.maxIterations,
         })) {
-          const adjacentDecision = await getAdjacentContinuationDecision(ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
+          const adjacentDecision = await getAdjacentContinuationDecisionImpl(ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
           if (adjacentDecision?.action === "continue") {
             const effectiveAdjacentDecision: ContinueDecision = {
               ...adjacentDecision,
@@ -1317,4 +1340,7 @@ export default function (pi: ExtensionAPI) {
       runtime.controllerBusy = false;
     }
   });
+  };
 }
+
+export default createAutoModeExtension();
