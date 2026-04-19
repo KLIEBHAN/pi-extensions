@@ -16,6 +16,8 @@ export type AutoMode = "iterations" | "until" | "hybrid";
 export type GoalStatus = "in_progress" | "likely_met" | "met" | "blocked" | "stalled";
 export type CommitPolicy = "none" | "milestones" | "final-or-milestone";
 export type PushPolicy = "never" | "if-upstream" | "final-or-milestone-if-upstream";
+export type CompletionPolicy = "stop" | "continue-similar";
+export type AutoPhase = "primary" | "adjacent";
 export type CommitRecommendation = "none" | "milestone" | "finalize";
 export type ProbeKind = "git_status" | "git_diff_names" | "git_head" | "verify_command";
 export type ResumePolicy = "restore-paused" | "restore-running";
@@ -36,6 +38,7 @@ export interface AutoStartConfig {
   verifyCommand?: string;
   commitPolicy: CommitPolicy;
   pushPolicy: PushPolicy;
+  completionPolicy: CompletionPolicy;
   allowControllerProbes: boolean;
   maxWallClockMinutes: number;
   resumeOnSessionStart: boolean;
@@ -122,6 +125,24 @@ export interface AutoStopOverrideRefinementInput {
 
 export type AutoStopOverrideFollowUpDecision = ContinueDecision | PauseDecision;
 
+export interface AutoContinueProgressInput {
+  completionPolicy: CompletionPolicy;
+  phase: AutoPhase;
+  goalStatus: GoalStatus;
+  currentIteration: number;
+  updatedSummary: string;
+  primaryGoalVerifiedAtIteration?: number;
+  adjacentContinuationCount: number;
+  primaryGoalCompletionSummary?: string;
+}
+
+export interface AutoContinueProgressState {
+  phase: AutoPhase;
+  primaryGoalVerifiedAtIteration?: number;
+  adjacentContinuationCount: number;
+  primaryGoalCompletionSummary?: string;
+}
+
 export interface AutoDecisionLogEntry {
   iteration: number;
   action: ControllerAction;
@@ -147,6 +168,11 @@ export interface AutoModeStateV1 {
   verifyCommand?: string;
   commitPolicy: CommitPolicy;
   pushPolicy: PushPolicy;
+  completionPolicy: CompletionPolicy;
+  phase: AutoPhase;
+  primaryGoalVerifiedAtIteration?: number;
+  adjacentContinuationCount: number;
+  primaryGoalCompletionSummary?: string;
   allowControllerProbes: boolean;
   maxWallClockMinutes: number;
   controllerSummary: string;
@@ -180,6 +206,7 @@ export interface AutoFlagValues {
   verify?: boolean | string;
   commitPolicy?: boolean | string;
   pushPolicy?: boolean | string;
+  completionPolicy?: boolean | string;
   allowControllerProbes?: boolean | string;
   resume?: boolean | string;
   maxWallClockMinutes?: boolean | string;
@@ -290,13 +317,26 @@ export function isAutoModeStateV1(value: unknown): value is AutoModeStateV1 {
   );
 }
 
+export function hydrateAutoModeState(snapshot: AutoModeStateV1): AutoModeStateV1 {
+  return {
+    ...snapshot,
+    completionPolicy: snapshot.completionPolicy === "continue-similar" ? "continue-similar" : "stop",
+    phase: snapshot.phase === "adjacent" ? "adjacent" : "primary",
+    adjacentContinuationCount: typeof snapshot.adjacentContinuationCount === "number" ? snapshot.adjacentContinuationCount : 0,
+    primaryGoalVerifiedAtIteration:
+      typeof snapshot.primaryGoalVerifiedAtIteration === "number" ? snapshot.primaryGoalVerifiedAtIteration : undefined,
+    primaryGoalCompletionSummary:
+      typeof snapshot.primaryGoalCompletionSummary === "string" ? snapshot.primaryGoalCompletionSummary : undefined,
+  };
+}
+
 export function extractLatestAutoModeState(entries: unknown[]): AutoModeStateV1 | undefined {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index] as AutoModeCustomEntryLike | undefined;
     if (!entry || entry.type !== "custom") continue;
     if (entry.customType !== AUTO_MODE_STATE_TYPE) continue;
     if (!isAutoModeStateV1(entry.data)) continue;
-    return entry.data;
+    return hydrateAutoModeState(entry.data);
   }
   return undefined;
 }
@@ -513,6 +553,7 @@ export function buildAutoControllerSystemPrompt(): string {
     "",
     "Decision policy:",
     "- Default to continue, not stop.",
+    "- goalStatus must always refer to the original primary goal, not just the current adjacent optimization.",
     "- Continue whenever there is any concrete, non-trivial, high-value next step toward verified completion, stronger validation, or required finalization.",
     "- Prefer next prompts that name the exact inspection, implementation, test, verification, or git-finalization step to do next.",
     "- Avoid vague prompts like \"continue improving\" when a concrete next step is available.",
@@ -524,6 +565,9 @@ export function buildAutoControllerSystemPrompt(): string {
     "- Use stop only when completion is supported by concrete verification evidence from this cycle, such as a passing verification command, passing tests/checks, or explicit validation evidence in the worker result.",
     "- If verification is failing or still missing, the task is not complete.",
     "- If final commit/push expectations are still unmet in a git repo, the task is not complete.",
+    "- If completionPolicy=continue-similar and the primary goal is verified met with iteration budget remaining, prefer continue with one bounded adjacent optimization when a concrete, high-value next step exists.",
+    "- An adjacent optimization must stay close to the same subsystem, changed files, or problem class; do not branch into a new broad project.",
+    "- If no worthwhile bounded adjacent optimization is clear, stop.",
     "- If obvious follow-up work remains that is necessary to satisfy the goal or quality goal, do not stop.",
     "- Use pause when the run appears blocked, unstable, unsafe, or repetitively unproductive, or when no fresh high-value next step is available without looping.",
     "- Use probe only if one fresh read-only repository snapshot would materially improve the next decision, and never for information that is already present.",
@@ -542,6 +586,39 @@ export function buildAutoControllerSystemPrompt(): string {
     '  "nextPrompt":"...",',
     '  "finalMessage":"...",',
     '  "probe":{"kind":"git_status|git_diff_names|git_head|verify_command"}',
+    "}",
+  ].join("\n");
+}
+
+export function buildAutoControllerAdjacentContinuationSystemPrompt(): string {
+  return [
+    "You are deciding whether an autonomous run should continue after the primary goal has already been verified complete.",
+    "",
+    "Output requirements:",
+    "- Return ONLY valid JSON.",
+    "- Use exactly one of these actions: continue, stop, pause.",
+    "- Do NOT use probe.",
+    "- If action=continue, include nextPrompt with exactly one bounded adjacent optimization.",
+    "",
+    "Decision policy:",
+    "- goalStatus must still refer to the original primary goal.",
+    "- Use continue only when there is a clear, local, high-value adjacent optimization that stays close to the same subsystem, files, or problem class.",
+    "- Do not broaden scope into a new major task or unrelated workstream.",
+    "- If there is no worthwhile bounded adjacent optimization left, use stop.",
+    "- If the best continuation would mostly restate the previous prompt or otherwise thrash, use pause instead of repeating yourself.",
+    "- Do not ask the user anything.",
+    "",
+    "JSON shape:",
+    "{",
+    '  "action":"continue|stop|pause",',
+    '  "reason":"...",',
+    '  "updatedSummary":"...",',
+    '  "goalStatus":"in_progress|likely_met|met|blocked|stalled",',
+    '  "qualityGoalMet":true,',
+    '  "progressPercent":0,',
+    '  "commitRecommendation":"none|milestone|finalize",',
+    '  "nextPrompt":"...",',
+    '  "finalMessage":"..."',
     "}",
   ].join("\n");
 }
@@ -761,6 +838,42 @@ export function applyControllerStopOverrideRefinement(input: AutoStopOverrideRef
   };
 }
 
+export function shouldAttemptAutoAdjacentContinuation(input: {
+  completionPolicy: CompletionPolicy;
+  goalStatus: GoalStatus;
+  currentIteration: number;
+  maxIterations: number;
+}): boolean {
+  return input.completionPolicy === "continue-similar" && input.goalStatus === "met" && input.currentIteration < input.maxIterations;
+}
+
+export function deriveAutoContinueProgressState(input: AutoContinueProgressInput): AutoContinueProgressState {
+  if (input.completionPolicy !== "continue-similar") {
+    return {
+      phase: "primary",
+      primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration,
+      adjacentContinuationCount: 0,
+      primaryGoalCompletionSummary: input.primaryGoalCompletionSummary,
+    };
+  }
+
+  if (input.goalStatus !== "met") {
+    return {
+      phase: "primary",
+      primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration,
+      adjacentContinuationCount: 0,
+      primaryGoalCompletionSummary: input.primaryGoalCompletionSummary,
+    };
+  }
+
+  return {
+    phase: "adjacent",
+    primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration ?? input.currentIteration,
+    adjacentContinuationCount: input.phase === "adjacent" ? input.adjacentContinuationCount + 1 : 1,
+    primaryGoalCompletionSummary: input.primaryGoalCompletionSummary ?? truncateControllerSummary(input.updatedSummary),
+  };
+}
+
 export function planAutoFollowUp(input: AutoFollowUpPlanInput): AutoFollowUpPlan {
   if (input.currentIteration >= input.maxIterations) {
     return {
@@ -836,6 +949,10 @@ function isPushPolicy(value: string): value is PushPolicy {
   return value === "never" || value === "if-upstream" || value === "final-or-milestone-if-upstream";
 }
 
+function isCompletionPolicy(value: string): value is CompletionPolicy {
+  return value === "stop" || value === "continue-similar";
+}
+
 function isGoalStatus(value: string): value is GoalStatus {
   return value === "in_progress" || value === "likely_met" || value === "met" || value === "blocked" || value === "stalled";
 }
@@ -865,6 +982,7 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
   let verifyCommand: string | undefined;
   let commitPolicy: CommitPolicy = "final-or-milestone";
   let pushPolicy: PushPolicy = "final-or-milestone-if-upstream";
+  let completionPolicy: CompletionPolicy = "stop";
   let allowControllerProbes = true;
   let maxWallClockMinutes = DEFAULT_MAX_WALL_CLOCK_MINUTES;
   const goalTokens: string[] = [];
@@ -934,6 +1052,16 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       continue;
     }
 
+    if (token === "--completion-policy") {
+      const value = tokens[index + 1];
+      if (!value || !isCompletionPolicy(value)) {
+        return { error: "--completion-policy must be one of: stop, continue-similar" };
+      }
+      completionPolicy = value;
+      index += 1;
+      continue;
+    }
+
     if (token === "--no-controller-probes") {
       allowControllerProbes = false;
       continue;
@@ -975,6 +1103,7 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       verifyCommand,
       commitPolicy,
       pushPolicy,
+      completionPolicy,
       allowControllerProbes,
       maxWallClockMinutes,
       resumeOnSessionStart: false,
@@ -1030,6 +1159,7 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
   const verifyCommand = parseStringFlag(flags.verify);
   const commitPolicyFlag = parseStringFlag(flags.commitPolicy);
   const pushPolicyFlag = parseStringFlag(flags.pushPolicy);
+  const completionPolicyFlag = parseStringFlag(flags.completionPolicy);
   const maxWallClockFlag = parseStringFlag(flags.maxWallClockMinutes);
 
   const iterations = iterationsFlag ? parsePositiveInteger(iterationsFlag) : undefined;
@@ -1058,6 +1188,14 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
     pushPolicy = pushPolicyFlag;
   }
 
+  let completionPolicy: CompletionPolicy = "stop";
+  if (completionPolicyFlag) {
+    if (!isCompletionPolicy(completionPolicyFlag)) {
+      return { error: "--auto-completion-policy must be one of: stop, continue-similar" };
+    }
+    completionPolicy = completionPolicyFlag;
+  }
+
   let maxWallClockMinutes = DEFAULT_MAX_WALL_CLOCK_MINUTES;
   if (maxWallClockFlag) {
     const parsed = parsePositiveInteger(maxWallClockFlag, 24 * 60);
@@ -1077,6 +1215,7 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
     verifyCommand,
     commitPolicy,
     pushPolicy,
+    completionPolicy,
     allowControllerProbes: parseBooleanFlag(flags.allowControllerProbes, true),
     maxWallClockMinutes,
     resumeOnSessionStart: parseBooleanFlag(flags.resume, false),

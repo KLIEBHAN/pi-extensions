@@ -4,6 +4,7 @@ import {
   appendDecisionHistory,
   applyControllerStopOverrideRefinement,
   AUTO_MODE_STATE_TYPE,
+  buildAutoControllerAdjacentContinuationSystemPrompt,
   buildAutoControllerStopOverrideSystemPrompt,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
@@ -15,6 +16,7 @@ import {
   buildResumePrompt,
   buildStartPrompt,
   decideAutoModeSessionStart,
+  deriveAutoContinueProgressState,
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_CONTROLLER_FAILURE_LIMIT,
   DEFAULT_CONTROLLER_MODEL,
@@ -26,6 +28,7 @@ import {
   evaluateAutoStopGuard,
   extractLatestAutoModeState,
   extractMessageText,
+  shouldAttemptAutoAdjacentContinuation,
   parseAutoCommandArgs,
   parseControllerDecision,
   parseModelRef,
@@ -45,9 +48,10 @@ import {
 const STATUS_KEY = "auto-mode";
 const PROBE_LIMIT_PER_CYCLE = 1;
 const COMMAND_USAGE =
-  "Usage: /auto on [--iterations N] [--until \"goal\"] [--controller-model provider/model] [--verify \"cmd\"] <goal>";
+  "Usage: /auto on [--iterations N] [--until \"goal\"] [--controller-model provider/model] [--verify \"cmd\"] [--completion-policy stop|continue-similar] <goal>";
 
 const AUTO_CONTROLLER_SYSTEM_PROMPT = buildAutoControllerSystemPrompt();
+const AUTO_CONTROLLER_ADJACENT_CONTINUATION_SYSTEM_PROMPT = buildAutoControllerAdjacentContinuationSystemPrompt();
 const AUTO_CONTROLLER_STOP_OVERRIDE_SYSTEM_PROMPT = buildAutoControllerStopOverrideSystemPrompt();
 
 interface GitSnapshot {
@@ -155,6 +159,9 @@ function buildInitialState(config: AutoStartConfig, summary: string): AutoModeSt
     verifyCommand: config.verifyCommand,
     commitPolicy: config.commitPolicy,
     pushPolicy: config.pushPolicy,
+    completionPolicy: config.completionPolicy,
+    phase: "primary",
+    adjacentContinuationCount: 0,
     allowControllerProbes: config.allowControllerProbes,
     maxWallClockMinutes: config.maxWallClockMinutes,
     controllerSummary: summary,
@@ -258,14 +265,19 @@ function buildControllerUserPrompt(
     snapshot.untilPrompt ? `Quality goal:\n${snapshot.untilPrompt}` : undefined,
     [
       `Mode: ${snapshot.mode}`,
+      `Completion policy: ${snapshot.completionPolicy}`,
+      `Phase: ${snapshot.phase}`,
       `Current iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
       `Remaining iterations after this turn: ${remainingIterations}`,
+      `Primary goal verified at iteration: ${snapshot.primaryGoalVerifiedAtIteration ?? "no"}`,
+      `Adjacent continuation count: ${snapshot.adjacentContinuationCount}`,
       `Commit policy: ${snapshot.commitPolicy}`,
       `Push policy: ${snapshot.pushPolicy}`,
       `Controller probes allowed: ${snapshot.allowControllerProbes ? "yes" : "no"}`,
       `Verification command configured: ${snapshot.verifyCommand ? snapshot.verifyCommand : "no"}`,
     ].join("\n"),
     `Controller summary:\n${snapshot.controllerSummary || "(empty)"}`,
+    snapshot.primaryGoalCompletionSummary ? `Primary goal completion summary:\n${snapshot.primaryGoalCompletionSummary}` : undefined,
     `Recent controller decisions:\n${buildControllerDecisionHistoryText(snapshot)}`,
     snapshot.lastAutoPrompt ? `Last auto prompt sent to worker:\n${snapshot.lastAutoPrompt}` : undefined,
     `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
@@ -549,6 +561,24 @@ function updateNoChangeCounters(snapshot: AutoModeStateV1, gitSnapshot: GitSnaps
   snapshot.lastSeenChangedFiles = [...nextFiles];
 }
 
+function applyContinueDecisionProgress(snapshot: AutoModeStateV1, decision: ContinueDecision): void {
+  const nextProgress = deriveAutoContinueProgressState({
+    completionPolicy: snapshot.completionPolicy,
+    phase: snapshot.phase,
+    goalStatus: decision.goalStatus,
+    currentIteration: snapshot.currentIteration,
+    updatedSummary: decision.updatedSummary,
+    primaryGoalVerifiedAtIteration: snapshot.primaryGoalVerifiedAtIteration,
+    adjacentContinuationCount: snapshot.adjacentContinuationCount,
+    primaryGoalCompletionSummary: snapshot.primaryGoalCompletionSummary,
+  });
+
+  snapshot.phase = nextProgress.phase;
+  snapshot.primaryGoalVerifiedAtIteration = nextProgress.primaryGoalVerifiedAtIteration;
+  snapshot.adjacentContinuationCount = nextProgress.adjacentContinuationCount;
+  snapshot.primaryGoalCompletionSummary = nextProgress.primaryGoalCompletionSummary;
+}
+
 function recordControllerDecision(snapshot: AutoModeStateV1, decision: ControllerDecision): void {
   snapshot.lastControllerAt = now();
   snapshot.controllerSummary = truncateControllerSummary(decision.updatedSummary);
@@ -610,6 +640,54 @@ function buildStopOverrideControllerUserPrompt(
   ].filter((value): value is string => !!value);
 
   return sections.join("\n\n");
+}
+
+function buildAdjacentContinuationControllerUserPrompt(
+  snapshot: AutoModeStateV1,
+  verifiedStop: Extract<ControllerDecision, { action: "stop" }>,
+  workerTurn: WorkerTurnSnapshot,
+  gitSnapshot: GitSnapshot | undefined,
+  verifyResult: VerifyCommandResult | undefined,
+): string {
+  const remainingIterations = Math.max(0, snapshot.maxIterations - snapshot.currentIteration);
+  const sections = [
+    "The primary goal appears verified complete and a normal stop would be allowed.",
+    `Completion policy: ${snapshot.completionPolicy}`,
+    `Current phase: ${snapshot.phase}`,
+    `Current iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
+    `Remaining iterations after this turn: ${remainingIterations}`,
+    `Adjacent continuation count so far: ${snapshot.adjacentContinuationCount}`,
+    `Proposed stop reason:\n${verifiedStop.reason}`,
+    `Proposed stop summary:\n${verifiedStop.updatedSummary}`,
+    snapshot.primaryGoalCompletionSummary ? `Primary goal completion summary:\n${snapshot.primaryGoalCompletionSummary}` : undefined,
+    snapshot.lastAutoPrompt ? `Previous auto prompt sent to the worker:\n${snapshot.lastAutoPrompt}` : undefined,
+    `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
+    `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
+    verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
+    "If you continue, choose one bounded adjacent optimization that stays close to the same subsystem, changed files, or problem class.",
+  ].filter((value): value is string => !!value);
+
+  return sections.join("\n\n");
+}
+
+async function getAdjacentContinuationDecision(
+  ctx: ExtensionContext,
+  snapshot: AutoModeStateV1,
+  decision: Extract<ControllerDecision, { action: "stop" }>,
+  workerTurn: WorkerTurnSnapshot,
+  gitSnapshot: GitSnapshot | undefined,
+  verifyResult: VerifyCommandResult | undefined,
+): Promise<Exclude<ControllerDecision, Extract<ControllerDecision, { action: "probe" }>> | undefined> {
+  const controllerDecision = await completeControllerDecision(
+    ctx,
+    snapshot,
+    AUTO_CONTROLLER_ADJACENT_CONTINUATION_SYSTEM_PROMPT,
+    buildAdjacentContinuationControllerUserPrompt(snapshot, decision, workerTurn, gitSnapshot, verifyResult),
+  );
+  if (!controllerDecision || controllerDecision.action === "probe") {
+    return undefined;
+  }
+  return controllerDecision;
 }
 
 async function getStopOverrideDecision(
@@ -876,6 +954,8 @@ function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 
 
   const lines = [
     `mode=${snapshot.mode}`,
+    `completion-policy=${snapshot.completionPolicy}`,
+    `phase=${snapshot.phase}`,
     `paused=${snapshot.paused ? "yes" : "no"}`,
     `iteration=${snapshot.currentIteration}/${snapshot.maxIterations}`,
     `goal=${snapshot.goal}`,
@@ -884,6 +964,8 @@ function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 
     snapshot.verifyCommand ? `verify=${snapshot.verifyCommand}` : undefined,
     `commit-policy=${snapshot.commitPolicy}`,
     `push-policy=${snapshot.pushPolicy}`,
+    `adjacent-count=${snapshot.adjacentContinuationCount}`,
+    snapshot.primaryGoalVerifiedAtIteration !== undefined ? `primary-verified-at=${snapshot.primaryGoalVerifiedAtIteration}` : undefined,
     `controller-failures=${snapshot.consecutiveControllerFailures}`,
     `worker-failures=${snapshot.consecutiveWorkerFailures}`,
     `stagnation=${snapshot.consecutiveStagnationCount}`,
@@ -914,6 +996,7 @@ function buildFlagsFromPi(pi: ExtensionAPI) {
     verify: pi.getFlag("auto-verify"),
     commitPolicy: pi.getFlag("auto-commit-policy"),
     pushPolicy: pi.getFlag("auto-push-policy"),
+    completionPolicy: pi.getFlag("auto-completion-policy"),
     allowControllerProbes: pi.getFlag("auto-allow-controller-probes"),
     resume: pi.getFlag("auto-resume"),
     maxWallClockMinutes: pi.getFlag("auto-max-wall-clock-minutes"),
@@ -954,6 +1037,11 @@ export default function (pi: ExtensionAPI) {
     description: "Push policy: never | if-upstream | final-or-milestone-if-upstream",
     type: "string",
     default: "final-or-milestone-if-upstream",
+  });
+  pi.registerFlag("auto-completion-policy", {
+    description: "Completion policy: stop | continue-similar",
+    type: "string",
+    default: "stop",
   });
   pi.registerFlag("auto-allow-controller-probes", {
     description: "Allow the controller to request a limited read-only repository probe",
@@ -1155,6 +1243,7 @@ export default function (pi: ExtensionAPI) {
           ...decision,
           nextPrompt,
         };
+        applyContinueDecisionProgress(snapshot, effectiveDecision);
         recordControllerDecision(snapshot, effectiveDecision);
         queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveDecision, {
           budgetPauseReason: "iteration budget exhausted",
@@ -1173,18 +1262,60 @@ export default function (pi: ExtensionAPI) {
       if (decision.action === "stop") {
         const overrideDecision = await getStopOverrideDecision(pi, ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
         if (overrideDecision) {
-          recordControllerDecision(snapshot, overrideDecision);
           if (overrideDecision.action === "pause") {
+            recordControllerDecision(snapshot, overrideDecision);
             pauseSnapshot(pi, ctx, runtime, overrideDecision.reason, "warning");
             return;
           }
 
-          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, overrideDecision, {
+          const effectiveOverrideDecision: ContinueDecision = {
+            ...overrideDecision,
+            nextPrompt: augmentContinuePrompt(overrideDecision, snapshot, gitSnapshot),
+          };
+          applyContinueDecisionProgress(snapshot, effectiveOverrideDecision);
+          recordControllerDecision(snapshot, effectiveOverrideDecision);
+          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveOverrideDecision, {
             budgetPauseReason: `iteration budget exhausted before verified completion: ${decision.reason}`,
-            notifyMessage: `Auto-mode finalization pass requested: ${overrideDecision.reason}`,
+            notifyMessage: `Auto-mode finalization pass requested: ${effectiveOverrideDecision.reason}`,
             notifyLevel: "warning",
           });
           return;
+        }
+
+        if (shouldAttemptAutoAdjacentContinuation({
+          completionPolicy: snapshot.completionPolicy,
+          goalStatus: decision.goalStatus,
+          currentIteration: snapshot.currentIteration,
+          maxIterations: snapshot.maxIterations,
+        })) {
+          const adjacentDecision = await getAdjacentContinuationDecision(ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
+          if (adjacentDecision?.action === "continue") {
+            const effectiveAdjacentDecision: ContinueDecision = {
+              ...adjacentDecision,
+              nextPrompt: augmentContinuePrompt(adjacentDecision, snapshot, gitSnapshot),
+            };
+            applyContinueDecisionProgress(snapshot, effectiveAdjacentDecision);
+            recordControllerDecision(snapshot, effectiveAdjacentDecision);
+            queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveAdjacentDecision, {
+              budgetPauseReason: `iteration budget exhausted after verified completion: ${decision.reason}`,
+              notifyMessage: `Auto-mode exploring adjacent optimization (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
+              notifyLevel: "info",
+            });
+            return;
+          }
+
+          if (adjacentDecision?.action === "pause") {
+            recordControllerDecision(snapshot, adjacentDecision);
+            pauseSnapshot(pi, ctx, runtime, adjacentDecision.reason, "warning");
+            return;
+          }
+
+          if (adjacentDecision?.action === "stop") {
+            recordControllerDecision(snapshot, adjacentDecision);
+            persistSnapshot(pi, snapshot);
+            disableSnapshot(pi, ctx, runtime, adjacentDecision.finalMessage || adjacentDecision.reason, adjacentDecision.qualityGoalMet ? "info" : "warning");
+            return;
+          }
         }
 
         recordControllerDecision(snapshot, decision);

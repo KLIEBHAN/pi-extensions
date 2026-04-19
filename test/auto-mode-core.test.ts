@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   applyControllerStopOverrideRefinement,
   AUTO_MODE_STATE_TYPE,
+  buildAutoControllerAdjacentContinuationSystemPrompt,
   buildAutoControllerStopOverrideSystemPrompt,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
@@ -14,6 +15,7 @@ import {
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS,
   DEFAULT_STAGNATION_LIMIT,
+  deriveAutoContinueProgressState,
   evaluateAutoStopGuard,
   extractLatestAutoModeState,
   hasConcreteVerificationEvidence,
@@ -24,6 +26,7 @@ import {
   parseModelRef,
   planAutoFollowUp,
   parsePositiveInteger,
+  shouldAttemptAutoAdjacentContinuation,
   shouldAutoResumeOnSessionStart,
   shouldPreRunVerifyCommand,
   summarizeGoal,
@@ -55,6 +58,7 @@ test("parseAutoCommandArgs parses /auto on with defaults", () => {
   assert.equal(parsed.config.mode, "iterations");
   assert.equal(parsed.config.maxIterations, DEFAULT_AUTO_ITERATIONS);
   assert.equal(parsed.config.untilPrompt, undefined);
+  assert.equal(parsed.config.completionPolicy, "stop");
 });
 
 test("parseAutoCommandArgs parses hybrid mode with quoted until prompt and controller model", () => {
@@ -80,6 +84,14 @@ test("parseAutoCommandArgs parses no-controller-probes and max wall clock overri
 
   assert.equal(parsed.config.allowControllerProbes, false);
   assert.equal(parsed.config.maxWallClockMinutes, 90);
+});
+
+test("parseAutoCommandArgs parses completion-policy continue-similar", () => {
+  const parsed = parseAutoCommandArgs("on --completion-policy continue-similar improve nearby reliability");
+  assert.equal(parsed.kind, "on");
+  if (parsed.kind !== "on") return;
+
+  assert.equal(parsed.config.completionPolicy, "continue-similar");
 });
 
 test("parseAutoCommandArgs uses until safety limit when only --until is provided", () => {
@@ -113,6 +125,9 @@ test("parseAutoCommandArgs reports invalid input", () => {
   assert.deepEqual(parseAutoCommandArgs("on --commit-policy nope improve app"), {
     error: "--commit-policy must be one of: none, milestones, final-or-milestone",
   });
+  assert.deepEqual(parseAutoCommandArgs("on --completion-policy nope improve app"), {
+    error: "--completion-policy must be one of: stop, continue-similar",
+  });
   assert.deepEqual(parseAutoCommandArgs("nudge   "), {
     error: "Usage: /auto nudge <instruction>",
   });
@@ -135,12 +150,24 @@ test("buildAutoStartConfigFromFlags applies defaults and parses optional values"
   assert.equal(parsed.mode, "until");
   assert.equal(parsed.maxIterations, DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS);
   assert.equal(parsed.verifyCommand, "npm test");
+  assert.equal(parsed.completionPolicy, "stop");
   assert.equal(parsed.allowControllerProbes, false);
   assert.equal(parsed.resumeOnSessionStart, true);
   assert.deepEqual(parsed.controllerModel, {
     provider: "openai",
     id: "gpt-5.4-mini",
   });
+});
+
+test("buildAutoStartConfigFromFlags parses completion policy overrides", () => {
+  const parsed = buildAutoStartConfigFromFlags({
+    goal: "improve settings UX",
+    completionPolicy: "continue-similar",
+  });
+
+  assert.ok(parsed && !("error" in parsed));
+  if (!parsed || "error" in parsed) return;
+  assert.equal(parsed.completionPolicy, "continue-similar");
 });
 
 test("buildAutoStartConfigFromFlags returns errors for invalid values", () => {
@@ -152,6 +179,9 @@ test("buildAutoStartConfigFromFlags returns errors for invalid values", () => {
   });
   assert.deepEqual(buildAutoStartConfigFromFlags({ goal: "improve app", pushPolicy: "bad" }), {
     error: "--auto-push-policy must be one of: never, if-upstream, final-or-milestone-if-upstream",
+  });
+  assert.deepEqual(buildAutoStartConfigFromFlags({ goal: "improve app", completionPolicy: "bad" }), {
+    error: "--auto-completion-policy must be one of: stop, continue-similar",
   });
 });
 
@@ -343,6 +373,7 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
 
   assert.match(prompt, /^You are the controller for an autonomous coding loop\./);
   assert.match(prompt, /Default to continue, not stop\./);
+  assert.match(prompt, /goalStatus must always refer to the original primary goal/);
   assert.match(prompt, /Never treat a worker completion claim by itself as proof that the goal is done\./);
   assert.match(prompt, /When in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step\./);
   assert.match(prompt, /Use stop only when goalStatus=met\./);
@@ -350,7 +381,22 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
   assert.match(prompt, /Use stop only when completion is supported by concrete verification evidence/);
   assert.match(prompt, /If verification is failing or still missing, the task is not complete\./);
   assert.match(prompt, /If final commit\/push expectations are still unmet in a git repo, the task is not complete\./);
+  assert.match(prompt, /If completionPolicy=continue-similar and the primary goal is verified met with iteration budget remaining, prefer continue with one bounded adjacent optimization/);
+  assert.match(prompt, /An adjacent optimization must stay close to the same subsystem, changed files, or problem class/);
+  assert.match(prompt, /If no worthwhile bounded adjacent optimization is clear, stop\./);
   assert.match(prompt, /If the next prompt would be nearly identical to the previous one, make it materially more specific or prefer pause over repetition\./);
+});
+
+
+test("buildAutoControllerAdjacentContinuationSystemPrompt keeps adjacent work bounded", () => {
+  const prompt = buildAutoControllerAdjacentContinuationSystemPrompt();
+
+  assert.match(prompt, /^You are deciding whether an autonomous run should continue after the primary goal has already been verified complete\./);
+  assert.match(prompt, /Use exactly one of these actions: continue, stop, pause\./);
+  assert.match(prompt, /Do NOT use probe\./);
+  assert.match(prompt, /Use continue only when there is a clear, local, high-value adjacent optimization/);
+  assert.match(prompt, /Do not broaden scope into a new major task or unrelated workstream\./);
+  assert.match(prompt, /If there is no worthwhile bounded adjacent optimization left, use stop\./);
 });
 
 
@@ -596,6 +642,106 @@ test("applyControllerStopOverrideRefinement can pause instead of repeating a low
   assert.equal(refined.goalStatus, "stalled");
 });
 
+test("shouldAttemptAutoAdjacentContinuation only continues similar work when goal is met and budget remains", () => {
+  assert.equal(
+    shouldAttemptAutoAdjacentContinuation({
+      completionPolicy: "continue-similar",
+      goalStatus: "met",
+      currentIteration: 3,
+      maxIterations: 8,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAttemptAutoAdjacentContinuation({
+      completionPolicy: "stop",
+      goalStatus: "met",
+      currentIteration: 3,
+      maxIterations: 8,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldAttemptAutoAdjacentContinuation({
+      completionPolicy: "continue-similar",
+      goalStatus: "likely_met",
+      currentIteration: 3,
+      maxIterations: 8,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldAttemptAutoAdjacentContinuation({
+      completionPolicy: "continue-similar",
+      goalStatus: "met",
+      currentIteration: 8,
+      maxIterations: 8,
+    }),
+    false,
+  );
+});
+
+test("deriveAutoContinueProgressState enters adjacent phase after verified completion", () => {
+  assert.deepEqual(
+    deriveAutoContinueProgressState({
+      completionPolicy: "continue-similar",
+      phase: "primary",
+      goalStatus: "met",
+      currentIteration: 4,
+      updatedSummary: "Primary goal is verified complete.",
+      adjacentContinuationCount: 0,
+    }),
+    {
+      phase: "adjacent",
+      primaryGoalVerifiedAtIteration: 4,
+      adjacentContinuationCount: 1,
+      primaryGoalCompletionSummary: "Primary goal is verified complete.",
+    },
+  );
+});
+
+test("deriveAutoContinueProgressState keeps adjacent phase and count while primary goal remains met", () => {
+  assert.deepEqual(
+    deriveAutoContinueProgressState({
+      completionPolicy: "continue-similar",
+      phase: "adjacent",
+      goalStatus: "met",
+      currentIteration: 6,
+      updatedSummary: "Primary goal remains met while adjacent work continues.",
+      primaryGoalVerifiedAtIteration: 4,
+      adjacentContinuationCount: 2,
+      primaryGoalCompletionSummary: "Primary goal is verified complete.",
+    }),
+    {
+      phase: "adjacent",
+      primaryGoalVerifiedAtIteration: 4,
+      adjacentContinuationCount: 3,
+      primaryGoalCompletionSummary: "Primary goal is verified complete.",
+    },
+  );
+});
+
+test("deriveAutoContinueProgressState falls back to primary phase when verified completion is lost", () => {
+  assert.deepEqual(
+    deriveAutoContinueProgressState({
+      completionPolicy: "continue-similar",
+      phase: "adjacent",
+      goalStatus: "in_progress",
+      currentIteration: 6,
+      updatedSummary: "Adjacent work regressed the original goal.",
+      primaryGoalVerifiedAtIteration: 4,
+      adjacentContinuationCount: 2,
+      primaryGoalCompletionSummary: "Primary goal is verified complete.",
+    }),
+    {
+      phase: "primary",
+      primaryGoalVerifiedAtIteration: 4,
+      adjacentContinuationCount: 0,
+      primaryGoalCompletionSummary: "Primary goal is verified complete.",
+    },
+  );
+});
+
 test("planAutoFollowUp sends a concrete finalization pass when the prompt is new", () => {
   const plan = planAutoFollowUp({
     nextPrompt: "Run npm test, create the final commit, and push if upstream is configured.",
@@ -735,7 +881,14 @@ test("extractLatestAutoModeState returns the latest valid state from the current
     { type: "custom", customType: AUTO_MODE_STATE_TYPE, data: newState },
   ];
 
-  assert.deepEqual(extractLatestAutoModeState(entries), newState);
+  assert.deepEqual(extractLatestAutoModeState(entries), {
+    ...newState,
+    completionPolicy: "stop",
+    phase: "primary",
+    adjacentContinuationCount: 0,
+    primaryGoalVerifiedAtIteration: undefined,
+    primaryGoalCompletionSummary: undefined,
+  });
 });
 
 test("normalizeComparableText collapses whitespace, lowercases, and strips punctuation noise", () => {
