@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildAutoStartConfigFromFlags,
   buildResumePrompt,
+  buildStartPrompt,
   decideAutoModeSessionStart,
   DEFAULT_AUTO_ITERATIONS,
   extractLatestAutoModeState,
@@ -290,21 +291,32 @@ test("decideAutoModeSessionStart prefers startup flags but still restores persis
   );
 });
 
-test("buildResumePrompt includes summary and verification context", () => {
+test("buildStartPrompt stays minimal and excludes auto-mode boilerplate", () => {
+  const prompt = buildStartPrompt({
+    goal: "Improve onboarding robustness",
+    untilPrompt: "Stop when onboarding is robust and tests are green",
+  });
+
+  assert.equal(prompt, "Improve onboarding robustness\n\nQuality goal: Stop when onboarding is robust and tests are green");
+  assert.doesNotMatch(prompt, /Iteration budget:/);
+  assert.doesNotMatch(prompt, /Do not ask the user anything/i);
+  assert.doesNotMatch(prompt, /Verification command:/);
+});
+
+test("buildResumePrompt stays focused and excludes iteration/meta boilerplate", () => {
   const prompt = buildResumePrompt({
     goal: "improve onboarding robustness",
     untilPrompt: "Stop when onboarding is robust and tests are green",
-    verifyCommand: "npm test",
     controllerSummary: "We hardened error handling, but regression tests still look thin.",
-    currentIteration: 3,
-    maxIterations: 8,
   });
 
-  assert.match(prompt, /Resume the active auto-mode goal now: improve onboarding robustness/);
+  assert.match(prompt, /Resume the active goal from the current repository state\./);
+  assert.match(prompt, /Goal: improve onboarding robustness/);
   assert.match(prompt, /Quality goal: Stop when onboarding is robust and tests are green/);
-  assert.match(prompt, /Verification command: npm test/);
   assert.match(prompt, /Controller summary:\nWe hardened error handling, but regression tests still look thin\./);
-  assert.match(prompt, /Iteration budget: 3\/8/);
+  assert.doesNotMatch(prompt, /Iteration budget:/);
+  assert.doesNotMatch(prompt, /Verification command:/);
+  assert.doesNotMatch(prompt, /Do not ask the user anything/i);
 });
 
 test("extractLatestAutoModeState returns the latest valid state from the current branch entries", () => {

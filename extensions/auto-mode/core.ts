@@ -112,13 +112,15 @@ export interface VerifyPreflightInput {
   maxIterations: number;
 }
 
+export interface StartPromptInput {
+  goal: string;
+  untilPrompt?: string;
+}
+
 export interface ResumePromptInput {
   goal: string;
   untilPrompt?: string;
-  verifyCommand?: string;
   controllerSummary: string;
-  currentIteration: number;
-  maxIterations: number;
 }
 
 export interface SessionStartDecisionInput {
@@ -375,14 +377,21 @@ export function shouldAutoResumeOnSessionStart(
   return reason === "startup" && (autoResumeFlag || resumePolicy === "restore-running");
 }
 
+export function buildStartPrompt(input: StartPromptInput): string {
+  const sections = [
+    input.goal.trim(),
+    input.untilPrompt ? `Quality goal: ${input.untilPrompt}` : undefined,
+  ].filter((value): value is string => !!value);
+
+  return sections.join("\n\n");
+}
+
 export function buildResumePrompt(input: ResumePromptInput): string {
   const sections = [
-    `Resume the active auto-mode goal now: ${input.goal}`,
+    `Resume the active goal from the current repository state.`,
+    `Goal: ${input.goal}`,
     input.untilPrompt ? `Quality goal: ${input.untilPrompt}` : undefined,
-    input.verifyCommand ? `Verification command: ${input.verifyCommand}` : undefined,
-    `Iteration budget: ${input.currentIteration}/${input.maxIterations}`,
     input.controllerSummary ? `Controller summary:\n${input.controllerSummary}` : undefined,
-    "Continue autonomously from the current repository state. Start with the highest-value concrete next step implied by the controller summary. Do not ask the user anything.",
   ].filter((value): value is string => !!value);
 
   return sections.join("\n\n");

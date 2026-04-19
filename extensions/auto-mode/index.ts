@@ -8,6 +8,7 @@ import {
   buildLatestUserMessageContext,
   buildRecentConversationContext,
   buildResumePrompt,
+  buildStartPrompt,
   decideAutoModeSessionStart,
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_CONTROLLER_FAILURE_LIMIT,
@@ -210,26 +211,18 @@ function buildInitialState(config: AutoStartConfig, summary: string): AutoModeSt
   };
 }
 
-function buildStartPrompt(snapshot: AutoModeStateV1): string {
-  const sections = [
-    `Auto-mode goal: ${snapshot.goal}`,
-    snapshot.untilPrompt ? `Quality goal: ${snapshot.untilPrompt}` : undefined,
-    snapshot.verifyCommand ? `Verification command: ${snapshot.verifyCommand}` : undefined,
-    `Iteration budget: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
-    "Work autonomously toward this goal now. Prioritize the highest-value concrete improvement you can make next. Do not ask the user anything.",
-  ].filter((value): value is string => !!value);
-
-  return sections.join("\n\n");
+function getStartPrompt(snapshot: AutoModeStateV1): string {
+  return buildStartPrompt({
+    goal: snapshot.goal,
+    untilPrompt: snapshot.untilPrompt,
+  });
 }
 
 function getResumePrompt(snapshot: AutoModeStateV1): string {
   return buildResumePrompt({
     goal: snapshot.goal,
     untilPrompt: snapshot.untilPrompt,
-    verifyCommand: snapshot.verifyCommand,
     controllerSummary: snapshot.controllerSummary,
-    currentIteration: snapshot.currentIteration,
-    maxIterations: snapshot.maxIterations,
   });
 }
 
@@ -237,9 +230,7 @@ function buildWorkerPromptSuffix(snapshot: AutoModeStateV1): string {
   const policyBits = [
     `Goal: ${snapshot.goal}`,
     snapshot.untilPrompt ? `Quality goal: ${snapshot.untilPrompt}` : undefined,
-    `Mode: ${snapshot.mode}`,
-    `Iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
-    snapshot.verifyCommand ? `Verification command: ${snapshot.verifyCommand}` : undefined,
+    snapshot.verifyCommand ? `Verification command before concluding: ${snapshot.verifyCommand}` : undefined,
     `Commit policy: ${snapshot.commitPolicy}`,
     `Push policy: ${snapshot.pushPolicy}`,
   ].filter((value): value is string => !!value);
@@ -766,7 +757,7 @@ async function startAutoMode(
     pi.setSessionName(`Auto: ${summarizeGoal(snapshot.goal, 56)}`);
   }
 
-  const startPrompt = buildStartPrompt(snapshot);
+  const startPrompt = getStartPrompt(snapshot);
   snapshot.lastAutoPrompt = startPrompt;
   persistSnapshot(pi, snapshot);
 
