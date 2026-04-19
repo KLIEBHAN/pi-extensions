@@ -427,9 +427,37 @@ test("buildAutoControllerStopOverrideSystemPrompt asks for a specific continue o
 
 test("hasConcreteVerificationEvidence requires real validation signals", () => {
   assert.equal(hasConcreteVerificationEvidence("Ran npm test, all tests pass, and verified the fix manually."), true);
+  assert.equal(
+    hasConcreteVerificationEvidence(
+      "Verifikation im aktuellen Checkout erneut nachgewiesen. pnpm lint exit 0 with All checks passed; pnpm build exit 0 with Compiled successfully; working tree clean, ahead=0, behind=0.",
+    ),
+    true,
+  );
+  assert.equal(hasConcreteVerificationEvidence("Verifikation nicht nachgewiesen, Tests nicht ausgeführt."), false);
   assert.equal(hasConcreteVerificationEvidence("Verified with npm test, but tests failed."), false);
   assert.equal(hasConcreteVerificationEvidence("Implemented the fix and updated the docs."), false);
   assert.equal(hasConcreteVerificationEvidence("Added regression tests but did not run them yet."), false);
+});
+
+
+test("evaluateAutoStopGuard accepts German structured verification evidence when no verify command is configured", () => {
+  assert.deepEqual(
+    evaluateAutoStopGuard({
+      goalStatus: "met",
+      requiresQualityGoal: false,
+      qualityGoalMet: true,
+      verifyCommandConfigured: false,
+      verifyCommandPassed: false,
+      workerAssistantText:
+        "1. HEAD / Repo-Status: git rev-parse HEAD => abc123; git status --short --branch => ## master...origin/master. 2. Checks: pnpm lint — exit 0 — All checks passed!; pnpm build exit 0 — Compiled successfully. 3. Remote-Sync: working tree clean, ahead=0, behind=0. 4. Abschluss: Verifikation im aktuellen Checkout erneut nachgewiesen, keine Codeänderungen.",
+      commitPolicy: "none",
+      pushPolicy: "never",
+    }),
+    {
+      allowed: true,
+      blockers: [],
+    },
+  );
 });
 
 

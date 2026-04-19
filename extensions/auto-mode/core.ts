@@ -665,6 +665,9 @@ export function hasConcreteVerificationEvidence(text: string): boolean {
     /\b(need to|needs to|manual step|manual follow up|manual follow-up|pending|maybe|should work|should now work|probably)\b/,
     /\b(cannot verify|can t verify|unable to verify|could not verify|waiting for|blocked)\b/,
     /\b(failed|failing|failure|does not pass|do not pass|not passing|broke|broken|errors remain|error remains)\b/,
+    /\b(nicht verifiziert|nicht validiert|nicht nachgewiesen|nicht geprüft|nicht gepruft|nicht getestet|nicht ausgeführt|nicht ausgefuhrt|nicht gelaufen|noch nicht)\b/,
+    /\b(kann nicht verifizieren|konnte nicht verifizieren|konnte nicht prüfen|konnte nicht prufen|warte auf|blockiert)\b/,
+    /\b(fehlgeschlagen|fehlschlug|fehlerhaft|nicht bestanden|nicht erfolgreich|fehler bleiben|fehler verbleiben)\b/,
   ];
   if (blockingPatterns.some((pattern) => pattern.test(normalized))) {
     return false;
@@ -679,8 +682,21 @@ export function hasConcreteVerificationEvidence(text: string): boolean {
     /\b(lint passes|checks pass|all checks pass)\b/,
     /\b(build passes|build succeeded|build succeeds)\b/,
     /\b(smoke test passed|manual test passed)\b/,
+    /\b(verifiziert|validiert)\b/,
+    /\b(verifikation|verifizierung|prüfung|prüfungen|prufung|prufungen)\b.*\b(nachgewiesen|bestätigt|bestatigt|erfolgreich)\b/,
+    /\b(alle tests bestanden|tests bestanden|test suite bestanden)\b/,
+    /\b(alle checks bestanden|checks bestanden|alle checks erfolgreich|checks erfolgreich)\b/,
+    /\b(build erfolgreich|erfolgreich kompiliert|kompiliert erfolgreich|fehlerfrei durch)\b/,
   ];
-  return verificationPatterns.some((pattern) => pattern.test(normalized));
+  if (verificationPatterns.some((pattern) => pattern.test(normalized))) {
+    return true;
+  }
+
+  const hasVerificationContext = /\b(verification|verified|validated|tests?|checks?|build|lint|typecheck|working tree|verifikation|verifizierung|verifiziert|validiert|tests?|checks?|build|lint|typecheck|nachgewiesen|bestatigt|fehlerfrei)\b/.test(normalized);
+  const hasPassingIndicator = /\b(exit code 0|exit 0|all checks passed|compiled successfully|tests? \d+ passed|test suites? \d+ passed|alle checks bestanden|tests? \d+ bestanden|fehlerfrei)\b/.test(normalized);
+  const hasRepoCleanIndicator = /\b(working tree clean|ahead 0 behind 0|keine codeänderungen|keine codeanderungen|arbeitsbaum sauber|working tree sauber)\b/.test(normalized);
+
+  return (hasVerificationContext && hasPassingIndicator) || (hasRepoCleanIndicator && (hasVerificationContext || hasPassingIndicator));
 }
 
 export function evaluateAutoStopGuard(input: AutoStopGuardInput): AutoStopGuardResult {
