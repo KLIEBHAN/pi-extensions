@@ -136,6 +136,12 @@ export interface SessionStartDecision {
   warning?: string;
 }
 
+export interface AutoModeCustomEntryLike {
+  type?: unknown;
+  customType?: unknown;
+  data?: unknown;
+}
+
 interface BaseControllerDecision {
   action: ControllerAction;
   reason: string;
@@ -187,6 +193,29 @@ interface ParsedControllerPayload {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function isAutoModeStateV1(value: unknown): value is AutoModeStateV1 {
+  if (!isRecord(value)) return false;
+  return (
+    value.version === 1 &&
+    typeof value.goal === "string" &&
+    typeof value.enabled === "boolean" &&
+    typeof value.paused === "boolean" &&
+    typeof value.currentIteration === "number" &&
+    typeof value.maxIterations === "number"
+  );
+}
+
+export function extractLatestAutoModeState(entries: unknown[]): AutoModeStateV1 | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index] as AutoModeCustomEntryLike | undefined;
+    if (!entry || entry.type !== "custom") continue;
+    if (entry.customType !== AUTO_MODE_STATE_TYPE) continue;
+    if (!isAutoModeStateV1(entry.data)) continue;
+    return entry.data;
+  }
+  return undefined;
 }
 
 function collapseWhitespace(text: string): string {

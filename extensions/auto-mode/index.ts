@@ -18,6 +18,7 @@ import {
   DEFAULT_STAGNATION_LIMIT,
   DEFAULT_STATUS_GOAL_MAX_CHARS,
   DEFAULT_WORKER_FAILURE_LIMIT,
+  extractLatestAutoModeState,
   extractMessageText,
   normalizeComparableText,
   parseAutoCommandArgs,
@@ -162,19 +163,7 @@ function persistSnapshot(pi: ExtensionAPI, snapshot: AutoModeStateV1): void {
 }
 
 function restorePersistedSnapshot(ctx: ExtensionContext): AutoModeStateV1 | undefined {
-  const entries = [...ctx.sessionManager.getEntries()].reverse();
-  for (const entry of entries) {
-    if (entry.type !== "custom") continue;
-    if ((entry as { customType?: string }).customType !== AUTO_MODE_STATE_TYPE) continue;
-    const data = (entry as { data?: unknown }).data;
-    if (!isRecord(data)) return undefined;
-    if (data.version !== 1) return undefined;
-    if (typeof data.goal !== "string") return undefined;
-    if (typeof data.enabled !== "boolean" || typeof data.paused !== "boolean") return undefined;
-    if (typeof data.currentIteration !== "number" || typeof data.maxIterations !== "number") return undefined;
-    return data as unknown as AutoModeStateV1;
-  }
-  return undefined;
+  return extractLatestAutoModeState(ctx.sessionManager.getBranch());
 }
 
 function buildInitialControllerSummary(ctx: ExtensionContext, config: AutoStartConfig): string {

@@ -5,6 +5,8 @@ import {
   buildResumePrompt,
   decideAutoModeSessionStart,
   DEFAULT_AUTO_ITERATIONS,
+  extractLatestAutoModeState,
+  AUTO_MODE_STATE_TYPE,
   DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS,
   looksLikeCompletionClaim,
   normalizeComparableText,
@@ -303,6 +305,47 @@ test("buildResumePrompt includes summary and verification context", () => {
   assert.match(prompt, /Verification command: npm test/);
   assert.match(prompt, /Controller summary:\nWe hardened error handling, but regression tests still look thin\./);
   assert.match(prompt, /Iteration budget: 3\/8/);
+});
+
+test("extractLatestAutoModeState returns the latest valid state from the current branch entries", () => {
+  const oldState = {
+    version: 1,
+    enabled: true,
+    paused: true,
+    runId: "auto-old",
+    goal: "old goal",
+    mode: "iterations",
+    maxIterations: 8,
+    currentIteration: 2,
+    startedAt: 1,
+    maxWallClockMinutes: 60,
+    commitPolicy: "final-or-milestone",
+    pushPolicy: "final-or-milestone-if-upstream",
+    allowControllerProbes: true,
+    controllerSummary: "old",
+    recentDecisions: [],
+    consecutiveControllerFailures: 0,
+    consecutiveWorkerFailures: 0,
+    consecutiveStagnationCount: 0,
+    consecutiveNoChangeCount: 0,
+    resumePolicy: "restore-paused",
+  } as const;
+  const newState = {
+    ...oldState,
+    runId: "auto-new",
+    goal: "current branch goal",
+    currentIteration: 5,
+    controllerSummary: "new",
+  };
+
+  const entries = [
+    { type: "custom", customType: AUTO_MODE_STATE_TYPE, data: oldState },
+    { type: "message", message: { role: "user", content: "ignored" } },
+    { type: "custom", customType: AUTO_MODE_STATE_TYPE, data: { nope: true } },
+    { type: "custom", customType: AUTO_MODE_STATE_TYPE, data: newState },
+  ];
+
+  assert.deepEqual(extractLatestAutoModeState(entries), newState);
 });
 
 test("normalizeComparableText collapses whitespace, lowercases, and strips punctuation noise", () => {
