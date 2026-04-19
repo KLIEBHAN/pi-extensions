@@ -93,7 +93,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 - `/auto on <goal>` to start an autonomous improvement run
 - optional stop modes:
   - iteration budget via `--iterations <n>`
-  - quality-goal stop prompt via `--until "..."`
+  - controller-only completion gate via `--until "..."`
   - hybrid mode when both are set
 - `/auto status`, `/auto summary`, `/auto pause`, `/auto resume`, `/auto off`, `/auto nudge <instruction>`
 - separate controller model support via `--controller-model provider/model` or `--auto-controller-model provider/model` (defaults to the active worker model)
@@ -101,7 +101,8 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 - rolling controller summary with restore-on-start behavior (restored paused by default, or auto-resumed on startup when `--auto-resume` is set)
 - optional verification command for candidate-stop checks via `--verify "..."` / `--auto-verify "..."`, including proactive pre-stop verification when the worker looks close to done
 - limited read-only controller probes for fresh git snapshots when needed
-- pragmatic defaults for V1: 8 iterations by default, 12-iteration safety budget for `--until`, paused restore on restart unless you opt into `--auto-resume`
+- pragmatic defaults for V1: 8 iterations by default, 12-iteration safety budget for completion-gate-only `--until` runs, paused restore on restart unless you opt into `--auto-resume`
+- `--until` is evaluated by the controller only; if the worker should explicitly optimize for that criterion, include it directly in the goal/prompt itself
 
 ### Usage
 
@@ -122,7 +123,7 @@ Inside pi:
 /auto off
 ```
 
-Optional dedicated controller model and verify command:
+Optional dedicated controller model, completion gate, and verify command:
 
 ```bash
 pi -e ./extensions/auto-mode \

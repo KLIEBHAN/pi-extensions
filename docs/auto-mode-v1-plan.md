@@ -86,10 +86,11 @@ When auto-mode is active and not paused:
 
 - append a short worker system-prompt suffix with
   - goal
-  - optional quality goal
-  - iteration budget
+  - verification requirement / verify command
   - commit/push policy
   - autonomy rules
+
+The optional `--until` completion gate stays controller-only.
 
 ### `agent_end`
 
@@ -124,7 +125,7 @@ When auto-mode is active and not paused:
   "reason": "...",
   "updatedSummary": "...",
   "goalStatus": "in_progress|likely_met|met|blocked|stalled",
-  "qualityGoalMet": false,
+  "completionGateMet": false,
   "progressPercent": 62,
   "commitRecommendation": "none|milestone|finalize",
   "nextPrompt": "...",

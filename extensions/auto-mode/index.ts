@@ -48,7 +48,7 @@ import {
 const STATUS_KEY = "auto-mode";
 const PROBE_LIMIT_PER_CYCLE = 1;
 const COMMAND_USAGE =
-  "Usage: /auto on [--iterations N] [--until \"goal\"] [--controller-model provider/model] [--verify \"cmd\"] [--completion-policy stop|continue-similar] <goal>";
+  "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--completion-policy stop|continue-similar] <goal>";
 
 const AUTO_CONTROLLER_SYSTEM_PROMPT = buildAutoControllerSystemPrompt();
 const AUTO_CONTROLLER_ADJACENT_CONTINUATION_SYSTEM_PROMPT = buildAutoControllerAdjacentContinuationSystemPrompt();
@@ -142,7 +142,7 @@ function buildInitialControllerSummary(ctx: ExtensionContext, config: AutoStartC
   const recentConversation = buildRecentConversationContext(branch);
   const sections = [
     `Goal:\n${config.goal}`,
-    config.untilPrompt ? `Quality goal:\n${config.untilPrompt}` : undefined,
+    config.untilPrompt ? `Completion gate:\n${config.untilPrompt}` : undefined,
     latestUser ? `Latest user context:\n${latestUser}` : undefined,
     latestAssistant ? `Latest assistant context:\n${latestAssistant}` : undefined,
     recentConversation ? `Recent conversation:\n${recentConversation}` : undefined,
@@ -185,14 +185,12 @@ function buildInitialState(config: AutoStartConfig, summary: string): AutoModeSt
 function getStartPrompt(snapshot: AutoModeStateV1): string {
   return buildStartPrompt({
     goal: snapshot.goal,
-    untilPrompt: snapshot.untilPrompt,
   });
 }
 
 function getResumePrompt(snapshot: AutoModeStateV1): string {
   return buildResumePrompt({
     goal: snapshot.goal,
-    untilPrompt: snapshot.untilPrompt,
     controllerSummary: snapshot.controllerSummary,
   });
 }
@@ -200,7 +198,6 @@ function getResumePrompt(snapshot: AutoModeStateV1): string {
 function buildWorkerPromptSuffix(snapshot: AutoModeStateV1): string {
   return buildAutoWorkerSystemPrompt({
     goal: snapshot.goal,
-    untilPrompt: snapshot.untilPrompt,
     verifyCommand: snapshot.verifyCommand,
     commitPolicy: snapshot.commitPolicy,
     pushPolicy: snapshot.pushPolicy,
@@ -270,7 +267,7 @@ function buildControllerUserPrompt(
   const remainingIterations = Math.max(0, snapshot.maxIterations - snapshot.currentIteration);
   const sections = [
     `Goal:\n${snapshot.goal}`,
-    snapshot.untilPrompt ? `Quality goal:\n${snapshot.untilPrompt}` : undefined,
+    snapshot.untilPrompt ? `Completion gate:\n${snapshot.untilPrompt}` : undefined,
     [
       `Mode: ${snapshot.mode}`,
       `Completion policy: ${snapshot.completionPolicy}`,
@@ -518,7 +515,7 @@ async function decideControllerAction(
       reason: "Controller requested a probe, but probes are disabled.",
       updatedSummary: decision.updatedSummary,
       goalStatus: "blocked",
-      qualityGoalMet: false,
+      completionGateMet: false,
       progressPercent: decision.progressPercent,
       commitRecommendation: decision.commitRecommendation,
     };
@@ -540,7 +537,7 @@ async function decideControllerAction(
       reason: "Controller requested repeated probes in one cycle.",
       updatedSummary: decision.updatedSummary,
       goalStatus: "blocked",
-      qualityGoalMet: false,
+      completionGateMet: false,
       progressPercent: decision.progressPercent,
       commitRecommendation: decision.commitRecommendation,
     };
@@ -715,8 +712,8 @@ async function getStopOverrideDecision(
   );
   const stopGuard = evaluateAutoStopGuard({
     goalStatus: decision.goalStatus,
-    requiresQualityGoal: !!snapshot.untilPrompt,
-    qualityGoalMet: decision.qualityGoalMet,
+    requiresCompletionGate: !!snapshot.untilPrompt,
+    completionGateMet: decision.completionGateMet,
     verifyCommandConfigured: !!snapshot.verifyCommand,
     verifyCommandPassed: snapshot.verifyCommand ? !!resolvedVerifyResult?.ok : false,
     workerAssistantText: workerTurn.assistantText,
@@ -968,7 +965,7 @@ function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 
     `paused=${snapshot.paused ? "yes" : "no"}`,
     `iteration=${snapshot.currentIteration}/${snapshot.maxIterations}`,
     `goal=${snapshot.goal}`,
-    snapshot.untilPrompt ? `until=${snapshot.untilPrompt}` : undefined,
+    snapshot.untilPrompt ? `completion-gate=${snapshot.untilPrompt}` : undefined,
     snapshot.controllerModel ? `controller-model=${snapshot.controllerModel.provider}/${snapshot.controllerModel.id}` : `controller-model=${DEFAULT_CONTROLLER_MODEL} (default)`,
     snapshot.verifyCommand ? `verify=${snapshot.verifyCommand}` : undefined,
     `commit-policy=${snapshot.commitPolicy}`,
@@ -1031,7 +1028,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
     type: "string",
   });
   pi.registerFlag("auto-until", {
-    description: "Optional quality goal prompt for auto-mode stop decisions",
+    description: "Optional completion gate prompt for controller stop decisions",
     type: "string",
   });
   pi.registerFlag("auto-controller-model", {
@@ -1327,14 +1324,14 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           if (adjacentDecision?.action === "stop") {
             recordControllerDecision(snapshot, adjacentDecision);
             persistSnapshot(pi, snapshot);
-            disableSnapshot(pi, ctx, runtime, adjacentDecision.finalMessage || adjacentDecision.reason, adjacentDecision.qualityGoalMet ? "info" : "warning");
+            disableSnapshot(pi, ctx, runtime, adjacentDecision.finalMessage || adjacentDecision.reason, adjacentDecision.completionGateMet ? "info" : "warning");
             return;
           }
         }
 
         recordControllerDecision(snapshot, decision);
         persistSnapshot(pi, snapshot);
-        disableSnapshot(pi, ctx, runtime, decision.finalMessage || decision.reason, decision.qualityGoalMet ? "info" : "warning");
+        disableSnapshot(pi, ctx, runtime, decision.finalMessage || decision.reason, decision.completionGateMet ? "info" : "warning");
       }
     } finally {
       runtime.controllerBusy = false;

@@ -46,7 +46,6 @@ export interface AutoStartConfig {
 
 export interface AutoWorkerPromptInput {
   goal: string;
-  untilPrompt?: string;
   verifyCommand?: string;
   commitPolicy: CommitPolicy;
   pushPolicy: PushPolicy;
@@ -61,8 +60,8 @@ export interface AutoStopGuardGitState {
 
 export interface AutoStopGuardInput {
   goalStatus: GoalStatus;
-  requiresQualityGoal: boolean;
-  qualityGoalMet: boolean;
+  requiresCompletionGate: boolean;
+  completionGateMet: boolean;
   verifyCommandConfigured: boolean;
   verifyCommandPassed: boolean;
   workerAssistantText: string;
@@ -73,7 +72,7 @@ export interface AutoStopGuardInput {
 
 export type AutoStopBlocker =
   | "goal-not-met"
-  | "quality-goal-not-met"
+  | "completion-gate-not-met"
   | "verification-missing"
   | "verification-failed"
   | "commit-required"
@@ -223,12 +222,10 @@ export interface VerifyPreflightInput {
 
 export interface StartPromptInput {
   goal: string;
-  untilPrompt?: string;
 }
 
 export interface ResumePromptInput {
   goal: string;
-  untilPrompt?: string;
   controllerSummary: string;
 }
 
@@ -258,7 +255,7 @@ interface BaseControllerDecision {
   reason: string;
   updatedSummary: string;
   goalStatus: GoalStatus;
-  qualityGoalMet: boolean;
+  completionGateMet: boolean;
   progressPercent: number;
   commitRecommendation: CommitRecommendation;
 }
@@ -293,6 +290,7 @@ interface ParsedControllerPayload {
   updatedSummary?: unknown;
   summary?: unknown;
   goalStatus?: unknown;
+  completionGateMet?: unknown;
   qualityGoalMet?: unknown;
   progressPercent?: unknown;
   commitRecommendation?: unknown;
@@ -500,19 +498,13 @@ export function shouldAutoResumeOnSessionStart(
 }
 
 export function buildStartPrompt(input: StartPromptInput): string {
-  const sections = [
-    input.goal.trim(),
-    input.untilPrompt ? `Quality goal: ${input.untilPrompt}` : undefined,
-  ].filter((value): value is string => !!value);
-
-  return sections.join("\n\n");
+  return input.goal.trim();
 }
 
 export function buildResumePrompt(input: ResumePromptInput): string {
   const sections = [
     `Resume the active goal from the current repository state.`,
     `Goal: ${input.goal}`,
-    input.untilPrompt ? `Quality goal: ${input.untilPrompt}` : undefined,
     input.controllerSummary ? `Controller summary:\n${input.controllerSummary}` : undefined,
   ].filter((value): value is string => !!value);
 
@@ -529,12 +521,7 @@ export function buildAutoWorkerSystemPrompt(input: AutoWorkerPromptInput): strin
     `- Follow this push policy: ${input.pushPolicy}`,
   ];
 
-  const metadata = [
-    `Goal: ${input.goal}`,
-    input.untilPrompt ? `Quality goal: ${input.untilPrompt}` : undefined,
-  ].filter((value): value is string => !!value);
-
-  return ["Auto-mode rules:", ...rules, "", ...metadata].join("\n");
+  return ["Auto-mode rules:", ...rules, "", `Goal: ${input.goal}`].join("\n");
 }
 
 export function buildAutoControllerSystemPrompt(): string {
@@ -562,14 +549,14 @@ export function buildAutoControllerSystemPrompt(): string {
     "- If completion evidence is thin, ambiguous, or missing, do not stop yet.",
     "- When in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step.",
     "- Use stop only when goalStatus=met.",
-    "- If a quality goal exists, use stop only when it is met too.",
+    "- If a completion gate exists, use stop only when it is met too.",
     "- Use stop only when completion is supported by concrete verification evidence from this cycle, such as a passing verification command, passing tests/checks, or explicit validation evidence in the worker result.",
     "- If verification is failing or still missing, the task is not complete.",
     "- If final commit/push expectations are still unmet in a git repo, the task is not complete.",
     "- If completionPolicy=continue-similar and the primary goal is verified met with iteration budget remaining, prefer continue with one bounded adjacent optimization when a concrete, high-value next step exists.",
     "- An adjacent optimization must stay close to the same subsystem, changed files, or problem class; do not branch into a new broad project.",
     "- If no worthwhile bounded adjacent optimization is clear, stop.",
-    "- If obvious follow-up work remains that is necessary to satisfy the goal or quality goal, do not stop.",
+    "- If obvious follow-up work remains that is necessary to satisfy the goal or completion gate, do not stop.",
     "- Use pause when the run appears blocked, unstable, unsafe, or repetitively unproductive, or when no fresh high-value next step is available without looping.",
     "- Use probe only if one fresh read-only repository snapshot would materially improve the next decision, and never for information that is already present.",
     "- If the next prompt would be nearly identical to the previous one, make it materially more specific or prefer pause over repetition.",
@@ -581,7 +568,7 @@ export function buildAutoControllerSystemPrompt(): string {
     '  "reason":"...",',
     '  "updatedSummary":"...",',
     '  "goalStatus":"in_progress|likely_met|met|blocked|stalled",',
-    '  "qualityGoalMet":true,',
+    '  "completionGateMet":true,',
     '  "progressPercent":0,',
     '  "commitRecommendation":"none|milestone|finalize",',
     '  "nextPrompt":"...",',
@@ -615,7 +602,7 @@ export function buildAutoControllerAdjacentContinuationSystemPrompt(): string {
     '  "reason":"...",',
     '  "updatedSummary":"...",',
     '  "goalStatus":"in_progress|likely_met|met|blocked|stalled",',
-    '  "qualityGoalMet":true,',
+    '  "completionGateMet":true,',
     '  "progressPercent":0,',
     '  "commitRecommendation":"none|milestone|finalize",',
     '  "nextPrompt":"...",',
@@ -649,7 +636,7 @@ export function buildAutoControllerStopOverrideSystemPrompt(): string {
     '  "reason":"...",',
     '  "updatedSummary":"...",',
     '  "goalStatus":"in_progress|likely_met|blocked|stalled",',
-    '  "qualityGoalMet":true,',
+    '  "completionGateMet":true,',
     '  "progressPercent":0,',
     '  "commitRecommendation":"none|milestone|finalize",',
     '  "nextPrompt":"..."',
@@ -707,8 +694,8 @@ export function evaluateAutoStopGuard(input: AutoStopGuardInput): AutoStopGuardR
     blockers.push("goal-not-met");
   }
 
-  if (input.requiresQualityGoal && !input.qualityGoalMet) {
-    blockers.push("quality-goal-not-met");
+  if (input.requiresCompletionGate && !input.completionGateMet) {
+    blockers.push("completion-gate-not-met");
   }
 
   if (input.verifyCommandConfigured) {
@@ -741,8 +728,8 @@ export function describeAutoStopBlocker(blocker: AutoStopBlocker, verifyCommand:
   switch (blocker) {
     case "goal-not-met":
       return "the active goal is not yet verified as met";
-    case "quality-goal-not-met":
-      return "the quality goal is not yet verified as met";
+    case "completion-gate-not-met":
+      return "the completion gate is not yet verified as met";
     case "verification-missing":
       return "verification evidence is still missing";
     case "verification-failed":
@@ -763,8 +750,8 @@ function buildStopOverridePrompt(blockers: AutoStopBlocker[], verifyCommand: str
     return "Do not conclude yet. The active goal is not yet verified as fully met. Inspect the current repository state, identify the highest-value remaining gap, close it, and verify the result before considering completion. Do not ask the user anything.";
   }
 
-  if (blockers.includes("quality-goal-not-met")) {
-    return "Do not conclude yet. The quality goal is not yet verified as met. Focus on the remaining quality gap, run the most relevant verification for it, and only then consider the task complete. Do not ask the user anything.";
+  if (blockers.includes("completion-gate-not-met")) {
+    return "Do not conclude yet. The completion gate is not yet verified as met. Focus on the remaining gate gap, run the most relevant verification for it, and only then consider the task complete. Do not ask the user anything.";
   }
 
   if (blockers.includes("verification-failed")) {
@@ -796,7 +783,7 @@ export function buildAutoStopOverrideDecision(input: AutoStopOverrideDecisionInp
   }
 
   const blockerSummary = input.stopGuard.blockers.map((blocker) => describeAutoStopBlocker(blocker, input.verifyCommand)).join("; ");
-  const hasGoalGap = input.stopGuard.blockers.includes("goal-not-met") || input.stopGuard.blockers.includes("quality-goal-not-met");
+  const hasGoalGap = input.stopGuard.blockers.includes("goal-not-met") || input.stopGuard.blockers.includes("completion-gate-not-met");
   const hasFinalizationOnlyBlockers = input.stopGuard.blockers.every(
     (blocker) => blocker === "verification-missing" || blocker === "commit-required" || blocker === "push-required" || blocker === "sync-required",
   );
@@ -808,7 +795,7 @@ export function buildAutoStopOverrideDecision(input: AutoStopOverrideDecisionInp
       `Stop overridden. Remaining blockers: ${blockerSummary}. Previous stop reason: ${input.decision.reason}. ${input.decision.updatedSummary}`,
     ),
     goalStatus: hasGoalGap ? "in_progress" : hasFinalizationOnlyBlockers ? "likely_met" : input.decision.goalStatus,
-    qualityGoalMet: input.stopGuard.blockers.includes("quality-goal-not-met") ? false : input.decision.qualityGoalMet,
+    completionGateMet: input.stopGuard.blockers.includes("completion-gate-not-met") ? false : input.decision.completionGateMet,
     progressPercent: Math.min(input.decision.progressPercent, hasGoalGap ? 95 : 99),
     commitRecommendation: input.stopGuard.blockers.includes("commit-required") || input.stopGuard.blockers.includes("push-required") || input.stopGuard.blockers.includes("sync-required")
       ? "finalize"
@@ -831,7 +818,7 @@ export function applyControllerStopOverrideRefinement(input: AutoStopOverrideRef
         `${input.fallbackDecision.updatedSummary}\n\nController refinement requested a pause: ${decision.updatedSummary}`,
       ),
       goalStatus: decision.goalStatus === "blocked" || decision.goalStatus === "stalled" ? decision.goalStatus : input.fallbackDecision.goalStatus,
-      qualityGoalMet: input.fallbackDecision.qualityGoalMet && decision.qualityGoalMet,
+      completionGateMet: input.fallbackDecision.completionGateMet && decision.completionGateMet,
       progressPercent: Math.min(input.fallbackDecision.progressPercent, decision.progressPercent),
       commitRecommendation: input.fallbackDecision.commitRecommendation,
     };
@@ -1272,13 +1259,18 @@ export function parseControllerDecision(rawText: string): ControllerDecision | u
       const goalStatus = typeof parsed.goalStatus === "string" && isGoalStatus(parsed.goalStatus)
         ? parsed.goalStatus
         : undefined;
-      const qualityGoalMet = typeof parsed.qualityGoalMet === "boolean" ? parsed.qualityGoalMet : undefined;
+      const completionGateMet =
+        typeof parsed.completionGateMet === "boolean"
+          ? parsed.completionGateMet
+          : typeof parsed.qualityGoalMet === "boolean"
+            ? parsed.qualityGoalMet
+            : undefined;
       const progressRaw = typeof parsed.progressPercent === "number" ? parsed.progressPercent : undefined;
       const commitRecommendation = typeof parsed.commitRecommendation === "string" && isCommitRecommendation(parsed.commitRecommendation)
         ? parsed.commitRecommendation
         : undefined;
 
-      if (!action || !reason || !updatedSummary || !goalStatus || qualityGoalMet === undefined || progressRaw === undefined || !commitRecommendation) {
+      if (!action || !reason || !updatedSummary || !goalStatus || completionGateMet === undefined || progressRaw === undefined || !commitRecommendation) {
         continue;
       }
 
@@ -1288,7 +1280,7 @@ export function parseControllerDecision(rawText: string): ControllerDecision | u
         reason,
         updatedSummary,
         goalStatus,
-        qualityGoalMet,
+        completionGateMet,
         progressPercent,
         commitRecommendation,
       };

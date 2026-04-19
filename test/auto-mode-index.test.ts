@@ -125,10 +125,11 @@ test("default export is a callable extension entry", async () => {
   assert.equal(typeof autoModeModule.createAutoModeExtension, "function");
 });
 
-test("session_start auto-starts from flags and before_agent_start appends the worker prompt", async () => {
+test("session_start keeps the completion gate controller-only while before_agent_start appends worker rules", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({
     "auto-goal": "improve onboarding robustness",
+    "auto-until": "Stop when onboarding is robust and tests are green",
   });
 
   createAutoModeExtension()(harness.pi as never);
@@ -142,12 +143,17 @@ test("session_start auto-starts from flags and before_agent_start appends the wo
 
   assert.equal(harness.sentMessages.length, 1);
   assert.equal(harness.sentMessages[0]?.text, "improve onboarding robustness");
+  assert.doesNotMatch(harness.sentMessages[0]?.text ?? "", /completion gate/i);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.match(String(latestState?.controllerSummary ?? ""), /Completion gate:\nStop when onboarding is robust and tests are green/);
 
   const result = await beforeAgentStart?.({ systemPrompt: "BASE" });
   assert.equal(typeof result?.systemPrompt, "string");
   assert.match(result?.systemPrompt ?? "", /^BASE/);
   assert.match(result?.systemPrompt ?? "", /Auto-mode rules:/);
   assert.match(result?.systemPrompt ?? "", /Goal: improve onboarding robustness/);
+  assert.doesNotMatch(result?.systemPrompt ?? "", /Completion gate:/);
 });
 
 test("agent_end no-change heuristic does not treat changed diffs in the same files as unchanged", async () => {
@@ -178,7 +184,7 @@ test("agent_end no-change heuristic does not treat changed diffs in the same fil
       reason: "Keep iterating",
       updatedSummary: "First refinement in progress.",
       goalStatus: "in_progress",
-      qualityGoalMet: false,
+      completionGateMet: false,
       progressPercent: 20,
       commitRecommendation: "none",
       nextPrompt: "Refine the first gap in the same file and verify it.",
@@ -188,7 +194,7 @@ test("agent_end no-change heuristic does not treat changed diffs in the same fil
       reason: "Keep iterating",
       updatedSummary: "Second refinement in progress.",
       goalStatus: "in_progress",
-      qualityGoalMet: false,
+      completionGateMet: false,
       progressPercent: 35,
       commitRecommendation: "none",
       nextPrompt: "Refine the second gap in the same file and verify it.",
@@ -246,7 +252,7 @@ test("agent_end can continue with an adjacent optimization after verified comple
       reason: "Primary goal is verified complete",
       updatedSummary: "The onboarding robustness goal is complete and verified.",
       goalStatus: "met",
-      qualityGoalMet: true,
+      completionGateMet: true,
       progressPercent: 100,
       commitRecommendation: "finalize",
       finalMessage: "Done.",
@@ -257,7 +263,7 @@ test("agent_end can continue with an adjacent optimization after verified comple
       reason: "One adjacent hardening step remains",
       updatedSummary: "Primary goal complete; continuing with one adjacent regression-hardening step.",
       goalStatus: "met",
-      qualityGoalMet: true,
+      completionGateMet: true,
       progressPercent: 100,
       commitRecommendation: "milestone",
       nextPrompt: "Add one adjacent regression test in the same onboarding flow and verify it passes.",

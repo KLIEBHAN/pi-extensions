@@ -200,7 +200,7 @@ test("buildAutoStartConfigFromFlags returns errors for invalid values", () => {
 });
 
 test("parseControllerDecision parses continue decisions and clamps progress", () => {
-  const parsed = parseControllerDecision(`{"action":"continue","reason":"More tests are needed","nextPrompt":"Add regression tests for the onboarding flow and verify they pass.","updatedSummary":"Onboarding improved but tests remain.","goalStatus":"in_progress","qualityGoalMet":false,"progressPercent":135,"commitRecommendation":"none"}`);
+  const parsed = parseControllerDecision(`{"action":"continue","reason":"More tests are needed","nextPrompt":"Add regression tests for the onboarding flow and verify they pass.","updatedSummary":"Onboarding improved but tests remain.","goalStatus":"in_progress","completionGateMet":false,"progressPercent":135,"commitRecommendation":"none"}`);
   assert.ok(parsed);
   assert.equal(parsed?.action, "continue");
   if (!parsed || parsed.action !== "continue") return;
@@ -210,7 +210,7 @@ test("parseControllerDecision parses continue decisions and clamps progress", ()
 });
 
 test("parseControllerDecision parses stop decisions wrapped in extra text", () => {
-  const parsed = parseControllerDecision(`Decision follows:\n{"action":"stop","reason":"The quality goal is met","updatedSummary":"Onboarding is robust and tests are green.","goalStatus":"met","qualityGoalMet":true,"progressPercent":100,"commitRecommendation":"finalize","finalMessage":"Stopping now."}`);
+  const parsed = parseControllerDecision(`Decision follows:\n{"action":"stop","reason":"The completion gate is met","updatedSummary":"Onboarding is robust and tests are green.","goalStatus":"met","completionGateMet":true,"progressPercent":100,"commitRecommendation":"finalize","finalMessage":"Stopping now."}`);
   assert.ok(parsed);
   assert.equal(parsed?.action, "stop");
   if (!parsed || parsed.action !== "stop") return;
@@ -219,7 +219,7 @@ test("parseControllerDecision parses stop decisions wrapped in extra text", () =
 });
 
 test("parseControllerDecision parses probe decisions", () => {
-  const parsed = parseControllerDecision(`{"action":"probe","reason":"Need fresh git status","updatedSummary":"Commit readiness unclear.","goalStatus":"in_progress","qualityGoalMet":false,"progressPercent":72,"commitRecommendation":"milestone","probe":{"kind":"git_status"}}`);
+  const parsed = parseControllerDecision(`{"action":"probe","reason":"Need fresh git status","updatedSummary":"Commit readiness unclear.","goalStatus":"in_progress","completionGateMet":false,"progressPercent":72,"commitRecommendation":"milestone","probe":{"kind":"git_status"}}`);
   assert.ok(parsed);
   assert.equal(parsed?.action, "probe");
   if (!parsed || parsed.action !== "probe") return;
@@ -227,14 +227,23 @@ test("parseControllerDecision parses probe decisions", () => {
   assert.equal(parsed.probe.kind, "git_status");
 });
 
+test("parseControllerDecision still accepts legacy qualityGoalMet output", () => {
+  const parsed = parseControllerDecision(`{"action":"stop","reason":"Legacy controller payload","updatedSummary":"Legacy payload remains compatible.","goalStatus":"met","qualityGoalMet":true,"progressPercent":100,"commitRecommendation":"finalize"}`);
+  assert.ok(parsed);
+  assert.equal(parsed?.action, "stop");
+  if (!parsed || parsed.action !== "stop") return;
+
+  assert.equal(parsed.completionGateMet, true);
+});
+
 test("parseControllerDecision rejects invalid decisions", () => {
   assert.equal(parseControllerDecision("{}"), undefined);
   assert.equal(
-    parseControllerDecision(`{"action":"continue","reason":"x","updatedSummary":"y","goalStatus":"in_progress","qualityGoalMet":false,"progressPercent":50,"commitRecommendation":"none"}`),
+    parseControllerDecision(`{"action":"continue","reason":"x","updatedSummary":"y","goalStatus":"in_progress","completionGateMet":false,"progressPercent":50,"commitRecommendation":"none"}`),
     undefined,
   );
   assert.equal(
-    parseControllerDecision(`{"action":"probe","reason":"x","updatedSummary":"y","goalStatus":"in_progress","qualityGoalMet":false,"progressPercent":50,"commitRecommendation":"none","probe":{"kind":"bash"}}`),
+    parseControllerDecision(`{"action":"probe","reason":"x","updatedSummary":"y","goalStatus":"in_progress","completionGateMet":false,"progressPercent":50,"commitRecommendation":"none","probe":{"kind":"bash"}}`),
     undefined,
   );
 });
@@ -344,22 +353,21 @@ test("decideAutoModeSessionStart prefers startup flags but still restores persis
   );
 });
 
-test("buildStartPrompt stays minimal and excludes auto-mode boilerplate", () => {
+test("buildStartPrompt stays minimal and keeps the worker focused on the main goal", () => {
   const prompt = buildStartPrompt({
     goal: "Improve onboarding robustness",
-    untilPrompt: "Stop when onboarding is robust and tests are green",
   });
 
-  assert.equal(prompt, "Improve onboarding robustness\n\nQuality goal: Stop when onboarding is robust and tests are green");
+  assert.equal(prompt, "Improve onboarding robustness");
+  assert.doesNotMatch(prompt, /Completion gate:/);
   assert.doesNotMatch(prompt, /Iteration budget:/);
   assert.doesNotMatch(prompt, /Do not ask the user anything/i);
   assert.doesNotMatch(prompt, /Verification command:/);
 });
 
-test("buildAutoWorkerSystemPrompt keeps only required rules and metadata", () => {
+test("buildAutoWorkerSystemPrompt keeps only required rules and worker-visible metadata", () => {
   const prompt = buildAutoWorkerSystemPrompt({
     goal: "Improve onboarding robustness",
-    untilPrompt: "Stop when onboarding is robust and tests are green",
     verifyCommand: "npm test",
     commitPolicy: "final-or-milestone",
     pushPolicy: "final-or-milestone-if-upstream",
@@ -371,7 +379,7 @@ test("buildAutoWorkerSystemPrompt keeps only required rules and metadata", () =>
   assert.match(prompt, /Follow this commit policy: final-or-milestone/);
   assert.match(prompt, /Follow this push policy: final-or-milestone-if-upstream/);
   assert.match(prompt, /Goal: Improve onboarding robustness/);
-  assert.match(prompt, /Quality goal: Stop when onboarding is robust and tests are green/);
+  assert.doesNotMatch(prompt, /Completion gate:/);
 
   assert.doesNotMatch(prompt, /Do not ask the user/i);
   assert.doesNotMatch(prompt, /Prefer concrete, verifiable progress/i);
@@ -391,7 +399,7 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
   assert.match(prompt, /Never treat a worker completion claim by itself as proof that the goal is done\./);
   assert.match(prompt, /When in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step\./);
   assert.match(prompt, /Use stop only when goalStatus=met\./);
-  assert.match(prompt, /If a quality goal exists, use stop only when it is met too\./);
+  assert.match(prompt, /If a completion gate exists, use stop only when it is met too\./);
   assert.match(prompt, /Use stop only when completion is supported by concrete verification evidence/);
   assert.match(prompt, /If verification is failing or still missing, the task is not complete\./);
   assert.match(prompt, /If final commit\/push expectations are still unmet in a git repo, the task is not complete\./);
@@ -444,8 +452,8 @@ test("evaluateAutoStopGuard accepts German structured verification evidence when
   assert.deepEqual(
     evaluateAutoStopGuard({
       goalStatus: "met",
-      requiresQualityGoal: false,
-      qualityGoalMet: true,
+      requiresCompletionGate: false,
+      completionGateMet: true,
       verifyCommandConfigured: false,
       verifyCommandPassed: false,
       workerAssistantText:
@@ -461,12 +469,12 @@ test("evaluateAutoStopGuard accepts German structured verification evidence when
 });
 
 
-test("evaluateAutoStopGuard blocks stop until goal and quality goal are actually met", () => {
+test("evaluateAutoStopGuard blocks stop until goal and completion gate are actually met", () => {
   assert.deepEqual(
     evaluateAutoStopGuard({
       goalStatus: "likely_met",
-      requiresQualityGoal: true,
-      qualityGoalMet: false,
+      requiresCompletionGate: true,
+      completionGateMet: false,
       verifyCommandConfigured: true,
       verifyCommandPassed: true,
       workerAssistantText: "Ran npm test and all tests pass.",
@@ -475,7 +483,7 @@ test("evaluateAutoStopGuard blocks stop until goal and quality goal are actually
     }),
     {
       allowed: false,
-      blockers: ["goal-not-met", "quality-goal-not-met"],
+      blockers: ["goal-not-met", "completion-gate-not-met"],
     },
   );
 });
@@ -485,8 +493,8 @@ test("evaluateAutoStopGuard blocks stop when verification evidence is still miss
   assert.deepEqual(
     evaluateAutoStopGuard({
       goalStatus: "met",
-      requiresQualityGoal: false,
-      qualityGoalMet: true,
+      requiresCompletionGate: false,
+      completionGateMet: true,
       verifyCommandConfigured: false,
       verifyCommandPassed: false,
       workerAssistantText: "Implemented the fix and cleaned up the code.",
@@ -505,8 +513,8 @@ test("evaluateAutoStopGuard blocks stop when the configured verification command
   assert.deepEqual(
     evaluateAutoStopGuard({
       goalStatus: "met",
-      requiresQualityGoal: false,
-      qualityGoalMet: true,
+      requiresCompletionGate: false,
+      completionGateMet: true,
       verifyCommandConfigured: true,
       verifyCommandPassed: false,
       workerAssistantText: "Implemented the fix and believe it is done.",
@@ -525,8 +533,8 @@ test("evaluateAutoStopGuard blocks stop until commit and push expectations are s
   assert.deepEqual(
     evaluateAutoStopGuard({
       goalStatus: "met",
-      requiresQualityGoal: false,
-      qualityGoalMet: true,
+      requiresCompletionGate: false,
+      completionGateMet: true,
       verifyCommandConfigured: true,
       verifyCommandPassed: true,
       workerAssistantText: "Ran npm test and all tests pass.",
@@ -551,8 +559,8 @@ test("evaluateAutoStopGuard allows stop only after verified completion and clean
   assert.deepEqual(
     evaluateAutoStopGuard({
       goalStatus: "met",
-      requiresQualityGoal: true,
-      qualityGoalMet: true,
+      requiresCompletionGate: true,
+      completionGateMet: true,
       verifyCommandConfigured: false,
       verifyCommandPassed: false,
       workerAssistantText: "Verified the fix manually, ran the relevant checks, and all tests pass.",
@@ -579,7 +587,7 @@ test("buildAutoStopOverrideDecision converts blocked stop into a concrete contin
       reason: "Everything appears done",
       updatedSummary: "Core work is implemented.",
       goalStatus: "met",
-      qualityGoalMet: true,
+      completionGateMet: true,
       progressPercent: 100,
       commitRecommendation: "finalize",
       finalMessage: "Done.",
@@ -611,7 +619,7 @@ test("buildAutoStopOverrideDecision returns undefined when stop is actually allo
         reason: "Verified completion",
         updatedSummary: "Goal is complete and checks passed.",
         goalStatus: "met",
-        qualityGoalMet: true,
+        completionGateMet: true,
         progressPercent: 100,
         commitRecommendation: "finalize",
       },
@@ -631,7 +639,7 @@ test("applyControllerStopOverrideRefinement adopts a controller-specific continu
       reason: "Stop overridden: verification evidence is still missing.",
       updatedSummary: "Stop overridden. Remaining blockers: verification evidence is still missing.",
       goalStatus: "likely_met",
-      qualityGoalMet: true,
+      completionGateMet: true,
       progressPercent: 99,
       commitRecommendation: "finalize",
       nextPrompt: "Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete. Do not ask the user anything.",
@@ -641,7 +649,7 @@ test("applyControllerStopOverrideRefinement adopts a controller-specific continu
       reason: "Run one concrete final verification step",
       updatedSummary: "The remaining gap is specific verification evidence.",
       goalStatus: "likely_met",
-      qualityGoalMet: true,
+      completionGateMet: true,
       progressPercent: 99,
       commitRecommendation: "finalize",
       nextPrompt: "Run npm test, summarize the passing result in one sentence, and then check git status before concluding.",
@@ -661,7 +669,7 @@ test("applyControllerStopOverrideRefinement can pause instead of repeating a low
       reason: "Stop overridden: verification evidence is still missing.",
       updatedSummary: "Stop overridden. Remaining blockers: verification evidence is still missing.",
       goalStatus: "likely_met",
-      qualityGoalMet: true,
+      completionGateMet: true,
       progressPercent: 99,
       commitRecommendation: "finalize",
       nextPrompt: "Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete. Do not ask the user anything.",
@@ -671,7 +679,7 @@ test("applyControllerStopOverrideRefinement can pause instead of repeating a low
       reason: "No materially more specific verification step is available without repeating the same instruction.",
       updatedSummary: "The loop is close to completion but would just restate the same verification request.",
       goalStatus: "stalled",
-      qualityGoalMet: true,
+      completionGateMet: true,
       progressPercent: 99,
       commitRecommendation: "finalize",
     },
@@ -869,16 +877,15 @@ test("buildAutoWorkerSystemPrompt still requires verification without an explici
   assert.doesNotMatch(prompt, /Verification command:/);
 });
 
-test("buildResumePrompt stays focused and excludes iteration\/meta boilerplate", () => {
+test("buildResumePrompt stays focused and keeps completion gates controller-only", () => {
   const prompt = buildResumePrompt({
     goal: "improve onboarding robustness",
-    untilPrompt: "Stop when onboarding is robust and tests are green",
     controllerSummary: "We hardened error handling, but regression tests still look thin.",
   });
 
   assert.match(prompt, /Resume the active goal from the current repository state\./);
   assert.match(prompt, /Goal: improve onboarding robustness/);
-  assert.match(prompt, /Quality goal: Stop when onboarding is robust and tests are green/);
+  assert.doesNotMatch(prompt, /Completion gate:/);
   assert.match(prompt, /Controller summary:\nWe hardened error handling, but regression tests still look thin\./);
   assert.doesNotMatch(prompt, /Iteration budget:/);
   assert.doesNotMatch(prompt, /Verification command:/);
