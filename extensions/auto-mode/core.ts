@@ -287,7 +287,11 @@ export function summarizeGoal(goal: string, maxLength = DEFAULT_STATUS_GOAL_MAX_
 }
 
 export function normalizeComparableText(text: string): string {
-  return collapseWhitespace(text).toLowerCase();
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 export function looksLikeCompletionClaim(text: string): boolean {

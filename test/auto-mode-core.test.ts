@@ -256,8 +256,10 @@ test("buildResumePrompt includes summary and verification context", () => {
   assert.match(prompt, /Iteration budget: 3\/8/);
 });
 
-test("normalizeComparableText collapses whitespace and lowercases", () => {
+test("normalizeComparableText collapses whitespace, lowercases, and strips punctuation noise", () => {
   assert.equal(normalizeComparableText("  Add   Tests\nNow "), "add tests now");
+  assert.equal(normalizeComparableText("Add regression-tests now!!!"), "add regression tests now");
+  assert.equal(normalizeComparableText("Run `npm test` before stopping."), "run npm test before stopping");
 });
 
 test("summarizeGoal truncates long goal text", () => {
