@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildAutoStartConfigFromFlags,
+  buildResumePrompt,
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS,
   looksLikeCompletionClaim,
@@ -10,6 +11,7 @@ import {
   parseControllerDecision,
   parseModelRef,
   parsePositiveInteger,
+  shouldAutoResumeOnSessionStart,
   shouldPreRunVerifyCommand,
   summarizeGoal,
 } from "../extensions/auto-mode/core.ts";
@@ -227,6 +229,31 @@ test("shouldPreRunVerifyCommand uses completion and budget heuristics", () => {
     }),
     false,
   );
+});
+
+test("shouldAutoResumeOnSessionStart only resumes on startup", () => {
+  assert.equal(shouldAutoResumeOnSessionStart("startup", true, "restore-paused"), true);
+  assert.equal(shouldAutoResumeOnSessionStart("startup", false, "restore-running"), true);
+  assert.equal(shouldAutoResumeOnSessionStart("startup", false, "restore-paused"), false);
+  assert.equal(shouldAutoResumeOnSessionStart("reload", true, "restore-running"), false);
+  assert.equal(shouldAutoResumeOnSessionStart("resume", true, "restore-running"), false);
+});
+
+test("buildResumePrompt includes summary and verification context", () => {
+  const prompt = buildResumePrompt({
+    goal: "improve onboarding robustness",
+    untilPrompt: "Stop when onboarding is robust and tests are green",
+    verifyCommand: "npm test",
+    controllerSummary: "We hardened error handling, but regression tests still look thin.",
+    currentIteration: 3,
+    maxIterations: 8,
+  });
+
+  assert.match(prompt, /Resume the active auto-mode goal now: improve onboarding robustness/);
+  assert.match(prompt, /Quality goal: Stop when onboarding is robust and tests are green/);
+  assert.match(prompt, /Verification command: npm test/);
+  assert.match(prompt, /Controller summary:\nWe hardened error handling, but regression tests still look thin\./);
+  assert.match(prompt, /Iteration budget: 3\/8/);
 });
 
 test("normalizeComparableText collapses whitespace and lowercases", () => {

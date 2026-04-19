@@ -7,6 +7,7 @@ import {
   buildLatestAssistantMessageContext,
   buildLatestUserMessageContext,
   buildRecentConversationContext,
+  buildResumePrompt,
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_CONTROLLER_FAILURE_LIMIT,
   DEFAULT_CONTROLLER_MODEL,
@@ -21,6 +22,7 @@ import {
   parseAutoCommandArgs,
   parseControllerDecision,
   parseModelRef,
+  shouldAutoResumeOnSessionStart,
   shouldPreRunVerifyCommand,
   summarizeGoal,
   truncateControllerSummary,
@@ -228,6 +230,17 @@ function buildStartPrompt(snapshot: AutoModeStateV1): string {
   ].filter((value): value is string => !!value);
 
   return sections.join("\n\n");
+}
+
+function getResumePrompt(snapshot: AutoModeStateV1): string {
+  return buildResumePrompt({
+    goal: snapshot.goal,
+    untilPrompt: snapshot.untilPrompt,
+    verifyCommand: snapshot.verifyCommand,
+    controllerSummary: snapshot.controllerSummary,
+    currentIteration: snapshot.currentIteration,
+    maxIterations: snapshot.maxIterations,
+  });
 }
 
 function buildWorkerPromptSuffix(snapshot: AutoModeStateV1): string {
@@ -763,30 +776,35 @@ async function startAutoMode(
     pi.setSessionName(`Auto: ${summarizeGoal(snapshot.goal, 56)}`);
   }
 
+  const startPrompt = buildStartPrompt(snapshot);
+  snapshot.lastAutoPrompt = startPrompt;
+  persistSnapshot(pi, snapshot);
+
   ctx.ui.notify(`Auto-mode started (${snapshot.mode}, ${snapshot.currentIteration}/${snapshot.maxIterations})`, "info");
-  pi.sendUserMessage(buildStartPrompt(snapshot));
+  pi.sendUserMessage(startPrompt);
 }
 
 function restoreSnapshotOnSessionStart(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   runtime: AutoRuntimeState,
+  eventReason: "startup" | "reload" | "new" | "resume" | "fork",
   autoResume: boolean,
-): void {
+): { resumed: boolean } {
   const restored = restorePersistedSnapshot(ctx);
   if (!restored) {
     runtime.snapshot = undefined;
     setStatus(ctx, undefined);
-    return;
+    return { resumed: false };
   }
 
   runtime.snapshot = restored;
   if (!restored.enabled) {
     setStatus(ctx, undefined);
-    return;
+    return { resumed: false };
   }
 
-  const shouldResume = autoResume || restored.resumePolicy === "restore-running";
+  const shouldResume = shouldAutoResumeOnSessionStart(eventReason, autoResume, restored.resumePolicy);
   const previousPaused = restored.paused;
   restored.paused = !shouldResume;
 
@@ -801,6 +819,7 @@ function restoreSnapshotOnSessionStart(
   }
 
   setStatus(ctx, restored);
+  return { resumed: shouldResume };
 }
 
 async function resumeAutoMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, runtime: AutoRuntimeState): Promise<void> {
@@ -821,12 +840,12 @@ async function resumeAutoMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, ru
   }
 
   snapshot.paused = false;
+  const resumePrompt = getResumePrompt(snapshot);
+  snapshot.lastAutoPrompt = resumePrompt;
   persistSnapshot(pi, snapshot);
   setStatus(ctx, snapshot);
   ctx.ui.notify("Auto-mode resumed", "info");
-  pi.sendUserMessage(
-    `Resume the active auto-mode goal now: ${snapshot.goal}${snapshot.untilPrompt ? `\n\nQuality goal: ${snapshot.untilPrompt}` : ""}\n\nContinue autonomously from the current repository state. Do not ask the user anything.`,
-  );
+  pi.sendUserMessage(resumePrompt);
 }
 
 function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 | undefined): void {
@@ -922,7 +941,7 @@ export default function (pi: ExtensionAPI) {
     default: true,
   });
   pi.registerFlag("auto-resume", {
-    description: "Resume a restored auto-mode run automatically on session start",
+    description: "Resume a restored auto-mode run automatically on startup",
     type: "boolean",
     default: false,
   });
@@ -1014,12 +1033,19 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    restoreSnapshotOnSessionStart(pi, ctx, runtime, flags.resume === true);
-
-    if (event.reason === "startup" && fromFlags && !('error' in fromFlags)) {
+    if (event.reason === "startup" && fromFlags && !("error" in fromFlags)) {
       runtime.snapshot = undefined;
       setStatus(ctx, undefined);
       await startAutoMode(pi, ctx, runtime, fromFlags);
+      return;
+    }
+
+    const restoreResult = restoreSnapshotOnSessionStart(pi, ctx, runtime, event.reason, flags.resume === true);
+    if (restoreResult.resumed && runtime.snapshot && ctx.isIdle()) {
+      const resumePrompt = getResumePrompt(runtime.snapshot);
+      runtime.snapshot.lastAutoPrompt = resumePrompt;
+      persistSnapshot(pi, runtime.snapshot);
+      pi.sendUserMessage(resumePrompt);
     }
   });
 

@@ -98,7 +98,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 - `/auto status`, `/auto summary`, `/auto pause`, `/auto resume`, `/auto off`, `/auto nudge <instruction>`
 - separate controller model support via `--controller-model provider/model` or `--auto-controller-model provider/model`
 - transparent follow-up prompts via real user messages, so autonomous iterations stay visible in the transcript
-- rolling controller summary with restore-on-start behavior (restored paused by default)
+- rolling controller summary with restore-on-start behavior (restored paused by default, or auto-resumed on startup when `--auto-resume` is set)
 - optional verification command for candidate-stop checks via `--verify "..."` / `--auto-verify "..."`, including proactive pre-stop verification when the worker looks close to done
 - limited read-only controller probes for fresh git snapshots when needed
 - pragmatic defaults for V1: 8 iterations by default, 12-iteration safety budget for `--until`, paused restore on restart unless you opt into `--auto-resume`

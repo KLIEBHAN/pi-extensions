@@ -20,6 +20,7 @@ export type CommitRecommendation = "none" | "milestone" | "finalize";
 export type ProbeKind = "git_status" | "git_diff_names" | "git_head" | "verify_command";
 export type ResumePolicy = "restore-paused" | "restore-running";
 export type AutoCommandKind = "on" | "status" | "pause" | "resume" | "off" | "summary" | "nudge";
+export type AutoSessionStartReason = "startup" | "reload" | "new" | "resume" | "fork";
 
 export interface ModelRef {
   provider: string;
@@ -107,6 +108,15 @@ export interface VerifyPreflightInput {
   verifyCommandConfigured: boolean;
   stopReason: string;
   assistantText: string;
+  currentIteration: number;
+  maxIterations: number;
+}
+
+export interface ResumePromptInput {
+  goal: string;
+  untilPrompt?: string;
+  verifyCommand?: string;
+  controllerSummary: string;
   currentIteration: number;
   maxIterations: number;
 }
@@ -307,6 +317,27 @@ export function shouldPreRunVerifyCommand(input: VerifyPreflightInput): boolean 
   if (input.stopReason !== "stop") return false;
   if (input.currentIteration >= input.maxIterations) return true;
   return looksLikeCompletionClaim(input.assistantText);
+}
+
+export function shouldAutoResumeOnSessionStart(
+  reason: AutoSessionStartReason,
+  autoResumeFlag: boolean,
+  resumePolicy: ResumePolicy,
+): boolean {
+  return reason === "startup" && (autoResumeFlag || resumePolicy === "restore-running");
+}
+
+export function buildResumePrompt(input: ResumePromptInput): string {
+  const sections = [
+    `Resume the active auto-mode goal now: ${input.goal}`,
+    input.untilPrompt ? `Quality goal: ${input.untilPrompt}` : undefined,
+    input.verifyCommand ? `Verification command: ${input.verifyCommand}` : undefined,
+    `Iteration budget: ${input.currentIteration}/${input.maxIterations}`,
+    input.controllerSummary ? `Controller summary:\n${input.controllerSummary}` : undefined,
+    "Continue autonomously from the current repository state. Start with the highest-value concrete next step implied by the controller summary. Do not ask the user anything.",
+  ].filter((value): value is string => !!value);
+
+  return sections.join("\n\n");
 }
 
 function isCommitPolicy(value: string): value is CommitPolicy {

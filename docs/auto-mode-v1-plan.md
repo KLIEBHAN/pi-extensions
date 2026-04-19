@@ -77,7 +77,7 @@ Runtime-only structures:
 
 1. restore last persisted `auto-mode-state`
 2. restore as paused by default
-3. optionally auto-resume when `--auto-resume` is set
+3. optionally auto-resume on startup when `--auto-resume` is set (and immediately kick off a resume prompt)
 4. optionally start a fresh run from CLI flags (`--auto-goal`, ...)
 
 ### `before_agent_start`
