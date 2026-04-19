@@ -12,6 +12,7 @@ Load an individual extension from the repository:
 pi -e ./extensions/hello.ts
 pi -e ./extensions/notify.ts
 pi -e ./extensions/permission-gate.ts
+pi -e ./extensions/auto-mode --auto-goal "improve onboarding robustness"
 pi -e ./extensions/prompt-autocomplete --prompt-autocomplete
 pi -e ./extensions/ralphy-loop
 pi -e ./extensions/session-name.ts
@@ -77,10 +78,59 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 | `hello.ts` | Minimal custom tool example | `pi -e ./extensions/hello.ts` |
 | `notify.ts` | Adds `/notify` for lightweight in-app notifications | `/notify build finished` |
 | `permission-gate.ts` | Asks for confirmation before dangerous bash commands | `pi -e ./extensions/permission-gate.ts` |
+| `auto-mode/` | Controller-driven autonomous improvement loop that keeps iterating with transparent follow-up prompts | `/auto on --iterations 8 improve onboarding robustness` |
 | `prompt-autocomplete/` | Copilot/Cursor-style inline AI autocomplete for the prompt editor with Tab accept and Escape dismiss | `pi -e ./extensions/prompt-autocomplete --prompt-autocomplete` |
 | `ralphy-loop/` | Repeats the same task with autonomous prompts, AI completion verification, and per-iteration context pruning | `/ralphy-loop 5 harden edge cases` |
 | `session-name.ts` | Adds `/session-name <name>` to label the current session | `/session-name auth-refactor` |
 | `terminal-bench.ts` | Migrated from `feat/terminal-bench-optimizations`; adds Terminal-Bench prompt rules, tmux tools, environment bootstrapping, and completion verification | `pi -e ./extensions/terminal-bench.ts --terminal-bench` |
+
+## Auto-mode extension
+
+`extensions/auto-mode/` adds an autonomous controller loop on top of the normal pi worker.
+
+### What it adds
+
+- `/auto on <goal>` to start an autonomous improvement run
+- optional stop modes:
+  - iteration budget via `--iterations <n>`
+  - quality-goal stop prompt via `--until "..."`
+  - hybrid mode when both are set
+- `/auto status`, `/auto summary`, `/auto pause`, `/auto resume`, `/auto off`, `/auto nudge <instruction>`
+- separate controller model support via `--controller-model provider/model` or `--auto-controller-model provider/model`
+- transparent follow-up prompts via real user messages, so autonomous iterations stay visible in the transcript
+- rolling controller summary with restore-on-start behavior (restored paused by default)
+- optional verification command for candidate-stop checks via `--verify "..."` / `--auto-verify "..."`, including proactive pre-stop verification when the worker looks close to done
+- limited read-only controller probes for fresh git snapshots when needed
+- pragmatic defaults for V1: 8 iterations by default, 12-iteration safety budget for `--until`, paused restore on restart unless you opt into `--auto-resume`
+
+### Usage
+
+Directly from this repository:
+
+```bash
+pi -e ./extensions/auto-mode --auto-goal "improve onboarding robustness"
+```
+
+Inside pi:
+
+```text
+/auto on --iterations 8 improve onboarding robustness
+/auto on --until "Stop when onboarding is robust and tests are green" improve onboarding robustness
+/auto status
+/auto pause
+/auto resume
+/auto off
+```
+
+Optional dedicated controller model and verify command:
+
+```bash
+pi -e ./extensions/auto-mode \
+  --auto-goal "improve onboarding robustness" \
+  --auto-until "Stop when onboarding is robust and tests are green" \
+  --auto-controller-model openai/gpt-5.4-mini \
+  --auto-verify "npm test"
+```
 
 ## Prompt autocomplete extension
 
@@ -293,6 +343,9 @@ pi-extensions/
 │       ├── agent.py
 │       └── README.md
 ├── extensions/
+│   ├── auto-mode/
+│   │   ├── core.ts
+│   │   └── index.ts
 │   ├── hello.ts
 │   ├── notify.ts
 │   ├── permission-gate.ts
