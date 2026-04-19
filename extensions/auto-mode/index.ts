@@ -4,6 +4,7 @@ import {
   appendDecisionHistory,
   AUTO_MODE_STATE_TYPE,
   buildAutoStartConfigFromFlags,
+  buildAutoWorkerSystemPrompt,
   buildLatestAssistantMessageContext,
   buildLatestUserMessageContext,
   buildRecentConversationContext,
@@ -40,19 +41,6 @@ const STATUS_KEY = "auto-mode";
 const PROBE_LIMIT_PER_CYCLE = 1;
 const COMMAND_USAGE =
   "Usage: /auto on [--iterations N] [--until \"goal\"] [--controller-model provider/model] [--verify \"cmd\"] <goal>";
-
-const AUTO_WORKER_SYSTEM_PROMPT = `Auto-mode is active.
-
-Rules:
-- Work autonomously toward the active goal.
-- Do not ask the user for clarification unless it is literally impossible to continue without new external information.
-- Prefer concrete, verifiable progress over vague planning.
-- Re-check repository state, tests, logs, configs, and changed files yourself.
-- Avoid repetitive meta-planning when you could instead inspect, implement, test, or verify something concrete.
-- When the work seems close to done, run the most relevant available verification yourself before concluding.
-- When appropriate, make meaningful atomic commits according to the active commit policy.
-- If an upstream is configured and push policy allows it, push at meaningful milestones or finalization points.
-- Do not stop just because one local improvement is done if the broader active goal still has obvious high-value follow-up work.`;
 
 const AUTO_CONTROLLER_SYSTEM_PROMPT = `You are the controller for an autonomous coding loop.
 
@@ -227,15 +215,13 @@ function getResumePrompt(snapshot: AutoModeStateV1): string {
 }
 
 function buildWorkerPromptSuffix(snapshot: AutoModeStateV1): string {
-  const policyBits = [
-    `Goal: ${snapshot.goal}`,
-    snapshot.untilPrompt ? `Quality goal: ${snapshot.untilPrompt}` : undefined,
-    snapshot.verifyCommand ? `Verification command before concluding: ${snapshot.verifyCommand}` : undefined,
-    `Commit policy: ${snapshot.commitPolicy}`,
-    `Push policy: ${snapshot.pushPolicy}`,
-  ].filter((value): value is string => !!value);
-
-  return `${AUTO_WORKER_SYSTEM_PROMPT}\n\n${policyBits.join("\n")}`;
+  return buildAutoWorkerSystemPrompt({
+    goal: snapshot.goal,
+    untilPrompt: snapshot.untilPrompt,
+    verifyCommand: snapshot.verifyCommand,
+    commitPolicy: snapshot.commitPolicy,
+    pushPolicy: snapshot.pushPolicy,
+  });
 }
 
 function buildControllerDecisionHistoryText(snapshot: AutoModeStateV1): string {

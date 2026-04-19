@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildAutoStartConfigFromFlags,
+  buildAutoWorkerSystemPrompt,
   buildResumePrompt,
   buildStartPrompt,
   decideAutoModeSessionStart,
@@ -303,7 +304,44 @@ test("buildStartPrompt stays minimal and excludes auto-mode boilerplate", () => 
   assert.doesNotMatch(prompt, /Verification command:/);
 });
 
-test("buildResumePrompt stays focused and excludes iteration/meta boilerplate", () => {
+test("buildAutoWorkerSystemPrompt keeps only required rules and metadata", () => {
+  const prompt = buildAutoWorkerSystemPrompt({
+    goal: "Improve onboarding robustness",
+    untilPrompt: "Stop when onboarding is robust and tests are green",
+    verifyCommand: "npm test",
+    commitPolicy: "final-or-milestone",
+    pushPolicy: "final-or-milestone-if-upstream",
+  });
+
+  assert.match(prompt, /^Auto-mode rules:/);
+  assert.match(prompt, /Do not claim completion until the active goal is actually satisfied\./);
+  assert.match(prompt, /Before concluding, run this verification command: npm test/);
+  assert.match(prompt, /Follow this commit policy: final-or-milestone/);
+  assert.match(prompt, /Follow this push policy: final-or-milestone-if-upstream/);
+  assert.match(prompt, /Goal: Improve onboarding robustness/);
+  assert.match(prompt, /Quality goal: Stop when onboarding is robust and tests are green/);
+
+  assert.doesNotMatch(prompt, /Do not ask the user/i);
+  assert.doesNotMatch(prompt, /Prefer concrete, verifiable progress/i);
+  assert.doesNotMatch(prompt, /Re-check repository state/i);
+  assert.doesNotMatch(prompt, /Avoid repetitive meta-planning/i);
+  assert.doesNotMatch(prompt, /one local improvement is done/i);
+  assert.doesNotMatch(prompt, /Iteration:/);
+  assert.doesNotMatch(prompt, /Mode:/);
+});
+
+test("buildAutoWorkerSystemPrompt still requires verification without an explicit command", () => {
+  const prompt = buildAutoWorkerSystemPrompt({
+    goal: "Improve onboarding robustness",
+    commitPolicy: "milestones",
+    pushPolicy: "if-upstream",
+  });
+
+  assert.match(prompt, /Before concluding, run the most relevant available verification\./);
+  assert.doesNotMatch(prompt, /Verification command:/);
+});
+
+test("buildResumePrompt stays focused and excludes iteration\/meta boilerplate", () => {
   const prompt = buildResumePrompt({
     goal: "improve onboarding robustness",
     untilPrompt: "Stop when onboarding is robust and tests are green",

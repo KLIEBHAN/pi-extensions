@@ -41,6 +41,14 @@ export interface AutoStartConfig {
   resumeOnSessionStart: boolean;
 }
 
+export interface AutoWorkerPromptInput {
+  goal: string;
+  untilPrompt?: string;
+  verifyCommand?: string;
+  commitPolicy: CommitPolicy;
+  pushPolicy: PushPolicy;
+}
+
 export interface AutoDecisionLogEntry {
   iteration: number;
   action: ControllerAction;
@@ -395,6 +403,24 @@ export function buildResumePrompt(input: ResumePromptInput): string {
   ].filter((value): value is string => !!value);
 
   return sections.join("\n\n");
+}
+
+export function buildAutoWorkerSystemPrompt(input: AutoWorkerPromptInput): string {
+  const rules = [
+    "- Do not claim completion until the active goal is actually satisfied.",
+    input.verifyCommand
+      ? `- Before concluding, run this verification command: ${input.verifyCommand}`
+      : "- Before concluding, run the most relevant available verification.",
+    `- Follow this commit policy: ${input.commitPolicy}`,
+    `- Follow this push policy: ${input.pushPolicy}`,
+  ];
+
+  const metadata = [
+    `Goal: ${input.goal}`,
+    input.untilPrompt ? `Quality goal: ${input.untilPrompt}` : undefined,
+  ].filter((value): value is string => !!value);
+
+  return ["Auto-mode rules:", ...rules, "", ...metadata].join("\n");
 }
 
 export function decideAutoModeSessionStart(input: SessionStartDecisionInput): SessionStartDecision {
