@@ -1,5 +1,5 @@
 import { completeSimple, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
-import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@mariozechner/pi-coding-agent";
 import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@mariozechner/pi-tui";
 import {
   buildLatestAssistantMessageContext,
@@ -32,6 +32,33 @@ const REQUEST_CACHE_MAX_ENTRIES = 128;
 const WORD_ACCEPT_KEYS: readonly KeyId[] = ["ctrl+space", "ctrl+tab"];
 const CYCLE_NEXT_KEYS: readonly KeyId[] = ["ctrl+.", "alt+]"];
 const CYCLE_PREV_KEYS: readonly KeyId[] = ["ctrl+,", "alt+["];
+const NAVIGATION_ACTIONS = [
+  "tui.editor.cursorUp",
+  "tui.editor.cursorDown",
+  "tui.editor.cursorLeft",
+  "tui.editor.cursorRight",
+  "tui.editor.cursorWordLeft",
+  "tui.editor.cursorWordRight",
+  "tui.editor.cursorLineStart",
+  "tui.editor.cursorLineEnd",
+  "tui.editor.jumpForward",
+  "tui.editor.jumpBackward",
+  "tui.editor.pageUp",
+  "tui.editor.pageDown",
+] as const;
+const EDIT_ACTIONS = [
+  "tui.editor.deleteCharBackward",
+  "tui.editor.deleteCharForward",
+  "tui.editor.deleteWordBackward",
+  "tui.editor.deleteWordForward",
+  "tui.editor.deleteToLineStart",
+  "tui.editor.deleteToLineEnd",
+  "tui.editor.yank",
+  "tui.editor.yankPop",
+  "tui.editor.undo",
+  "tui.input.newLine",
+  "app.clear",
+] as const;
 
 interface PromptAutocompleteConfig {
   allowWhileStreaming: boolean;
@@ -248,6 +275,7 @@ function storeCachedRequest(
 class PromptAutocompleteEditor extends CustomEditor {
   private readonly shared: PromptAutocompleteSharedState;
   private readonly activationId: number;
+  private readonly keybindings: KeybindingsManager;
 
   private suggestions: string[] = [];
   private suggestionIndex: number = 0;
@@ -263,31 +291,30 @@ class PromptAutocompleteEditor extends CustomEditor {
   constructor(
     tui: TUI,
     theme: EditorTheme,
-    keybindings: any,
+    keybindings: KeybindingsManager,
     shared: PromptAutocompleteSharedState,
     activationId: number,
   ) {
     super(tui, theme, keybindings);
     this.shared = shared;
     this.activationId = activationId;
+    this.keybindings = keybindings;
   }
 
   override setText(text: string): void {
     super.setText(text);
-    this.refreshSuggestion();
+    this.refreshSuggestion({ clearExisting: true });
   }
 
   override insertTextAtCursor(text: string): void {
     super.insertTextAtCursor(text);
-    this.refreshSuggestion();
+    this.refreshSuggestion({ clearExisting: true });
   }
 
   override handleInput(data: string): void {
     if (this.canDismissInlineSuggestion(data)) {
       this.dismissedKey = this.buildRequest()?.cacheKey;
-      this.cancelPendingRequest();
-      updateDebugState(this.shared, "dismissed", "Suggestion dismissed for current draft");
-      this.setSuggestions([]);
+      this.clearInlineSuggestion("dismissed", "Suggestion dismissed for current draft");
       return;
     }
 
@@ -306,6 +333,8 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
+    this.clearInlineSuggestionForUserIntent(data);
+
     const beforeText = this.getText();
     const beforeCursor = this.getCursor();
     const beforeAutocomplete = this.isShowingAutocomplete();
@@ -320,7 +349,12 @@ class PromptAutocompleteEditor extends CustomEditor {
     const cursorChanged = beforeCursor.line !== afterCursor.line || beforeCursor.col !== afterCursor.col;
     const autocompleteChanged = beforeAutocomplete !== afterAutocomplete;
 
-    if (textChanged || cursorChanged || autocompleteChanged || this.getActiveSuggestion()) {
+    if (textChanged || cursorChanged || autocompleteChanged) {
+      this.refreshSuggestion({ clearExisting: true });
+      return;
+    }
+
+    if (this.getActiveSuggestion()) {
       this.refreshSuggestion();
     }
   }
@@ -444,14 +478,45 @@ class PromptAutocompleteEditor extends CustomEditor {
     return matchesAnyKey(data, CYCLE_NEXT_KEYS) || matchesAnyKey(data, CYCLE_PREV_KEYS);
   }
 
+  private clearInlineSuggestion(state: string, details: string): void {
+    this.cancelPendingRequest();
+    updateDebugState(this.shared, state, details);
+    this.setSuggestions([]);
+  }
+
+  private clearInlineSuggestionForUserIntent(data: string): boolean {
+    const clearReason = this.getInlineSuggestionClearReason(data);
+    if (!clearReason) return false;
+    this.clearInlineSuggestion(clearReason.state, clearReason.details);
+    return true;
+  }
+
+  private getInlineSuggestionClearReason(data: string): { state: string; details: string } | undefined {
+    if (!this.getActiveSuggestion()) return undefined;
+
+    if (NAVIGATION_ACTIONS.some((action) => this.keybindings.matches(data, action))) {
+      return {
+        state: "navigated",
+        details: "Suggestion cleared during editor navigation",
+      };
+    }
+
+    if (EDIT_ACTIONS.some((action) => this.keybindings.matches(data, action))) {
+      return {
+        state: "editing",
+        details: "Suggestion cleared before editor edit command",
+      };
+    }
+
+    return undefined;
+  }
+
   private acceptInlineSuggestion(): void {
     const suggestion = this.getActiveSuggestion();
     if (!suggestion) return;
 
-    this.cancelPendingRequest();
     this.dismissedKey = undefined;
-    updateDebugState(this.shared, "accepted", "Accepted full suggestion");
-    this.setSuggestions([]);
+    this.clearInlineSuggestion("accepted", "Accepted full suggestion");
     super.insertTextAtCursor(suggestion);
     this.refreshSuggestion();
   }
@@ -463,10 +528,8 @@ class PromptAutocompleteEditor extends CustomEditor {
     const chunk = extractNextSuggestionChunk(suggestion) ?? suggestion;
     if (!chunk) return;
 
-    this.cancelPendingRequest();
     this.dismissedKey = undefined;
-    updateDebugState(this.shared, "accepted-word", `Accepted chunk: ${chunk}`);
-    this.setSuggestions([]);
+    this.clearInlineSuggestion("accepted-word", `Accepted chunk: ${chunk}`);
     super.insertTextAtCursor(chunk);
     this.refreshSuggestion();
   }
@@ -830,6 +893,129 @@ function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedSt
   shared.setStatusText = undefined;
 }
 
+function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
+  shared.enabled = pi.getFlag("prompt-autocomplete") === true;
+  shared.config = parseConfig(pi);
+  shared.lastError = undefined;
+  shared.lastRawResponse = undefined;
+  shared.requestCache.clear();
+  shared.inFlightRequests.clear();
+  shared.debugState = shared.enabled ? "configured" : "disabled";
+}
+
+function bindRuntimeContext(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
+  shared.currentModel = ctx.model as Model<Api> | undefined;
+  shared.modelRegistry = ctx.modelRegistry;
+  shared.sessionManager = ctx.sessionManager;
+  shared.streaming = false;
+}
+
+function refreshEditorImmediately(shared: PromptAutocompleteSharedState, state: string, details: string): void {
+  updateDebugState(shared, state, details);
+  shared.refreshEditor?.({ clearExisting: true, immediate: true });
+}
+
+function setDebugDisplay(shared: PromptAutocompleteSharedState, enabled: boolean): void {
+  shared.config.debug = enabled;
+  if (enabled) {
+    updateDebugState(shared, shared.debugState || "ready");
+  } else {
+    clearDebugUi(shared);
+  }
+}
+
+function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
+  shared.enabled = true;
+  mountEditor(ctx, shared);
+}
+
+function disablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
+  shared.enabled = false;
+  unmountEditor(ctx, shared);
+}
+
+function notifyPromptAutocompleteEnabled(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  options: { includeModel: boolean },
+): void {
+  const keyHint =
+    `Tab accepts all, ${formatPrimaryKey(WORD_ACCEPT_KEYS)} accepts one word, ` +
+    `${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives.`;
+  const resolvedModel = resolveSuggestionModel(shared);
+
+  if (options.includeModel) {
+    if (resolvedModel) {
+      ctx.ui.notify(`Prompt autocomplete enabled. ${keyHint} Model: ${formatModelLabel(resolvedModel)}`, "info");
+    } else {
+      ctx.ui.notify(
+        "Prompt autocomplete enabled, but no usable model/auth is configured yet. Select a model or configure auth first.",
+        "warning",
+      );
+    }
+    return;
+  }
+
+  ctx.ui.notify(`Prompt autocomplete enabled. ${keyHint}`, "info");
+}
+
+function createPromptAutocompleteCommandHandlers(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+): Record<string, () => void> {
+  return {
+    status: () => {
+      ctx.ui.notify(formatStatus(shared), "info");
+    },
+    "debug-on": () => {
+      setDebugDisplay(shared, true);
+      ctx.ui.notify("Prompt autocomplete debug display enabled", "info");
+    },
+    "debug-off": () => {
+      setDebugDisplay(shared, false);
+      ctx.ui.notify("Prompt autocomplete debug display disabled", "info");
+    },
+    "debug-toggle": () => {
+      const nextDebugEnabled = !shared.config.debug;
+      setDebugDisplay(shared, nextDebugEnabled);
+      ctx.ui.notify(
+        nextDebugEnabled
+          ? "Prompt autocomplete debug display enabled"
+          : "Prompt autocomplete debug display disabled",
+        "info",
+      );
+    },
+    on: () => {
+      if (shared.enabled) {
+        ctx.ui.notify(`Prompt autocomplete already enabled (${formatStatus(shared)})`, "info");
+        return;
+      }
+
+      enablePromptAutocomplete(ctx, shared);
+      notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: true });
+    },
+    off: () => {
+      if (!shared.enabled) {
+        ctx.ui.notify("Prompt autocomplete is already disabled", "info");
+        return;
+      }
+
+      disablePromptAutocomplete(ctx, shared);
+      ctx.ui.notify("Prompt autocomplete disabled", "info");
+    },
+    toggle: () => {
+      if (shared.enabled) {
+        disablePromptAutocomplete(ctx, shared);
+        ctx.ui.notify("Prompt autocomplete disabled", "info");
+        return;
+      }
+
+      enablePromptAutocomplete(ctx, shared);
+      notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: false });
+    },
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("prompt-autocomplete", {
     description: "Enable inline AI prompt autocomplete in the editor",
@@ -882,51 +1068,31 @@ export default function (pi: ExtensionAPI) {
     inFlightRequests: new Map(),
   };
 
-  pi.on("session_start", async () => {
-    shared.enabled = pi.getFlag("prompt-autocomplete") === true;
-    shared.config = parseConfig(pi);
-    shared.lastError = undefined;
-    shared.lastRawResponse = undefined;
-    shared.requestCache.clear();
-    shared.inFlightRequests.clear();
-    shared.debugState = shared.enabled ? "configured" : "disabled";
-  });
-
   pi.on("session_start", async (_event, ctx) => {
-    shared.currentModel = ctx.model as Model<Api> | undefined;
-    shared.modelRegistry = ctx.modelRegistry;
-    shared.sessionManager = ctx.sessionManager;
-    shared.streaming = false;
+    resetSharedForSession(pi, shared);
+    bindRuntimeContext(ctx, shared);
 
-    if (!ctx.hasUI) return;
-    if (!shared.enabled) return;
-
+    if (!ctx.hasUI || !shared.enabled) return;
     mountEditor(ctx, shared);
   });
 
   pi.on("model_select", async (event, ctx) => {
     shared.currentModel = event.model as Model<Api>;
     shared.modelRegistry = ctx.modelRegistry;
-    if (shared.enabled) {
-      updateDebugState(shared, "model-changed", formatModelLabel(event.model as Model<Api>));
-      shared.refreshEditor?.({ clearExisting: true, immediate: true });
-    }
+    if (!shared.enabled) return;
+    refreshEditorImmediately(shared, "model-changed", formatModelLabel(event.model as Model<Api>));
   });
 
   pi.on("agent_start", async () => {
     shared.streaming = true;
-    if (shared.enabled && !shared.config.allowWhileStreaming) {
-      updateDebugState(shared, "waiting", "Main agent is still working");
-      shared.refreshEditor?.({ clearExisting: true, immediate: true });
-    }
+    if (!shared.enabled || shared.config.allowWhileStreaming) return;
+    refreshEditorImmediately(shared, "waiting", "Main agent is still working");
   });
 
   pi.on("agent_end", async () => {
     shared.streaming = false;
-    if (shared.enabled) {
-      updateDebugState(shared, "ready", "Agent finished; autocomplete can request suggestions again");
-      shared.refreshEditor?.({ clearExisting: true, immediate: true });
-    }
+    if (!shared.enabled) return;
+    refreshEditorImmediately(shared, "ready", "Agent finished; autocomplete can request suggestions again");
   });
 
   pi.registerCommand("prompt-autocomplete", {
@@ -937,88 +1103,12 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const command = args.trim().toLowerCase();
+      const command = args.trim().toLowerCase() || "status";
+      const handlers = createPromptAutocompleteCommandHandlers(ctx, shared);
+      const handler = handlers[command];
 
-      if (!command || command === "status") {
-        ctx.ui.notify(formatStatus(shared), "info");
-        return;
-      }
-
-      if (command === "debug-on") {
-        shared.config.debug = true;
-        updateDebugState(shared, shared.debugState || "ready");
-        ctx.ui.notify("Prompt autocomplete debug display enabled", "info");
-        return;
-      }
-
-      if (command === "debug-off") {
-        shared.config.debug = false;
-        clearDebugUi(shared);
-        ctx.ui.notify("Prompt autocomplete debug display disabled", "info");
-        return;
-      }
-
-      if (command === "debug-toggle") {
-        shared.config.debug = !shared.config.debug;
-        if (shared.config.debug) {
-          updateDebugState(shared, shared.debugState || "ready");
-          ctx.ui.notify("Prompt autocomplete debug display enabled", "info");
-        } else {
-          clearDebugUi(shared);
-          ctx.ui.notify("Prompt autocomplete debug display disabled", "info");
-        }
-        return;
-      }
-
-      if (command === "on") {
-        if (shared.enabled) {
-          ctx.ui.notify(`Prompt autocomplete already enabled (${formatStatus(shared)})`, "info");
-          return;
-        }
-
-        shared.enabled = true;
-        mountEditor(ctx, shared);
-
-        const resolvedModel = resolveSuggestionModel(shared);
-        if (resolvedModel) {
-          ctx.ui.notify(
-            `Prompt autocomplete enabled. Tab accepts all, ${formatPrimaryKey(WORD_ACCEPT_KEYS)} accepts one word, ${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives. Model: ${formatModelLabel(resolvedModel)}`,
-            "info",
-          );
-        } else {
-          ctx.ui.notify(
-            "Prompt autocomplete enabled, but no usable model/auth is configured yet. Select a model or configure auth first.",
-            "warning",
-          );
-        }
-        return;
-      }
-
-      if (command === "off") {
-        if (!shared.enabled) {
-          ctx.ui.notify("Prompt autocomplete is already disabled", "info");
-          return;
-        }
-
-        shared.enabled = false;
-        unmountEditor(ctx, shared);
-        ctx.ui.notify("Prompt autocomplete disabled", "info");
-        return;
-      }
-
-      if (command === "toggle") {
-        if (shared.enabled) {
-          shared.enabled = false;
-          unmountEditor(ctx, shared);
-          ctx.ui.notify("Prompt autocomplete disabled", "info");
-        } else {
-          shared.enabled = true;
-          mountEditor(ctx, shared);
-          ctx.ui.notify(
-            `Prompt autocomplete enabled. Tab accepts all, ${formatPrimaryKey(WORD_ACCEPT_KEYS)} accepts one word, ${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives.`,
-            "info",
-          );
-        }
+      if (handler) {
+        handler();
         return;
       }
 
