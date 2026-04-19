@@ -565,7 +565,7 @@ export function buildAutoControllerSystemPrompt(): string {
     "- Use pause when the run appears blocked, unstable, unsafe, or repetitively unproductive, or when no fresh high-value next step is available without looping.",
     "- Use probe only if one fresh read-only repository snapshot would materially improve the next decision, and never for information that is already present.",
     "- If the next prompt would be nearly identical to the previous one, make it materially more specific or prefer pause over repetition.",
-    "- Do not ask the user anything.",
+    "- Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary. If essential external input is genuinely missing, prefer pause over asking the user.",
     "",
     "JSON shape:",
     "{",
@@ -602,7 +602,7 @@ export function buildAutoControllerAdjacentContinuationSystemPrompt(): string {
     "- Do not broaden scope into a new major task or unrelated workstream.",
     "- Use stop only when no worthwhile bounded adjacent optimization is clear or no adjacent continuation budget remains.",
     "- If the best continuation would mostly restate the previous prompt or otherwise thrash, use pause instead of repeating yourself.",
-    "- Do not ask the user anything.",
+    "- Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary. If essential external input is genuinely missing, prefer pause over asking the user.",
     "",
     "JSON shape:",
     "{",
@@ -636,7 +636,7 @@ export function buildAutoControllerStopOverrideSystemPrompt(): string {
     "- Prefer continue when you can name a concrete, high-value next step that directly addresses the blockers.",
     "- Use the listed blockers, repository evidence, and previous auto prompt to make the nextPrompt materially more specific than the fallback prompt when possible.",
     "- If the best next step would still be nearly identical to the previous or fallback prompt, prefer pause over repetition.",
-    "- Do not ask the user anything.",
+    "- Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary. If essential external input is genuinely missing, prefer pause over asking the user.",
     "",
     "JSON shape:",
     "{",
@@ -755,17 +755,17 @@ export function describeAutoStopBlocker(blocker: AutoStopBlocker, verifyCommand:
 
 function buildStopOverridePrompt(blockers: AutoStopBlocker[], verifyCommand: string | undefined): string {
   if (blockers.includes("goal-not-met")) {
-    return "Do not conclude yet. The active goal is not yet verified as fully met. Inspect the current repository state, identify the highest-value remaining gap, close it, and verify the result before considering completion. Do not ask the user anything.";
+    return "Do not conclude yet. The active goal is not yet verified as fully met. Inspect the current repository state, identify the highest-value remaining gap, close it, and verify the result before considering completion.";
   }
 
   if (blockers.includes("completion-gate-not-met")) {
-    return "Do not conclude yet. The completion gate is not yet verified as met. Focus on the remaining gate gap, run the most relevant verification for it, and only then consider the task complete. Do not ask the user anything.";
+    return "Do not conclude yet. The completion gate is not yet verified as met. Focus on the remaining gate gap, run the most relevant verification for it, and only then consider the task complete.";
   }
 
   if (blockers.includes("verification-failed")) {
     return verifyCommand
-      ? `Do not conclude yet. The configured verification command failed (${verifyCommand}). Fix the remaining issues, rerun the verification command until it passes, and only then consider the task complete. Do not ask the user anything.`
-      : "Do not conclude yet. Verification is still failing. Fix the remaining issues, rerun the relevant verification until it passes, and only then consider the task complete. Do not ask the user anything.";
+      ? `Do not conclude yet. The configured verification command failed (${verifyCommand}). Fix the remaining issues, rerun the verification command until it passes, and only then consider the task complete.`
+      : "Do not conclude yet. Verification is still failing. Fix the remaining issues, rerun the relevant verification until it passes, and only then consider the task complete.";
   }
 
   const actions: string[] = [];
@@ -782,7 +782,7 @@ function buildStopOverridePrompt(blockers: AutoStopBlocker[], verifyCommand: str
     actions.push("Bring the branch back in sync with upstream before stopping.");
   }
 
-  return `${actions.join(" ")} Do not ask the user anything.`;
+  return actions.join(" ");
 }
 
 export function buildAutoStopOverrideDecision(input: AutoStopOverrideDecisionInput): ContinueDecision | undefined {

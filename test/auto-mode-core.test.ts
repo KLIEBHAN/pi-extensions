@@ -417,6 +417,8 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
   assert.match(prompt, /If final commit\/push expectations are still unmet in a git repo, the task is not complete\./);
   assert.match(prompt, /If the primary goal is verified complete and a normal stop would otherwise be allowed, return stop here even when completionPolicy=continue-similar/);
   assert.match(prompt, /If the next prompt would be nearly identical to the previous one, make it materially more specific or prefer pause over repetition\./);
+  assert.match(prompt, /Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary\./);
+  assert.doesNotMatch(prompt, /Do not ask the user anything/i);
 });
 
 
@@ -430,6 +432,8 @@ test("buildAutoControllerAdjacentContinuationSystemPrompt keeps adjacent work bo
   assert.match(prompt, /Default to continue, not stop, when there is any clear, local, high-value adjacent optimization within the remaining adjacent continuation budget\./);
   assert.match(prompt, /Do not broaden scope into a new major task or unrelated workstream\./);
   assert.match(prompt, /Use stop only when no worthwhile bounded adjacent optimization is clear or no adjacent continuation budget remains\./);
+  assert.match(prompt, /Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary\./);
+  assert.doesNotMatch(prompt, /Do not ask the user anything/i);
 });
 
 
@@ -441,6 +445,8 @@ test("buildAutoControllerStopOverrideSystemPrompt asks for a specific continue o
   assert.match(prompt, /Do NOT use stop or probe\./);
   assert.match(prompt, /make the nextPrompt materially more specific than the fallback prompt when possible\./);
   assert.match(prompt, /If the best next step would still be nearly identical to the previous or fallback prompt, prefer pause over repetition\./);
+  assert.match(prompt, /Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary\./);
+  assert.doesNotMatch(prompt, /Do not ask the user anything/i);
 });
 
 
@@ -653,7 +659,7 @@ test("applyControllerStopOverrideRefinement adopts a controller-specific continu
       completionGateMet: true,
       progressPercent: 99,
       commitRecommendation: "finalize",
-      nextPrompt: "Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete. Do not ask the user anything.",
+      nextPrompt: "Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete.",
     },
     controllerDecision: {
       action: "continue",
@@ -683,7 +689,7 @@ test("applyControllerStopOverrideRefinement can pause instead of repeating a low
       completionGateMet: true,
       progressPercent: 99,
       commitRecommendation: "finalize",
-      nextPrompt: "Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete. Do not ask the user anything.",
+      nextPrompt: "Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete.",
     },
     controllerDecision: {
       action: "pause",
