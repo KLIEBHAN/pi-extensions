@@ -49,6 +49,39 @@ export interface AutoWorkerPromptInput {
   pushPolicy: PushPolicy;
 }
 
+export interface AutoStopGuardGitState {
+  dirty: boolean;
+  hasUpstream: boolean;
+  ahead?: number;
+  behind?: number;
+}
+
+export interface AutoStopGuardInput {
+  goalStatus: GoalStatus;
+  requiresQualityGoal: boolean;
+  qualityGoalMet: boolean;
+  verifyCommandConfigured: boolean;
+  verifyCommandPassed: boolean;
+  workerAssistantText: string;
+  commitPolicy: CommitPolicy;
+  pushPolicy: PushPolicy;
+  git?: AutoStopGuardGitState;
+}
+
+export type AutoStopBlocker =
+  | "goal-not-met"
+  | "quality-goal-not-met"
+  | "verification-missing"
+  | "verification-failed"
+  | "commit-required"
+  | "push-required"
+  | "sync-required";
+
+export interface AutoStopGuardResult {
+  allowed: boolean;
+  blockers: AutoStopBlocker[];
+}
+
 export interface AutoDecisionLogEntry {
   iteration: number;
   action: ControllerAction;
@@ -421,6 +454,120 @@ export function buildAutoWorkerSystemPrompt(input: AutoWorkerPromptInput): strin
   ].filter((value): value is string => !!value);
 
   return ["Auto-mode rules:", ...rules, "", ...metadata].join("\n");
+}
+
+export function buildAutoControllerSystemPrompt(): string {
+  return [
+    "You are the controller for an autonomous coding loop.",
+    "",
+    "Your job is to decide the single best next action for the worker assistant.",
+    "",
+    "Output requirements:",
+    "- Return ONLY valid JSON.",
+    "- Use exactly one of these actions: continue, stop, pause, probe.",
+    "- If action=continue, include nextPrompt with the single highest-value next step.",
+    "- If action=stop, reason and updatedSummary must briefly state the concrete verification/finalization evidence that justifies stopping.",
+    "- If action=probe, probe.kind must be one of: git_status, git_diff_names, git_head, verify_command.",
+    "- Keep reason and updatedSummary concise but specific.",
+    "- updatedSummary should be a rolling controller summary for future iterations.",
+    "",
+    "Decision policy:",
+    "- Default to continue, not stop.",
+    "- Continue whenever there is any concrete, non-trivial, high-value next step toward verified completion, stronger validation, or required finalization.",
+    "- Prefer next prompts that name the exact inspection, implementation, test, verification, or git-finalization step to do next.",
+    "- Avoid vague prompts like \"continue improving\" when a concrete next step is available.",
+    "- Never treat a worker completion claim by itself as proof that the goal is done.",
+    "- If completion evidence is thin, ambiguous, or missing, do not stop yet.",
+    "- When in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step.",
+    "- Use stop only when goalStatus=met.",
+    "- If a quality goal exists, use stop only when it is met too.",
+    "- Use stop only when completion is supported by concrete verification evidence from this cycle, such as a passing verification command, passing tests/checks, or explicit validation evidence in the worker result.",
+    "- If verification is failing or still missing, the task is not complete.",
+    "- If final commit/push expectations are still unmet in a git repo, the task is not complete.",
+    "- If obvious follow-up work remains that is necessary to satisfy the goal or quality goal, do not stop.",
+    "- Use pause when the run appears blocked, unstable, unsafe, or repetitively unproductive, or when no fresh high-value next step is available without looping.",
+    "- Use probe only if one fresh read-only repository snapshot would materially improve the next decision, and never for information that is already present.",
+    "- If the next prompt would be nearly identical to the previous one, make it materially more specific or prefer pause over repetition.",
+    "- Do not ask the user anything.",
+    "",
+    "JSON shape:",
+    "{",
+    '  "action":"continue|stop|pause|probe",',
+    '  "reason":"...",',
+    '  "updatedSummary":"...",',
+    '  "goalStatus":"in_progress|likely_met|met|blocked|stalled",',
+    '  "qualityGoalMet":true,',
+    '  "progressPercent":0,',
+    '  "commitRecommendation":"none|milestone|finalize",',
+    '  "nextPrompt":"...",',
+    '  "finalMessage":"...",',
+    '  "probe":{"kind":"git_status|git_diff_names|git_head|verify_command"}',
+    "}",
+  ].join("\n");
+}
+
+export function hasConcreteVerificationEvidence(text: string): boolean {
+  const normalized = normalizeComparableText(text);
+  if (!normalized) return false;
+
+  const blockingPatterns = [
+    /\b(todo|follow up|follow-up|remaining work|still need|still needs|not verified|unverified|not run|did not run|didn t run)\b/,
+    /\b(need to|needs to|manual step|manual follow up|manual follow-up|pending|maybe|should work|should now work|probably)\b/,
+    /\b(cannot verify|can t verify|unable to verify|could not verify|waiting for|blocked)\b/,
+    /\b(failed|failing|failure|does not pass|do not pass|not passing|broke|broken|errors remain|error remains)\b/,
+  ];
+  if (blockingPatterns.some((pattern) => pattern.test(normalized))) {
+    return false;
+  }
+
+  const verificationPatterns = [
+    /\bverified\b/,
+    /\bvalidated\b/,
+    /\bmanual(ly)? verified\b/,
+    /\bverification passed\b/,
+    /\b(all tests pass|tests pass|test suite passes)\b/,
+    /\b(lint passes|checks pass|all checks pass)\b/,
+    /\b(build passes|build succeeded|build succeeds)\b/,
+    /\b(smoke test passed|manual test passed)\b/,
+  ];
+  return verificationPatterns.some((pattern) => pattern.test(normalized));
+}
+
+export function evaluateAutoStopGuard(input: AutoStopGuardInput): AutoStopGuardResult {
+  const blockers: AutoStopBlocker[] = [];
+
+  if (input.goalStatus !== "met") {
+    blockers.push("goal-not-met");
+  }
+
+  if (input.requiresQualityGoal && !input.qualityGoalMet) {
+    blockers.push("quality-goal-not-met");
+  }
+
+  if (input.verifyCommandConfigured) {
+    if (!input.verifyCommandPassed) {
+      blockers.push("verification-failed");
+    }
+  } else if (!hasConcreteVerificationEvidence(input.workerAssistantText)) {
+    blockers.push("verification-missing");
+  }
+
+  if (input.git) {
+    if (input.commitPolicy !== "none" && input.git.dirty) {
+      blockers.push("commit-required");
+    }
+    if (input.pushPolicy !== "never" && input.git.hasUpstream && (input.git.ahead ?? 0) > 0) {
+      blockers.push("push-required");
+    }
+    if (input.pushPolicy !== "never" && input.git.hasUpstream && (input.git.behind ?? 0) > 0) {
+      blockers.push("sync-required");
+    }
+  }
+
+  return {
+    allowed: blockers.length === 0,
+    blockers,
+  };
 }
 
 export function decideAutoModeSessionStart(input: SessionStartDecisionInput): SessionStartDecision {

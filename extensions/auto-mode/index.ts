@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@m
 import {
   appendDecisionHistory,
   AUTO_MODE_STATE_TYPE,
+  buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
   buildAutoWorkerSystemPrompt,
   buildLatestAssistantMessageContext,
@@ -20,6 +21,7 @@ import {
   DEFAULT_STAGNATION_LIMIT,
   DEFAULT_STATUS_GOAL_MAX_CHARS,
   DEFAULT_WORKER_FAILURE_LIMIT,
+  evaluateAutoStopGuard,
   extractLatestAutoModeState,
   extractMessageText,
   normalizeComparableText,
@@ -42,45 +44,7 @@ const PROBE_LIMIT_PER_CYCLE = 1;
 const COMMAND_USAGE =
   "Usage: /auto on [--iterations N] [--until \"goal\"] [--controller-model provider/model] [--verify \"cmd\"] <goal>";
 
-const AUTO_CONTROLLER_SYSTEM_PROMPT = `You are the controller for an autonomous coding loop.
-
-Your job is to decide the single best next action for the worker assistant.
-
-Output requirements:
-- Return ONLY valid JSON.
-- Use exactly one of these actions: continue, stop, pause, probe.
-- If action=continue, include nextPrompt.
-- If action=probe, probe.kind must be one of: git_status, git_diff_names, git_head, verify_command.
-- Keep reason and updatedSummary concise but specific.
-- updatedSummary should be a rolling controller summary for future iterations.
-
-Decision policy:
-- Prefer continue when there is still clear, high-value work toward the active goal.
-- Prefer specific next prompts that tell the worker what to inspect, implement, test, or verify next.
-- Avoid vague prompts like “continue improving” when a concrete next step is available.
-- If the latest worker result already looks close to completion, weigh git state and verification evidence heavily.
-- If verification is failing, the task is not complete.
-- If final commit/push expectations are still unmet in a git repo, the task is not complete.
-- Use stop only when the goal (or quality goal) appears met, or when iteration budget is exhausted and no further continuation is allowed.
-- Use pause when the run appears blocked, unstable, or stuck and should not continue automatically.
-- Use probe only if one fresh read-only repository snapshot would materially improve the next decision, and never for information that is already present.
-- If the next prompt would be nearly identical to the previous one, prefer pause over repetition unless there is a strong reason to try once more.
-- Be conservative about claiming completion.
-- Do not ask the user anything.
-
-JSON shape:
-{
-  "action":"continue|stop|pause|probe",
-  "reason":"...",
-  "updatedSummary":"...",
-  "goalStatus":"in_progress|likely_met|met|blocked|stalled",
-  "qualityGoalMet":true,
-  "progressPercent":0,
-  "commitRecommendation":"none|milestone|finalize",
-  "nextPrompt":"...",
-  "finalMessage":"...",
-  "probe":{"kind":"git_status|git_diff_names|git_head|verify_command"}
-}`;
+const AUTO_CONTROLLER_SYSTEM_PROMPT = buildAutoControllerSystemPrompt();
 
 interface GitSnapshot {
   isGitRepo: boolean;
@@ -617,6 +581,8 @@ async function getStopOverridePrompt(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   snapshot: AutoModeStateV1,
+  decision: Extract<ControllerDecision, { action: "stop" }>,
+  workerTurn: WorkerTurnSnapshot,
   gitSnapshot: GitSnapshot | undefined,
   verifyResult?: VerifyCommandResult,
 ): Promise<string | undefined> {
@@ -625,30 +591,56 @@ async function getStopOverridePrompt(
       ? await runVerifyCommand(pi, ctx.cwd, snapshot.verifyCommand)
       : undefined
   );
-  if (snapshot.verifyCommand && resolvedVerifyResult && !resolvedVerifyResult.ok) {
-    return `The configured verification command failed (${snapshot.verifyCommand}). Fix the remaining issues, rerun the verification command until it passes, and only then consider the task complete. Do not ask the user anything.`;
+  const stopGuard = evaluateAutoStopGuard({
+    goalStatus: decision.goalStatus,
+    requiresQualityGoal: !!snapshot.untilPrompt,
+    qualityGoalMet: decision.qualityGoalMet,
+    verifyCommandConfigured: !!snapshot.verifyCommand,
+    verifyCommandPassed: snapshot.verifyCommand ? !!resolvedVerifyResult?.ok : false,
+    workerAssistantText: workerTurn.assistantText,
+    commitPolicy: snapshot.commitPolicy,
+    pushPolicy: snapshot.pushPolicy,
+    git: gitSnapshot
+      ? {
+          dirty: gitSnapshot.dirty,
+          hasUpstream: gitSnapshot.hasUpstream,
+          ahead: gitSnapshot.ahead,
+          behind: gitSnapshot.behind,
+        }
+      : undefined,
+  });
+
+  if (stopGuard.allowed) {
+    return undefined;
   }
 
-  if (!gitSnapshot) {
-    return undefined;
+  if (stopGuard.blockers.includes("goal-not-met")) {
+    return "Do not conclude yet. The active goal is not yet verified as fully met. Inspect the current repository state, identify the highest-value remaining gap, close it, and verify the result before considering completion. Do not ask the user anything.";
+  }
+
+  if (stopGuard.blockers.includes("quality-goal-not-met")) {
+    return "Do not conclude yet. The quality goal is not yet verified as met. Focus on the remaining quality gap, run the most relevant verification for it, and only then consider the task complete. Do not ask the user anything.";
+  }
+
+  if (stopGuard.blockers.includes("verification-failed")) {
+    return `Do not conclude yet. The configured verification command failed (${snapshot.verifyCommand}). Fix the remaining issues, rerun the verification command until it passes, and only then consider the task complete. Do not ask the user anything.`;
   }
 
   const actions: string[] = [];
-  if (snapshot.commitPolicy !== "none" && gitSnapshot.dirty) {
+  if (stopGuard.blockers.includes("verification-missing")) {
+    actions.push("Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete.");
+  }
+  if (stopGuard.blockers.includes("commit-required")) {
     actions.push("Create an atomic commit for the completed work.");
   }
-  if (snapshot.pushPolicy !== "never" && gitSnapshot.hasUpstream && (gitSnapshot.ahead ?? 0) > 0) {
+  if (stopGuard.blockers.includes("push-required")) {
     actions.push("Push the current branch so it is in sync with upstream.");
   }
-  if (snapshot.pushPolicy !== "never" && gitSnapshot.hasUpstream && (gitSnapshot.behind ?? 0) > 0) {
+  if (stopGuard.blockers.includes("sync-required")) {
     actions.push("Bring the branch back in sync with upstream before stopping.");
   }
 
-  if (actions.length === 0) {
-    return undefined;
-  }
-
-  return `${actions.join(" ")} Then verify git status is clean and the branch is synchronized. Do not ask the user anything.`;
+  return `${actions.join(" ")} Do not ask the user anything.`;
 }
 
 function getLastAssistantTurn(event: { messages?: unknown[] }): WorkerTurnSnapshot | undefined {
@@ -1099,7 +1091,7 @@ export default function (pi: ExtensionAPI) {
 
       if (decision.action === "continue") {
         if (snapshot.currentIteration >= snapshot.maxIterations) {
-          disableSnapshot(pi, ctx, runtime, "iteration budget exhausted", snapshot.mode === "iterations" ? "info" : "warning");
+          pauseSnapshot(pi, ctx, runtime, "iteration budget exhausted", snapshot.mode === "iterations" ? "info" : "warning");
           return;
         }
 
@@ -1132,10 +1124,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (decision.action === "stop") {
-        const overridePrompt = await getStopOverridePrompt(pi, ctx, snapshot, gitSnapshot, verifyResult);
+        const overridePrompt = await getStopOverridePrompt(pi, ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
         if (overridePrompt) {
           if (snapshot.currentIteration >= snapshot.maxIterations) {
-            disableSnapshot(pi, ctx, runtime, `iteration budget exhausted before finalization: ${decision.reason}`, "warning");
+            pauseSnapshot(pi, ctx, runtime, `iteration budget exhausted before verified completion: ${decision.reason}`, "warning");
             return;
           }
 

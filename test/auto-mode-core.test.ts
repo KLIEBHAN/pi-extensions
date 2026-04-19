@@ -1,15 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  AUTO_MODE_STATE_TYPE,
+  buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
   buildAutoWorkerSystemPrompt,
   buildResumePrompt,
   buildStartPrompt,
   decideAutoModeSessionStart,
   DEFAULT_AUTO_ITERATIONS,
-  extractLatestAutoModeState,
-  AUTO_MODE_STATE_TYPE,
   DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS,
+  evaluateAutoStopGuard,
+  extractLatestAutoModeState,
+  hasConcreteVerificationEvidence,
   looksLikeCompletionClaim,
   normalizeComparableText,
   parseAutoCommandArgs,
@@ -328,6 +331,141 @@ test("buildAutoWorkerSystemPrompt keeps only required rules and metadata", () =>
   assert.doesNotMatch(prompt, /one local improvement is done/i);
   assert.doesNotMatch(prompt, /Iteration:/);
   assert.doesNotMatch(prompt, /Mode:/);
+});
+
+test("buildAutoControllerSystemPrompt strongly biases against premature stopping", () => {
+  const prompt = buildAutoControllerSystemPrompt();
+
+  assert.match(prompt, /^You are the controller for an autonomous coding loop\./);
+  assert.match(prompt, /Default to continue, not stop\./);
+  assert.match(prompt, /Never treat a worker completion claim by itself as proof that the goal is done\./);
+  assert.match(prompt, /When in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step\./);
+  assert.match(prompt, /Use stop only when goalStatus=met\./);
+  assert.match(prompt, /If a quality goal exists, use stop only when it is met too\./);
+  assert.match(prompt, /Use stop only when completion is supported by concrete verification evidence/);
+  assert.match(prompt, /If verification is failing or still missing, the task is not complete\./);
+  assert.match(prompt, /If final commit\/push expectations are still unmet in a git repo, the task is not complete\./);
+  assert.match(prompt, /If the next prompt would be nearly identical to the previous one, make it materially more specific or prefer pause over repetition\./);
+});
+
+
+test("hasConcreteVerificationEvidence requires real validation signals", () => {
+  assert.equal(hasConcreteVerificationEvidence("Ran npm test, all tests pass, and verified the fix manually."), true);
+  assert.equal(hasConcreteVerificationEvidence("Verified with npm test, but tests failed."), false);
+  assert.equal(hasConcreteVerificationEvidence("Implemented the fix and updated the docs."), false);
+  assert.equal(hasConcreteVerificationEvidence("Added regression tests but did not run them yet."), false);
+});
+
+
+test("evaluateAutoStopGuard blocks stop until goal and quality goal are actually met", () => {
+  assert.deepEqual(
+    evaluateAutoStopGuard({
+      goalStatus: "likely_met",
+      requiresQualityGoal: true,
+      qualityGoalMet: false,
+      verifyCommandConfigured: true,
+      verifyCommandPassed: true,
+      workerAssistantText: "Ran npm test and all tests pass.",
+      commitPolicy: "none",
+      pushPolicy: "never",
+    }),
+    {
+      allowed: false,
+      blockers: ["goal-not-met", "quality-goal-not-met"],
+    },
+  );
+});
+
+
+test("evaluateAutoStopGuard blocks stop when verification evidence is still missing", () => {
+  assert.deepEqual(
+    evaluateAutoStopGuard({
+      goalStatus: "met",
+      requiresQualityGoal: false,
+      qualityGoalMet: true,
+      verifyCommandConfigured: false,
+      verifyCommandPassed: false,
+      workerAssistantText: "Implemented the fix and cleaned up the code.",
+      commitPolicy: "none",
+      pushPolicy: "never",
+    }),
+    {
+      allowed: false,
+      blockers: ["verification-missing"],
+    },
+  );
+});
+
+
+test("evaluateAutoStopGuard blocks stop when the configured verification command has not passed", () => {
+  assert.deepEqual(
+    evaluateAutoStopGuard({
+      goalStatus: "met",
+      requiresQualityGoal: false,
+      qualityGoalMet: true,
+      verifyCommandConfigured: true,
+      verifyCommandPassed: false,
+      workerAssistantText: "Implemented the fix and believe it is done.",
+      commitPolicy: "none",
+      pushPolicy: "never",
+    }),
+    {
+      allowed: false,
+      blockers: ["verification-failed"],
+    },
+  );
+});
+
+
+test("evaluateAutoStopGuard blocks stop until commit and push expectations are satisfied", () => {
+  assert.deepEqual(
+    evaluateAutoStopGuard({
+      goalStatus: "met",
+      requiresQualityGoal: false,
+      qualityGoalMet: true,
+      verifyCommandConfigured: true,
+      verifyCommandPassed: true,
+      workerAssistantText: "Ran npm test and all tests pass.",
+      commitPolicy: "final-or-milestone",
+      pushPolicy: "final-or-milestone-if-upstream",
+      git: {
+        dirty: true,
+        hasUpstream: true,
+        ahead: 2,
+        behind: 1,
+      },
+    }),
+    {
+      allowed: false,
+      blockers: ["commit-required", "push-required", "sync-required"],
+    },
+  );
+});
+
+
+test("evaluateAutoStopGuard allows stop only after verified completion and clean git finalization", () => {
+  assert.deepEqual(
+    evaluateAutoStopGuard({
+      goalStatus: "met",
+      requiresQualityGoal: true,
+      qualityGoalMet: true,
+      verifyCommandConfigured: false,
+      verifyCommandPassed: false,
+      workerAssistantText: "Verified the fix manually, ran the relevant checks, and all tests pass.",
+      commitPolicy: "final-or-milestone",
+      pushPolicy: "if-upstream",
+      git: {
+        dirty: false,
+        hasUpstream: true,
+        ahead: 0,
+        behind: 0,
+      },
+    }),
+    {
+      allowed: true,
+      blockers: [],
+    },
+  );
 });
 
 test("buildAutoWorkerSystemPrompt still requires verification without an explicit command", () => {
