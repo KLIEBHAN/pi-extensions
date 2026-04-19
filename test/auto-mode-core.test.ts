@@ -4,12 +4,14 @@ import {
   AUTO_MODE_STATE_TYPE,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
+  buildAutoStopOverrideDecision,
   buildAutoWorkerSystemPrompt,
   buildResumePrompt,
   buildStartPrompt,
   decideAutoModeSessionStart,
   DEFAULT_AUTO_ITERATIONS,
   DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS,
+  DEFAULT_STAGNATION_LIMIT,
   evaluateAutoStopGuard,
   extractLatestAutoModeState,
   hasConcreteVerificationEvidence,
@@ -18,6 +20,7 @@ import {
   parseAutoCommandArgs,
   parseControllerDecision,
   parseModelRef,
+  planAutoFollowUp,
   parsePositiveInteger,
   shouldAutoResumeOnSessionStart,
   shouldPreRunVerifyCommand,
@@ -466,6 +469,132 @@ test("evaluateAutoStopGuard allows stop only after verified completion and clean
       blockers: [],
     },
   );
+});
+
+test("buildAutoStopOverrideDecision converts blocked stop into a concrete continue decision", () => {
+  const override = buildAutoStopOverrideDecision({
+    decision: {
+      action: "stop",
+      reason: "Everything appears done",
+      updatedSummary: "Core work is implemented.",
+      goalStatus: "met",
+      qualityGoalMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done.",
+    },
+    stopGuard: {
+      allowed: false,
+      blockers: ["verification-missing", "commit-required"],
+    },
+  });
+
+  assert.ok(override);
+  assert.equal(override?.action, "continue");
+  assert.match(override?.reason ?? "", /Stop overridden:/);
+  assert.match(override?.reason ?? "", /verification evidence is still missing/);
+  assert.match(override?.reason ?? "", /a final commit is still required/);
+  assert.match(override?.updatedSummary ?? "", /Stop overridden\./);
+  assert.match(override?.updatedSummary ?? "", /Previous stop reason: Everything appears done\./);
+  assert.match(override?.nextPrompt ?? "", /Run the most relevant available verification/);
+  assert.match(override?.nextPrompt ?? "", /Create an atomic commit/);
+  assert.equal(override?.goalStatus, "likely_met");
+  assert.equal(override?.progressPercent, 99);
+});
+
+test("buildAutoStopOverrideDecision returns undefined when stop is actually allowed", () => {
+  assert.equal(
+    buildAutoStopOverrideDecision({
+      decision: {
+        action: "stop",
+        reason: "Verified completion",
+        updatedSummary: "Goal is complete and checks passed.",
+        goalStatus: "met",
+        qualityGoalMet: true,
+        progressPercent: 100,
+        commitRecommendation: "finalize",
+      },
+      stopGuard: {
+        allowed: true,
+        blockers: [],
+      },
+    }),
+    undefined,
+  );
+});
+
+test("planAutoFollowUp sends a concrete finalization pass when the prompt is new", () => {
+  const plan = planAutoFollowUp({
+    nextPrompt: "Run npm test, create the final commit, and push if upstream is configured.",
+    currentIteration: 4,
+    maxIterations: 8,
+    lastAutoPrompt: "Inspect the regression test coverage and fill any remaining gaps.",
+    consecutiveStagnationCount: 1,
+    consecutiveNoChangeCount: 0,
+    budgetPauseReason: "iteration budget exhausted before verified completion",
+  });
+
+  assert.deepEqual(plan, {
+    action: "send",
+    nextPrompt: "Run npm test, create the final commit, and push if upstream is configured.",
+    nextIteration: 5,
+    nextStagnationCount: 0,
+  });
+});
+
+test("planAutoFollowUp pauses repeated finalization prompts instead of looping", () => {
+  const repeatedPrompt = "Run npm test, create the final commit, and push if upstream is configured.";
+  const plan = planAutoFollowUp({
+    nextPrompt: repeatedPrompt,
+    currentIteration: 4,
+    maxIterations: 8,
+    lastAutoPrompt: repeatedPrompt,
+    consecutiveStagnationCount: DEFAULT_STAGNATION_LIMIT - 1,
+    consecutiveNoChangeCount: 0,
+    budgetPauseReason: "iteration budget exhausted before verified completion",
+  });
+
+  assert.deepEqual(plan, {
+    action: "pause",
+    reason: "controller produced the same next prompt repeatedly",
+    nextStagnationCount: DEFAULT_STAGNATION_LIMIT,
+  });
+});
+
+test("planAutoFollowUp pauses unverified finalization at the iteration budget", () => {
+  const plan = planAutoFollowUp({
+    nextPrompt: "Run npm test before concluding.",
+    currentIteration: 8,
+    maxIterations: 8,
+    lastAutoPrompt: "Create the final commit.",
+    consecutiveStagnationCount: 2,
+    consecutiveNoChangeCount: 0,
+    budgetPauseReason: "iteration budget exhausted before verified completion: Everything appears done",
+  });
+
+  assert.deepEqual(plan, {
+    action: "pause",
+    reason: "iteration budget exhausted before verified completion: Everything appears done",
+    nextStagnationCount: 2,
+  });
+});
+
+test("planAutoFollowUp pauses finalization when the repository is not changing", () => {
+  const plan = planAutoFollowUp({
+    nextPrompt: "Create the final commit and verify git status is clean.",
+    currentIteration: 5,
+    maxIterations: 8,
+    lastAutoPrompt: "Run npm test before concluding.",
+    consecutiveStagnationCount: 0,
+    consecutiveNoChangeCount: 3,
+    budgetPauseReason: "iteration budget exhausted before verified completion",
+  });
+
+  assert.deepEqual(plan, {
+    action: "pause",
+    reason: "repository state has not changed across several iterations",
+    nextStagnationCount: 0,
+  });
 });
 
 test("buildAutoWorkerSystemPrompt still requires verification without an explicit command", () => {

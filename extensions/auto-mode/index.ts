@@ -5,6 +5,7 @@ import {
   AUTO_MODE_STATE_TYPE,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
+  buildAutoStopOverrideDecision,
   buildAutoWorkerSystemPrompt,
   buildLatestAssistantMessageContext,
   buildLatestUserMessageContext,
@@ -17,17 +18,15 @@ import {
   DEFAULT_CONTROLLER_MODEL,
   DEFAULT_DECISION_HISTORY_LIMIT,
   DEFAULT_MAX_WALL_CLOCK_MINUTES,
-  DEFAULT_NO_CHANGE_LIMIT,
-  DEFAULT_STAGNATION_LIMIT,
   DEFAULT_STATUS_GOAL_MAX_CHARS,
   DEFAULT_WORKER_FAILURE_LIMIT,
   evaluateAutoStopGuard,
   extractLatestAutoModeState,
   extractMessageText,
-  normalizeComparableText,
   parseAutoCommandArgs,
   parseControllerDecision,
   parseModelRef,
+  planAutoFollowUp,
   shouldAutoResumeOnSessionStart,
   shouldPreRunVerifyCommand,
   summarizeGoal,
@@ -532,14 +531,6 @@ function updateNoChangeCounters(snapshot: AutoModeStateV1, gitSnapshot: GitSnaps
   snapshot.lastSeenChangedFiles = [...nextFiles];
 }
 
-function updateStagnationCounter(snapshot: AutoModeStateV1, nextPrompt: string): void {
-  if (snapshot.lastAutoPrompt && normalizeComparableText(snapshot.lastAutoPrompt) === normalizeComparableText(nextPrompt)) {
-    snapshot.consecutiveStagnationCount += 1;
-  } else {
-    snapshot.consecutiveStagnationCount = 0;
-  }
-}
-
 function recordControllerDecision(snapshot: AutoModeStateV1, decision: ControllerDecision): void {
   snapshot.lastControllerAt = now();
   snapshot.controllerSummary = truncateControllerSummary(decision.updatedSummary);
@@ -577,7 +568,7 @@ function augmentContinuePrompt(
   return `${decision.nextPrompt}\n\n${additions.join(" ")}`;
 }
 
-async function getStopOverridePrompt(
+async function getStopOverrideDecision(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   snapshot: AutoModeStateV1,
@@ -585,7 +576,7 @@ async function getStopOverridePrompt(
   workerTurn: WorkerTurnSnapshot,
   gitSnapshot: GitSnapshot | undefined,
   verifyResult?: VerifyCommandResult,
-): Promise<string | undefined> {
+): Promise<ContinueDecision | undefined> {
   const resolvedVerifyResult = verifyResult ?? (
     snapshot.verifyCommand
       ? await runVerifyCommand(pi, ctx.cwd, snapshot.verifyCommand)
@@ -610,37 +601,50 @@ async function getStopOverridePrompt(
       : undefined,
   });
 
-  if (stopGuard.allowed) {
-    return undefined;
+  return buildAutoStopOverrideDecision({
+    decision,
+    stopGuard,
+    verifyCommand: snapshot.verifyCommand,
+  });
+}
+
+function queueContinueLikeFollowUp(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV1,
+  decision: ContinueDecision,
+  options: {
+    budgetPauseReason: string;
+    notifyMessage: string;
+    notifyLevel?: "info" | "warning";
+  },
+): void {
+  const followUpPlan = planAutoFollowUp({
+    nextPrompt: decision.nextPrompt,
+    currentIteration: snapshot.currentIteration,
+    maxIterations: snapshot.maxIterations,
+    lastAutoPrompt: snapshot.lastAutoPrompt,
+    consecutiveStagnationCount: snapshot.consecutiveStagnationCount,
+    consecutiveNoChangeCount: snapshot.consecutiveNoChangeCount,
+    budgetPauseReason: options.budgetPauseReason,
+  });
+
+  snapshot.consecutiveStagnationCount = followUpPlan.nextStagnationCount;
+  if (snapshot.currentIteration < snapshot.maxIterations) {
+    snapshot.lastAutoPrompt = decision.nextPrompt;
   }
 
-  if (stopGuard.blockers.includes("goal-not-met")) {
-    return "Do not conclude yet. The active goal is not yet verified as fully met. Inspect the current repository state, identify the highest-value remaining gap, close it, and verify the result before considering completion. Do not ask the user anything.";
+  if (followUpPlan.action === "pause") {
+    pauseSnapshot(pi, ctx, runtime, followUpPlan.reason, options.notifyLevel ?? "warning");
+    return;
   }
 
-  if (stopGuard.blockers.includes("quality-goal-not-met")) {
-    return "Do not conclude yet. The quality goal is not yet verified as met. Focus on the remaining quality gap, run the most relevant verification for it, and only then consider the task complete. Do not ask the user anything.";
-  }
-
-  if (stopGuard.blockers.includes("verification-failed")) {
-    return `Do not conclude yet. The configured verification command failed (${snapshot.verifyCommand}). Fix the remaining issues, rerun the verification command until it passes, and only then consider the task complete. Do not ask the user anything.`;
-  }
-
-  const actions: string[] = [];
-  if (stopGuard.blockers.includes("verification-missing")) {
-    actions.push("Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete.");
-  }
-  if (stopGuard.blockers.includes("commit-required")) {
-    actions.push("Create an atomic commit for the completed work.");
-  }
-  if (stopGuard.blockers.includes("push-required")) {
-    actions.push("Push the current branch so it is in sync with upstream.");
-  }
-  if (stopGuard.blockers.includes("sync-required")) {
-    actions.push("Bring the branch back in sync with upstream before stopping.");
-  }
-
-  return `${actions.join(" ")} Do not ask the user anything.`;
+  snapshot.currentIteration = followUpPlan.nextIteration;
+  persistSnapshot(pi, snapshot);
+  setStatus(ctx, snapshot);
+  ctx.ui.notify(options.notifyMessage, options.notifyLevel ?? "info");
+  pi.sendUserMessage(followUpPlan.nextPrompt);
 }
 
 function getLastAssistantTurn(event: { messages?: unknown[] }): WorkerTurnSnapshot | undefined {
@@ -1087,33 +1091,19 @@ export default function (pi: ExtensionAPI) {
       }
 
       snapshot.consecutiveControllerFailures = 0;
-      recordControllerDecision(snapshot, decision);
 
       if (decision.action === "continue") {
-        if (snapshot.currentIteration >= snapshot.maxIterations) {
-          pauseSnapshot(pi, ctx, runtime, "iteration budget exhausted", snapshot.mode === "iterations" ? "info" : "warning");
-          return;
-        }
-
         const nextPrompt = augmentContinuePrompt(decision, snapshot, gitSnapshot);
-        updateStagnationCounter(snapshot, nextPrompt);
-        snapshot.lastAutoPrompt = nextPrompt;
-
-        if (snapshot.consecutiveStagnationCount >= DEFAULT_STAGNATION_LIMIT) {
-          pauseSnapshot(pi, ctx, runtime, "controller produced the same next prompt repeatedly");
-          return;
-        }
-
-        if (snapshot.consecutiveNoChangeCount >= DEFAULT_NO_CHANGE_LIMIT) {
-          pauseSnapshot(pi, ctx, runtime, "repository state has not changed across several iterations");
-          return;
-        }
-
-        snapshot.currentIteration += 1;
-        persistSnapshot(pi, snapshot);
-        setStatus(ctx, snapshot);
-        ctx.ui.notify(`Auto-mode continuing (${snapshot.currentIteration}/${snapshot.maxIterations})`, "info");
-        pi.sendUserMessage(nextPrompt);
+        const effectiveDecision: ContinueDecision = {
+          ...decision,
+          nextPrompt,
+        };
+        recordControllerDecision(snapshot, effectiveDecision);
+        queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveDecision, {
+          budgetPauseReason: "iteration budget exhausted",
+          notifyMessage: `Auto-mode continuing (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
+          notifyLevel: "info",
+        });
         return;
       }
 
@@ -1124,22 +1114,18 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (decision.action === "stop") {
-        const overridePrompt = await getStopOverridePrompt(pi, ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
-        if (overridePrompt) {
-          if (snapshot.currentIteration >= snapshot.maxIterations) {
-            pauseSnapshot(pi, ctx, runtime, `iteration budget exhausted before verified completion: ${decision.reason}`, "warning");
-            return;
-          }
-
-          snapshot.lastAutoPrompt = overridePrompt;
-          snapshot.currentIteration += 1;
-          persistSnapshot(pi, snapshot);
-          setStatus(ctx, snapshot);
-          ctx.ui.notify(`Auto-mode finalization pass requested: ${decision.reason}`, "warning");
-          pi.sendUserMessage(overridePrompt);
+        const overrideDecision = await getStopOverrideDecision(pi, ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
+        if (overrideDecision) {
+          recordControllerDecision(snapshot, overrideDecision);
+          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, overrideDecision, {
+            budgetPauseReason: `iteration budget exhausted before verified completion: ${decision.reason}`,
+            notifyMessage: `Auto-mode finalization pass requested: ${overrideDecision.reason}`,
+            notifyLevel: "warning",
+          });
           return;
         }
 
+        recordControllerDecision(snapshot, decision);
         persistSnapshot(pi, snapshot);
         disableSnapshot(pi, ctx, runtime, decision.finalMessage || decision.reason, decision.qualityGoalMet ? "info" : "warning");
       }

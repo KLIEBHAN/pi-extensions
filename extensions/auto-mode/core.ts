@@ -82,6 +82,39 @@ export interface AutoStopGuardResult {
   blockers: AutoStopBlocker[];
 }
 
+export interface AutoFollowUpPlanInput {
+  nextPrompt: string;
+  currentIteration: number;
+  maxIterations: number;
+  lastAutoPrompt?: string;
+  consecutiveStagnationCount: number;
+  consecutiveNoChangeCount: number;
+  budgetPauseReason: string;
+  stagnationPauseReason?: string;
+  noChangePauseReason?: string;
+  stagnationLimit?: number;
+  noChangeLimit?: number;
+}
+
+export type AutoFollowUpPlan =
+  | {
+      action: "send";
+      nextPrompt: string;
+      nextIteration: number;
+      nextStagnationCount: number;
+    }
+  | {
+      action: "pause";
+      reason: string;
+      nextStagnationCount: number;
+    };
+
+export interface AutoStopOverrideDecisionInput {
+  decision: StopDecision;
+  stopGuard: AutoStopGuardResult;
+  verifyCommand?: string;
+}
+
 export interface AutoDecisionLogEntry {
   iteration: number;
   action: ControllerAction;
@@ -567,6 +600,123 @@ export function evaluateAutoStopGuard(input: AutoStopGuardInput): AutoStopGuardR
   return {
     allowed: blockers.length === 0,
     blockers,
+  };
+}
+
+function describeStopBlocker(blocker: AutoStopBlocker, verifyCommand: string | undefined): string {
+  switch (blocker) {
+    case "goal-not-met":
+      return "the active goal is not yet verified as met";
+    case "quality-goal-not-met":
+      return "the quality goal is not yet verified as met";
+    case "verification-missing":
+      return "verification evidence is still missing";
+    case "verification-failed":
+      return verifyCommand
+        ? `the verification command is still failing (${verifyCommand})`
+        : "verification is still failing";
+    case "commit-required":
+      return "a final commit is still required";
+    case "push-required":
+      return "a push to upstream is still required";
+    case "sync-required":
+      return "the branch is not yet synchronized with upstream";
+  }
+}
+
+function buildStopOverridePrompt(blockers: AutoStopBlocker[], verifyCommand: string | undefined): string {
+  if (blockers.includes("goal-not-met")) {
+    return "Do not conclude yet. The active goal is not yet verified as fully met. Inspect the current repository state, identify the highest-value remaining gap, close it, and verify the result before considering completion. Do not ask the user anything.";
+  }
+
+  if (blockers.includes("quality-goal-not-met")) {
+    return "Do not conclude yet. The quality goal is not yet verified as met. Focus on the remaining quality gap, run the most relevant verification for it, and only then consider the task complete. Do not ask the user anything.";
+  }
+
+  if (blockers.includes("verification-failed")) {
+    return verifyCommand
+      ? `Do not conclude yet. The configured verification command failed (${verifyCommand}). Fix the remaining issues, rerun the verification command until it passes, and only then consider the task complete. Do not ask the user anything.`
+      : "Do not conclude yet. Verification is still failing. Fix the remaining issues, rerun the relevant verification until it passes, and only then consider the task complete. Do not ask the user anything.";
+  }
+
+  const actions: string[] = [];
+  if (blockers.includes("verification-missing")) {
+    actions.push("Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete.");
+  }
+  if (blockers.includes("commit-required")) {
+    actions.push("Create an atomic commit for the completed work.");
+  }
+  if (blockers.includes("push-required")) {
+    actions.push("Push the current branch so it is in sync with upstream.");
+  }
+  if (blockers.includes("sync-required")) {
+    actions.push("Bring the branch back in sync with upstream before stopping.");
+  }
+
+  return `${actions.join(" ")} Do not ask the user anything.`;
+}
+
+export function buildAutoStopOverrideDecision(input: AutoStopOverrideDecisionInput): ContinueDecision | undefined {
+  if (input.stopGuard.allowed) {
+    return undefined;
+  }
+
+  const blockerSummary = input.stopGuard.blockers.map((blocker) => describeStopBlocker(blocker, input.verifyCommand)).join("; ");
+  const hasGoalGap = input.stopGuard.blockers.includes("goal-not-met") || input.stopGuard.blockers.includes("quality-goal-not-met");
+  const hasFinalizationOnlyBlockers = input.stopGuard.blockers.every(
+    (blocker) => blocker === "verification-missing" || blocker === "commit-required" || blocker === "push-required" || blocker === "sync-required",
+  );
+
+  return {
+    action: "continue",
+    reason: `Stop overridden: ${blockerSummary}.`,
+    updatedSummary: truncateControllerSummary(
+      `Stop overridden. Remaining blockers: ${blockerSummary}. Previous stop reason: ${input.decision.reason}. ${input.decision.updatedSummary}`,
+    ),
+    goalStatus: hasGoalGap ? "in_progress" : hasFinalizationOnlyBlockers ? "likely_met" : input.decision.goalStatus,
+    qualityGoalMet: input.stopGuard.blockers.includes("quality-goal-not-met") ? false : input.decision.qualityGoalMet,
+    progressPercent: Math.min(input.decision.progressPercent, hasGoalGap ? 95 : 99),
+    commitRecommendation: input.stopGuard.blockers.includes("commit-required") || input.stopGuard.blockers.includes("push-required") || input.stopGuard.blockers.includes("sync-required")
+      ? "finalize"
+      : input.decision.commitRecommendation,
+    nextPrompt: buildStopOverridePrompt(input.stopGuard.blockers, input.verifyCommand),
+  };
+}
+
+export function planAutoFollowUp(input: AutoFollowUpPlanInput): AutoFollowUpPlan {
+  if (input.currentIteration >= input.maxIterations) {
+    return {
+      action: "pause",
+      reason: input.budgetPauseReason,
+      nextStagnationCount: input.consecutiveStagnationCount,
+    };
+  }
+
+  const nextStagnationCount = input.lastAutoPrompt && normalizeComparableText(input.lastAutoPrompt) === normalizeComparableText(input.nextPrompt)
+    ? input.consecutiveStagnationCount + 1
+    : 0;
+
+  if (nextStagnationCount >= (input.stagnationLimit ?? DEFAULT_STAGNATION_LIMIT)) {
+    return {
+      action: "pause",
+      reason: input.stagnationPauseReason ?? "controller produced the same next prompt repeatedly",
+      nextStagnationCount,
+    };
+  }
+
+  if (input.consecutiveNoChangeCount >= (input.noChangeLimit ?? DEFAULT_NO_CHANGE_LIMIT)) {
+    return {
+      action: "pause",
+      reason: input.noChangePauseReason ?? "repository state has not changed across several iterations",
+      nextStagnationCount,
+    };
+  }
+
+  return {
+    action: "send",
+    nextPrompt: input.nextPrompt,
+    nextIteration: input.currentIteration + 1,
+    nextStagnationCount,
   };
 }
 
