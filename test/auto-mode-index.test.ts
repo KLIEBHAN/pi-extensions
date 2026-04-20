@@ -1812,6 +1812,132 @@ test("agent_end keeps repeated adjacent continuations stable across renewed comp
   assert.ok(harness.notifications.every((entry) => !entry.message.includes("Auto-mode stopped")));
 });
 
+test("agent_end increments adjacent continuation count across repeated continues and then stops at the limit", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+    "auto-iterations": "8",
+    "auto-completion-policy": "continue-similar",
+    "auto-max-adjacent-continuations": "2",
+  });
+  let adjacentDecisionCalls = 0;
+  const gitSnapshots = [
+    {
+      isGitRepo: true,
+      head: "head-adjacent-limit-1",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "clean-fingerprint-adjacent-limit-1",
+    },
+    {
+      isGitRepo: true,
+      head: "head-adjacent-limit-2",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "clean-fingerprint-adjacent-limit-2",
+    },
+    {
+      isGitRepo: true,
+      head: "head-adjacent-limit-3",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "clean-fingerprint-adjacent-limit-3",
+    },
+  ];
+  const stopDecisions = [
+    {
+      action: "stop",
+      reason: "Primary goal is verified complete",
+      updatedSummary: "The onboarding robustness goal is complete and verified.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done now.",
+    },
+    {
+      action: "stop",
+      reason: "Primary goal remains verified complete after one adjacent pass",
+      updatedSummary: "The onboarding robustness goal remains complete and verified after the first adjacent hardening step.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done now.",
+    },
+    {
+      action: "stop",
+      reason: "Primary goal remains verified complete after two adjacent passes",
+      updatedSummary: "The onboarding robustness goal remains complete and verified after the second adjacent hardening step.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done now.",
+    },
+  ];
+  const adjacentPrompts = [
+    "Add one adjacent regression test in the same onboarding flow and verify it passes.",
+    "Tighten one nearby onboarding error-path assertion and rerun that focused test.",
+  ];
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => gitSnapshots.shift() as never,
+    decideControllerAction: async () => stopDecisions.shift() as never,
+    getStopOverrideDecision: async () => undefined,
+    getAdjacentContinuationDecision: async () => {
+      adjacentDecisionCalls += 1;
+      return {
+        action: "continue",
+        reason: adjacentDecisionCalls === 1 ? "One adjacent hardening step remains" : "One more local onboarding hardening step remains",
+        updatedSummary: adjacentDecisionCalls === 1
+          ? "Primary goal complete; continuing with one adjacent regression-hardening step."
+          : "Primary goal complete; continuing with one more nearby onboarding hardening step.",
+        goalStatus: "met",
+        completionGateMet: true,
+        progressPercent: 100,
+        commitRecommendation: "milestone",
+        nextPrompt: adjacentPrompts[adjacentDecisionCalls - 1]!,
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "Primary goal is verified complete.", stopReason: "stop" }],
+  }, harness.ctx);
+  let latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.adjacentContinuationCount, 1);
+  assert.equal(harness.sentMessages.at(-1)?.text, adjacentPrompts[0]);
+
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "The first adjacent regression test also passes.", stopReason: "stop" }],
+  }, harness.ctx);
+  latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.adjacentContinuationCount, 2);
+  assert.equal(harness.sentMessages.at(-1)?.text, adjacentPrompts[1]);
+
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "The second adjacent hardening step also passes.", stopReason: "stop" }],
+  }, harness.ctx);
+
+  latestState = getLatestAutoState(harness.entries);
+  assert.equal(adjacentDecisionCalls, 2);
+  assert.equal(latestState?.enabled, false);
+  assert.equal(latestState?.adjacentContinuationCount, 2);
+  assert.equal(harness.sentMessages.filter((entry) => adjacentPrompts.includes(entry.text)).length, 2);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode stopped: Done now.")));
+});
+
 test("agent_end stops after the configured adjacent continuation limit is reached", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({
