@@ -65,6 +65,20 @@ test("renderMiniTemplate prefers explicit variables over fallback values", () =>
   );
 });
 
+test("renderMiniTemplate leaves escaped placeholders literal", () => {
+  assert.equal(
+    renderMiniTemplate("Hello \\{{NAME}} and \\{{CITY|Berlin}}", { NAME: "World", CITY: "Paris" }),
+    "Hello {{NAME}} and {{CITY|Berlin}}",
+  );
+});
+
+test("renderMiniTemplate does not treat escaped placeholders as missing variables", () => {
+  assert.equal(
+    renderMiniTemplate("Hello \\{{MISSING}}", {}),
+    "Hello {{MISSING}}",
+  );
+});
+
 test("renderMiniTemplate throws when a placeholder variable is missing and no fallback exists", () => {
   assert.throws(
     () => renderMiniTemplate("Hello {{NAME}} {{MISSING}}", { NAME: "World" }),

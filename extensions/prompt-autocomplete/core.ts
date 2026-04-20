@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
-const TEMPLATE_VARIABLE_PATTERN = /\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
+const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
+const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
 const PROMPT_AUTOCOMPLETE_RESPONSE_KEY = "completions";
 
 export function normalizeTemplateText(template: string): string {
@@ -33,7 +34,7 @@ export function renderMiniTemplate(template: string, variables: Record<string, s
     throw new Error(`Missing template variable(s): ${[...missingVariables].sort().join(", ")}`);
   }
 
-  return rendered;
+  return rendered.replace(ESCAPED_TEMPLATE_VARIABLE_PATTERN, "$1");
 }
 
 export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES = {
