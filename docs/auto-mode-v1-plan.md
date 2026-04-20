@@ -144,7 +144,7 @@ When auto-mode is active and not paused:
 - proactive verify-command preflight when the worker appears to claim completion or iteration budget is exhausted
 - controller failures in a row: 2 → pause
 - worker failures in a row: 2 → pause
-- repeated identical next prompts: 3 → pause
+- repeated identical continue prompts get one targeted controller-refinement attempt; persistent repeats: 3 → pause
 - unchanged git snapshot across iterations: 3 → pause
 - max probes per controller cycle: 1
 

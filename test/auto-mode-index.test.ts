@@ -229,6 +229,74 @@ test("agent_end no-change heuristic does not treat changed diffs in the same fil
   assert.equal(harness.sentMessages.at(-1)?.text, "Refine the second gap in the same file and verify it.");
 });
 
+test("agent_end refines a repeated continue prompt before sending it again", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const repeatedPrompt = "improve onboarding robustness";
+  let repetitionRefinementCalls = 0;
+  const harness = createHarness({
+    "auto-goal": repeatedPrompt,
+    "auto-iterations": "6",
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-repeat",
+      status: "## main\n M src/onboarding.ts",
+      changedFiles: ["src/onboarding.ts"],
+      dirty: true,
+      hasUpstream: false,
+      repoFingerprint: "repeat-fingerprint",
+    }),
+    decideControllerAction: async () => ({
+      action: "continue",
+      reason: "A concrete onboarding follow-up remains",
+      updatedSummary: "The onboarding work still needs one more direct step.",
+      goalStatus: "in_progress",
+      completionGateMet: false,
+      progressPercent: 35,
+      commitRecommendation: "none",
+      nextPrompt: repeatedPrompt,
+    }),
+    getContinueRepetitionDecision: async (_ctx, _snapshot, decision) => {
+      repetitionRefinementCalls += 1;
+      assert.equal(decision.nextPrompt, repeatedPrompt);
+      return {
+        action: "continue",
+        reason: "Make the follow-up materially more specific",
+        updatedSummary: "The loop should target one concrete onboarding regression gap instead of repeating the generic goal.",
+        goalStatus: "in_progress",
+        completionGateMet: false,
+        progressPercent: 35,
+        commitRecommendation: "none",
+        nextPrompt: "Inspect src/onboarding.ts for the remaining validation gap, add one focused regression test, and run that targeted test before continuing.",
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "The onboarding flow is better, but I still need one concrete verification step.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(repetitionRefinementCalls, 1);
+  assert.equal(latestState?.paused, false);
+  assert.equal(latestState?.currentIteration, 2);
+  assert.match(String(latestState?.controllerSummary ?? ""), /Controller repetition refinement:/);
+  assert.equal(
+    harness.sentMessages.at(-1)?.text,
+    "Inspect src/onboarding.ts for the remaining validation gap, add one focused regression test, and run that targeted test before continuing.",
+  );
+});
+
 test("agent_end does not auto-enter adjacent phase on a normal continue even when the primary goal is already met", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({

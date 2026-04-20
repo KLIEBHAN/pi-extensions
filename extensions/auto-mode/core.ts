@@ -124,6 +124,13 @@ export interface AutoStopOverrideRefinementInput {
 
 export type AutoStopOverrideFollowUpDecision = ContinueDecision | PauseDecision;
 
+export interface AutoContinueRepetitionRefinementInput {
+  repeatedDecision: ContinueDecision;
+  controllerDecision?: ControllerDecision;
+}
+
+export type AutoContinueRepetitionFollowUpDecision = ContinueDecision | PauseDecision;
+
 export interface AutoContinueProgressInput {
   completionPolicy: CompletionPolicy;
   phase: AutoPhase;
@@ -463,6 +470,11 @@ export function normalizeComparableText(text: string): string {
     .replace(/\s+/g, " ");
 }
 
+export function areAutoPromptsEquivalent(previousPrompt: string | undefined, nextPrompt: string | undefined): boolean {
+  if (!previousPrompt || !nextPrompt) return false;
+  return normalizeComparableText(previousPrompt) === normalizeComparableText(nextPrompt);
+}
+
 export function looksLikeCompletionClaim(text: string): boolean {
   const normalized = normalizeComparableText(text);
   if (!normalized) return false;
@@ -640,6 +652,39 @@ export function buildAutoControllerStopOverrideSystemPrompt(): string {
     '  "reason":"...",',
     '  "updatedSummary":"...",',
     '  "goalStatus":"in_progress|likely_met|blocked|stalled",',
+    '  "completionGateMet":true,',
+    '  "progressPercent":0,',
+    '  "commitRecommendation":"none|milestone|finalize",',
+    '  "nextPrompt":"..."',
+    "}",
+  ].join("\n");
+}
+
+export function buildAutoControllerContinueRepetitionSystemPrompt(): string {
+  return [
+    "You are revising a repeated continue decision in an autonomous coding loop.",
+    "",
+    "A proposed continue prompt is too similar to the previous auto prompt already sent to the worker.",
+    "",
+    "Output requirements:",
+    "- Return ONLY valid JSON.",
+    "- Use exactly one of these actions: continue, pause.",
+    "- Do NOT use stop or probe.",
+    "- If action=continue, include nextPrompt with the single best next step.",
+    "- Keep reason and updatedSummary concise but specific.",
+    "",
+    "Decision policy:",
+    "- Prefer continue when you can make the nextPrompt materially more specific than both the previous prompt and the proposed repeated prompt.",
+    "- Use the goal, controller summary, worker result, and repository evidence to name the exact inspection, implementation, verification, or finalization step.",
+    "- If the best next step would still be nearly identical to the previous or proposed prompt, prefer pause over repetition.",
+    "- Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary. If essential external input is genuinely missing, prefer pause over asking the user.",
+    "",
+    "JSON shape:",
+    "{",
+    '  "action":"continue|pause",',
+    '  "reason":"...",',
+    '  "updatedSummary":"...",',
+    '  "goalStatus":"in_progress|likely_met|met|blocked|stalled",',
     '  "completionGateMet":true,',
     '  "progressPercent":0,',
     '  "commitRecommendation":"none|milestone|finalize",',
@@ -846,6 +891,46 @@ export function applyControllerStopOverrideRefinement(input: AutoStopOverrideRef
   };
 }
 
+export function applyControllerContinueRepetitionRefinement(
+  input: AutoContinueRepetitionRefinementInput,
+): AutoContinueRepetitionFollowUpDecision {
+  const decision = input.controllerDecision;
+  if (!decision) {
+    return input.repeatedDecision;
+  }
+
+  if (decision.action === "pause") {
+    return {
+      action: "pause",
+      reason: `${input.repeatedDecision.reason} Controller requested pause instead of another repeated continue prompt: ${decision.reason}`,
+      updatedSummary: truncateControllerSummary(
+        `${input.repeatedDecision.updatedSummary}\n\nController repetition refinement requested a pause: ${decision.updatedSummary}`,
+      ),
+      goalStatus: decision.goalStatus === "blocked" || decision.goalStatus === "stalled" ? decision.goalStatus : input.repeatedDecision.goalStatus,
+      completionGateMet: input.repeatedDecision.completionGateMet && decision.completionGateMet,
+      progressPercent: Math.min(input.repeatedDecision.progressPercent, decision.progressPercent),
+      commitRecommendation: input.repeatedDecision.commitRecommendation,
+    };
+  }
+
+  if (decision.action !== "continue") {
+    return input.repeatedDecision;
+  }
+
+  const nextPrompt = decision.nextPrompt.trim();
+  if (!nextPrompt) {
+    return input.repeatedDecision;
+  }
+
+  return {
+    ...input.repeatedDecision,
+    updatedSummary: truncateControllerSummary(
+      `${input.repeatedDecision.updatedSummary}\n\nController repetition refinement: ${decision.updatedSummary}`,
+    ),
+    nextPrompt,
+  };
+}
+
 export function shouldAttemptAutoAdjacentContinuation(input: {
   completionPolicy: CompletionPolicy;
   goalStatus: GoalStatus;
@@ -915,7 +1000,7 @@ export function planAutoFollowUp(input: AutoFollowUpPlanInput): AutoFollowUpPlan
     };
   }
 
-  const nextStagnationCount = input.lastAutoPrompt && normalizeComparableText(input.lastAutoPrompt) === normalizeComparableText(input.nextPrompt)
+  const nextStagnationCount = areAutoPromptsEquivalent(input.lastAutoPrompt, input.nextPrompt)
     ? input.consecutiveStagnationCount + 1
     : 0;
 

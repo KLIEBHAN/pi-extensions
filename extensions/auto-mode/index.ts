@@ -3,9 +3,12 @@ import { complete, type Api, type Model, type UserMessage } from "@mariozechner/
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
   appendDecisionHistory,
+  applyControllerContinueRepetitionRefinement,
   applyControllerStopOverrideRefinement,
+  areAutoPromptsEquivalent,
   AUTO_MODE_STATE_TYPE,
   buildAutoControllerAdjacentContinuationSystemPrompt,
+  buildAutoControllerContinueRepetitionSystemPrompt,
   buildAutoControllerStopOverrideSystemPrompt,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
@@ -53,6 +56,7 @@ const COMMAND_USAGE =
 const AUTO_CONTROLLER_SYSTEM_PROMPT = buildAutoControllerSystemPrompt();
 const AUTO_CONTROLLER_ADJACENT_CONTINUATION_SYSTEM_PROMPT = buildAutoControllerAdjacentContinuationSystemPrompt();
 const AUTO_CONTROLLER_STOP_OVERRIDE_SYSTEM_PROMPT = buildAutoControllerStopOverrideSystemPrompt();
+const AUTO_CONTROLLER_CONTINUE_REPETITION_SYSTEM_PROMPT = buildAutoControllerContinueRepetitionSystemPrompt();
 
 interface GitSnapshot {
   isGitRepo: boolean;
@@ -95,6 +99,7 @@ interface AutoModeDependencies {
   decideControllerAction?: typeof decideControllerAction;
   getStopOverrideDecision?: typeof getStopOverrideDecision;
   getAdjacentContinuationDecision?: typeof getAdjacentContinuationDecision;
+  getContinueRepetitionDecision?: typeof getContinueRepetitionDecision;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -653,6 +658,39 @@ function buildStopOverrideControllerUserPrompt(
   return sections.join("\n\n");
 }
 
+function buildContinueRepetitionControllerUserPrompt(
+  snapshot: AutoModeStateV1,
+  repeatedDecision: ContinueDecision,
+  workerTurn: WorkerTurnSnapshot,
+  gitSnapshot: GitSnapshot | undefined,
+  verifyResult: VerifyCommandResult | undefined,
+): string {
+  const remainingIterations = Math.max(0, snapshot.maxIterations - snapshot.currentIteration);
+  const sections = [
+    "A proposed continue decision would repeat the previous auto prompt.",
+    `Goal:\n${snapshot.goal}`,
+    snapshot.untilPrompt ? `Completion gate:\n${snapshot.untilPrompt}` : undefined,
+    [
+      `Mode: ${snapshot.mode}`,
+      `Completion policy: ${snapshot.completionPolicy}`,
+      `Phase: ${snapshot.phase}`,
+      `Current iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
+      `Remaining iterations after this turn: ${remainingIterations}`,
+    ].join("\n"),
+    `Previous auto prompt sent to the worker:\n${snapshot.lastAutoPrompt || "(none)"}`,
+    `Proposed repeated continue reason:\n${repeatedDecision.reason}`,
+    `Proposed repeated continue summary:\n${repeatedDecision.updatedSummary}`,
+    `Proposed repeated continue prompt:\n${repeatedDecision.nextPrompt}`,
+    `Current controller summary:\n${snapshot.controllerSummary || "(empty)"}`,
+    `Recent controller decisions:\n${buildControllerDecisionHistoryText(snapshot)}`,
+    `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
+    `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
+    verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
+  ].filter((value): value is string => !!value);
+
+  return sections.join("\n\n");
+}
+
 function buildAdjacentContinuationControllerUserPrompt(
   snapshot: AutoModeStateV1,
   verifiedStop: Extract<ControllerDecision, { action: "stop" }>,
@@ -699,6 +737,26 @@ async function getAdjacentContinuationDecision(
     buildAdjacentContinuationControllerUserPrompt(snapshot, decision, workerTurn, gitSnapshot, verifyResult),
   );
   if (!controllerDecision || controllerDecision.action === "probe") {
+    return undefined;
+  }
+  return controllerDecision;
+}
+
+async function getContinueRepetitionDecision(
+  ctx: ExtensionContext,
+  snapshot: AutoModeStateV1,
+  decision: ContinueDecision,
+  workerTurn: WorkerTurnSnapshot,
+  gitSnapshot: GitSnapshot | undefined,
+  verifyResult: VerifyCommandResult | undefined,
+): Promise<Exclude<ControllerDecision, Extract<ControllerDecision, { action: "stop" | "probe" }>> | undefined> {
+  const controllerDecision = await completeControllerDecision(
+    ctx,
+    snapshot,
+    AUTO_CONTROLLER_CONTINUE_REPETITION_SYSTEM_PROMPT,
+    buildContinueRepetitionControllerUserPrompt(snapshot, decision, workerTurn, gitSnapshot, verifyResult),
+  );
+  if (!controllerDecision || controllerDecision.action === "stop" || controllerDecision.action === "probe") {
     return undefined;
   }
   return controllerDecision;
@@ -756,6 +814,39 @@ async function getStopOverrideDecision(
   return applyControllerStopOverrideRefinement({
     fallbackDecision,
     controllerDecision: controllerRefinement,
+  });
+}
+
+async function resolveRepeatedContinueDecision(
+  ctx: ExtensionContext,
+  snapshot: AutoModeStateV1,
+  decision: ContinueDecision,
+  workerTurn: WorkerTurnSnapshot,
+  gitSnapshot: GitSnapshot | undefined,
+  verifyResult: VerifyCommandResult | undefined,
+  getContinueRepetitionDecisionImpl: typeof getContinueRepetitionDecision,
+): Promise<ContinueDecision | Exclude<ControllerDecision, Extract<ControllerDecision, { action: "continue" | "stop" | "probe" }>>> {
+  if (!areAutoPromptsEquivalent(snapshot.lastAutoPrompt, decision.nextPrompt)) {
+    return decision;
+  }
+
+  const controllerRefinement = await getContinueRepetitionDecisionImpl(
+    ctx,
+    snapshot,
+    decision,
+    workerTurn,
+    gitSnapshot,
+    verifyResult,
+  );
+
+  return applyControllerContinueRepetitionRefinement({
+    repeatedDecision: decision,
+    controllerDecision: controllerRefinement?.action === "continue"
+      ? {
+          ...controllerRefinement,
+          nextPrompt: augmentContinuePrompt(controllerRefinement, snapshot, gitSnapshot),
+        }
+      : controllerRefinement,
   });
 }
 
@@ -1021,6 +1112,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
     const decideControllerActionImpl = deps.decideControllerAction ?? decideControllerAction;
     const getStopOverrideDecisionImpl = deps.getStopOverrideDecision ?? getStopOverrideDecision;
     const getAdjacentContinuationDecisionImpl = deps.getAdjacentContinuationDecision ?? getAdjacentContinuationDecision;
+    const getContinueRepetitionDecisionImpl = deps.getContinueRepetitionDecision ?? getContinueRepetitionDecision;
 
   pi.registerFlag("auto-goal", {
     description: "Start auto-mode with the given goal",
@@ -1248,13 +1340,26 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
 
       if (decision.action === "continue") {
         const nextPrompt = augmentContinuePrompt(decision, snapshot, gitSnapshot);
-        const effectiveDecision: ContinueDecision = {
-          ...decision,
-          nextPrompt,
-        };
-        applyContinueDecisionProgress(snapshot, effectiveDecision, false);
-        recordControllerDecision(snapshot, effectiveDecision);
-        queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveDecision, {
+        const refinedDecision = await resolveRepeatedContinueDecision(
+          ctx,
+          snapshot,
+          {
+            ...decision,
+            nextPrompt,
+          },
+          workerTurn,
+          gitSnapshot,
+          verifyResult,
+          getContinueRepetitionDecisionImpl,
+        );
+        if (refinedDecision.action === "pause") {
+          recordControllerDecision(snapshot, refinedDecision);
+          pauseSnapshot(pi, ctx, runtime, refinedDecision.reason, "warning");
+          return;
+        }
+        applyContinueDecisionProgress(snapshot, refinedDecision, false);
+        recordControllerDecision(snapshot, refinedDecision);
+        queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, refinedDecision, {
           budgetPauseReason: "iteration budget exhausted",
           notifyMessage: `Auto-mode continuing (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
           notifyLevel: "info",
@@ -1277,15 +1382,28 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
             return;
           }
 
-          const effectiveOverrideDecision: ContinueDecision = {
-            ...overrideDecision,
-            nextPrompt: augmentContinuePrompt(overrideDecision, snapshot, gitSnapshot),
-          };
-          applyContinueDecisionProgress(snapshot, effectiveOverrideDecision, false);
-          recordControllerDecision(snapshot, effectiveOverrideDecision);
-          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveOverrideDecision, {
+          const refinedOverrideDecision = await resolveRepeatedContinueDecision(
+            ctx,
+            snapshot,
+            {
+              ...overrideDecision,
+              nextPrompt: augmentContinuePrompt(overrideDecision, snapshot, gitSnapshot),
+            },
+            workerTurn,
+            gitSnapshot,
+            verifyResult,
+            getContinueRepetitionDecisionImpl,
+          );
+          if (refinedOverrideDecision.action === "pause") {
+            recordControllerDecision(snapshot, refinedOverrideDecision);
+            pauseSnapshot(pi, ctx, runtime, refinedOverrideDecision.reason, "warning");
+            return;
+          }
+          applyContinueDecisionProgress(snapshot, refinedOverrideDecision, false);
+          recordControllerDecision(snapshot, refinedOverrideDecision);
+          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, refinedOverrideDecision, {
             budgetPauseReason: `iteration budget exhausted before verified completion: ${decision.reason}`,
-            notifyMessage: `Auto-mode finalization pass requested: ${effectiveOverrideDecision.reason}`,
+            notifyMessage: `Auto-mode finalization pass requested: ${refinedOverrideDecision.reason}`,
             notifyLevel: "warning",
           });
           return;
@@ -1301,13 +1419,26 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
         })) {
           const adjacentDecision = await getAdjacentContinuationDecisionImpl(ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
           if (adjacentDecision?.action === "continue") {
-            const effectiveAdjacentDecision: ContinueDecision = {
-              ...adjacentDecision,
-              nextPrompt: augmentContinuePrompt(adjacentDecision, snapshot, gitSnapshot),
-            };
-            applyContinueDecisionProgress(snapshot, effectiveAdjacentDecision, true);
-            recordControllerDecision(snapshot, effectiveAdjacentDecision);
-            queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, effectiveAdjacentDecision, {
+            const refinedAdjacentDecision = await resolveRepeatedContinueDecision(
+              ctx,
+              snapshot,
+              {
+                ...adjacentDecision,
+                nextPrompt: augmentContinuePrompt(adjacentDecision, snapshot, gitSnapshot),
+              },
+              workerTurn,
+              gitSnapshot,
+              verifyResult,
+              getContinueRepetitionDecisionImpl,
+            );
+            if (refinedAdjacentDecision.action === "pause") {
+              recordControllerDecision(snapshot, refinedAdjacentDecision);
+              pauseSnapshot(pi, ctx, runtime, refinedAdjacentDecision.reason, "warning");
+              return;
+            }
+            applyContinueDecisionProgress(snapshot, refinedAdjacentDecision, true);
+            recordControllerDecision(snapshot, refinedAdjacentDecision);
+            queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, refinedAdjacentDecision, {
               budgetPauseReason: `iteration budget exhausted after verified completion: ${decision.reason}`,
               notifyMessage: `Auto-mode exploring adjacent optimization (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
               notifyLevel: "info",

@@ -103,6 +103,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 - separate controller model support via `--controller-model provider/model` or `--auto-controller-model provider/model` (defaults to the active worker model)
 - transparent follow-up prompts via real user messages, so autonomous iterations stay visible in the transcript
 - rolling controller summary with restore-on-start behavior (restored paused by default, or auto-resumed on startup when `--auto-resume` is set)
+- targeted continue-prompt refinement when the controller would otherwise repeat the previous follow-up, preferring a materially more specific next step or pause over low-value repetition
 - optional verification command for candidate-stop checks via `--verify "..."` / `--auto-verify "..."`, including proactive pre-stop verification when the worker looks close to done
 - limited read-only controller probes for fresh git snapshots when needed
 - pragmatic defaults for V1: 8 iterations by default, 12-iteration safety budget for completion-gate-only `--until` runs, `1` adjacent continuation by default for `continue-similar`, paused restore on restart unless you opt into `--auto-resume`

@@ -2,9 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
+  applyControllerContinueRepetitionRefinement,
   applyControllerStopOverrideRefinement,
   AUTO_MODE_STATE_TYPE,
   buildAutoControllerAdjacentContinuationSystemPrompt,
+  buildAutoControllerContinueRepetitionSystemPrompt,
   buildAutoControllerStopOverrideSystemPrompt,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
@@ -449,6 +451,19 @@ test("buildAutoControllerStopOverrideSystemPrompt asks for a specific continue o
 });
 
 
+test("buildAutoControllerContinueRepetitionSystemPrompt asks for a materially better continue or pause", () => {
+  const prompt = buildAutoControllerContinueRepetitionSystemPrompt();
+
+  assert.match(prompt, /^You are revising a repeated continue decision in an autonomous coding loop\./);
+  assert.match(prompt, /Use exactly one of these actions: continue, pause\./);
+  assert.match(prompt, /Do NOT use stop or probe\./);
+  assert.match(prompt, /materially more specific than both the previous prompt and the proposed repeated prompt\./);
+  assert.match(prompt, /If the best next step would still be nearly identical to the previous or proposed prompt, prefer pause over repetition\./);
+  assert.match(prompt, /Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary\./);
+  assert.doesNotMatch(prompt, /Do not ask the user anything/i);
+});
+
+
 test("hasConcreteVerificationEvidence requires real validation signals", () => {
   assert.equal(hasConcreteVerificationEvidence("Ran npm test, all tests pass, and verified the fix manually."), true);
   assert.equal(
@@ -705,6 +720,66 @@ test("applyControllerStopOverrideRefinement can pause instead of repeating a low
   assert.match(refined.reason, /Stop overridden: verification evidence is still missing\./);
   assert.match(refined.reason, /Controller requested pause instead of another repeated follow-up/);
   assert.match(refined.updatedSummary, /Controller refinement requested a pause:/);
+  assert.equal(refined.goalStatus, "stalled");
+});
+
+test("applyControllerContinueRepetitionRefinement adopts a controller-specific continue prompt", () => {
+  const refined = applyControllerContinueRepetitionRefinement({
+    repeatedDecision: {
+      action: "continue",
+      reason: "A concrete verification step is still warranted.",
+      updatedSummary: "Verification still needs one more direct step before stopping.",
+      goalStatus: "likely_met",
+      completionGateMet: true,
+      progressPercent: 94,
+      commitRecommendation: "none",
+      nextPrompt: "Run one more targeted verification and summarize the result.",
+    },
+    controllerDecision: {
+      action: "continue",
+      reason: "Focus the follow-up on the exact failing area",
+      updatedSummary: "The next step should target one concrete verification gap instead of repeating the generic request.",
+      goalStatus: "likely_met",
+      completionGateMet: true,
+      progressPercent: 94,
+      commitRecommendation: "none",
+      nextPrompt: "Run the onboarding regression test that changed in this cycle, summarize the passing output, and then check git status before concluding.",
+    },
+  });
+
+  assert.equal(refined.action, "continue");
+  assert.equal(refined.reason, "A concrete verification step is still warranted.");
+  assert.match(refined.updatedSummary, /Controller repetition refinement:/);
+  assert.equal(refined.nextPrompt, "Run the onboarding regression test that changed in this cycle, summarize the passing output, and then check git status before concluding.");
+});
+
+test("applyControllerContinueRepetitionRefinement can pause instead of repeating a low-value continue prompt", () => {
+  const refined = applyControllerContinueRepetitionRefinement({
+    repeatedDecision: {
+      action: "continue",
+      reason: "A concrete verification step is still warranted.",
+      updatedSummary: "Verification still needs one more direct step before stopping.",
+      goalStatus: "likely_met",
+      completionGateMet: true,
+      progressPercent: 94,
+      commitRecommendation: "none",
+      nextPrompt: "Run one more targeted verification and summarize the result.",
+    },
+    controllerDecision: {
+      action: "pause",
+      reason: "No materially more specific next step is available without restating the same follow-up.",
+      updatedSummary: "The loop would just repeat the same verification request.",
+      goalStatus: "stalled",
+      completionGateMet: true,
+      progressPercent: 94,
+      commitRecommendation: "none",
+    },
+  });
+
+  assert.equal(refined.action, "pause");
+  assert.match(refined.reason, /A concrete verification step is still warranted\./);
+  assert.match(refined.reason, /Controller requested pause instead of another repeated continue prompt/);
+  assert.match(refined.updatedSummary, /Controller repetition refinement requested a pause:/);
   assert.equal(refined.goalStatus, "stalled");
 });
 
