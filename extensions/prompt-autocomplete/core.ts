@@ -1,27 +1,58 @@
+import { readFileSync } from "node:fs";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
-export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT = `You generate inline prompt suggestions for a coding-agent user.
+const TEMPLATE_VARIABLE_PATTERN = /\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
+const PROMPT_AUTOCOMPLETE_RESPONSE_KEY = "completions";
 
-Return ONLY valid JSON with exactly this shape:
-{"completions":["suggestion 1","suggestion 2"]}
+export function normalizeTemplateText(template: string): string {
+  return template.replace(/\r\n/g, "\n").trim();
+}
 
-Rules:
-- If the current draft is non-empty, each item must be the exact continuation to insert at the cursor.
-- If the current draft is empty, each item must be a complete next prompt the user could send now.
-- Return 0 to the requested number of ranked alternatives.
-- Strongly use the latest assistant message as primary context.
-- Suggest the next prompt most likely to move the overall project forward.
-- Keep suggestions short, concrete, high-signal, and action-oriented.
-- Prefer 3-10 words when possible.
-- Prefer direct imperative phrasing over questions when natural.
-- Match the language and specificity of the draft and conversation.
-- Avoid filler, politeness, hedging, repetition, meta-commentary, and unnecessary setup.
-- Do not repeat the full draft unless needed for a natural continuation.
-- Do not explain anything.
-- Do not wrap output in code fences.
-- If there is no strong suggestion, return {"completions":[]}.`;
+export function renderMiniTemplate(template: string, variables: Record<string, string>): string {
+  const missingVariables = new Set<string>();
 
-export const DEFAULT_PREFERRED_MODEL = "openai/gpt-5.4-mini";
+  const rendered = template.replace(
+    TEMPLATE_VARIABLE_PATTERN,
+    (_match, rawName: string, rawFallback: string | undefined) => {
+      const name = String(rawName);
+      const value = variables[name];
+      if (typeof value === "string") {
+        return value;
+      }
+
+      if (typeof rawFallback === "string") {
+        return rawFallback.trim();
+      }
+
+      missingVariables.add(name);
+      return `{{${name}}}`;
+    },
+  );
+
+  if (missingVariables.size > 0) {
+    throw new Error(`Missing template variable(s): ${[...missingVariables].sort().join(", ")}`);
+  }
+
+  return rendered;
+}
+
+export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES = {
+  RESPONSE_KEY: PROMPT_AUTOCOMPLETE_RESPONSE_KEY,
+  RESPONSE_EXAMPLE: JSON.stringify({ [PROMPT_AUTOCOMPLETE_RESPONSE_KEY]: ["suggestion 1", "suggestion 2"] }),
+  EMPTY_RESPONSE_EXAMPLE: JSON.stringify({ [PROMPT_AUTOCOMPLETE_RESPONSE_KEY]: [] }),
+} as const;
+
+export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT = renderMiniTemplate(
+  normalizeTemplateText(
+    readFileSync(
+      new URL("./system-prompt.template.md", import.meta.url),
+      "utf8",
+    ),
+  ),
+  PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES,
+);
+
+export const DEFAULT_PREFERRED_MODEL = "current active model";
 export const DEFAULT_DEBOUNCE_MS = 350;
 export const DEFAULT_MIN_PROMPT_CHARS = 0;
 export const DEFAULT_MAX_SUGGESTION_CHARS = 160;

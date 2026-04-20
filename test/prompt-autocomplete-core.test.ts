@@ -1,13 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   buildLatestAssistantMessageContext,
   buildRecentConversationContext,
+  DEFAULT_PREFERRED_MODEL,
   extractNextSuggestionChunk,
   normalizePromptSuggestion,
   normalizePromptSuggestions,
+  normalizeTemplateText,
   parseBoundedIntFlag,
   parseModelRef,
+  PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+  PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES,
+  renderMiniTemplate,
   truncateDraftTail,
 } from "../extensions/prompt-autocomplete/core.ts";
 
@@ -25,6 +31,65 @@ test("parseBoundedIntFlag clamps invalid and out-of-range values", () => {
   assert.equal(parseBoundedIntFlag("-1", 100, 0, 1000), 0);
   assert.equal(parseBoundedIntFlag("5000", 100, 0, 1000), 1000);
   assert.equal(parseBoundedIntFlag("abc", 100, 0, 1000), 100);
+});
+
+test("default prompt autocomplete model now follows the active model", () => {
+  assert.equal(DEFAULT_PREFERRED_MODEL, "current active model");
+});
+
+test("prompt-autocomplete index no longer hardcodes a provider/model default", () => {
+  const source = readFileSync(new URL("../extensions/prompt-autocomplete/index.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /default:\s*"openai\/[^"]+"/);
+  assert.match(source, /Optional provider\/model override for prompt autocomplete/);
+  assert.match(source, /default:\s*DEFAULT_PREFERRED_MODEL/);
+});
+
+test("renderMiniTemplate replaces placeholders and supports repeated variables", () => {
+  assert.equal(
+    renderMiniTemplate("Hello {{NAME}} / {{NAME}}", { NAME: "World" }),
+    "Hello World / World",
+  );
+});
+
+test("renderMiniTemplate uses fallback values when variables are missing", () => {
+  assert.equal(
+    renderMiniTemplate("Hello {{NAME|friend}} from {{ CITY | Berlin }}", {}),
+    "Hello friend from Berlin",
+  );
+});
+
+test("renderMiniTemplate prefers explicit variables over fallback values", () => {
+  assert.equal(
+    renderMiniTemplate("Hello {{NAME|friend}}", { NAME: "World" }),
+    "Hello World",
+  );
+});
+
+test("renderMiniTemplate throws when a placeholder variable is missing and no fallback exists", () => {
+  assert.throws(
+    () => renderMiniTemplate("Hello {{NAME}} {{MISSING}}", { NAME: "World" }),
+    /Missing template variable\(s\): MISSING/,
+  );
+});
+
+test("prompt autocomplete system prompt is rendered from the template file", () => {
+  const template = normalizeTemplateText(
+    readFileSync(
+      new URL("../extensions/prompt-autocomplete/system-prompt.template.md", import.meta.url),
+      "utf8",
+    ),
+  );
+
+  const rendered = renderMiniTemplate(template, PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES);
+  assert.equal(PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT, rendered);
+  assert.doesNotMatch(PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT, /\{\{\s*[A-Z0-9_]+(?:\|[\s\S]*?)?\s*\}\}/);
+});
+
+test("prompt-autocomplete core loads and renders the system prompt template file instead of inlining it", () => {
+  const source = readFileSync(new URL("../extensions/prompt-autocomplete/core.ts", import.meta.url), "utf8");
+  assert.match(source, /readFileSync\(\s*new URL\("\.\/system-prompt\.template\.md", import\.meta\.url\)/s);
+  assert.match(source, /renderMiniTemplate\(/);
+  assert.doesNotMatch(source, /Return ONLY valid JSON with exactly this shape:/);
 });
 
 test("normalizePromptSuggestion strips repeated draft and prefixes a space when needed", () => {

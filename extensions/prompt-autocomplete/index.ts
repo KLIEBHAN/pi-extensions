@@ -186,7 +186,7 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
   const resolvedModel = resolveSuggestionModel(shared);
   const requestedModel = shared.config.preferredModel
     ? `${shared.config.preferredModel.provider}/${shared.config.preferredModel.id}`
-    : "current model";
+    : "current active model";
 
   return [
     `enabled=${shared.enabled ? "yes" : "no"}`,
@@ -1023,7 +1023,7 @@ export default function (pi: ExtensionAPI) {
     default: true,
   });
   pi.registerFlag("prompt-autocomplete-model", {
-    description: "Provider/model for prompt autocomplete, e.g. openai/gpt-5.4-mini",
+    description: "Optional provider/model override for prompt autocomplete, e.g. openai/gpt-5.4-mini",
     type: "string",
     default: DEFAULT_PREFERRED_MODEL,
   });
