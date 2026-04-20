@@ -588,6 +588,70 @@ test("agent_end can continue with an adjacent optimization after verified comple
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode exploring adjacent optimization")));
 });
 
+test("agent_end stops after verified completion when continue-similar is not active", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+    "auto-iterations": "6",
+  });
+  let adjacentDecisionCalls = 0;
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-stop-default-policy",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "clean-fingerprint-stop",
+    }),
+    decideControllerAction: async () => ({
+      action: "stop",
+      reason: "Primary goal is verified complete",
+      updatedSummary: "The onboarding robustness goal is complete and verified.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done.",
+    }),
+    getStopOverrideDecision: async () => undefined,
+    getAdjacentContinuationDecision: async () => {
+      adjacentDecisionCalls += 1;
+      return {
+        action: "continue",
+        reason: "This adjacent step should never be requested when completionPolicy=stop",
+        updatedSummary: "Unexpected adjacent continuation.",
+        goalStatus: "met",
+        completionGateMet: true,
+        progressPercent: 100,
+        commitRecommendation: "milestone",
+        nextPrompt: "Do not send this prompt.",
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "Ran npm test, all tests pass, and verified the fix manually.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(adjacentDecisionCalls, 0);
+  assert.equal(latestState?.enabled, false);
+  assert.equal(latestState?.phase, "primary");
+  assert.notEqual(harness.sentMessages.at(-1)?.text, "Do not send this prompt.");
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode stopped: Done.")));
+});
+
 test("agent_end keeps continuing adjacent local follow-ups after a prior continue while adjacent budget remains", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({
