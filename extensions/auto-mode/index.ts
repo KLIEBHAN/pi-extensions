@@ -23,7 +23,6 @@ import {
   DEFAULT_CONTROLLER_FAILURE_LIMIT,
   DEFAULT_CONTROLLER_MODEL,
   DEFAULT_DECISION_HISTORY_LIMIT,
-  DEFAULT_MAX_WALL_CLOCK_MINUTES,
   DEFAULT_STATUS_GOAL_MAX_CHARS,
   DEFAULT_WORKER_FAILURE_LIMIT,
   describeAutoStopBlocker,
@@ -173,7 +172,6 @@ function buildInitialState(config: AutoStartConfig, summary: string): AutoModeSt
     adjacentContinuationCount: 0,
     maxAdjacentContinuations: config.maxAdjacentContinuations,
     allowControllerProbes: config.allowControllerProbes,
-    maxWallClockMinutes: config.maxWallClockMinutes,
     controllerSummary: summary,
     recentDecisions: [],
     consecutiveControllerFailures: 0,
@@ -810,11 +808,6 @@ function getLastAssistantTurn(event: { messages?: unknown[] }): WorkerTurnSnapsh
   return undefined;
 }
 
-function isWallClockBudgetExceeded(snapshot: AutoModeStateV1): boolean {
-  const elapsedMs = now() - snapshot.startedAt;
-  return elapsedMs >= snapshot.maxWallClockMinutes * 60_000;
-}
-
 function pauseSnapshot(
   pi: ExtensionAPI,
   ctx: ExtensionContext | ExtensionCommandContext,
@@ -1016,7 +1009,6 @@ function buildFlagsFromPi(pi: ExtensionAPI) {
     maxAdjacentContinuations: pi.getFlag("auto-max-adjacent-continuations"),
     allowControllerProbes: pi.getFlag("auto-allow-controller-probes"),
     resume: pi.getFlag("auto-resume"),
-    maxWallClockMinutes: pi.getFlag("auto-max-wall-clock-minutes"),
   };
 }
 
@@ -1079,11 +1071,6 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
     description: "Resume a restored auto-mode run automatically on startup",
     type: "boolean",
     default: false,
-  });
-  pi.registerFlag("auto-max-wall-clock-minutes", {
-    description: `Wall-clock safety limit for one auto-mode run (default ${DEFAULT_MAX_WALL_CLOCK_MINUTES})`,
-    type: "string",
-    default: String(DEFAULT_MAX_WALL_CLOCK_MINUTES),
   });
 
   pi.registerCommand("auto", {
@@ -1218,11 +1205,6 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
 
     try {
       snapshot.lastWorkerFinishedAt = now();
-
-      if (isWallClockBudgetExceeded(snapshot)) {
-        pauseSnapshot(pi, ctx, runtime, `wall-clock limit of ${snapshot.maxWallClockMinutes} minutes reached`);
-        return;
-      }
 
       if (shouldTreatWorkerFailure(workerTurn.stopReason)) {
         snapshot.consecutiveWorkerFailures += 1;

@@ -141,7 +141,6 @@ When auto-mode is active and not paused:
 - default iteration budget: 8
 - until-only safety budget: 12
 - default max adjacent continuations for `continue-similar`: 1
-- wall-clock limit: 60 minutes
 - proactive verify-command preflight when the worker appears to claim completion or iteration budget is exhausted
 - controller failures in a row: 2 → pause
 - worker failures in a row: 2 → pause

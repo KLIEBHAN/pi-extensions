@@ -4,7 +4,6 @@ export const DEFAULT_AUTO_ITERATIONS = 8;
 export const DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS = 12;
 export const DEFAULT_MAX_ADJACENT_CONTINUATIONS = 1;
 export const DEFAULT_MAX_ITERATIONS_LIMIT = 1_000;
-export const DEFAULT_MAX_WALL_CLOCK_MINUTES = 60;
 export const DEFAULT_CONTROLLER_FAILURE_LIMIT = 2;
 export const DEFAULT_WORKER_FAILURE_LIMIT = 2;
 export const DEFAULT_STAGNATION_LIMIT = 3;
@@ -42,7 +41,6 @@ export interface AutoStartConfig {
   pushPolicy: PushPolicy;
   completionPolicy: CompletionPolicy;
   allowControllerProbes: boolean;
-  maxWallClockMinutes: number;
   resumeOnSessionStart: boolean;
 }
 
@@ -177,7 +175,6 @@ export interface AutoModeStateV1 {
   maxAdjacentContinuations: number;
   primaryGoalCompletionSummary?: string;
   allowControllerProbes: boolean;
-  maxWallClockMinutes: number;
   controllerSummary: string;
   recentDecisions: AutoDecisionLogEntry[];
   lastAutoPrompt?: string;
@@ -214,7 +211,6 @@ export interface AutoFlagValues {
   maxAdjacentContinuations?: boolean | string;
   allowControllerProbes?: boolean | string;
   resume?: boolean | string;
-  maxWallClockMinutes?: boolean | string;
 }
 
 export interface VerifyPreflightInput {
@@ -1021,7 +1017,6 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
   let completionPolicy: CompletionPolicy = "stop";
   let maxAdjacentContinuations = DEFAULT_MAX_ADJACENT_CONTINUATIONS;
   let allowControllerProbes = true;
-  let maxWallClockMinutes = DEFAULT_MAX_WALL_CLOCK_MINUTES;
   const goalTokens: string[] = [];
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -1115,17 +1110,6 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       continue;
     }
 
-    if (token === "--max-wall-clock-minutes") {
-      const value = tokens[index + 1];
-      const parsed = value ? parsePositiveInteger(value, 24 * 60) : undefined;
-      if (!parsed) {
-        return { error: "--max-wall-clock-minutes must be an integer between 1 and 1440" };
-      }
-      maxWallClockMinutes = parsed;
-      index += 1;
-      continue;
-    }
-
     if (token.startsWith("--")) {
       return { error: `Unknown flag: ${token}` };
     }
@@ -1154,7 +1138,6 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       completionPolicy,
       maxAdjacentContinuations,
       allowControllerProbes,
-      maxWallClockMinutes,
       resumeOnSessionStart: false,
     },
   };
@@ -1210,7 +1193,6 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
   const pushPolicyFlag = parseStringFlag(flags.pushPolicy);
   const completionPolicyFlag = parseStringFlag(flags.completionPolicy);
   const maxAdjacentContinuationsFlag = parseStringFlag(flags.maxAdjacentContinuations);
-  const maxWallClockFlag = parseStringFlag(flags.maxWallClockMinutes);
 
   const iterations = iterationsFlag ? parsePositiveInteger(iterationsFlag) : undefined;
   if (iterationsFlag && !iterations) {
@@ -1255,15 +1237,6 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
     maxAdjacentContinuations = parsed;
   }
 
-  let maxWallClockMinutes = DEFAULT_MAX_WALL_CLOCK_MINUTES;
-  if (maxWallClockFlag) {
-    const parsed = parsePositiveInteger(maxWallClockFlag, 24 * 60);
-    if (!parsed) {
-      return { error: "--auto-max-wall-clock-minutes must be an integer between 1 and 1440" };
-    }
-    maxWallClockMinutes = parsed;
-  }
-
   const { mode, maxIterations } = resolveAutoMode(iterations, untilPrompt);
   return {
     goal,
@@ -1277,7 +1250,6 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
     completionPolicy,
     maxAdjacentContinuations,
     allowControllerProbes: parseBooleanFlag(flags.allowControllerProbes, true),
-    maxWallClockMinutes,
     resumeOnSessionStart: parseBooleanFlag(flags.resume, false),
   };
 }

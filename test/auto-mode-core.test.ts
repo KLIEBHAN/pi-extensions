@@ -93,13 +93,12 @@ test("parseAutoCommandArgs parses hybrid mode with quoted until prompt and contr
   });
 });
 
-test("parseAutoCommandArgs parses no-controller-probes and max wall clock overrides", () => {
-  const parsed = parseAutoCommandArgs("on --no-controller-probes --max-wall-clock-minutes 90 improve stability");
+test("parseAutoCommandArgs parses no-controller-probes", () => {
+  const parsed = parseAutoCommandArgs("on --no-controller-probes improve stability");
   assert.equal(parsed.kind, "on");
   if (parsed.kind !== "on") return;
 
   assert.equal(parsed.config.allowControllerProbes, false);
-  assert.equal(parsed.config.maxWallClockMinutes, 90);
 });
 
 test("parseAutoCommandArgs parses completion-policy continue-similar", () => {
@@ -961,7 +960,6 @@ test("extractLatestAutoModeState returns the latest valid state from the current
     maxIterations: 8,
     currentIteration: 2,
     startedAt: 1,
-    maxWallClockMinutes: 60,
     commitPolicy: "final-or-milestone",
     pushPolicy: "final-or-milestone-if-upstream",
     allowControllerProbes: true,
