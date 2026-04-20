@@ -1136,6 +1136,161 @@ test("agent_end stops from restored adjacent state when the adjacent budget is a
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode stopped: Done now.")));
 });
 
+test("agent_end increments restored adjacent continuation state exactly once per renewed continue without mutating the limit", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const initialState = {
+    version: 1,
+    enabled: true,
+    paused: false,
+    runId: "auto-restored-adjacent-renewed",
+    goal: "improve onboarding robustness",
+    mode: "iterations",
+    maxIterations: 8,
+    currentIteration: 2,
+    startedAt: 1,
+    commitPolicy: "final-or-milestone",
+    pushPolicy: "never",
+    completionPolicy: "continue-similar",
+    phase: "adjacent",
+    primaryGoalVerifiedAtIteration: 1,
+    adjacentContinuationCount: 1,
+    maxAdjacentContinuations: 3,
+    primaryGoalCompletionSummary: "Primary goal complete; continuing with nearby onboarding hardening.",
+    allowControllerProbes: true,
+    controllerSummary: "Primary goal complete; one nearby onboarding hardening step remains.",
+    recentDecisions: [{
+      iteration: 1,
+      action: "continue",
+      reason: "One adjacent hardening step remains",
+      nextPrompt: "Add one adjacent regression test in the same onboarding flow and verify it passes.",
+      timestamp: 1,
+    }],
+    lastAutoPrompt: "Add one adjacent regression test in the same onboarding flow and verify it passes.",
+    consecutiveControllerFailures: 0,
+    consecutiveWorkerFailures: 0,
+    consecutiveStagnationCount: 0,
+    consecutiveNoChangeCount: 0,
+    resumePolicy: "restore-running",
+  };
+  const firstPrompt = "Tighten one nearby onboarding error-path assertion and rerun that focused test.";
+  const secondPrompt = "Refine one final nearby onboarding validation assertion and rerun that focused test.";
+
+  const harness = createHarness();
+  harness.entries.push({
+    type: "custom",
+    customType: AUTO_MODE_STATE_TYPE,
+    data: initialState,
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-restored-adjacent-renewed-1",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "clean-fingerprint-restored-adjacent-renewed-1",
+    }),
+    decideControllerAction: async () => ({
+      action: "stop",
+      reason: "Primary goal remains verified complete after the adjacent step",
+      updatedSummary: "The onboarding robustness goal remains complete and verified after the adjacent hardening step.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done now.",
+    }),
+    getStopOverrideDecision: async () => undefined,
+    getAdjacentContinuationDecision: async () => ({
+      action: "continue",
+      reason: "One more local onboarding hardening step remains",
+      updatedSummary: "Primary goal complete; continuing with one more nearby onboarding hardening step.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "milestone",
+      nextPrompt: firstPrompt,
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "The first restored adjacent hardening step is done and the primary goal is still verified complete.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+
+  let latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.adjacentContinuationCount, 2);
+  assert.equal(latestState?.maxAdjacentContinuations, 3);
+  assert.equal(latestState?.primaryGoalVerifiedAtIteration, 1);
+  assert.equal(latestState?.primaryGoalCompletionSummary, initialState.primaryGoalCompletionSummary);
+  assert.equal(harness.sentMessages.at(-1)?.text, firstPrompt);
+
+  const restoredHarness = createHarness();
+  restoredHarness.entries.push(...JSON.parse(JSON.stringify(harness.entries)));
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-restored-adjacent-renewed-2",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "clean-fingerprint-restored-adjacent-renewed-2",
+    }),
+    decideControllerAction: async () => ({
+      action: "stop",
+      reason: "Primary goal remains verified complete after the next adjacent step",
+      updatedSummary: "The onboarding robustness goal remains complete and verified after the next adjacent hardening step.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "finalize",
+      finalMessage: "Done now.",
+    }),
+    getStopOverrideDecision: async () => undefined,
+    getAdjacentContinuationDecision: async () => ({
+      action: "continue",
+      reason: "One final nearby onboarding hardening step remains",
+      updatedSummary: "Primary goal complete; continuing with one final nearby onboarding hardening step.",
+      goalStatus: "met",
+      completionGateMet: true,
+      progressPercent: 100,
+      commitRecommendation: "milestone",
+      nextPrompt: secondPrompt,
+    }),
+  })(restoredHarness.pi as never);
+
+  await restoredHarness.handlers.get("session_start")?.({ reason: "startup" }, restoredHarness.ctx);
+  const restoredAgentEnd = restoredHarness.handlers.get("agent_end");
+  assert.ok(restoredAgentEnd);
+
+  await restoredAgentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "The second restored adjacent hardening step is done and the primary goal is still verified complete.",
+      stopReason: "stop",
+    }],
+  }, restoredHarness.ctx);
+
+  latestState = getLatestAutoState(restoredHarness.entries);
+  assert.equal(latestState?.adjacentContinuationCount, 3);
+  assert.equal(latestState?.maxAdjacentContinuations, 3);
+  assert.equal(latestState?.primaryGoalVerifiedAtIteration, 1);
+  assert.equal(latestState?.primaryGoalCompletionSummary, initialState.primaryGoalCompletionSummary);
+  assert.equal(restoredHarness.sentMessages.at(-1)?.text, secondPrompt);
+  assert.ok(restoredHarness.notifications.every((entry) => !entry.message.includes("Auto-mode stopped")));
+});
+
 test("agent_end continues one more local adjacent follow-up from restored adjacent state while budget remains", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness();
