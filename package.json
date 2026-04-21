@@ -8,7 +8,8 @@
   "keywords": ["pi-package"],
   "scripts": {
     "check": "npm run test",
-    "test": "node --experimental-strip-types --test test/*.test.ts"
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:auto-mode": "node --experimental-strip-types --test test/auto-mode-core.test.ts test/auto-mode-index.test.ts"
   },
   "pi": {
     "extensions": ["./extensions"]
