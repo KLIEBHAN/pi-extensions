@@ -1137,6 +1137,8 @@ test("extractLatestAutoModeState returns the latest valid state from the current
     maxAdjacentContinuations: DEFAULT_MAX_ADJACENT_CONTINUATIONS,
     primaryGoalVerifiedAtIteration: undefined,
     primaryGoalCompletionSummary: undefined,
+    workerReflectionEnabled: false,
+    workerReflectionUsed: false,
   });
 });
 

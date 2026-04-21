@@ -51,7 +51,7 @@ import {
 const STATUS_KEY = "auto-mode";
 const PROBE_LIMIT_PER_CYCLE = 1;
 const COMMAND_USAGE =
-  "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--completion-policy stop|continue-similar] [--max-adjacent-continuations N] <goal>";
+  "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--completion-policy stop|continue-similar] [--max-adjacent-continuations N] [--worker-reflection] <goal>";
 
 const AUTO_CONTROLLER_SYSTEM_PROMPT = buildAutoControllerSystemPrompt();
 const AUTO_CONTROLLER_ADJACENT_CONTINUATION_SYSTEM_PROMPT = buildAutoControllerAdjacentContinuationSystemPrompt();
@@ -177,6 +177,8 @@ function buildInitialState(config: AutoStartConfig, summary: string): AutoModeSt
     adjacentContinuationCount: 0,
     maxAdjacentContinuations: config.maxAdjacentContinuations,
     allowControllerProbes: config.allowControllerProbes,
+    workerReflectionEnabled: config.workerReflectionEnabled,
+    workerReflectionUsed: false,
     controllerSummary: summary,
     recentDecisions: [],
     consecutiveControllerFailures: 0,
@@ -207,6 +209,53 @@ function buildWorkerPromptSuffix(snapshot: AutoModeStateV1): string {
     commitPolicy: snapshot.commitPolicy,
     pushPolicy: snapshot.pushPolicy,
   });
+}
+
+function buildWorkerReflectionPrompt(snapshot: AutoModeStateV1, workerTurn: WorkerTurnSnapshot, reason: string): string {
+  const guidance = [
+    "Briefly reassess why progress is stuck or unclear, then take exactly one best next action now.",
+    "- If the goal is still clearly incomplete, prefer one concrete implementation step.",
+    "- If the goal looks nearly complete, prefer the smallest sufficient verification.",
+    "- Do not repeat the previous auto prompt verbatim.",
+    snapshot.verifyCommand
+      ? `- If you are about to claim completion or request stop, run ${snapshot.verifyCommand}.`
+      : "- Do not claim completion or request stop unless the result is actually verified.",
+    "- Do not ask the user for help.",
+  ].join("\n");
+
+  return [
+    "Auto-mode reflection step.",
+    `Reason: ${reason}`,
+    `Goal:\n${snapshot.goal}`,
+    snapshot.controllerSummary ? `Controller summary:\n${snapshot.controllerSummary}` : undefined,
+    snapshot.lastAutoPrompt ? `Previous auto prompt:\n${snapshot.lastAutoPrompt}` : undefined,
+    `Latest worker result:\n${workerTurn.assistantText || "(no assistant text)"}`,
+    guidance,
+  ]
+    .filter((value): value is string => !!value)
+    .join("\n\n");
+}
+
+function canUseWorkerReflection(snapshot: AutoModeStateV1): boolean {
+  return snapshot.workerReflectionEnabled && !snapshot.workerReflectionUsed && snapshot.currentIteration < snapshot.maxIterations;
+}
+
+function queueWorkerReflection(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  snapshot: AutoModeStateV1,
+  workerTurn: WorkerTurnSnapshot,
+  reason: string,
+  level: "info" | "warning" = "warning",
+): void {
+  const prompt = buildWorkerReflectionPrompt(snapshot, workerTurn, reason);
+  snapshot.workerReflectionUsed = true;
+  snapshot.lastAutoPrompt = prompt;
+  snapshot.currentIteration += 1;
+  persistSnapshot(pi, snapshot);
+  setStatus(ctx, snapshot);
+  ctx.ui.notify("Auto-mode requested one worker reflection step", level);
+  pi.sendUserMessage(prompt);
 }
 
 function buildControllerDecisionHistoryText(snapshot: AutoModeStateV1): string {
@@ -855,6 +904,7 @@ function queueContinueLikeFollowUp(
   ctx: ExtensionContext,
   runtime: AutoRuntimeState,
   snapshot: AutoModeStateV1,
+  workerTurn: WorkerTurnSnapshot,
   decision: ContinueDecision,
   options: {
     budgetPauseReason: string;
@@ -875,6 +925,14 @@ function queueContinueLikeFollowUp(
   snapshot.consecutiveStagnationCount = followUpPlan.nextStagnationCount;
 
   if (followUpPlan.action === "pause") {
+    if (
+      canUseWorkerReflection(snapshot)
+      && (followUpPlan.reason === "controller produced the same next prompt repeatedly"
+        || followUpPlan.reason === "repository state has not changed across several iterations")
+    ) {
+      queueWorkerReflection(pi, ctx, snapshot, workerTurn, followUpPlan.reason, options.notifyLevel ?? "warning");
+      return;
+    }
     pauseSnapshot(pi, ctx, runtime, followUpPlan.reason, options.notifyLevel ?? "warning");
     return;
   }
@@ -1099,6 +1157,7 @@ function buildFlagsFromPi(pi: ExtensionAPI) {
     completionPolicy: pi.getFlag("auto-completion-policy"),
     maxAdjacentContinuations: pi.getFlag("auto-max-adjacent-continuations"),
     allowControllerProbes: pi.getFlag("auto-allow-controller-probes"),
+    workerReflection: pi.getFlag("auto-worker-reflection"),
     resume: pi.getFlag("auto-resume"),
   };
 }
@@ -1158,6 +1217,11 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
     description: "Allow the controller to request a limited read-only repository probe",
     type: "boolean",
     default: true,
+  });
+  pi.registerFlag("auto-worker-reflection", {
+    description: "Allow one worker reflection follow-up when progress is stuck or the controller is inconclusive",
+    type: "boolean",
+    default: false,
   });
   pi.registerFlag("auto-resume", {
     description: "Resume a restored auto-mode run automatically on startup",
@@ -1327,6 +1391,10 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
 
       if (!decision) {
         snapshot.consecutiveControllerFailures += 1;
+        if (snapshot.consecutiveControllerFailures === 1 && canUseWorkerReflection(snapshot)) {
+          queueWorkerReflection(pi, ctx, snapshot, workerTurn, "controller was inconclusive about the next best step");
+          return;
+        }
         persistSnapshot(pi, snapshot);
         if (snapshot.consecutiveControllerFailures >= DEFAULT_CONTROLLER_FAILURE_LIMIT) {
           pauseSnapshot(pi, ctx, runtime, `controller failed ${snapshot.consecutiveControllerFailures} times in a row`);
@@ -1359,7 +1427,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
         }
         applyContinueDecisionProgress(snapshot, refinedDecision, false);
         recordControllerDecision(snapshot, refinedDecision);
-        queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, refinedDecision, {
+        queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, workerTurn, refinedDecision, {
           budgetPauseReason: "iteration budget exhausted",
           notifyMessage: `Auto-mode continuing (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
           notifyLevel: "info",
@@ -1401,7 +1469,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           }
           applyContinueDecisionProgress(snapshot, refinedOverrideDecision, false);
           recordControllerDecision(snapshot, refinedOverrideDecision);
-          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, refinedOverrideDecision, {
+          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, workerTurn, refinedOverrideDecision, {
             budgetPauseReason: `iteration budget exhausted before verified completion: ${decision.reason}`,
             notifyMessage: `Auto-mode finalization pass requested: ${refinedOverrideDecision.reason}`,
             notifyLevel: "warning",
@@ -1438,7 +1506,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
             }
             applyContinueDecisionProgress(snapshot, refinedAdjacentDecision, true);
             recordControllerDecision(snapshot, refinedAdjacentDecision);
-            queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, refinedAdjacentDecision, {
+            queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, workerTurn, refinedAdjacentDecision, {
               budgetPauseReason: `iteration budget exhausted after verified completion: ${decision.reason}`,
               notifyMessage: `Auto-mode exploring adjacent optimization (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
               notifyLevel: "info",

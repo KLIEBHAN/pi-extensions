@@ -43,6 +43,7 @@ export interface AutoStartConfig {
   pushPolicy: PushPolicy;
   completionPolicy: CompletionPolicy;
   allowControllerProbes: boolean;
+  workerReflectionEnabled: boolean;
   resumeOnSessionStart: boolean;
 }
 
@@ -184,6 +185,8 @@ export interface AutoModeStateV1 {
   maxAdjacentContinuations: number;
   primaryGoalCompletionSummary?: string;
   allowControllerProbes: boolean;
+  workerReflectionEnabled: boolean;
+  workerReflectionUsed: boolean;
   controllerSummary: string;
   recentDecisions: AutoDecisionLogEntry[];
   lastAutoPrompt?: string;
@@ -219,6 +222,7 @@ export interface AutoFlagValues {
   completionPolicy?: boolean | string;
   maxAdjacentContinuations?: boolean | string;
   allowControllerProbes?: boolean | string;
+  workerReflection?: boolean | string;
   resume?: boolean | string;
 }
 
@@ -439,6 +443,8 @@ export function hydrateAutoModeState(snapshot: AutoModeStateV1): AutoModeStateV1
       typeof snapshot.primaryGoalVerifiedAtIteration === "number" ? snapshot.primaryGoalVerifiedAtIteration : undefined,
     primaryGoalCompletionSummary:
       typeof snapshot.primaryGoalCompletionSummary === "string" ? snapshot.primaryGoalCompletionSummary : undefined,
+    workerReflectionEnabled: snapshot.workerReflectionEnabled === true,
+    workerReflectionUsed: snapshot.workerReflectionUsed === true,
   };
 }
 
@@ -1061,6 +1067,7 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
   let completionPolicy: CompletionPolicy = "stop";
   let maxAdjacentContinuations = DEFAULT_MAX_ADJACENT_CONTINUATIONS;
   let allowControllerProbes = true;
+  let workerReflectionEnabled = false;
   const goalTokens: string[] = [];
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -1154,6 +1161,11 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       continue;
     }
 
+    if (token === "--worker-reflection") {
+      workerReflectionEnabled = true;
+      continue;
+    }
+
     if (token.startsWith("--")) {
       return { error: `Unknown flag: ${token}` };
     }
@@ -1182,6 +1194,7 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       completionPolicy,
       maxAdjacentContinuations,
       allowControllerProbes,
+      workerReflectionEnabled,
       resumeOnSessionStart: false,
     },
   };
@@ -1294,6 +1307,7 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
     completionPolicy,
     maxAdjacentContinuations,
     allowControllerProbes: parseBooleanFlag(flags.allowControllerProbes, true),
+    workerReflectionEnabled: parseBooleanFlag(flags.workerReflection, false),
     resumeOnSessionStart: parseBooleanFlag(flags.resume, false),
   };
 }

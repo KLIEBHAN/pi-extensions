@@ -297,6 +297,135 @@ test("agent_end refines a repeated continue prompt before sending it again", asy
   );
 });
 
+test("agent_end requests one worker reflection step instead of pausing on stagnation when enabled", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const repeatedPrompt = "improve onboarding robustness";
+  const harness = createHarness({
+    "auto-goal": repeatedPrompt,
+    "auto-iterations": "6",
+    "auto-worker-reflection": true,
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: `head-worker-reflection-${harness.sentMessages.length}`,
+      status: "## main\n M src/onboarding.ts",
+      changedFiles: ["src/onboarding.ts"],
+      dirty: true,
+      hasUpstream: false,
+      repoFingerprint: `worker-reflection-${harness.sentMessages.length}`,
+    }),
+    decideControllerAction: async () => ({
+      action: "continue",
+      reason: "The next step is still too repetitive to be useful.",
+      updatedSummary: "The onboarding loop is stuck on the same generic follow-up.",
+      goalStatus: "in_progress",
+      completionGateMet: false,
+      progressPercent: 35,
+      commitRecommendation: "none",
+      nextPrompt: repeatedPrompt,
+    }),
+    getContinueRepetitionDecision: async () => undefined,
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "The onboarding flow is still incomplete.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "The onboarding flow is still incomplete.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "The onboarding flow is still incomplete.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.workerReflectionUsed, true);
+  assert.equal(latestState?.paused, false);
+  assert.equal(latestState?.currentIteration, 4);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /^Auto-mode reflection step\./);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /Reason: controller produced the same next prompt repeatedly/);
+  assert.equal(
+    harness.notifications.filter((entry) => entry.message.includes("Auto-mode requested one worker reflection step")).length,
+    1,
+  );
+  assert.ok(harness.notifications.every((entry) => !entry.message.includes("Auto-mode paused: controller produced the same next prompt repeatedly")));
+});
+
+test("agent_end uses the worker-reflection loop guard before falling back to the normal inconclusive-controller pause", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+    "auto-iterations": "6",
+    "auto-worker-reflection": true,
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: `head-inconclusive-${harness.notifications.length}`,
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: `inconclusive-${harness.notifications.length}`,
+    }),
+    decideControllerAction: async () => undefined,
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "I implemented another onboarding improvement.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+
+  let latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.workerReflectionUsed, true);
+  assert.equal(latestState?.paused, false);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /^Auto-mode reflection step\./);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /Reason: controller was inconclusive about the next best step/);
+  const sentMessageCountAfterReflection = harness.sentMessages.length;
+
+  await agentEnd?.({
+    messages: [{
+      role: "assistant",
+      content: "I reassessed the latest onboarding change.",
+      stopReason: "stop",
+    }],
+  }, harness.ctx);
+
+  latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.paused, true);
+  assert.equal(harness.sentMessages.length, sentMessageCountAfterReflection);
+  assert.equal(
+    harness.notifications.filter((entry) => entry.message.includes("Auto-mode requested one worker reflection step")).length,
+    1,
+  );
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode paused: controller failed 2 times in a row")));
+});
+
 test("agent_end does not auto-enter adjacent phase on a normal continue even when the primary goal is already met", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({
