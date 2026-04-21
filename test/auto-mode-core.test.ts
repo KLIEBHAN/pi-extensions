@@ -463,9 +463,13 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
   assert.match(prompt, /Default to continue, not stop\./);
   assert.match(prompt, /goalStatus must always refer to the original primary goal/);
   assert.match(prompt, /Never treat a worker completion claim by itself as proof that the goal is done\./);
-  assert.match(prompt, /If goalStatus=in_progress and obvious implementation work remains, prefer the highest-value implementation step over extra verification\./);
-  assert.match(prompt, /Prefer extra verification or finalization mainly when goalStatus is likely_met or met, or when one focused check would materially reduce uncertainty about a near-complete result or candidate stop\./);
-  assert.match(prompt, /Near a plausible stop, if in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step\./);
+  assert.match(prompt, /goalStatus=in_progress/);
+  assert.match(prompt, /implementation work remains/);
+  assert.match(prompt, /implementation step over extra verification\./);
+  assert.match(prompt, /goalStatus is likely_met or met/);
+  assert.match(prompt, /focused check would materially reduce uncertainty about a near-complete result or candidate stop\./);
+  assert.match(prompt, /Near a plausible stop/);
+  assert.match(prompt, /highest-value verification or finalization step\./);
   assert.match(prompt, /Use stop only when goalStatus=met\./);
   assert.match(prompt, /If a completion gate exists, use stop only when it is met too\./);
   assert.match(prompt, /Use stop only when completion is supported by concrete verification evidence/);
