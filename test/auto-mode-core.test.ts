@@ -440,7 +440,8 @@ test("buildAutoWorkerSystemPrompt keeps only required rules and worker-visible m
 
   assert.match(prompt, /^Auto-mode rules:/);
   assert.match(prompt, /Do not claim completion until the active goal is actually satisfied\./);
-  assert.match(prompt, /Before concluding, run this verification command: npm test/);
+  assert.match(prompt, /Before claiming completion or requesting stop, run this verification command: npm test/);
+  assert.doesNotMatch(prompt, /Before concluding, run this verification command: npm test/);
   assert.match(prompt, /Follow this commit policy: final-or-milestone/);
   assert.match(prompt, /Follow this push policy: final-or-milestone-if-upstream/);
   assert.match(prompt, /Goal: Improve onboarding robustness/);
@@ -462,7 +463,9 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
   assert.match(prompt, /Default to continue, not stop\./);
   assert.match(prompt, /goalStatus must always refer to the original primary goal/);
   assert.match(prompt, /Never treat a worker completion claim by itself as proof that the goal is done\./);
-  assert.match(prompt, /When in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step\./);
+  assert.match(prompt, /If obvious implementation work remains, prefer the highest-value implementation step over additional verification\./);
+  assert.match(prompt, /Ask for additional verification when it would materially reduce uncertainty about a near-complete result or candidate stop\./);
+  assert.match(prompt, /When in doubt between stop and continue near a plausible stop, prefer continue with the single highest-value verification or finalization step\./);
   assert.match(prompt, /Use stop only when goalStatus=met\./);
   assert.match(prompt, /If a completion gate exists, use stop only when it is met too\./);
   assert.match(prompt, /Use stop only when completion is supported by concrete verification evidence/);
@@ -1057,7 +1060,8 @@ test("buildAutoWorkerSystemPrompt still requires verification without an explici
     pushPolicy: "if-upstream",
   });
 
-  assert.match(prompt, /Before concluding, run the most relevant available verification\./);
+  assert.match(prompt, /Before claiming completion or requesting stop, run the most relevant available verification\./);
+  assert.doesNotMatch(prompt, /Before concluding, run the most relevant available verification\./);
   assert.doesNotMatch(prompt, /Verification command:/);
 });
 

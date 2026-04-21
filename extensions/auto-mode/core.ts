@@ -396,8 +396,8 @@ export const AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS = loadAutoModeSystemPromp
 export function buildAutoWorkerSystemPromptTemplateVariables(input: AutoWorkerPromptInput): Record<string, string> {
   return {
     VERIFY_RULE: input.verifyCommand
-      ? `Before concluding, run this verification command: ${input.verifyCommand}`
-      : "Before concluding, run the most relevant available verification.",
+      ? `Before claiming completion or requesting stop, run this verification command: ${input.verifyCommand}`
+      : "Before claiming completion or requesting stop, run the most relevant available verification.",
     COMMIT_POLICY: input.commitPolicy,
     PUSH_POLICY: input.pushPolicy,
     GOAL: input.goal,
