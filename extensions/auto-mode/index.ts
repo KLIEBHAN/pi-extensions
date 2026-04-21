@@ -213,9 +213,9 @@ function buildWorkerPromptSuffix(snapshot: AutoModeStateV1): string {
 
 function buildWorkerReflectionPrompt(snapshot: AutoModeStateV1, workerTurn: WorkerTurnSnapshot, reason: string): string {
   const guidance = [
-    "Briefly reassess why progress is stuck or unclear, then take exactly one best next action now.",
+    "Briefly reassess why progress is stuck or unclear in at most 1-2 sentences. Then take exactly one best next action now and execute it immediately; do not stop at analysis or planning.",
     "- If the goal is still clearly incomplete, prefer one concrete implementation step.",
-    "- If the goal looks nearly complete, prefer the smallest sufficient verification.",
+    "- If the goal looks nearly complete, prefer the smallest sufficient local verification in the same subsystem or files; do not ask for a broader check when a local one is enough.",
     "- Do not repeat the previous auto prompt verbatim.",
     snapshot.verifyCommand
       ? `- If you are about to claim completion or request stop, run ${snapshot.verifyCommand}.`

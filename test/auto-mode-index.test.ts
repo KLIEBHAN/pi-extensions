@@ -361,6 +361,8 @@ test("agent_end requests one worker reflection step instead of pausing on stagna
   assert.equal(latestState?.currentIteration, 4);
   assert.match(harness.sentMessages.at(-1)?.text ?? "", /^Auto-mode reflection step\./);
   assert.match(harness.sentMessages.at(-1)?.text ?? "", /Reason: controller produced the same next prompt repeatedly/);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /execute it immediately; do not stop at analysis or planning\./);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /smallest sufficient local verification in the same subsystem or files/);
   assert.equal(
     harness.notifications.filter((entry) => entry.message.includes("Auto-mode requested one worker reflection step")).length,
     1,
@@ -406,6 +408,8 @@ test("agent_end uses the worker-reflection loop guard before falling back to the
   assert.equal(latestState?.paused, false);
   assert.match(harness.sentMessages.at(-1)?.text ?? "", /^Auto-mode reflection step\./);
   assert.match(harness.sentMessages.at(-1)?.text ?? "", /Reason: controller was inconclusive about the next best step/);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /execute it immediately; do not stop at analysis or planning\./);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /smallest sufficient local verification in the same subsystem or files/);
   const sentMessageCountAfterReflection = harness.sentMessages.length;
 
   await agentEnd?.({

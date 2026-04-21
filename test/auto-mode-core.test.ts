@@ -468,6 +468,7 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
   assert.match(prompt, /implementation step over extra verification\./);
   assert.match(prompt, /goalStatus is likely_met or met/);
   assert.match(prompt, /focused check would materially reduce uncertainty about a near-complete result or candidate stop\./);
+  assert.match(prompt, /If concrete passing evidence already exists and no relevant change has happened since, do not ask for another pure verification step\./);
   assert.match(prompt, /Near a plausible stop/);
   assert.match(prompt, /highest-value verification or finalization step\./);
   assert.match(prompt, /Use stop only when goalStatus=met\./);
@@ -487,6 +488,7 @@ test("buildAutoControllerSystemPrompt prefers focused follow-up over redundant d
   assert.match(prompt, /passing verification command, passing tests\/checks, or explicit validation evidence in the worker result\./);
   assert.match(prompt, /Prefer extra verification or finalization mainly when goalStatus is likely_met or met/);
   assert.match(prompt, /one focused check would materially reduce uncertainty about a near-complete result or candidate stop\./);
+  assert.match(prompt, /If concrete passing evidence already exists and no relevant change has happened since, do not ask for another pure verification step\./);
 });
 
 

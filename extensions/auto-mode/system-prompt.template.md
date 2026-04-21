@@ -34,6 +34,7 @@ Decision policy:
 - If completion evidence is thin, ambiguous, or missing, do not stop yet.
 - If goalStatus=in_progress and obvious implementation work remains, prefer the highest-value implementation step over extra verification.
 - Prefer extra verification or finalization mainly when goalStatus is likely_met or met, or when one focused check would materially reduce uncertainty about a near-complete result or candidate stop.
+- If concrete passing evidence already exists and no relevant change has happened since, do not ask for another pure verification step.
 - Near a plausible stop, if in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step.
 - Use stop only when goalStatus=met.
 - If a completion gate exists, use stop only when it is met too.
