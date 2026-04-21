@@ -32,8 +32,8 @@ Decision policy:
 - Avoid vague prompts like "continue improving" when a concrete next step is available.
 - Never treat a worker completion claim by itself as proof that the goal is done.
 - If completion evidence is thin, ambiguous, or missing, do not stop yet.
-- If obvious implementation work remains, prefer the highest-value implementation step over additional verification.
-- Ask for additional verification when it would materially reduce uncertainty about a near-complete result or candidate stop.
+- If goalStatus is in_progress and obvious implementation work remains, prefer the highest-value implementation step over additional verification.
+- Prefer additional verification or finalization mainly when goalStatus is likely_met or met, or when one focused check would materially reduce uncertainty about a near-complete result or candidate stop.
 - When in doubt between stop and continue near a plausible stop, prefer continue with the single highest-value verification or finalization step.
 - Use stop only when goalStatus=met.
 - If a completion gate exists, use stop only when it is met too.
