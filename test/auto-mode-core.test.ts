@@ -5,6 +5,8 @@ import {
   applyControllerContinueRepetitionRefinement,
   applyControllerStopOverrideRefinement,
   AUTO_MODE_STATE_TYPE,
+  AUTO_MODE_SYSTEM_PROMPT_TEMPLATE,
+  AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS,
   buildAutoControllerAdjacentContinuationSystemPrompt,
   buildAutoControllerContinueRepetitionSystemPrompt,
   buildAutoControllerStopOverrideSystemPrompt,
@@ -12,6 +14,7 @@ import {
   buildAutoStartConfigFromFlags,
   buildAutoStopOverrideDecision,
   buildAutoWorkerSystemPrompt,
+  buildAutoWorkerSystemPromptTemplateVariables,
   buildResumePrompt,
   buildStartPrompt,
   decideAutoModeSessionStart,
@@ -26,11 +29,13 @@ import {
   hasConcreteVerificationEvidence,
   looksLikeCompletionClaim,
   normalizeComparableText,
+  normalizeTemplateText,
   parseAutoCommandArgs,
   parseControllerDecision,
   parseModelRef,
-  planAutoFollowUp,
   parsePositiveInteger,
+  planAutoFollowUp,
+  renderMiniTemplate,
   shouldAttemptAutoAdjacentContinuation,
   shouldAutoResumeOnSessionStart,
   shouldPreRunVerifyCommand,
@@ -64,6 +69,53 @@ test("auto-mode index no longer hardcodes a provider/model fallback for the cont
   assert.match(source, /if \(ctx\.model && registry\.hasConfiguredAuth\(ctx\.model\)\) \{/);
   assert.match(source, /defaults to the \$\{DEFAULT_CONTROLLER_MODEL\}/);
   assert.match(source, /controller-model=\$\{DEFAULT_CONTROLLER_MODEL\} \(default\)/);
+});
+
+test("auto-mode system prompts are rendered from the template file", () => {
+  const template = normalizeTemplateText(
+    readFileSync(
+      new URL("../extensions/auto-mode/system-prompt.template.md", import.meta.url),
+      "utf8",
+    ),
+  );
+
+  const workerInput = {
+    goal: "Improve onboarding robustness",
+    verifyCommand: "npm test",
+    commitPolicy: "final-or-milestone" as const,
+    pushPolicy: "final-or-milestone-if-upstream" as const,
+  };
+
+  assert.equal(AUTO_MODE_SYSTEM_PROMPT_TEMPLATE, template);
+  assert.equal(
+    buildAutoWorkerSystemPrompt(workerInput),
+    renderMiniTemplate(
+      AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS.worker,
+      buildAutoWorkerSystemPromptTemplateVariables(workerInput),
+    ),
+  );
+  assert.equal(buildAutoControllerSystemPrompt(), AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS.controller);
+  assert.equal(
+    buildAutoControllerAdjacentContinuationSystemPrompt(),
+    AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS["controller-adjacent-continuation"],
+  );
+  assert.equal(
+    buildAutoControllerStopOverrideSystemPrompt(),
+    AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS["controller-stop-override"],
+  );
+  assert.equal(
+    buildAutoControllerContinueRepetitionSystemPrompt(),
+    AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS["controller-continue-repetition"],
+  );
+  assert.doesNotMatch(buildAutoWorkerSystemPrompt(workerInput), /\{\{\s*[A-Z0-9_]+(?:\|[\s\S]*?)?\s*\}\}/);
+});
+
+test("auto-mode core loads and renders prompt templates from the template file instead of inlining them", () => {
+  const source = readFileSync(new URL("../extensions/auto-mode/core.ts", import.meta.url), "utf8");
+  assert.match(source, /readFileSync\(\s*new URL\("\.\/system-prompt\.template\.md", import\.meta\.url\)/s);
+  assert.match(source, /renderMiniTemplate\(/);
+  assert.doesNotMatch(source, /You are the controller for an autonomous coding loop\./);
+  assert.doesNotMatch(source, /You are revising a blocked stop decision in an autonomous coding loop\./);
 });
 
 test("parseAutoCommandArgs parses \/auto on with defaults", () => {

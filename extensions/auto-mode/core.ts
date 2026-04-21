@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 export const AUTO_MODE_STATE_TYPE = "auto-mode-state";
 export const DEFAULT_CONTROLLER_MODEL = "active worker model";
 export const DEFAULT_AUTO_ITERATIONS = 8;
@@ -308,6 +310,107 @@ interface ParsedControllerPayload {
   probe?: unknown;
 }
 
+const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
+const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
+const SECTIONED_PROMPT_TEMPLATE_PATTERN = /<!--\s*prompt:([a-z0-9-]+)\s*-->\n?([\s\S]*?)\n?<!--\s*\/prompt:\1\s*-->/g;
+const AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTION_NAMES = [
+  "worker",
+  "controller",
+  "controller-adjacent-continuation",
+  "controller-stop-override",
+  "controller-continue-repetition",
+] as const;
+
+export type AutoModeSystemPromptTemplateSectionName = typeof AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTION_NAMES[number];
+
+export function normalizeTemplateText(template: string): string {
+  return template.replace(/\r\n/g, "\n").trim();
+}
+
+export function renderMiniTemplate(template: string, variables: Record<string, string>): string {
+  const missingVariables = new Set<string>();
+
+  const rendered = template.replace(
+    TEMPLATE_VARIABLE_PATTERN,
+    (_match, rawName: string, rawFallback: string | undefined) => {
+      const name = String(rawName);
+      const value = variables[name];
+      if (typeof value === "string") {
+        return value;
+      }
+
+      if (typeof rawFallback === "string") {
+        return rawFallback.trim();
+      }
+
+      missingVariables.add(name);
+      return `{{${name}}}`;
+    },
+  );
+
+  if (missingVariables.size > 0) {
+    throw new Error(`Missing template variable(s): ${[...missingVariables].sort().join(", ")}`);
+  }
+
+  return rendered.replace(ESCAPED_TEMPLATE_VARIABLE_PATTERN, "$1");
+}
+
+function parseSectionedPromptTemplate(template: string): Record<string, string> {
+  const normalizedTemplate = normalizeTemplateText(template);
+  const sections: Record<string, string> = {};
+
+  for (const match of normalizedTemplate.matchAll(SECTIONED_PROMPT_TEMPLATE_PATTERN)) {
+    const sectionName = match[1];
+    const sectionBody = match[2];
+    if (!sectionName || !sectionBody) continue;
+    if (sections[sectionName]) {
+      throw new Error(`Duplicate prompt template section: ${sectionName}`);
+    }
+    sections[sectionName] = normalizeTemplateText(sectionBody);
+  }
+
+  return sections;
+}
+
+function loadAutoModeSystemPromptTemplateSections(template: string): Record<AutoModeSystemPromptTemplateSectionName, string> {
+  const parsedSections = parseSectionedPromptTemplate(template);
+  const missingSections = AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTION_NAMES.filter((sectionName) => !parsedSections[sectionName]);
+  if (missingSections.length > 0) {
+    throw new Error(`Missing auto-mode prompt template section(s): ${missingSections.join(", ")}`);
+  }
+
+  return Object.fromEntries(
+    AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTION_NAMES.map((sectionName) => [sectionName, parsedSections[sectionName]!]),
+  ) as Record<AutoModeSystemPromptTemplateSectionName, string>;
+}
+
+export const AUTO_MODE_SYSTEM_PROMPT_TEMPLATE = normalizeTemplateText(
+  readFileSync(
+    new URL("./system-prompt.template.md", import.meta.url),
+    "utf8",
+  ),
+);
+
+export const AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS = loadAutoModeSystemPromptTemplateSections(AUTO_MODE_SYSTEM_PROMPT_TEMPLATE);
+
+export function buildAutoWorkerSystemPromptTemplateVariables(input: AutoWorkerPromptInput): Record<string, string> {
+  return {
+    VERIFY_RULE: input.verifyCommand
+      ? `Before concluding, run this verification command: ${input.verifyCommand}`
+      : "Before concluding, run the most relevant available verification.",
+    COMMIT_POLICY: input.commitPolicy,
+    PUSH_POLICY: input.pushPolicy,
+    GOAL: input.goal,
+  };
+}
+
+function renderAutoModeSystemPromptTemplateSection(
+  sectionName: AutoModeSystemPromptTemplateSectionName,
+  variables: Record<string, string> = {},
+): string {
+  return renderMiniTemplate(AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS[sectionName], variables);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -527,170 +630,26 @@ export function buildResumePrompt(input: ResumePromptInput): string {
 }
 
 export function buildAutoWorkerSystemPrompt(input: AutoWorkerPromptInput): string {
-  const rules = [
-    "- Do not claim completion until the active goal is actually satisfied.",
-    input.verifyCommand
-      ? `- Before concluding, run this verification command: ${input.verifyCommand}`
-      : "- Before concluding, run the most relevant available verification.",
-    `- Follow this commit policy: ${input.commitPolicy}`,
-    `- Follow this push policy: ${input.pushPolicy}`,
-  ];
-
-  return ["Auto-mode rules:", ...rules, "", `Goal: ${input.goal}`].join("\n");
+  return renderAutoModeSystemPromptTemplateSection(
+    "worker",
+    buildAutoWorkerSystemPromptTemplateVariables(input),
+  );
 }
 
 export function buildAutoControllerSystemPrompt(): string {
-  return [
-    "You are the controller for an autonomous coding loop.",
-    "",
-    "Your job is to decide the single best next action for the worker assistant.",
-    "",
-    "Output requirements:",
-    "- Return ONLY valid JSON.",
-    "- Use exactly one of these actions: continue, stop, pause, probe.",
-    "- If action=continue, include nextPrompt with the single highest-value next step.",
-    "- If action=stop, reason and updatedSummary must briefly state the concrete verification/finalization evidence that justifies stopping.",
-    "- If action=probe, probe.kind must be one of: git_status, git_diff_names, git_head, verify_command.",
-    "- Keep reason and updatedSummary concise but specific.",
-    "- updatedSummary should be a rolling controller summary for future iterations.",
-    "",
-    "Decision policy:",
-    "- Default to continue, not stop.",
-    "- goalStatus must always refer to the original primary goal, not just the current adjacent optimization.",
-    "- Continue whenever there is any concrete, non-trivial, high-value next step toward verified completion, stronger validation, or required finalization.",
-    "- Prefer next prompts that name the exact inspection, implementation, test, verification, or git-finalization step to do next.",
-    "- Avoid vague prompts like \"continue improving\" when a concrete next step is available.",
-    "- Never treat a worker completion claim by itself as proof that the goal is done.",
-    "- If completion evidence is thin, ambiguous, or missing, do not stop yet.",
-    "- When in doubt between stop and continue, prefer continue with the single highest-value verification or finalization step.",
-    "- Use stop only when goalStatus=met.",
-    "- If a completion gate exists, use stop only when it is met too.",
-    "- Use stop only when completion is supported by concrete verification evidence from this cycle, such as a passing verification command, passing tests/checks, or explicit validation evidence in the worker result.",
-    "- If verification is failing or still missing, the task is not complete.",
-    "- If final commit/push expectations are still unmet in a git repo, the task is not complete.",
-    "- If the primary goal is verified complete and a normal stop would otherwise be allowed, return stop here even when completionPolicy=continue-similar; any optional adjacent continuation is decided separately after a valid stop.",
-    "- If obvious follow-up work remains that is necessary to satisfy the goal or completion gate, do not stop.",
-    "- Use pause when the run appears blocked, unstable, unsafe, or repetitively unproductive, or when no fresh high-value next step is available without looping.",
-    "- Use probe only if one fresh read-only repository snapshot would materially improve the next decision, and never for information that is already present.",
-    "- If the next prompt would be nearly identical to the previous one, make it materially more specific or prefer pause over repetition.",
-    "- Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary. If essential external input is genuinely missing, prefer pause over asking the user.",
-    "",
-    "JSON shape:",
-    "{",
-    '  "action":"continue|stop|pause|probe",',
-    '  "reason":"...",',
-    '  "updatedSummary":"...",',
-    '  "goalStatus":"in_progress|likely_met|met|blocked|stalled",',
-    '  "completionGateMet":true,',
-    '  "progressPercent":0,',
-    '  "commitRecommendation":"none|milestone|finalize",',
-    '  "nextPrompt":"...",',
-    '  "finalMessage":"...",',
-    '  "probe":{"kind":"git_status|git_diff_names|git_head|verify_command"}',
-    "}",
-  ].join("\n");
+  return renderAutoModeSystemPromptTemplateSection("controller");
 }
 
 export function buildAutoControllerAdjacentContinuationSystemPrompt(): string {
-  return [
-    "You are deciding whether an autonomous run should continue after the primary goal has already been verified complete.",
-    "",
-    "This decision point exists only because a normal stop would already be valid and completionPolicy=continue-similar explicitly asked for nearby follow-up work.",
-    "",
-    "Output requirements:",
-    "- Return ONLY valid JSON.",
-    "- Use exactly one of these actions: continue, stop, pause.",
-    "- Do NOT use probe.",
-    "- If action=continue, include nextPrompt with exactly one bounded adjacent optimization.",
-    "",
-    "Decision policy:",
-    "- goalStatus must still refer to the original primary goal.",
-    "- Default to continue, not stop, when there is any clear, local, high-value adjacent optimization within the remaining adjacent continuation budget.",
-    "- An adjacent optimization must stay close to the same subsystem, files, or problem class.",
-    "- Do not broaden scope into a new major task or unrelated workstream.",
-    "- Use stop only when no worthwhile bounded adjacent optimization is clear or no adjacent continuation budget remains.",
-    "- If the best continuation would mostly restate the previous prompt or otherwise thrash, use pause instead of repeating yourself.",
-    "- Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary. If essential external input is genuinely missing, prefer pause over asking the user.",
-    "",
-    "JSON shape:",
-    "{",
-    '  "action":"continue|stop|pause",',
-    '  "reason":"...",',
-    '  "updatedSummary":"...",',
-    '  "goalStatus":"in_progress|likely_met|met|blocked|stalled",',
-    '  "completionGateMet":true,',
-    '  "progressPercent":0,',
-    '  "commitRecommendation":"none|milestone|finalize",',
-    '  "nextPrompt":"...",',
-    '  "finalMessage":"..."',
-    "}",
-  ].join("\n");
+  return renderAutoModeSystemPromptTemplateSection("controller-adjacent-continuation");
 }
 
 export function buildAutoControllerStopOverrideSystemPrompt(): string {
-  return [
-    "You are revising a blocked stop decision in an autonomous coding loop.",
-    "",
-    "A runtime guard has already determined that the worker must not stop yet.",
-    "",
-    "Output requirements:",
-    "- Return ONLY valid JSON.",
-    "- Use exactly one of these actions: continue, pause.",
-    "- Do NOT use stop or probe.",
-    "- If action=continue, include nextPrompt with the single best next step to clear the listed blockers.",
-    "- Keep reason and updatedSummary concise but specific.",
-    "",
-    "Decision policy:",
-    "- Prefer continue when you can name a concrete, high-value next step that directly addresses the blockers.",
-    "- Use the listed blockers, repository evidence, and previous auto prompt to make the nextPrompt materially more specific than the fallback prompt when possible.",
-    "- If the best next step would still be nearly identical to the previous or fallback prompt, prefer pause over repetition.",
-    "- Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary. If essential external input is genuinely missing, prefer pause over asking the user.",
-    "",
-    "JSON shape:",
-    "{",
-    '  "action":"continue|pause",',
-    '  "reason":"...",',
-    '  "updatedSummary":"...",',
-    '  "goalStatus":"in_progress|likely_met|blocked|stalled",',
-    '  "completionGateMet":true,',
-    '  "progressPercent":0,',
-    '  "commitRecommendation":"none|milestone|finalize",',
-    '  "nextPrompt":"..."',
-    "}",
-  ].join("\n");
+  return renderAutoModeSystemPromptTemplateSection("controller-stop-override");
 }
 
 export function buildAutoControllerContinueRepetitionSystemPrompt(): string {
-  return [
-    "You are revising a repeated continue decision in an autonomous coding loop.",
-    "",
-    "A proposed continue prompt is too similar to the previous auto prompt already sent to the worker.",
-    "",
-    "Output requirements:",
-    "- Return ONLY valid JSON.",
-    "- Use exactly one of these actions: continue, pause.",
-    "- Do NOT use stop or probe.",
-    "- If action=continue, include nextPrompt with the single best next step.",
-    "- Keep reason and updatedSummary concise but specific.",
-    "",
-    "Decision policy:",
-    "- Prefer continue when you can make the nextPrompt materially more specific than both the previous prompt and the proposed repeated prompt.",
-    "- Use the goal, controller summary, worker result, and repository evidence to name the exact inspection, implementation, verification, or finalization step.",
-    "- If the best next step would still be nearly identical to the previous or proposed prompt, prefer pause over repetition.",
-    "- Prefer to resolve worker questions yourself from the existing goal, repository state, and controller summary. If essential external input is genuinely missing, prefer pause over asking the user.",
-    "",
-    "JSON shape:",
-    "{",
-    '  "action":"continue|pause",',
-    '  "reason":"...",',
-    '  "updatedSummary":"...",',
-    '  "goalStatus":"in_progress|likely_met|met|blocked|stalled",',
-    '  "completionGateMet":true,',
-    '  "progressPercent":0,',
-    '  "commitRecommendation":"none|milestone|finalize",',
-    '  "nextPrompt":"..."',
-    "}",
-  ].join("\n");
+  return renderAutoModeSystemPromptTemplateSection("controller-continue-repetition");
 }
 
 export function hasConcreteVerificationEvidence(text: string): boolean {

@@ -103,6 +103,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 - separate controller model support via `--controller-model provider/model` or `--auto-controller-model provider/model` (defaults to the active worker model)
 - transparent follow-up prompts via real user messages, so autonomous iterations stay visible in the transcript
 - rolling controller summary with restore-on-start behavior (restored paused by default, or auto-resumed on startup when `--auto-resume` is set)
+- the internal worker/controller system prompts live in `extensions/auto-mode/system-prompt.template.md` as named template sections, so prompt tuning stays decoupled from TypeScript
 - targeted continue-prompt refinement when the controller would otherwise repeat the previous follow-up, preferring a materially more specific next step or pause over low-value repetition
 - optional verification command for candidate-stop checks via `--verify "..."` / `--auto-verify "..."`, including proactive pre-stop verification when the worker looks close to done
 - limited read-only controller probes for fresh git snapshots when needed
@@ -140,6 +141,13 @@ pi -e ./extensions/auto-mode \
   --auto-controller-model openai/gpt-5.4-mini \
   --auto-verify "npm test"
 ```
+
+### Prompt tuning
+
+If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/system-prompt.template.md`.
+
+- `worker` is the worker-visible system-prompt section and is rendered with `{{VERIFY_RULE}}`, `{{COMMIT_POLICY}}`, `{{PUSH_POLICY}}`, and `{{GOAL}}`
+- the controller variants (`controller`, `controller-adjacent-continuation`, `controller-stop-override`, `controller-continue-repetition`) are separate named sections in the same file
 
 ## Prompt autocomplete extension
 
@@ -356,7 +364,8 @@ pi-extensions/
 ├── extensions/
 │   ├── auto-mode/
 │   │   ├── core.ts
-│   │   └── index.ts
+│   │   ├── index.ts
+│   │   └── system-prompt.template.md
 │   ├── hello.ts
 │   ├── notify.ts
 │   ├── permission-gate.ts
