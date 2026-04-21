@@ -481,6 +481,14 @@ test("buildAutoControllerSystemPrompt strongly biases against premature stopping
   assert.doesNotMatch(prompt, /Do not ask the user anything/i);
 });
 
+test("buildAutoControllerSystemPrompt prefers focused follow-up over redundant duplicate verification when passing evidence already exists", () => {
+  const prompt = buildAutoControllerSystemPrompt();
+
+  assert.match(prompt, /passing verification command, passing tests\/checks, or explicit validation evidence in the worker result\./);
+  assert.match(prompt, /Prefer extra verification or finalization mainly when goalStatus is likely_met or met/);
+  assert.match(prompt, /one focused check would materially reduce uncertainty about a near-complete result or candidate stop\./);
+});
+
 
 test("buildAutoControllerAdjacentContinuationSystemPrompt keeps adjacent work bounded", () => {
   const prompt = buildAutoControllerAdjacentContinuationSystemPrompt();
