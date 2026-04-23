@@ -3,26 +3,18 @@ import { complete, type Api, type Model, type UserMessage } from "@mariozechner/
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
   appendDecisionHistory,
-  applyControllerContinueRepetitionRefinement,
-  applyControllerStopOverrideRefinement,
-  areAutoPromptsEquivalent,
   AUTO_MODE_STATE_TYPE,
-  buildAutoControllerAdjacentContinuationSystemPrompt,
-  buildAutoControllerContinueRepetitionSystemPrompt,
-  buildAutoControllerStopOverrideSystemPrompt,
   buildAutoControllerSystemPrompt,
   buildAutoStartConfigFromFlags,
-  buildAutoStopOverrideDecision,
   buildAutoWorkerSystemPrompt,
+  buildBlockedStopFollowUp,
   buildLatestAssistantMessageContext,
   buildLatestUserMessageContext,
   buildRecentConversationContext,
   buildResumePrompt,
   buildStartPrompt,
   decideAutoModeSessionStart,
-  deriveAutoContinueProgressState,
   DEFAULT_AUTO_ITERATIONS,
-  DEFAULT_MAX_ADJACENT_CONTINUATIONS,
   DEFAULT_CONTROLLER_FAILURE_LIMIT,
   DEFAULT_CONTROLLER_MODEL,
   DEFAULT_DECISION_HISTORY_LIMIT,
@@ -32,7 +24,6 @@ import {
   evaluateAutoStopGuard,
   extractLatestAutoModeState,
   extractMessageText,
-  shouldAttemptAutoAdjacentContinuation,
   parseAutoCommandArgs,
   parseControllerDecision,
   planAutoFollowUp,
@@ -40,23 +31,19 @@ import {
   shouldPreRunVerifyCommand,
   summarizeGoal,
   truncateControllerSummary,
-  type AutoModeStateV1,
+  type AutoModeStateV2,
   type AutoStartConfig,
+  type AutoStartConfigBuildSuccess,
   type AutoStopGuardResult,
   type ContinueDecision,
   type ControllerDecision,
-  type ProbeKind,
 } from "./core.ts";
 
 const STATUS_KEY = "auto-mode";
-const PROBE_LIMIT_PER_CYCLE = 1;
 const COMMAND_USAGE =
-  "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--completion-policy stop|continue-similar] [--max-adjacent-continuations N] [--worker-reflection] <goal>";
+  "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--assurance pragmatic|strict] <goal>";
 
 const AUTO_CONTROLLER_SYSTEM_PROMPT = buildAutoControllerSystemPrompt();
-const AUTO_CONTROLLER_ADJACENT_CONTINUATION_SYSTEM_PROMPT = buildAutoControllerAdjacentContinuationSystemPrompt();
-const AUTO_CONTROLLER_STOP_OVERRIDE_SYSTEM_PROMPT = buildAutoControllerStopOverrideSystemPrompt();
-const AUTO_CONTROLLER_CONTINUE_REPETITION_SYSTEM_PROMPT = buildAutoControllerContinueRepetitionSystemPrompt();
 
 interface GitSnapshot {
   isGitRepo: boolean;
@@ -78,28 +65,20 @@ interface VerifyCommandResult {
   stderr: string;
 }
 
-interface ProbeResult {
-  kind: ProbeKind;
-  ok: boolean;
-  output: string;
-}
-
 interface WorkerTurnSnapshot {
   assistantText: string;
   stopReason: string;
 }
 
 interface AutoRuntimeState {
-  snapshot?: AutoModeStateV1;
+  snapshot?: AutoModeStateV2;
   controllerBusy: boolean;
 }
 
 interface AutoModeDependencies {
   getGitSnapshot?: typeof getGitSnapshot;
   decideControllerAction?: typeof decideControllerAction;
-  getStopOverrideDecision?: typeof getStopOverrideDecision;
-  getAdjacentContinuationDecision?: typeof getAdjacentContinuationDecision;
-  getContinueRepetitionDecision?: typeof getContinueRepetitionDecision;
+  runVerifyCommand?: typeof runVerifyCommand;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -114,29 +93,32 @@ function makeRunId(): string {
   return `auto-${now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function isAutoEnabled(snapshot: AutoModeStateV1 | undefined): snapshot is AutoModeStateV1 {
+function isAutoEnabled(snapshot: AutoModeStateV2 | undefined): snapshot is AutoModeStateV2 {
   return !!snapshot?.enabled;
 }
 
-function isAutoRunning(snapshot: AutoModeStateV1 | undefined): snapshot is AutoModeStateV1 {
+function isAutoRunning(snapshot: AutoModeStateV2 | undefined): snapshot is AutoModeStateV2 {
   return !!snapshot?.enabled && !snapshot.paused;
 }
 
-function setStatus(ctx: ExtensionContext | ExtensionCommandContext, snapshot: AutoModeStateV1 | undefined): void {
+function setStatus(ctx: ExtensionContext | ExtensionCommandContext, snapshot: AutoModeStateV2 | undefined): void {
   if (!snapshot?.enabled) {
     ctx.ui.setStatus(STATUS_KEY, undefined);
     return;
   }
 
   const stateLabel = snapshot.paused ? "paused" : `${snapshot.currentIteration}/${snapshot.maxIterations}`;
-  ctx.ui.setStatus(STATUS_KEY, `Auto ${stateLabel}: ${summarizeGoal(snapshot.goal, DEFAULT_STATUS_GOAL_MAX_CHARS)}`);
+  ctx.ui.setStatus(
+    STATUS_KEY,
+    `Auto ${snapshot.assuranceMode} ${stateLabel}: ${summarizeGoal(snapshot.goal, DEFAULT_STATUS_GOAL_MAX_CHARS)}`,
+  );
 }
 
-function persistSnapshot(pi: ExtensionAPI, snapshot: AutoModeStateV1): void {
+function persistSnapshot(pi: ExtensionAPI, snapshot: AutoModeStateV2): void {
   pi.appendEntry(AUTO_MODE_STATE_TYPE, snapshot);
 }
 
-function restorePersistedSnapshot(ctx: ExtensionContext): AutoModeStateV1 | undefined {
+function restorePersistedSnapshot(ctx: ExtensionContext): AutoModeStateV2 | undefined {
   return extractLatestAutoModeState(ctx.sessionManager.getBranch());
 }
 
@@ -156,9 +138,9 @@ function buildInitialControllerSummary(ctx: ExtensionContext, config: AutoStartC
   return truncateControllerSummary(sections.join("\n\n"));
 }
 
-function buildInitialState(config: AutoStartConfig, summary: string): AutoModeStateV1 {
+function buildInitialState(config: AutoStartConfig, summary: string): AutoModeStateV2 {
   return {
-    version: 1,
+    version: 2,
     enabled: true,
     paused: false,
     runId: makeRunId(),
@@ -172,13 +154,7 @@ function buildInitialState(config: AutoStartConfig, summary: string): AutoModeSt
     verifyCommand: config.verifyCommand,
     commitPolicy: config.commitPolicy,
     pushPolicy: config.pushPolicy,
-    completionPolicy: config.completionPolicy,
-    phase: "primary",
-    adjacentContinuationCount: 0,
-    maxAdjacentContinuations: config.maxAdjacentContinuations,
-    allowControllerProbes: config.allowControllerProbes,
-    workerReflectionEnabled: config.workerReflectionEnabled,
-    workerReflectionUsed: false,
+    assuranceMode: config.assuranceMode,
     controllerSummary: summary,
     recentDecisions: [],
     consecutiveControllerFailures: 0,
@@ -189,20 +165,18 @@ function buildInitialState(config: AutoStartConfig, summary: string): AutoModeSt
   };
 }
 
-function getStartPrompt(snapshot: AutoModeStateV1): string {
-  return buildStartPrompt({
-    goal: snapshot.goal,
-  });
+function getStartPrompt(snapshot: AutoModeStateV2): string {
+  return buildStartPrompt({ goal: snapshot.goal });
 }
 
-function getResumePrompt(snapshot: AutoModeStateV1): string {
+function getResumePrompt(snapshot: AutoModeStateV2): string {
   return buildResumePrompt({
     goal: snapshot.goal,
     controllerSummary: snapshot.controllerSummary,
   });
 }
 
-function buildWorkerPromptSuffix(snapshot: AutoModeStateV1): string {
+function buildWorkerPromptSuffix(snapshot: AutoModeStateV2): string {
   return buildAutoWorkerSystemPrompt({
     goal: snapshot.goal,
     verifyCommand: snapshot.verifyCommand,
@@ -211,54 +185,7 @@ function buildWorkerPromptSuffix(snapshot: AutoModeStateV1): string {
   });
 }
 
-function buildWorkerReflectionPrompt(snapshot: AutoModeStateV1, workerTurn: WorkerTurnSnapshot, reason: string): string {
-  const guidance = [
-    "Briefly reassess why progress is stuck or unclear in at most 1-2 sentences. Then take exactly one best next action now and execute it immediately; do not stop at analysis or planning.",
-    "- If the goal is still clearly incomplete, prefer one concrete implementation step.",
-    "- If the goal looks nearly complete, prefer the smallest sufficient local verification in the same subsystem or files; do not ask for a broader check when a local one is enough.",
-    "- Do not repeat the previous auto prompt verbatim.",
-    snapshot.verifyCommand
-      ? `- If you are about to claim completion or request stop, run ${snapshot.verifyCommand}.`
-      : "- Do not claim completion or request stop unless the result is actually verified.",
-    "- Do not ask the user for help.",
-  ].join("\n");
-
-  return [
-    "Auto-mode reflection step.",
-    `Reason: ${reason}`,
-    `Goal:\n${snapshot.goal}`,
-    snapshot.controllerSummary ? `Controller summary:\n${snapshot.controllerSummary}` : undefined,
-    snapshot.lastAutoPrompt ? `Previous auto prompt:\n${snapshot.lastAutoPrompt}` : undefined,
-    `Latest worker result:\n${workerTurn.assistantText || "(no assistant text)"}`,
-    guidance,
-  ]
-    .filter((value): value is string => !!value)
-    .join("\n\n");
-}
-
-function canUseWorkerReflection(snapshot: AutoModeStateV1): boolean {
-  return snapshot.workerReflectionEnabled && !snapshot.workerReflectionUsed && snapshot.currentIteration < snapshot.maxIterations;
-}
-
-function queueWorkerReflection(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  snapshot: AutoModeStateV1,
-  workerTurn: WorkerTurnSnapshot,
-  reason: string,
-  level: "info" | "warning" = "warning",
-): void {
-  const prompt = buildWorkerReflectionPrompt(snapshot, workerTurn, reason);
-  snapshot.workerReflectionUsed = true;
-  snapshot.lastAutoPrompt = prompt;
-  snapshot.currentIteration += 1;
-  persistSnapshot(pi, snapshot);
-  setStatus(ctx, snapshot);
-  ctx.ui.notify("Auto-mode requested one worker reflection step", level);
-  pi.sendUserMessage(prompt);
-}
-
-function buildControllerDecisionHistoryText(snapshot: AutoModeStateV1): string {
+function buildControllerDecisionHistoryText(snapshot: AutoModeStateV2): string {
   if (snapshot.recentDecisions.length === 0) {
     return "(none yet)";
   }
@@ -306,43 +233,28 @@ function buildVerifyResultText(verifyResult: VerifyCommandResult | undefined): s
   ].join("\n\n");
 }
 
-function buildProbeResultText(probeResult: ProbeResult | undefined): string | undefined {
-  if (!probeResult) return undefined;
-  return [`kind=${probeResult.kind}`, `ok=${probeResult.ok ? "yes" : "no"}`, `output:\n${probeResult.output}`].join("\n\n");
-}
-
 function buildControllerUserPrompt(
-  snapshot: AutoModeStateV1,
+  snapshot: AutoModeStateV2,
   workerTurn: WorkerTurnSnapshot,
   gitSnapshot: GitSnapshot | undefined,
   verifyResult: VerifyCommandResult | undefined,
-  probeResult: ProbeResult | undefined,
 ): string {
-  const remainingIterations = Math.max(0, snapshot.maxIterations - snapshot.currentIteration);
   const sections = [
     `Goal:\n${snapshot.goal}`,
     snapshot.untilPrompt ? `Completion gate:\n${snapshot.untilPrompt}` : undefined,
     [
-      `Mode: ${snapshot.mode}`,
-      `Completion policy: ${snapshot.completionPolicy}`,
-      `Phase: ${snapshot.phase}`,
-      `Current iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
-      `Remaining iterations after this turn: ${remainingIterations}`,
-      `Primary goal verified at iteration: ${snapshot.primaryGoalVerifiedAtIteration ?? "no"}`,
-      `Adjacent continuation count: ${snapshot.adjacentContinuationCount}/${snapshot.maxAdjacentContinuations}`,
+      `Assurance mode: ${snapshot.assuranceMode}`,
+      `Iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
       `Commit policy: ${snapshot.commitPolicy}`,
       `Push policy: ${snapshot.pushPolicy}`,
-      `Controller probes allowed: ${snapshot.allowControllerProbes ? "yes" : "no"}`,
       `Verification command configured: ${snapshot.verifyCommand ? snapshot.verifyCommand : "no"}`,
     ].join("\n"),
     `Controller summary:\n${snapshot.controllerSummary || "(empty)"}`,
-    snapshot.primaryGoalCompletionSummary ? `Primary goal completion summary:\n${snapshot.primaryGoalCompletionSummary}` : undefined,
-    `Recent controller decisions:\n${buildControllerDecisionHistoryText(snapshot)}`,
+    snapshot.recentDecisions.length > 0 ? `Recent controller decisions:\n${buildControllerDecisionHistoryText(snapshot)}` : undefined,
     snapshot.lastAutoPrompt ? `Last auto prompt sent to worker:\n${snapshot.lastAutoPrompt}` : undefined,
     `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
     `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
     verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
-    probeResult ? `Fresh probe result:\n${buildProbeResultText(probeResult)}` : undefined,
   ].filter((value): value is string => !!value);
 
   return sections.join("\n\n");
@@ -421,51 +333,7 @@ async function runVerifyCommand(pi: ExtensionAPI, cwd: string, command: string):
   };
 }
 
-async function executeProbe(pi: ExtensionAPI, ctx: ExtensionContext, snapshot: AutoModeStateV1, kind: ProbeKind): Promise<ProbeResult> {
-  switch (kind) {
-    case "git_status": {
-      const gitSnapshot = await getGitSnapshot(pi, ctx.cwd);
-      return {
-        kind,
-        ok: !!gitSnapshot,
-        output: buildGitSnapshotText(gitSnapshot),
-      };
-    }
-    case "git_diff_names": {
-      const gitSnapshot = await getGitSnapshot(pi, ctx.cwd);
-      return {
-        kind,
-        ok: !!gitSnapshot,
-        output: gitSnapshot?.changedFiles.join("\n") || "(no changed files or not a git repository)",
-      };
-    }
-    case "git_head": {
-      const gitSnapshot = await getGitSnapshot(pi, ctx.cwd);
-      return {
-        kind,
-        ok: !!gitSnapshot?.head,
-        output: gitSnapshot?.head || "(no git HEAD available)",
-      };
-    }
-    case "verify_command": {
-      if (!snapshot.verifyCommand) {
-        return {
-          kind,
-          ok: false,
-          output: "No verify command is configured.",
-        };
-      }
-      const verify = await runVerifyCommand(pi, ctx.cwd, snapshot.verifyCommand);
-      return {
-        kind,
-        ok: verify.ok,
-        output: buildVerifyResultText(verify),
-      };
-    }
-  }
-}
-
-function resolveControllerModel(snapshot: AutoModeStateV1, ctx: ExtensionContext): Model<Api> | undefined {
+function resolveControllerModel(snapshot: AutoModeStateV2, ctx: ExtensionContext): Model<Api> | undefined {
   const registry = ctx.modelRegistry;
   const explicit = snapshot.controllerModel;
   if (explicit) {
@@ -484,8 +352,7 @@ function resolveControllerModel(snapshot: AutoModeStateV1, ctx: ExtensionContext
 
 async function completeControllerDecision(
   ctx: ExtensionContext,
-  snapshot: AutoModeStateV1,
-  systemPrompt: string,
+  snapshot: AutoModeStateV2,
   userPrompt: string,
 ): Promise<ControllerDecision | undefined> {
   const model = resolveControllerModel(snapshot, ctx);
@@ -507,7 +374,7 @@ async function completeControllerDecision(
   const response = await complete(
     model,
     {
-      systemPrompt,
+      systemPrompt: AUTO_CONTROLLER_SYSTEM_PROMPT,
       messages: [userMessage],
     },
     {
@@ -530,77 +397,21 @@ async function completeControllerDecision(
   return parseControllerDecision(text);
 }
 
-async function callController(
+async function decideControllerAction(
   ctx: ExtensionContext,
-  snapshot: AutoModeStateV1,
+  snapshot: AutoModeStateV2,
   workerTurn: WorkerTurnSnapshot,
   gitSnapshot: GitSnapshot | undefined,
   verifyResult: VerifyCommandResult | undefined,
-  probeResult?: ProbeResult,
 ): Promise<ControllerDecision | undefined> {
   return completeControllerDecision(
     ctx,
     snapshot,
-    AUTO_CONTROLLER_SYSTEM_PROMPT,
-    buildControllerUserPrompt(snapshot, workerTurn, gitSnapshot, verifyResult, probeResult),
+    buildControllerUserPrompt(snapshot, workerTurn, gitSnapshot, verifyResult),
   );
 }
 
-async function decideControllerAction(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  snapshot: AutoModeStateV1,
-  workerTurn: WorkerTurnSnapshot,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult: VerifyCommandResult | undefined,
-): Promise<ControllerDecision | undefined> {
-  let decision = await callController(ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
-  if (!decision) {
-    return undefined;
-  }
-
-  if (decision.action !== "probe") {
-    return decision;
-  }
-
-  if (!snapshot.allowControllerProbes) {
-    return {
-      action: "pause",
-      reason: "Controller requested a probe, but probes are disabled.",
-      updatedSummary: decision.updatedSummary,
-      goalStatus: "blocked",
-      completionGateMet: false,
-      progressPercent: decision.progressPercent,
-      commitRecommendation: decision.commitRecommendation,
-    };
-  }
-
-  let probeRounds = 0;
-  while (decision.action === "probe" && probeRounds < PROBE_LIMIT_PER_CYCLE) {
-    const probeResult = await executeProbe(pi, ctx, snapshot, decision.probe.kind);
-    probeRounds += 1;
-    decision = await callController(ctx, snapshot, workerTurn, gitSnapshot, verifyResult, probeResult);
-    if (!decision) {
-      return undefined;
-    }
-  }
-
-  if (decision.action === "probe") {
-    return {
-      action: "pause",
-      reason: "Controller requested repeated probes in one cycle.",
-      updatedSummary: decision.updatedSummary,
-      goalStatus: "blocked",
-      completionGateMet: false,
-      progressPercent: decision.progressPercent,
-      commitRecommendation: decision.commitRecommendation,
-    };
-  }
-
-  return decision;
-}
-
-function updateNoChangeCounters(snapshot: AutoModeStateV1, gitSnapshot: GitSnapshot | undefined): void {
+function updateNoChangeCounters(snapshot: AutoModeStateV2, gitSnapshot: GitSnapshot | undefined): void {
   const nextHead = gitSnapshot?.head;
   const nextFiles = gitSnapshot?.changedFiles ?? [];
   const nextFingerprint = gitSnapshot?.repoFingerprint;
@@ -621,30 +432,7 @@ function updateNoChangeCounters(snapshot: AutoModeStateV1, gitSnapshot: GitSnaps
   snapshot.lastSeenRepoFingerprint = nextFingerprint;
 }
 
-function applyContinueDecisionProgress(
-  snapshot: AutoModeStateV1,
-  decision: ContinueDecision,
-  adjacentContinuationTriggered: boolean,
-): void {
-  const nextProgress = deriveAutoContinueProgressState({
-    completionPolicy: snapshot.completionPolicy,
-    phase: snapshot.phase,
-    goalStatus: decision.goalStatus,
-    currentIteration: snapshot.currentIteration,
-    updatedSummary: decision.updatedSummary,
-    adjacentContinuationTriggered,
-    primaryGoalVerifiedAtIteration: snapshot.primaryGoalVerifiedAtIteration,
-    adjacentContinuationCount: snapshot.adjacentContinuationCount,
-    primaryGoalCompletionSummary: snapshot.primaryGoalCompletionSummary,
-  });
-
-  snapshot.phase = nextProgress.phase;
-  snapshot.primaryGoalVerifiedAtIteration = nextProgress.primaryGoalVerifiedAtIteration;
-  snapshot.adjacentContinuationCount = nextProgress.adjacentContinuationCount;
-  snapshot.primaryGoalCompletionSummary = nextProgress.primaryGoalCompletionSummary;
-}
-
-function recordControllerDecision(snapshot: AutoModeStateV1, decision: ControllerDecision): void {
+function recordControllerDecision(snapshot: AutoModeStateV2, decision: ControllerDecision): void {
   snapshot.lastControllerAt = now();
   snapshot.controllerSummary = truncateControllerSummary(decision.updatedSummary);
   snapshot.recentDecisions = appendDecisionHistory(
@@ -658,291 +446,6 @@ function recordControllerDecision(snapshot: AutoModeStateV1, decision: Controlle
     },
     DEFAULT_DECISION_HISTORY_LIMIT,
   );
-}
-
-function augmentContinuePrompt(
-  decision: ContinueDecision,
-  snapshot: AutoModeStateV1,
-  gitSnapshot: GitSnapshot | undefined,
-): string {
-  const additions: string[] = [];
-
-  if (decision.commitRecommendation === "milestone" && snapshot.commitPolicy !== "none" && gitSnapshot?.dirty) {
-    additions.push("If the current changes already form a coherent milestone, make an atomic commit before moving on.");
-    if (snapshot.pushPolicy !== "never" && gitSnapshot.hasUpstream) {
-      additions.push("If you make a milestone commit and the current branch has an upstream, push it as well.");
-    }
-  }
-
-  if (additions.length === 0) {
-    return decision.nextPrompt;
-  }
-
-  return `${decision.nextPrompt}\n\n${additions.join(" ")}`;
-}
-
-function buildStopOverrideControllerUserPrompt(
-  snapshot: AutoModeStateV1,
-  workerTurn: WorkerTurnSnapshot,
-  blockedStop: Extract<ControllerDecision, { action: "stop" }>,
-  stopGuard: AutoStopGuardResult,
-  fallbackDecision: ContinueDecision,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult: VerifyCommandResult | undefined,
-): string {
-  const blockerLines = stopGuard.blockers.map((blocker) => `- ${describeAutoStopBlocker(blocker, snapshot.verifyCommand)}`).join("\n");
-  const sections = [
-    "A runtime guard rejected the proposed stop decision.",
-    `Blocked stop reason:\n${blockedStop.reason}`,
-    `Blocked stop summary:\n${blockedStop.updatedSummary}`,
-    `Runtime stop blockers:\n${blockerLines}`,
-    snapshot.lastAutoPrompt ? `Previous auto prompt sent to the worker:\n${snapshot.lastAutoPrompt}` : undefined,
-    `Fallback follow-up prompt if you cannot improve it:\n${fallbackDecision.nextPrompt}`,
-    `Current controller summary:\n${snapshot.controllerSummary || "(empty)"}`,
-    `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
-    `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
-    verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
-  ].filter((value): value is string => !!value);
-
-  return sections.join("\n\n");
-}
-
-function buildContinueRepetitionControllerUserPrompt(
-  snapshot: AutoModeStateV1,
-  repeatedDecision: ContinueDecision,
-  workerTurn: WorkerTurnSnapshot,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult: VerifyCommandResult | undefined,
-): string {
-  const remainingIterations = Math.max(0, snapshot.maxIterations - snapshot.currentIteration);
-  const sections = [
-    "A proposed continue decision would repeat the previous auto prompt.",
-    `Goal:\n${snapshot.goal}`,
-    snapshot.untilPrompt ? `Completion gate:\n${snapshot.untilPrompt}` : undefined,
-    [
-      `Mode: ${snapshot.mode}`,
-      `Completion policy: ${snapshot.completionPolicy}`,
-      `Phase: ${snapshot.phase}`,
-      `Current iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
-      `Remaining iterations after this turn: ${remainingIterations}`,
-    ].join("\n"),
-    `Previous auto prompt sent to the worker:\n${snapshot.lastAutoPrompt || "(none)"}`,
-    `Proposed repeated continue reason:\n${repeatedDecision.reason}`,
-    `Proposed repeated continue summary:\n${repeatedDecision.updatedSummary}`,
-    `Proposed repeated continue prompt:\n${repeatedDecision.nextPrompt}`,
-    `Current controller summary:\n${snapshot.controllerSummary || "(empty)"}`,
-    `Recent controller decisions:\n${buildControllerDecisionHistoryText(snapshot)}`,
-    `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
-    `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
-    verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
-  ].filter((value): value is string => !!value);
-
-  return sections.join("\n\n");
-}
-
-function buildAdjacentContinuationControllerUserPrompt(
-  snapshot: AutoModeStateV1,
-  verifiedStop: Extract<ControllerDecision, { action: "stop" }>,
-  workerTurn: WorkerTurnSnapshot,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult: VerifyCommandResult | undefined,
-): string {
-  const remainingIterations = Math.max(0, snapshot.maxIterations - snapshot.currentIteration);
-  const remainingAdjacentBudget = Math.max(0, snapshot.maxAdjacentContinuations - snapshot.adjacentContinuationCount);
-  const sections = [
-    "The primary goal appears verified complete and a normal stop would be allowed.",
-    `Completion policy: ${snapshot.completionPolicy}`,
-    `Current phase: ${snapshot.phase}`,
-    `Current iteration: ${snapshot.currentIteration}/${snapshot.maxIterations}`,
-    `Remaining iterations after this turn: ${remainingIterations}`,
-    `Adjacent continuation count so far: ${snapshot.adjacentContinuationCount}/${snapshot.maxAdjacentContinuations}`,
-    `Remaining adjacent continuation budget: ${remainingAdjacentBudget}`,
-    `Proposed stop reason:\n${verifiedStop.reason}`,
-    `Proposed stop summary:\n${verifiedStop.updatedSummary}`,
-    snapshot.primaryGoalCompletionSummary ? `Primary goal completion summary:\n${snapshot.primaryGoalCompletionSummary}` : undefined,
-    snapshot.lastAutoPrompt ? `Previous auto prompt sent to the worker:\n${snapshot.lastAutoPrompt}` : undefined,
-    `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
-    `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
-    verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
-    "Because completionPolicy=continue-similar is active and a normal stop would already be valid, prefer continue over stop when one clear bounded adjacent optimization exists within the remaining adjacent continuation budget.",
-    "If you continue, choose one bounded adjacent optimization that stays close to the same subsystem, changed files, or problem class.",
-  ].filter((value): value is string => !!value);
-
-  return sections.join("\n\n");
-}
-
-async function getAdjacentContinuationDecision(
-  ctx: ExtensionContext,
-  snapshot: AutoModeStateV1,
-  decision: Extract<ControllerDecision, { action: "stop" }>,
-  workerTurn: WorkerTurnSnapshot,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult: VerifyCommandResult | undefined,
-): Promise<Exclude<ControllerDecision, Extract<ControllerDecision, { action: "probe" }>> | undefined> {
-  const controllerDecision = await completeControllerDecision(
-    ctx,
-    snapshot,
-    AUTO_CONTROLLER_ADJACENT_CONTINUATION_SYSTEM_PROMPT,
-    buildAdjacentContinuationControllerUserPrompt(snapshot, decision, workerTurn, gitSnapshot, verifyResult),
-  );
-  if (!controllerDecision || controllerDecision.action === "probe") {
-    return undefined;
-  }
-  return controllerDecision;
-}
-
-async function getContinueRepetitionDecision(
-  ctx: ExtensionContext,
-  snapshot: AutoModeStateV1,
-  decision: ContinueDecision,
-  workerTurn: WorkerTurnSnapshot,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult: VerifyCommandResult | undefined,
-): Promise<Exclude<ControllerDecision, Extract<ControllerDecision, { action: "stop" | "probe" }>> | undefined> {
-  const controllerDecision = await completeControllerDecision(
-    ctx,
-    snapshot,
-    AUTO_CONTROLLER_CONTINUE_REPETITION_SYSTEM_PROMPT,
-    buildContinueRepetitionControllerUserPrompt(snapshot, decision, workerTurn, gitSnapshot, verifyResult),
-  );
-  if (!controllerDecision || controllerDecision.action === "stop" || controllerDecision.action === "probe") {
-    return undefined;
-  }
-  return controllerDecision;
-}
-
-async function getStopOverrideDecision(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  snapshot: AutoModeStateV1,
-  decision: Extract<ControllerDecision, { action: "stop" }>,
-  workerTurn: WorkerTurnSnapshot,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult?: VerifyCommandResult,
-): Promise<Exclude<ControllerDecision, Extract<ControllerDecision, { action: "stop" | "probe" }>> | undefined> {
-  const resolvedVerifyResult = verifyResult ?? (
-    snapshot.verifyCommand
-      ? await runVerifyCommand(pi, ctx.cwd, snapshot.verifyCommand)
-      : undefined
-  );
-  const stopGuard = evaluateAutoStopGuard({
-    goalStatus: decision.goalStatus,
-    requiresCompletionGate: !!snapshot.untilPrompt,
-    completionGateMet: decision.completionGateMet,
-    verifyCommandConfigured: !!snapshot.verifyCommand,
-    verifyCommandPassed: snapshot.verifyCommand ? !!resolvedVerifyResult?.ok : false,
-    workerAssistantText: workerTurn.assistantText,
-    commitPolicy: snapshot.commitPolicy,
-    pushPolicy: snapshot.pushPolicy,
-    git: gitSnapshot
-      ? {
-          dirty: gitSnapshot.dirty,
-          hasUpstream: gitSnapshot.hasUpstream,
-          ahead: gitSnapshot.ahead,
-          behind: gitSnapshot.behind,
-        }
-      : undefined,
-  });
-
-  const fallbackDecision = buildAutoStopOverrideDecision({
-    decision,
-    stopGuard,
-    verifyCommand: snapshot.verifyCommand,
-  });
-  if (!fallbackDecision) {
-    return undefined;
-  }
-
-  const controllerRefinement = await completeControllerDecision(
-    ctx,
-    snapshot,
-    AUTO_CONTROLLER_STOP_OVERRIDE_SYSTEM_PROMPT,
-    buildStopOverrideControllerUserPrompt(snapshot, workerTurn, decision, stopGuard, fallbackDecision, gitSnapshot, resolvedVerifyResult),
-  );
-
-  return applyControllerStopOverrideRefinement({
-    fallbackDecision,
-    controllerDecision: controllerRefinement,
-  });
-}
-
-async function resolveRepeatedContinueDecision(
-  ctx: ExtensionContext,
-  snapshot: AutoModeStateV1,
-  decision: ContinueDecision,
-  workerTurn: WorkerTurnSnapshot,
-  gitSnapshot: GitSnapshot | undefined,
-  verifyResult: VerifyCommandResult | undefined,
-  getContinueRepetitionDecisionImpl: typeof getContinueRepetitionDecision,
-): Promise<ContinueDecision | Exclude<ControllerDecision, Extract<ControllerDecision, { action: "continue" | "stop" | "probe" }>>> {
-  if (!areAutoPromptsEquivalent(snapshot.lastAutoPrompt, decision.nextPrompt)) {
-    return decision;
-  }
-
-  const controllerRefinement = await getContinueRepetitionDecisionImpl(
-    ctx,
-    snapshot,
-    decision,
-    workerTurn,
-    gitSnapshot,
-    verifyResult,
-  );
-
-  return applyControllerContinueRepetitionRefinement({
-    repeatedDecision: decision,
-    controllerDecision: controllerRefinement?.action === "continue"
-      ? {
-          ...controllerRefinement,
-          nextPrompt: augmentContinuePrompt(controllerRefinement, snapshot, gitSnapshot),
-        }
-      : controllerRefinement,
-  });
-}
-
-function queueContinueLikeFollowUp(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  runtime: AutoRuntimeState,
-  snapshot: AutoModeStateV1,
-  workerTurn: WorkerTurnSnapshot,
-  decision: ContinueDecision,
-  options: {
-    budgetPauseReason: string;
-    notifyMessage: string;
-    notifyLevel?: "info" | "warning";
-  },
-): void {
-  const followUpPlan = planAutoFollowUp({
-    nextPrompt: decision.nextPrompt,
-    currentIteration: snapshot.currentIteration,
-    maxIterations: snapshot.maxIterations,
-    lastAutoPrompt: snapshot.lastAutoPrompt,
-    consecutiveStagnationCount: snapshot.consecutiveStagnationCount,
-    consecutiveNoChangeCount: snapshot.consecutiveNoChangeCount,
-    budgetPauseReason: options.budgetPauseReason,
-  });
-
-  snapshot.consecutiveStagnationCount = followUpPlan.nextStagnationCount;
-
-  if (followUpPlan.action === "pause") {
-    if (
-      canUseWorkerReflection(snapshot)
-      && (followUpPlan.reason === "controller produced the same next prompt repeatedly"
-        || followUpPlan.reason === "repository state has not changed across several iterations")
-    ) {
-      queueWorkerReflection(pi, ctx, snapshot, workerTurn, followUpPlan.reason, options.notifyLevel ?? "warning");
-      return;
-    }
-    pauseSnapshot(pi, ctx, runtime, followUpPlan.reason, options.notifyLevel ?? "warning");
-    return;
-  }
-
-  snapshot.lastAutoPrompt = followUpPlan.nextPrompt;
-  snapshot.currentIteration = followUpPlan.nextIteration;
-  persistSnapshot(pi, snapshot);
-  setStatus(ctx, snapshot);
-  ctx.ui.notify(options.notifyMessage, options.notifyLevel ?? "info");
-  pi.sendUserMessage(followUpPlan.nextPrompt);
 }
 
 function getLastAssistantTurn(event: { messages?: unknown[] }): WorkerTurnSnapshot | undefined {
@@ -1000,6 +503,13 @@ function ensureModelAvailable(ctx: ExtensionContext | ExtensionCommandContext): 
   return undefined;
 }
 
+function notifyWarnings(ctx: ExtensionContext | ExtensionCommandContext, warnings: string[] | undefined): void {
+  if (!warnings) return;
+  for (const warning of warnings) {
+    ctx.ui.notify(warning, "warning");
+  }
+}
+
 async function startAutoMode(
   pi: ExtensionAPI,
   ctx: ExtensionContext | ExtensionCommandContext,
@@ -1022,7 +532,7 @@ async function startAutoMode(
     return;
   }
 
-  const summary = buildInitialControllerSummary(ctx, config as AutoStartConfig);
+  const summary = buildInitialControllerSummary(ctx as ExtensionContext, config);
   const snapshot = buildInitialState(config, summary);
   runtime.snapshot = snapshot;
   setStatus(ctx, snapshot);
@@ -1036,7 +546,10 @@ async function startAutoMode(
   snapshot.lastAutoPrompt = startPrompt;
   persistSnapshot(pi, snapshot);
 
-  ctx.ui.notify(`Auto-mode started (${snapshot.mode}, ${snapshot.currentIteration}/${snapshot.maxIterations})`, "info");
+  ctx.ui.notify(
+    `Auto-mode started (${snapshot.mode}, ${snapshot.assuranceMode}, ${snapshot.currentIteration}/${snapshot.maxIterations})`,
+    "info",
+  );
   pi.sendUserMessage(startPrompt);
 }
 
@@ -1060,9 +573,14 @@ function restoreSnapshotOnSessionStart(
     return { resumed: false };
   }
 
-  const shouldResume = shouldAutoResumeOnSessionStart(eventReason, autoResume, restored.resumePolicy);
+  const forcePausedForMigration = Array.isArray(restored.migrationWarnings) && restored.migrationWarnings.length > 0;
+  notifyWarnings(ctx, restored.migrationWarnings);
+
+  const shouldResume = forcePausedForMigration
+    ? false
+    : shouldAutoResumeOnSessionStart(eventReason, autoResume, restored.resumePolicy);
   const previousPaused = restored.paused;
-  restored.paused = !shouldResume;
+  restored.paused = forcePausedForMigration ? true : !shouldResume;
 
   if (restored.paused) {
     ctx.ui.notify("Auto-mode state restored in paused mode. Use /auto resume to continue.", "info");
@@ -1104,7 +622,7 @@ async function resumeAutoMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, ru
   pi.sendUserMessage(resumePrompt);
 }
 
-function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 | undefined): void {
+function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV2 | undefined): void {
   if (!snapshot?.enabled) {
     ctx.ui.notify("No active auto-mode run", "info");
     return;
@@ -1112,18 +630,17 @@ function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 
 
   const lines = [
     `mode=${snapshot.mode}`,
-    `completion-policy=${snapshot.completionPolicy}`,
-    `phase=${snapshot.phase}`,
+    `assurance=${snapshot.assuranceMode}`,
     `paused=${snapshot.paused ? "yes" : "no"}`,
     `iteration=${snapshot.currentIteration}/${snapshot.maxIterations}`,
     `goal=${snapshot.goal}`,
     snapshot.untilPrompt ? `completion-gate=${snapshot.untilPrompt}` : undefined,
-    snapshot.controllerModel ? `controller-model=${snapshot.controllerModel.provider}/${snapshot.controllerModel.id}` : `controller-model=${DEFAULT_CONTROLLER_MODEL} (default)`,
+    snapshot.controllerModel
+      ? `controller-model=${snapshot.controllerModel.provider}/${snapshot.controllerModel.id}`
+      : `controller-model=${DEFAULT_CONTROLLER_MODEL} (default)`,
     snapshot.verifyCommand ? `verify=${snapshot.verifyCommand}` : undefined,
     `commit-policy=${snapshot.commitPolicy}`,
     `push-policy=${snapshot.pushPolicy}`,
-    `adjacent-count=${snapshot.adjacentContinuationCount}/${snapshot.maxAdjacentContinuations}`,
-    snapshot.primaryGoalVerifiedAtIteration !== undefined ? `primary-verified-at=${snapshot.primaryGoalVerifiedAtIteration}` : undefined,
     `controller-failures=${snapshot.consecutiveControllerFailures}`,
     `worker-failures=${snapshot.consecutiveWorkerFailures}`,
     `stagnation=${snapshot.consecutiveStagnationCount}`,
@@ -1136,7 +653,7 @@ function showAutoStatus(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 
   ctx.ui.notify(lines, "info");
 }
 
-function showAutoSummary(ctx: ExtensionCommandContext, snapshot: AutoModeStateV1 | undefined): void {
+function showAutoSummary(ctx: ExtensionCommandContext, snapshot: AutoModeStateV2 | undefined): void {
   if (!snapshot?.enabled) {
     ctx.ui.notify("No active auto-mode run", "info");
     return;
@@ -1154,12 +671,77 @@ function buildFlagsFromPi(pi: ExtensionAPI) {
     verify: pi.getFlag("auto-verify"),
     commitPolicy: pi.getFlag("auto-commit-policy"),
     pushPolicy: pi.getFlag("auto-push-policy"),
+    assurance: pi.getFlag("auto-assurance"),
+    resume: pi.getFlag("auto-resume"),
     completionPolicy: pi.getFlag("auto-completion-policy"),
     maxAdjacentContinuations: pi.getFlag("auto-max-adjacent-continuations"),
     allowControllerProbes: pi.getFlag("auto-allow-controller-probes"),
     workerReflection: pi.getFlag("auto-worker-reflection"),
-    resume: pi.getFlag("auto-resume"),
   };
+}
+
+function buildBlockedStopDecision(
+  snapshot: AutoModeStateV2,
+  decision: Extract<ControllerDecision, { action: "stop" }>,
+  stopGuard: AutoStopGuardResult,
+): ContinueDecision {
+  const blockerSummary = stopGuard.blockers
+    .map((blocker) => describeAutoStopBlocker(blocker, snapshot.verifyCommand))
+    .join("; ");
+  const goalStillOpen = stopGuard.blockers.includes("goal-not-met") || stopGuard.blockers.includes("completion-gate-not-met");
+
+  return {
+    action: "continue",
+    reason: `Stop blocked: ${blockerSummary}.`,
+    updatedSummary: truncateControllerSummary(
+      `Stop blocked. Remaining blockers: ${blockerSummary}. Previous stop reason: ${decision.reason}. ${decision.updatedSummary}`,
+    ),
+    goalStatus: goalStillOpen ? "in_progress" : decision.goalStatus === "met" ? "likely_met" : decision.goalStatus,
+    completionGateMet: stopGuard.blockers.includes("completion-gate-not-met") ? false : decision.completionGateMet,
+    nextPrompt: buildBlockedStopFollowUp({
+      blockers: stopGuard.blockers,
+      goal: snapshot.goal,
+      untilPrompt: snapshot.untilPrompt,
+      verifyCommand: snapshot.verifyCommand,
+    }),
+  };
+}
+
+function queueContinueLikeFollowUp(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV2,
+  decision: ContinueDecision,
+  options: {
+    budgetPauseReason: string;
+    notifyMessage: string;
+    notifyLevel?: "info" | "warning";
+  },
+): void {
+  const followUpPlan = planAutoFollowUp({
+    nextPrompt: decision.nextPrompt,
+    currentIteration: snapshot.currentIteration,
+    maxIterations: snapshot.maxIterations,
+    lastAutoPrompt: snapshot.lastAutoPrompt,
+    consecutiveStagnationCount: snapshot.consecutiveStagnationCount,
+    consecutiveNoChangeCount: snapshot.consecutiveNoChangeCount,
+    budgetPauseReason: options.budgetPauseReason,
+  });
+
+  snapshot.consecutiveStagnationCount = followUpPlan.nextStagnationCount;
+
+  if (followUpPlan.action === "pause") {
+    pauseSnapshot(pi, ctx, runtime, followUpPlan.reason, options.notifyLevel ?? "warning");
+    return;
+  }
+
+  snapshot.lastAutoPrompt = followUpPlan.nextPrompt;
+  snapshot.currentIteration = followUpPlan.nextIteration;
+  persistSnapshot(pi, snapshot);
+  setStatus(ctx, snapshot);
+  ctx.ui.notify(options.notifyMessage, options.notifyLevel ?? "info");
+  pi.sendUserMessage(followUpPlan.nextPrompt);
 }
 
 export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
@@ -1169,373 +751,292 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
     };
     const getGitSnapshotImpl = deps.getGitSnapshot ?? getGitSnapshot;
     const decideControllerActionImpl = deps.decideControllerAction ?? decideControllerAction;
-    const getStopOverrideDecisionImpl = deps.getStopOverrideDecision ?? getStopOverrideDecision;
-    const getAdjacentContinuationDecisionImpl = deps.getAdjacentContinuationDecision ?? getAdjacentContinuationDecision;
-    const getContinueRepetitionDecisionImpl = deps.getContinueRepetitionDecision ?? getContinueRepetitionDecision;
+    const runVerifyCommandImpl = deps.runVerifyCommand ?? runVerifyCommand;
 
-  pi.registerFlag("auto-goal", {
-    description: "Start auto-mode with the given goal",
-    type: "string",
-  });
-  pi.registerFlag("auto-iterations", {
-    description: `Iteration limit for auto-mode (default ${DEFAULT_AUTO_ITERATIONS})`,
-    type: "string",
-  });
-  pi.registerFlag("auto-until", {
-    description: "Optional completion gate prompt for controller stop decisions",
-    type: "string",
-  });
-  pi.registerFlag("auto-controller-model", {
-    description: `Optional controller model in provider/model form (defaults to the ${DEFAULT_CONTROLLER_MODEL})`,
-    type: "string",
-  });
-  pi.registerFlag("auto-verify", {
-    description: "Optional verification command for candidate-stop checks, e.g. npm test",
-    type: "string",
-  });
-  pi.registerFlag("auto-commit-policy", {
-    description: "Commit policy: none | milestones | final-or-milestone",
-    type: "string",
-    default: "final-or-milestone",
-  });
-  pi.registerFlag("auto-push-policy", {
-    description: "Push policy: never | if-upstream | final-or-milestone-if-upstream",
-    type: "string",
-    default: "final-or-milestone-if-upstream",
-  });
-  pi.registerFlag("auto-completion-policy", {
-    description: "Completion policy: stop | continue-similar",
-    type: "string",
-    default: "stop",
-  });
-  pi.registerFlag("auto-max-adjacent-continuations", {
-    description: `Maximum adjacent continuations when completion-policy=continue-similar (default ${DEFAULT_MAX_ADJACENT_CONTINUATIONS})`,
-    type: "string",
-    default: String(DEFAULT_MAX_ADJACENT_CONTINUATIONS),
-  });
-  pi.registerFlag("auto-allow-controller-probes", {
-    description: "Allow the controller to request a limited read-only repository probe",
-    type: "boolean",
-    default: true,
-  });
-  pi.registerFlag("auto-worker-reflection", {
-    description: "Allow one worker reflection follow-up when progress is stuck or the controller is inconclusive",
-    type: "boolean",
-    default: false,
-  });
-  pi.registerFlag("auto-resume", {
-    description: "Resume a restored auto-mode run automatically on startup",
-    type: "boolean",
-    default: false,
-  });
-
-  pi.registerCommand("auto", {
-    description: "Autonomous improvement mode with a controller loop",
-    handler: async (args, ctx) => {
-      const parsed = parseAutoCommandArgs(args);
-      if ("error" in parsed) {
-        ctx.ui.notify(parsed.error, "warning");
-        if (parsed.error.startsWith("Unknown /auto subcommand:")) {
-          ctx.ui.notify(COMMAND_USAGE, "warning");
-        }
-        return;
-      }
-
-      switch (parsed.kind) {
-        case "on":
-          await startAutoMode(pi, ctx, runtime, parsed.config);
-          return;
-        case "status":
-          showAutoStatus(ctx, runtime.snapshot);
-          return;
-        case "summary":
-          showAutoSummary(ctx, runtime.snapshot);
-          return;
-        case "pause": {
-          if (!isAutoEnabled(runtime.snapshot)) {
-            ctx.ui.notify("No active auto-mode run", "info");
-            return;
-          }
-          pauseSnapshot(pi, ctx, runtime, "paused by user", "info");
-          if (!ctx.isIdle()) {
-            ctx.abort();
-          }
-          return;
-        }
-        case "resume":
-          await resumeAutoMode(pi, ctx, runtime);
-          return;
-        case "off": {
-          if (!isAutoEnabled(runtime.snapshot)) {
-            ctx.ui.notify("No active auto-mode run", "info");
-            return;
-          }
-          disableSnapshot(pi, ctx, runtime, "stopped by user", "info");
-          if (!ctx.isIdle()) {
-            ctx.abort();
-          }
-          return;
-        }
-        case "nudge": {
-          if (!isAutoEnabled(runtime.snapshot)) {
-            ctx.ui.notify("No active auto-mode run", "info");
-            return;
-          }
-          runtime.snapshot.controllerSummary = truncateControllerSummary(
-            `${runtime.snapshot.controllerSummary}\n\nUser nudge: ${parsed.text}`,
-          );
-          persistSnapshot(pi, runtime.snapshot);
-          ctx.ui.notify("Auto-mode nudge recorded", "info");
-          if (ctx.isIdle() && !runtime.snapshot.paused) {
-            pi.sendUserMessage(`Additional direction while continuing the same goal: ${parsed.text}`);
-          } else if (!ctx.isIdle()) {
-            pi.sendUserMessage(`Additional direction while continuing the same goal: ${parsed.text}`, {
-              deliverAs: "followUp",
-            });
-          }
-          return;
-        }
-      }
-    },
-  });
-
-  pi.on("session_start", async (event, ctx) => {
-    runtime.controllerBusy = false;
-
-    const flags = buildFlagsFromPi(pi);
-    const persistedSnapshot = restorePersistedSnapshot(ctx);
-    const fromFlags = buildAutoStartConfigFromFlags(flags);
-    const sessionStartDecision = decideAutoModeSessionStart({
-      reason: event.reason,
-      hasPersistedSnapshot: !!persistedSnapshot,
-      autoStartConfigState: !fromFlags ? "none" : "error" in fromFlags ? "invalid" : "valid",
-      autoStartError: fromFlags && "error" in fromFlags ? fromFlags.error : undefined,
-      autoResumeFlag: flags.resume === true,
-      persistedResumePolicy: persistedSnapshot?.resumePolicy,
+    pi.registerFlag("auto-goal", {
+      description: "Start auto-mode with the given goal",
+      type: "string",
+    });
+    pi.registerFlag("auto-iterations", {
+      description: `Iteration limit for auto-mode (default ${DEFAULT_AUTO_ITERATIONS})`,
+      type: "string",
+    });
+    pi.registerFlag("auto-until", {
+      description: "Optional completion gate prompt for controller stop decisions",
+      type: "string",
+    });
+    pi.registerFlag("auto-controller-model", {
+      description: `Optional controller model in provider/model form (defaults to the ${DEFAULT_CONTROLLER_MODEL})`,
+      type: "string",
+    });
+    pi.registerFlag("auto-verify", {
+      description: "Optional verification command for near-stop checks, e.g. npm test",
+      type: "string",
+    });
+    pi.registerFlag("auto-commit-policy", {
+      description: "Commit policy: none | milestones | final-or-milestone",
+      type: "string",
+      default: "final-or-milestone",
+    });
+    pi.registerFlag("auto-push-policy", {
+      description: "Push policy: never | if-upstream | final-or-milestone-if-upstream",
+      type: "string",
+      default: "final-or-milestone-if-upstream",
+    });
+    pi.registerFlag("auto-assurance", {
+      description: "Assurance mode: pragmatic | strict",
+      type: "string",
+      default: "pragmatic",
+    });
+    pi.registerFlag("auto-resume", {
+      description: "Resume a restored auto-mode run automatically on startup",
+      type: "boolean",
+      default: false,
+    });
+    pi.registerFlag("auto-completion-policy", {
+      description: "Deprecated in auto-mode V2 and ignored",
+      type: "string",
+    });
+    pi.registerFlag("auto-max-adjacent-continuations", {
+      description: "Deprecated in auto-mode V2 and ignored",
+      type: "string",
+    });
+    pi.registerFlag("auto-allow-controller-probes", {
+      description: "Deprecated in auto-mode V2 and ignored",
+      type: "boolean",
+    });
+    pi.registerFlag("auto-worker-reflection", {
+      description: "Deprecated in auto-mode V2 and ignored",
+      type: "boolean",
     });
 
-    if (sessionStartDecision.warning) {
-      ctx.ui.notify(sessionStartDecision.warning, sessionStartDecision.action === "noop" ? "error" : "warning");
-    }
+    pi.registerCommand("auto", {
+      description: "Autonomous improvement mode with a controller loop",
+      handler: async (args, ctx) => {
+        const parsed = parseAutoCommandArgs(args);
+        if ("error" in parsed) {
+          ctx.ui.notify(parsed.error, "warning");
+          if (parsed.error.startsWith("Unknown /auto subcommand:")) {
+            ctx.ui.notify(COMMAND_USAGE, "warning");
+          }
+          return;
+        }
 
-    if (sessionStartDecision.action === "start-from-flags") {
+        switch (parsed.kind) {
+          case "on":
+            notifyWarnings(ctx, parsed.warnings);
+            await startAutoMode(pi, ctx, runtime, parsed.config);
+            return;
+          case "status":
+            showAutoStatus(ctx, runtime.snapshot);
+            return;
+          case "summary":
+            showAutoSummary(ctx, runtime.snapshot);
+            return;
+          case "pause": {
+            if (!isAutoEnabled(runtime.snapshot)) {
+              ctx.ui.notify("No active auto-mode run", "info");
+              return;
+            }
+            pauseSnapshot(pi, ctx, runtime, "paused by user", "info");
+            if (!ctx.isIdle()) {
+              ctx.abort();
+            }
+            return;
+          }
+          case "resume":
+            await resumeAutoMode(pi, ctx, runtime);
+            return;
+          case "off": {
+            if (!isAutoEnabled(runtime.snapshot)) {
+              ctx.ui.notify("No active auto-mode run", "info");
+              return;
+            }
+            disableSnapshot(pi, ctx, runtime, "stopped by user", "info");
+            if (!ctx.isIdle()) {
+              ctx.abort();
+            }
+            return;
+          }
+          case "nudge": {
+            if (!isAutoEnabled(runtime.snapshot)) {
+              ctx.ui.notify("No active auto-mode run", "info");
+              return;
+            }
+            runtime.snapshot.controllerSummary = truncateControllerSummary(
+              `${runtime.snapshot.controllerSummary}\n\nUser nudge: ${parsed.text}`,
+            );
+            persistSnapshot(pi, runtime.snapshot);
+            ctx.ui.notify("Auto-mode nudge recorded", "info");
+            if (ctx.isIdle() && !runtime.snapshot.paused) {
+              pi.sendUserMessage(`Additional direction while continuing the same goal: ${parsed.text}`);
+            } else if (!ctx.isIdle()) {
+              pi.sendUserMessage(`Additional direction while continuing the same goal: ${parsed.text}`, {
+                deliverAs: "followUp",
+              });
+            }
+            return;
+          }
+        }
+      },
+    });
+
+    pi.on("session_start", async (event, ctx) => {
+      runtime.controllerBusy = false;
+
+      const flags = buildFlagsFromPi(pi);
+      const persistedSnapshot = restorePersistedSnapshot(ctx);
+      const fromFlags = buildAutoStartConfigFromFlags(flags);
+      const sessionStartDecision = decideAutoModeSessionStart({
+        reason: event.reason,
+        hasPersistedSnapshot: !!persistedSnapshot,
+        autoStartConfigState: !fromFlags ? "none" : "error" in fromFlags ? "invalid" : "valid",
+        autoStartError: fromFlags && "error" in fromFlags ? fromFlags.error : undefined,
+        autoResumeFlag: flags.resume === true,
+        persistedResumePolicy: persistedSnapshot?.resumePolicy,
+      });
+
+      if (sessionStartDecision.warning) {
+        ctx.ui.notify(sessionStartDecision.warning, sessionStartDecision.action === "noop" ? "error" : "warning");
+      }
+
+      if (sessionStartDecision.action === "start-from-flags") {
+        runtime.snapshot = undefined;
+        setStatus(ctx, undefined);
+        const success = fromFlags as AutoStartConfigBuildSuccess;
+        notifyWarnings(ctx, success.warnings);
+        await startAutoMode(pi, ctx, runtime, success.config);
+        return;
+      }
+
+      if (sessionStartDecision.action === "restore") {
+        const restoreResult = restoreSnapshotOnSessionStart(pi, ctx, runtime, event.reason, sessionStartDecision.autoResume);
+        if (restoreResult.resumed && runtime.snapshot && ctx.isIdle()) {
+          const resumePrompt = getResumePrompt(runtime.snapshot);
+          runtime.snapshot.lastAutoPrompt = resumePrompt;
+          persistSnapshot(pi, runtime.snapshot);
+          pi.sendUserMessage(resumePrompt);
+        }
+        return;
+      }
+
       runtime.snapshot = undefined;
       setStatus(ctx, undefined);
-      await startAutoMode(pi, ctx, runtime, fromFlags as AutoStartConfig);
-      return;
-    }
+    });
 
-    if (sessionStartDecision.action === "restore") {
-      const restoreResult = restoreSnapshotOnSessionStart(pi, ctx, runtime, event.reason, sessionStartDecision.autoResume);
-      if (restoreResult.resumed && runtime.snapshot && ctx.isIdle()) {
-        const resumePrompt = getResumePrompt(runtime.snapshot);
-        runtime.snapshot.lastAutoPrompt = resumePrompt;
-        persistSnapshot(pi, runtime.snapshot);
-        pi.sendUserMessage(resumePrompt);
-      }
-      return;
-    }
+    pi.on("before_agent_start", async (event) => {
+      const snapshot = runtime.snapshot;
+      if (!isAutoRunning(snapshot)) return;
 
-    runtime.snapshot = undefined;
-    setStatus(ctx, undefined);
-  });
+      return {
+        systemPrompt: `${event.systemPrompt}\n\n${buildWorkerPromptSuffix(snapshot)}`,
+      };
+    });
 
-  pi.on("before_agent_start", async (event) => {
-    const snapshot = runtime.snapshot;
-    if (!isAutoRunning(snapshot)) return;
+    pi.on("agent_end", async (event, ctx) => {
+      const snapshot = runtime.snapshot;
+      if (!isAutoRunning(snapshot)) return;
+      if (runtime.controllerBusy) return;
 
-    return {
-      systemPrompt: `${event.systemPrompt}\n\n${buildWorkerPromptSuffix(snapshot)}`,
-    };
-  });
+      const workerTurn = getLastAssistantTurn(event);
+      if (!workerTurn) return;
 
-  pi.on("agent_end", async (event, ctx) => {
-    const snapshot = runtime.snapshot;
-    if (!isAutoRunning(snapshot)) return;
-    if (runtime.controllerBusy) return;
+      runtime.controllerBusy = true;
 
-    const workerTurn = getLastAssistantTurn(event);
-    if (!workerTurn) return;
+      try {
+        snapshot.lastWorkerFinishedAt = now();
 
-    runtime.controllerBusy = true;
-
-    try {
-      snapshot.lastWorkerFinishedAt = now();
-
-      if (shouldTreatWorkerFailure(workerTurn.stopReason)) {
-        snapshot.consecutiveWorkerFailures += 1;
-        persistSnapshot(pi, snapshot);
-        if (snapshot.consecutiveWorkerFailures >= DEFAULT_WORKER_FAILURE_LIMIT) {
-          pauseSnapshot(pi, ctx, runtime, `worker failed ${snapshot.consecutiveWorkerFailures} times in a row`);
-          return;
-        }
-      } else {
-        snapshot.consecutiveWorkerFailures = 0;
-      }
-
-      const gitSnapshot = await getGitSnapshotImpl(pi, ctx.cwd);
-      updateNoChangeCounters(snapshot, gitSnapshot);
-      persistSnapshot(pi, snapshot);
-
-      const verifyResult = shouldPreRunVerifyCommand({
-        verifyCommandConfigured: !!snapshot.verifyCommand,
-        stopReason: workerTurn.stopReason,
-        assistantText: workerTurn.assistantText,
-        currentIteration: snapshot.currentIteration,
-        maxIterations: snapshot.maxIterations,
-      }) && snapshot.verifyCommand
-        ? await runVerifyCommand(pi, ctx.cwd, snapshot.verifyCommand)
-        : undefined;
-
-      const decision = await decideControllerActionImpl(pi, ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
-
-      if (!decision) {
-        snapshot.consecutiveControllerFailures += 1;
-        if (snapshot.consecutiveControllerFailures === 1 && canUseWorkerReflection(snapshot)) {
-          queueWorkerReflection(pi, ctx, snapshot, workerTurn, "controller was inconclusive about the next best step");
-          return;
-        }
-        persistSnapshot(pi, snapshot);
-        if (snapshot.consecutiveControllerFailures >= DEFAULT_CONTROLLER_FAILURE_LIMIT) {
-          pauseSnapshot(pi, ctx, runtime, `controller failed ${snapshot.consecutiveControllerFailures} times in a row`);
+        if (shouldTreatWorkerFailure(workerTurn.stopReason)) {
+          snapshot.consecutiveWorkerFailures += 1;
+          persistSnapshot(pi, snapshot);
+          if (snapshot.consecutiveWorkerFailures >= DEFAULT_WORKER_FAILURE_LIMIT) {
+            pauseSnapshot(pi, ctx, runtime, `worker failed ${snapshot.consecutiveWorkerFailures} times in a row`);
+            return;
+          }
         } else {
-          ctx.ui.notify("Auto-mode controller was inconclusive; waiting for the next worker turn.", "warning");
+          snapshot.consecutiveWorkerFailures = 0;
         }
-        return;
-      }
 
-      snapshot.consecutiveControllerFailures = 0;
+        const gitSnapshot = await getGitSnapshotImpl(pi, ctx.cwd);
+        updateNoChangeCounters(snapshot, gitSnapshot);
+        persistSnapshot(pi, snapshot);
 
-      if (decision.action === "continue") {
-        const nextPrompt = augmentContinuePrompt(decision, snapshot, gitSnapshot);
-        const refinedDecision = await resolveRepeatedContinueDecision(
-          ctx,
-          snapshot,
-          {
-            ...decision,
-            nextPrompt,
-          },
-          workerTurn,
-          gitSnapshot,
-          verifyResult,
-          getContinueRepetitionDecisionImpl,
-        );
-        if (refinedDecision.action === "pause") {
-          recordControllerDecision(snapshot, refinedDecision);
-          pauseSnapshot(pi, ctx, runtime, refinedDecision.reason, "warning");
+        const verifyResult = shouldPreRunVerifyCommand({
+          verifyCommandConfigured: !!snapshot.verifyCommand,
+          stopReason: workerTurn.stopReason,
+          currentIteration: snapshot.currentIteration,
+          maxIterations: snapshot.maxIterations,
+        }) && snapshot.verifyCommand
+          ? await runVerifyCommandImpl(pi, ctx.cwd, snapshot.verifyCommand)
+          : undefined;
+
+        const decision = await decideControllerActionImpl(ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
+
+        if (!decision) {
+          snapshot.consecutiveControllerFailures += 1;
+          persistSnapshot(pi, snapshot);
+          if (snapshot.consecutiveControllerFailures >= DEFAULT_CONTROLLER_FAILURE_LIMIT) {
+            pauseSnapshot(pi, ctx, runtime, `controller failed ${snapshot.consecutiveControllerFailures} times in a row`);
+          } else {
+            ctx.ui.notify("Auto-mode controller was inconclusive; waiting for the next worker turn.", "warning");
+          }
           return;
         }
-        applyContinueDecisionProgress(snapshot, refinedDecision, false);
-        recordControllerDecision(snapshot, refinedDecision);
-        queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, workerTurn, refinedDecision, {
-          budgetPauseReason: "iteration budget exhausted",
-          notifyMessage: `Auto-mode continuing (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
-          notifyLevel: "info",
+
+        snapshot.consecutiveControllerFailures = 0;
+
+        if (decision.action === "continue") {
+          recordControllerDecision(snapshot, decision);
+          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, decision, {
+            budgetPauseReason: "iteration budget exhausted",
+            notifyMessage: `Auto-mode continuing (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
+            notifyLevel: "info",
+          });
+          return;
+        }
+
+        if (decision.action === "pause") {
+          recordControllerDecision(snapshot, decision);
+          pauseSnapshot(pi, ctx, runtime, decision.reason);
+          return;
+        }
+
+        const stopGuard = evaluateAutoStopGuard({
+          goalStatus: decision.goalStatus,
+          requiresCompletionGate: !!snapshot.untilPrompt,
+          completionGateMet: decision.completionGateMet,
+          verifyCommandConfigured: !!snapshot.verifyCommand,
+          verifyCommandPassed: snapshot.verifyCommand ? !!verifyResult?.ok : false,
+          commitPolicy: snapshot.commitPolicy,
+          pushPolicy: snapshot.pushPolicy,
+          git: gitSnapshot
+            ? {
+                dirty: gitSnapshot.dirty,
+                hasUpstream: gitSnapshot.hasUpstream,
+                ahead: gitSnapshot.ahead,
+                behind: gitSnapshot.behind,
+              }
+            : undefined,
         });
-        return;
-      }
 
-      if (decision.action === "pause") {
-        recordControllerDecision(snapshot, decision);
-        pauseSnapshot(pi, ctx, runtime, decision.reason);
-        return;
-      }
-
-      if (decision.action === "stop") {
-        const overrideDecision = await getStopOverrideDecisionImpl(pi, ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
-        if (overrideDecision) {
-          if (overrideDecision.action === "pause") {
-            recordControllerDecision(snapshot, overrideDecision);
-            pauseSnapshot(pi, ctx, runtime, overrideDecision.reason, "warning");
-            return;
-          }
-
-          const refinedOverrideDecision = await resolveRepeatedContinueDecision(
-            ctx,
-            snapshot,
-            {
-              ...overrideDecision,
-              nextPrompt: augmentContinuePrompt(overrideDecision, snapshot, gitSnapshot),
-            },
-            workerTurn,
-            gitSnapshot,
-            verifyResult,
-            getContinueRepetitionDecisionImpl,
-          );
-          if (refinedOverrideDecision.action === "pause") {
-            recordControllerDecision(snapshot, refinedOverrideDecision);
-            pauseSnapshot(pi, ctx, runtime, refinedOverrideDecision.reason, "warning");
-            return;
-          }
-          applyContinueDecisionProgress(snapshot, refinedOverrideDecision, false);
-          recordControllerDecision(snapshot, refinedOverrideDecision);
-          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, workerTurn, refinedOverrideDecision, {
-            budgetPauseReason: `iteration budget exhausted before verified completion: ${decision.reason}`,
-            notifyMessage: `Auto-mode finalization pass requested: ${refinedOverrideDecision.reason}`,
+        if (!stopGuard.allowed) {
+          const blockedDecision = buildBlockedStopDecision(snapshot, decision, stopGuard);
+          recordControllerDecision(snapshot, blockedDecision);
+          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, blockedDecision, {
+            budgetPauseReason: `iteration budget exhausted before completion: ${decision.reason}`,
+            notifyMessage: `Auto-mode finalization pass requested: ${blockedDecision.reason}`,
             notifyLevel: "warning",
           });
           return;
         }
 
-        if (shouldAttemptAutoAdjacentContinuation({
-          completionPolicy: snapshot.completionPolicy,
-          goalStatus: decision.goalStatus,
-          currentIteration: snapshot.currentIteration,
-          maxIterations: snapshot.maxIterations,
-          adjacentContinuationCount: snapshot.adjacentContinuationCount,
-          maxAdjacentContinuations: snapshot.maxAdjacentContinuations,
-        })) {
-          const adjacentDecision = await getAdjacentContinuationDecisionImpl(ctx, snapshot, decision, workerTurn, gitSnapshot, verifyResult);
-          if (adjacentDecision?.action === "continue") {
-            const refinedAdjacentDecision = await resolveRepeatedContinueDecision(
-              ctx,
-              snapshot,
-              {
-                ...adjacentDecision,
-                nextPrompt: augmentContinuePrompt(adjacentDecision, snapshot, gitSnapshot),
-              },
-              workerTurn,
-              gitSnapshot,
-              verifyResult,
-              getContinueRepetitionDecisionImpl,
-            );
-            if (refinedAdjacentDecision.action === "pause") {
-              recordControllerDecision(snapshot, refinedAdjacentDecision);
-              pauseSnapshot(pi, ctx, runtime, refinedAdjacentDecision.reason, "warning");
-              return;
-            }
-            applyContinueDecisionProgress(snapshot, refinedAdjacentDecision, true);
-            recordControllerDecision(snapshot, refinedAdjacentDecision);
-            queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, workerTurn, refinedAdjacentDecision, {
-              budgetPauseReason: `iteration budget exhausted after verified completion: ${decision.reason}`,
-              notifyMessage: `Auto-mode exploring adjacent optimization (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
-              notifyLevel: "info",
-            });
-            return;
-          }
-
-          if (adjacentDecision?.action === "pause") {
-            recordControllerDecision(snapshot, adjacentDecision);
-            pauseSnapshot(pi, ctx, runtime, adjacentDecision.reason, "warning");
-            return;
-          }
-
-          if (adjacentDecision?.action === "stop") {
-            recordControllerDecision(snapshot, adjacentDecision);
-            persistSnapshot(pi, snapshot);
-            disableSnapshot(pi, ctx, runtime, adjacentDecision.finalMessage || adjacentDecision.reason, adjacentDecision.completionGateMet ? "info" : "warning");
-            return;
-          }
-        }
-
         recordControllerDecision(snapshot, decision);
         persistSnapshot(pi, snapshot);
         disableSnapshot(pi, ctx, runtime, decision.finalMessage || decision.reason, decision.completionGateMet ? "info" : "warning");
+      } finally {
+        runtime.controllerBusy = false;
       }
-    } finally {
-      runtime.controllerBusy = false;
-    }
-  });
+    });
   };
 }
 

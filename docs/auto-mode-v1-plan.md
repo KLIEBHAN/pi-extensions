@@ -1,5 +1,7 @@
 # Auto-Mode V1 Implementation Sketch
 
+> Historical reference. The current simplified design lives in `docs/auto-mode-v2-plan.md`.
+
 ## Goal
 
 `extensions/auto-mode/` adds an autonomous controller loop for pi.

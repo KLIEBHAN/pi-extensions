@@ -4,7 +4,6 @@ export const AUTO_MODE_STATE_TYPE = "auto-mode-state";
 export const DEFAULT_CONTROLLER_MODEL = "active worker model";
 export const DEFAULT_AUTO_ITERATIONS = 8;
 export const DEFAULT_AUTO_UNTIL_SAFETY_ITERATIONS = 12;
-export const DEFAULT_MAX_ADJACENT_CONTINUATIONS = 1;
 export const DEFAULT_MAX_ITERATIONS_LIMIT = 1_000;
 export const DEFAULT_CONTROLLER_FAILURE_LIMIT = 2;
 export const DEFAULT_WORKER_FAILURE_LIMIT = 2;
@@ -15,13 +14,10 @@ export const DEFAULT_CONTROLLER_SUMMARY_MAX_CHARS = 2_500;
 export const DEFAULT_STATUS_GOAL_MAX_CHARS = 42;
 
 export type AutoMode = "iterations" | "until" | "hybrid";
+export type AssuranceMode = "pragmatic" | "strict";
 export type GoalStatus = "in_progress" | "likely_met" | "met" | "blocked" | "stalled";
 export type CommitPolicy = "none" | "milestones" | "final-or-milestone";
 export type PushPolicy = "never" | "if-upstream" | "final-or-milestone-if-upstream";
-export type CompletionPolicy = "stop" | "continue-similar";
-export type AutoPhase = "primary" | "adjacent";
-export type CommitRecommendation = "none" | "milestone" | "finalize";
-export type ProbeKind = "git_status" | "git_diff_names" | "git_head" | "verify_command";
 export type ResumePolicy = "restore-paused" | "restore-running";
 export type AutoCommandKind = "on" | "status" | "pause" | "resume" | "off" | "summary" | "nudge";
 export type AutoSessionStartReason = "startup" | "reload" | "new" | "resume" | "fork";
@@ -36,14 +32,11 @@ export interface AutoStartConfig {
   untilPrompt?: string;
   mode: AutoMode;
   maxIterations: number;
-  maxAdjacentContinuations: number;
   controllerModel?: ModelRef;
   verifyCommand?: string;
   commitPolicy: CommitPolicy;
   pushPolicy: PushPolicy;
-  completionPolicy: CompletionPolicy;
-  allowControllerProbes: boolean;
-  workerReflectionEnabled: boolean;
+  assuranceMode: AssuranceMode;
   resumeOnSessionStart: boolean;
 }
 
@@ -54,105 +47,6 @@ export interface AutoWorkerPromptInput {
   pushPolicy: PushPolicy;
 }
 
-export interface AutoStopGuardGitState {
-  dirty: boolean;
-  hasUpstream: boolean;
-  ahead?: number;
-  behind?: number;
-}
-
-export interface AutoStopGuardInput {
-  goalStatus: GoalStatus;
-  requiresCompletionGate: boolean;
-  completionGateMet: boolean;
-  verifyCommandConfigured: boolean;
-  verifyCommandPassed: boolean;
-  workerAssistantText: string;
-  commitPolicy: CommitPolicy;
-  pushPolicy: PushPolicy;
-  git?: AutoStopGuardGitState;
-}
-
-export type AutoStopBlocker =
-  | "goal-not-met"
-  | "completion-gate-not-met"
-  | "verification-missing"
-  | "verification-failed"
-  | "commit-required"
-  | "push-required"
-  | "sync-required";
-
-export interface AutoStopGuardResult {
-  allowed: boolean;
-  blockers: AutoStopBlocker[];
-}
-
-export interface AutoFollowUpPlanInput {
-  nextPrompt: string;
-  currentIteration: number;
-  maxIterations: number;
-  lastAutoPrompt?: string;
-  consecutiveStagnationCount: number;
-  consecutiveNoChangeCount: number;
-  budgetPauseReason: string;
-  stagnationPauseReason?: string;
-  noChangePauseReason?: string;
-  stagnationLimit?: number;
-  noChangeLimit?: number;
-}
-
-export type AutoFollowUpPlan =
-  | {
-      action: "send";
-      nextPrompt: string;
-      nextIteration: number;
-      nextStagnationCount: number;
-    }
-  | {
-      action: "pause";
-      reason: string;
-      nextStagnationCount: number;
-    };
-
-export interface AutoStopOverrideDecisionInput {
-  decision: StopDecision;
-  stopGuard: AutoStopGuardResult;
-  verifyCommand?: string;
-}
-
-export interface AutoStopOverrideRefinementInput {
-  fallbackDecision: ContinueDecision;
-  controllerDecision?: ControllerDecision;
-}
-
-export type AutoStopOverrideFollowUpDecision = ContinueDecision | PauseDecision;
-
-export interface AutoContinueRepetitionRefinementInput {
-  repeatedDecision: ContinueDecision;
-  controllerDecision?: ControllerDecision;
-}
-
-export type AutoContinueRepetitionFollowUpDecision = ContinueDecision | PauseDecision;
-
-export interface AutoContinueProgressInput {
-  completionPolicy: CompletionPolicy;
-  phase: AutoPhase;
-  goalStatus: GoalStatus;
-  currentIteration: number;
-  updatedSummary: string;
-  adjacentContinuationTriggered: boolean;
-  primaryGoalVerifiedAtIteration?: number;
-  adjacentContinuationCount: number;
-  primaryGoalCompletionSummary?: string;
-}
-
-export interface AutoContinueProgressState {
-  phase: AutoPhase;
-  primaryGoalVerifiedAtIteration?: number;
-  adjacentContinuationCount: number;
-  primaryGoalCompletionSummary?: string;
-}
-
 export interface AutoDecisionLogEntry {
   iteration: number;
   action: ControllerAction;
@@ -161,8 +55,8 @@ export interface AutoDecisionLogEntry {
   timestamp: number;
 }
 
-export interface AutoModeStateV1 {
-  version: 1;
+export interface AutoModeStateV2 {
+  version: 2;
   enabled: boolean;
   paused: boolean;
   runId: string;
@@ -178,15 +72,7 @@ export interface AutoModeStateV1 {
   verifyCommand?: string;
   commitPolicy: CommitPolicy;
   pushPolicy: PushPolicy;
-  completionPolicy: CompletionPolicy;
-  phase: AutoPhase;
-  primaryGoalVerifiedAtIteration?: number;
-  adjacentContinuationCount: number;
-  maxAdjacentContinuations: number;
-  primaryGoalCompletionSummary?: string;
-  allowControllerProbes: boolean;
-  workerReflectionEnabled: boolean;
-  workerReflectionUsed: boolean;
+  assuranceMode: AssuranceMode;
   controllerSummary: string;
   recentDecisions: AutoDecisionLogEntry[];
   lastAutoPrompt?: string;
@@ -199,10 +85,51 @@ export interface AutoModeStateV1 {
   lastSeenChangedFiles?: string[];
   lastSeenRepoFingerprint?: string;
   resumePolicy: ResumePolicy;
+  migrationWarnings?: string[];
 }
 
+export interface AutoModeStateV1Like {
+  version: 1;
+  enabled?: unknown;
+  paused?: unknown;
+  runId?: unknown;
+  goal?: unknown;
+  untilPrompt?: unknown;
+  mode?: unknown;
+  maxIterations?: unknown;
+  currentIteration?: unknown;
+  startedAt?: unknown;
+  lastControllerAt?: unknown;
+  lastWorkerFinishedAt?: unknown;
+  controllerModel?: unknown;
+  verifyCommand?: unknown;
+  commitPolicy?: unknown;
+  pushPolicy?: unknown;
+  completionPolicy?: unknown;
+  phase?: unknown;
+  adjacentContinuationCount?: unknown;
+  maxAdjacentContinuations?: unknown;
+  allowControllerProbes?: unknown;
+  workerReflectionEnabled?: unknown;
+  workerReflectionUsed?: unknown;
+  controllerSummary?: unknown;
+  recentDecisions?: unknown;
+  lastAutoPrompt?: unknown;
+  lastStopReason?: unknown;
+  consecutiveControllerFailures?: unknown;
+  consecutiveWorkerFailures?: unknown;
+  consecutiveStagnationCount?: unknown;
+  consecutiveNoChangeCount?: unknown;
+  lastSeenHead?: unknown;
+  lastSeenChangedFiles?: unknown;
+  lastSeenRepoFingerprint?: unknown;
+  resumePolicy?: unknown;
+}
+
+export type AutoModeState = AutoModeStateV2;
+
 export type AutoCommandParseResult =
-  | { kind: "on"; config: AutoStartConfig }
+  | { kind: "on"; config: AutoStartConfig; warnings: string[] }
   | { kind: "status" }
   | { kind: "pause" }
   | { kind: "resume" }
@@ -219,17 +146,24 @@ export interface AutoFlagValues {
   verify?: boolean | string;
   commitPolicy?: boolean | string;
   pushPolicy?: boolean | string;
+  assurance?: boolean | string;
+  resume?: boolean | string;
   completionPolicy?: boolean | string;
   maxAdjacentContinuations?: boolean | string;
   allowControllerProbes?: boolean | string;
   workerReflection?: boolean | string;
-  resume?: boolean | string;
 }
+
+export interface AutoStartConfigBuildSuccess {
+  config: AutoStartConfig;
+  warnings: string[];
+}
+
+export type AutoStartConfigBuildResult = AutoStartConfigBuildSuccess | { error: string } | undefined;
 
 export interface VerifyPreflightInput {
   verifyCommandConfigured: boolean;
   stopReason: string;
-  assistantText: string;
   currentIteration: number;
   maxIterations: number;
 }
@@ -264,14 +198,77 @@ export interface AutoModeCustomEntryLike {
   data?: unknown;
 }
 
+export interface AutoStopGuardGitState {
+  dirty: boolean;
+  hasUpstream: boolean;
+  ahead?: number;
+  behind?: number;
+}
+
+export interface AutoStopGuardInput {
+  goalStatus: GoalStatus;
+  requiresCompletionGate: boolean;
+  completionGateMet: boolean;
+  verifyCommandConfigured: boolean;
+  verifyCommandPassed: boolean;
+  commitPolicy: CommitPolicy;
+  pushPolicy: PushPolicy;
+  git?: AutoStopGuardGitState;
+}
+
+export type AutoStopBlocker =
+  | "goal-not-met"
+  | "completion-gate-not-met"
+  | "verification-failed"
+  | "commit-required"
+  | "push-required"
+  | "sync-required";
+
+export interface AutoStopGuardResult {
+  allowed: boolean;
+  blockers: AutoStopBlocker[];
+}
+
+export interface BlockedStopFollowUpInput {
+  blockers: AutoStopBlocker[];
+  goal: string;
+  untilPrompt?: string;
+  verifyCommand?: string;
+}
+
+export interface AutoFollowUpPlanInput {
+  nextPrompt: string;
+  currentIteration: number;
+  maxIterations: number;
+  lastAutoPrompt?: string;
+  consecutiveStagnationCount: number;
+  consecutiveNoChangeCount: number;
+  budgetPauseReason: string;
+  stagnationPauseReason?: string;
+  noChangePauseReason?: string;
+  stagnationLimit?: number;
+  noChangeLimit?: number;
+}
+
+export type AutoFollowUpPlan =
+  | {
+      action: "send";
+      nextPrompt: string;
+      nextIteration: number;
+      nextStagnationCount: number;
+    }
+  | {
+      action: "pause";
+      reason: string;
+      nextStagnationCount: number;
+    };
+
 interface BaseControllerDecision {
   action: ControllerAction;
   reason: string;
   updatedSummary: string;
   goalStatus: GoalStatus;
   completionGateMet: boolean;
-  progressPercent: number;
-  commitRecommendation: CommitRecommendation;
 }
 
 export interface ContinueDecision extends BaseControllerDecision {
@@ -288,15 +285,8 @@ export interface PauseDecision extends BaseControllerDecision {
   action: "pause";
 }
 
-export interface ProbeDecision extends BaseControllerDecision {
-  action: "probe";
-  probe: {
-    kind: ProbeKind;
-  };
-}
-
-export type ControllerAction = "continue" | "stop" | "pause" | "probe";
-export type ControllerDecision = ContinueDecision | StopDecision | PauseDecision | ProbeDecision;
+export type ControllerAction = "continue" | "stop" | "pause";
+export type ControllerDecision = ContinueDecision | StopDecision | PauseDecision;
 
 interface ParsedControllerPayload {
   action?: unknown;
@@ -306,26 +296,21 @@ interface ParsedControllerPayload {
   goalStatus?: unknown;
   completionGateMet?: unknown;
   qualityGoalMet?: unknown;
-  progressPercent?: unknown;
-  commitRecommendation?: unknown;
   nextPrompt?: unknown;
   prompt?: unknown;
   finalMessage?: unknown;
-  probe?: unknown;
 }
 
 const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
 const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
 const SECTIONED_PROMPT_TEMPLATE_PATTERN = /<!--\s*prompt:([a-z0-9-]+)\s*-->\n?([\s\S]*?)\n?<!--\s*\/prompt:\1\s*-->/g;
-const AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTION_NAMES = [
-  "worker",
-  "controller",
-  "controller-adjacent-continuation",
-  "controller-stop-override",
-  "controller-continue-repetition",
-] as const;
+const AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTION_NAMES = ["worker", "controller"] as const;
 
-export type AutoModeSystemPromptTemplateSectionName = typeof AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTION_NAMES[number];
+type AutoModeSystemPromptTemplateSectionName = typeof AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTION_NAMES[number];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 export function normalizeTemplateText(template: string): string {
   return template.replace(/\r\n/g, "\n").trim();
@@ -400,8 +385,8 @@ export const AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS = loadAutoModeSystemPromp
 export function buildAutoWorkerSystemPromptTemplateVariables(input: AutoWorkerPromptInput): Record<string, string> {
   return {
     VERIFY_RULE: input.verifyCommand
-      ? `Before claiming completion or requesting stop, run this verification command: ${input.verifyCommand}`
-      : "Before claiming completion or requesting stop, run the most relevant available verification.",
+      ? `run this verification command before you stop: ${input.verifyCommand}`
+      : "run the most relevant local verification before you stop and mention the concrete result",
     COMMIT_POLICY: input.commitPolicy,
     PUSH_POLICY: input.pushPolicy,
     GOAL: input.goal,
@@ -415,46 +400,138 @@ function renderAutoModeSystemPromptTemplateSection(
   return renderMiniTemplate(AUTO_MODE_SYSTEM_PROMPT_TEMPLATE_SECTIONS[sectionName], variables);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function isModelRef(value: unknown): value is ModelRef {
+  return isRecord(value) && typeof value.provider === "string" && typeof value.id === "string";
 }
 
-export function isAutoModeStateV1(value: unknown): value is AutoModeStateV1 {
+function isCommitPolicy(value: string): value is CommitPolicy {
+  return value === "none" || value === "milestones" || value === "final-or-milestone";
+}
+
+function isPushPolicy(value: string): value is PushPolicy {
+  return value === "never" || value === "if-upstream" || value === "final-or-milestone-if-upstream";
+}
+
+function isGoalStatus(value: string): value is GoalStatus {
+  return value === "in_progress" || value === "likely_met" || value === "met" || value === "blocked" || value === "stalled";
+}
+
+function isAssuranceMode(value: string): value is AssuranceMode {
+  return value === "pragmatic" || value === "strict";
+}
+
+function isResumePolicy(value: unknown): value is ResumePolicy {
+  return value === "restore-paused" || value === "restore-running";
+}
+
+function isAutoModeStateV2(value: unknown): value is AutoModeStateV2 {
   if (!isRecord(value)) return false;
   return (
-    value.version === 1 &&
-    typeof value.goal === "string" &&
-    typeof value.enabled === "boolean" &&
-    typeof value.paused === "boolean" &&
-    typeof value.currentIteration === "number" &&
-    typeof value.maxIterations === "number"
+    value.version === 2
+    && typeof value.goal === "string"
+    && typeof value.enabled === "boolean"
+    && typeof value.paused === "boolean"
+    && typeof value.currentIteration === "number"
+    && typeof value.maxIterations === "number"
   );
 }
 
-export function hydrateAutoModeState(snapshot: AutoModeStateV1): AutoModeStateV1 {
+function isAutoModeStateV1Like(value: unknown): value is AutoModeStateV1Like {
+  if (!isRecord(value)) return false;
+  return (
+    value.version === 1
+    && typeof value.goal === "string"
+    && typeof value.enabled === "boolean"
+    && typeof value.paused === "boolean"
+    && typeof value.currentIteration === "number"
+    && typeof value.maxIterations === "number"
+  );
+}
+
+function hydrateAutoModeStateV2(snapshot: AutoModeStateV2): AutoModeStateV2 {
   return {
     ...snapshot,
-    completionPolicy: snapshot.completionPolicy === "continue-similar" ? "continue-similar" : "stop",
-    phase: snapshot.phase === "adjacent" ? "adjacent" : "primary",
-    adjacentContinuationCount: typeof snapshot.adjacentContinuationCount === "number" ? snapshot.adjacentContinuationCount : 0,
-    maxAdjacentContinuations:
-      typeof snapshot.maxAdjacentContinuations === "number" ? snapshot.maxAdjacentContinuations : DEFAULT_MAX_ADJACENT_CONTINUATIONS,
-    primaryGoalVerifiedAtIteration:
-      typeof snapshot.primaryGoalVerifiedAtIteration === "number" ? snapshot.primaryGoalVerifiedAtIteration : undefined,
-    primaryGoalCompletionSummary:
-      typeof snapshot.primaryGoalCompletionSummary === "string" ? snapshot.primaryGoalCompletionSummary : undefined,
-    workerReflectionEnabled: snapshot.workerReflectionEnabled === true,
-    workerReflectionUsed: snapshot.workerReflectionUsed === true,
+    assuranceMode: snapshot.assuranceMode === "strict" ? "strict" : "pragmatic",
+    recentDecisions: Array.isArray(snapshot.recentDecisions) ? snapshot.recentDecisions.filter(isRecentDecisionLogEntry) : [],
+    migrationWarnings: Array.isArray(snapshot.migrationWarnings)
+      ? snapshot.migrationWarnings.filter((warning): warning is string => typeof warning === "string" && warning.trim().length > 0)
+      : undefined,
   };
 }
 
-export function extractLatestAutoModeState(entries: unknown[]): AutoModeStateV1 | undefined {
+function isRecentDecisionLogEntry(value: unknown): value is AutoDecisionLogEntry {
+  return isRecord(value)
+    && typeof value.iteration === "number"
+    && typeof value.action === "string"
+    && typeof value.reason === "string"
+    && (value.nextPrompt === undefined || typeof value.nextPrompt === "string")
+    && typeof value.timestamp === "number";
+}
+
+function migrateLegacyState(snapshot: AutoModeStateV1Like): AutoModeStateV2 {
+  const warnings = ["Restored a legacy auto-mode V1 state under V2 semantics."];
+
+  if (snapshot.completionPolicy === "continue-similar" || snapshot.phase === "adjacent") {
+    warnings.push("Legacy adjacent-continuation behavior is deprecated and this run was restored in paused mode.");
+  }
+  if (snapshot.workerReflectionEnabled === true || snapshot.workerReflectionUsed === true) {
+    warnings.push("Legacy worker-reflection behavior is deprecated and this run was restored in paused mode.");
+  }
+  if (snapshot.allowControllerProbes === true || snapshot.allowControllerProbes === false) {
+    warnings.push("Legacy controller probe behavior is no longer used in auto-mode V2.");
+  }
+
+  return {
+    version: 2,
+    enabled: snapshot.enabled === true,
+    paused: snapshot.paused === true,
+    runId: typeof snapshot.runId === "string" ? snapshot.runId : `auto-migrated-${Date.now()}`,
+    goal: typeof snapshot.goal === "string" ? snapshot.goal : "",
+    untilPrompt: typeof snapshot.untilPrompt === "string" ? snapshot.untilPrompt : undefined,
+    mode: snapshot.mode === "hybrid" || snapshot.mode === "until" ? snapshot.mode : "iterations",
+    maxIterations: typeof snapshot.maxIterations === "number" ? snapshot.maxIterations : DEFAULT_AUTO_ITERATIONS,
+    currentIteration: typeof snapshot.currentIteration === "number" ? snapshot.currentIteration : 1,
+    startedAt: typeof snapshot.startedAt === "number" ? snapshot.startedAt : Date.now(),
+    lastControllerAt: typeof snapshot.lastControllerAt === "number" ? snapshot.lastControllerAt : undefined,
+    lastWorkerFinishedAt: typeof snapshot.lastWorkerFinishedAt === "number" ? snapshot.lastWorkerFinishedAt : undefined,
+    controllerModel: isModelRef(snapshot.controllerModel) ? snapshot.controllerModel : undefined,
+    verifyCommand: typeof snapshot.verifyCommand === "string" ? snapshot.verifyCommand : undefined,
+    commitPolicy: typeof snapshot.commitPolicy === "string" && isCommitPolicy(snapshot.commitPolicy) ? snapshot.commitPolicy : "final-or-milestone",
+    pushPolicy: typeof snapshot.pushPolicy === "string" && isPushPolicy(snapshot.pushPolicy) ? snapshot.pushPolicy : "final-or-milestone-if-upstream",
+    assuranceMode: "pragmatic",
+    controllerSummary: typeof snapshot.controllerSummary === "string" ? snapshot.controllerSummary : "",
+    recentDecisions: Array.isArray(snapshot.recentDecisions) ? snapshot.recentDecisions.filter(isRecentDecisionLogEntry) : [],
+    lastAutoPrompt: typeof snapshot.lastAutoPrompt === "string" ? snapshot.lastAutoPrompt : undefined,
+    lastStopReason: typeof snapshot.lastStopReason === "string" ? snapshot.lastStopReason : undefined,
+    consecutiveControllerFailures:
+      typeof snapshot.consecutiveControllerFailures === "number" ? snapshot.consecutiveControllerFailures : 0,
+    consecutiveWorkerFailures:
+      typeof snapshot.consecutiveWorkerFailures === "number" ? snapshot.consecutiveWorkerFailures : 0,
+    consecutiveStagnationCount:
+      typeof snapshot.consecutiveStagnationCount === "number" ? snapshot.consecutiveStagnationCount : 0,
+    consecutiveNoChangeCount:
+      typeof snapshot.consecutiveNoChangeCount === "number" ? snapshot.consecutiveNoChangeCount : 0,
+    lastSeenHead: typeof snapshot.lastSeenHead === "string" ? snapshot.lastSeenHead : undefined,
+    lastSeenChangedFiles: Array.isArray(snapshot.lastSeenChangedFiles)
+      ? snapshot.lastSeenChangedFiles.filter((value): value is string => typeof value === "string")
+      : undefined,
+    lastSeenRepoFingerprint: typeof snapshot.lastSeenRepoFingerprint === "string" ? snapshot.lastSeenRepoFingerprint : undefined,
+    resumePolicy: isResumePolicy(snapshot.resumePolicy) ? snapshot.resumePolicy : "restore-paused",
+    migrationWarnings: warnings,
+  };
+}
+
+export function extractLatestAutoModeState(entries: unknown[]): AutoModeStateV2 | undefined {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index] as AutoModeCustomEntryLike | undefined;
     if (!entry || entry.type !== "custom") continue;
     if (entry.customType !== AUTO_MODE_STATE_TYPE) continue;
-    if (!isAutoModeStateV1(entry.data)) continue;
-    return hydrateAutoModeState(entry.data);
+    if (isAutoModeStateV2(entry.data)) {
+      return hydrateAutoModeStateV2(entry.data);
+    }
+    if (isAutoModeStateV1Like(entry.data)) {
+      return migrateLegacyState(entry.data);
+    }
   }
   return undefined;
 }
@@ -567,486 +644,6 @@ export function parsePositiveInteger(value: string, max = DEFAULT_MAX_ITERATIONS
   return parsed;
 }
 
-export function summarizeGoal(goal: string, maxLength = DEFAULT_STATUS_GOAL_MAX_CHARS): string {
-  return truncateWithEllipsis(collapseWhitespace(goal), maxLength);
-}
-
-export function normalizeComparableText(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-export function areAutoPromptsEquivalent(previousPrompt: string | undefined, nextPrompt: string | undefined): boolean {
-  if (!previousPrompt || !nextPrompt) return false;
-  return normalizeComparableText(previousPrompt) === normalizeComparableText(nextPrompt);
-}
-
-export function looksLikeCompletionClaim(text: string): boolean {
-  const normalized = normalizeComparableText(text);
-  if (!normalized) return false;
-
-  const blockingPatterns = [
-    /\b(todo|follow-up|follow up|remaining work|still need|still needs|not done|not complete)\b/,
-    /\b(need to|needs to|should still|left to do|manual step|manual follow-up|please confirm)\b/,
-    /\b(cannot|can't|unable to|blocked|waiting for)\b/,
-    /\?$/,
-  ];
-  if (blockingPatterns.some((pattern) => pattern.test(normalized))) {
-    return false;
-  }
-
-  const positivePatterns = [
-    /\b(done|completed|finished|implemented|resolved|fixed|verified|ready)\b/,
-    /\b(all tests pass|tests pass|test suite passes|verification passed)\b/,
-    /\b(committed and pushed|pushed successfully|work is complete)\b/,
-  ];
-  return positivePatterns.some((pattern) => pattern.test(normalized));
-}
-
-export function shouldPreRunVerifyCommand(input: VerifyPreflightInput): boolean {
-  if (!input.verifyCommandConfigured) return false;
-  if (input.stopReason !== "stop") return false;
-  if (input.currentIteration >= input.maxIterations) return true;
-  return looksLikeCompletionClaim(input.assistantText);
-}
-
-export function shouldAutoResumeOnSessionStart(
-  reason: AutoSessionStartReason,
-  autoResumeFlag: boolean,
-  resumePolicy: ResumePolicy,
-): boolean {
-  return reason === "startup" && (autoResumeFlag || resumePolicy === "restore-running");
-}
-
-export function buildStartPrompt(input: StartPromptInput): string {
-  return input.goal.trim();
-}
-
-export function buildResumePrompt(input: ResumePromptInput): string {
-  const sections = [
-    `Resume the active goal from the current repository state.`,
-    `Goal: ${input.goal}`,
-    input.controllerSummary ? `Controller summary:\n${input.controllerSummary}` : undefined,
-  ].filter((value): value is string => !!value);
-
-  return sections.join("\n\n");
-}
-
-export function buildAutoWorkerSystemPrompt(input: AutoWorkerPromptInput): string {
-  return renderAutoModeSystemPromptTemplateSection(
-    "worker",
-    buildAutoWorkerSystemPromptTemplateVariables(input),
-  );
-}
-
-export function buildAutoControllerSystemPrompt(): string {
-  return renderAutoModeSystemPromptTemplateSection("controller");
-}
-
-export function buildAutoControllerAdjacentContinuationSystemPrompt(): string {
-  return renderAutoModeSystemPromptTemplateSection("controller-adjacent-continuation");
-}
-
-export function buildAutoControllerStopOverrideSystemPrompt(): string {
-  return renderAutoModeSystemPromptTemplateSection("controller-stop-override");
-}
-
-export function buildAutoControllerContinueRepetitionSystemPrompt(): string {
-  return renderAutoModeSystemPromptTemplateSection("controller-continue-repetition");
-}
-
-export function hasConcreteVerificationEvidence(text: string): boolean {
-  const normalized = normalizeComparableText(text);
-  if (!normalized) return false;
-
-  const blockingPatterns = [
-    /\b(todo|follow up|follow-up|remaining work|still need|still needs|not verified|unverified|not run|did not run|didn t run)\b/,
-    /\b(need to|needs to|manual step|manual follow up|manual follow-up|pending|maybe|should work|should now work|probably)\b/,
-    /\b(cannot verify|can t verify|unable to verify|could not verify|waiting for|blocked)\b/,
-    /\b(failed|failing|failure|does not pass|do not pass|not passing|broke|broken|errors remain|error remains)\b/,
-    /\b(nicht verifiziert|nicht validiert|nicht nachgewiesen|nicht geprüft|nicht gepruft|nicht getestet|nicht ausgeführt|nicht ausgefuhrt|nicht gelaufen|noch nicht)\b/,
-    /\b(kann nicht verifizieren|konnte nicht verifizieren|konnte nicht prüfen|konnte nicht prufen|warte auf|blockiert)\b/,
-    /\b(fehlgeschlagen|fehlschlug|fehlerhaft|nicht bestanden|nicht erfolgreich|fehler bleiben|fehler verbleiben)\b/,
-  ];
-  if (blockingPatterns.some((pattern) => pattern.test(normalized))) {
-    return false;
-  }
-
-  const verificationPatterns = [
-    /\bverified\b/,
-    /\bvalidated\b/,
-    /\bmanual(ly)? verified\b/,
-    /\bverification passed\b/,
-    /\b(all tests pass|tests pass|test suite passes)\b/,
-    /\b(lint passes|checks pass|all checks pass)\b/,
-    /\b(build passes|build succeeded|build succeeds)\b/,
-    /\b(smoke test passed|manual test passed)\b/,
-    /\b(verifiziert|validiert)\b/,
-    /\b(verifikation|verifizierung|prüfung|prüfungen|prufung|prufungen)\b.*\b(nachgewiesen|bestätigt|bestatigt|erfolgreich)\b/,
-    /\b(alle tests bestanden|tests bestanden|test suite bestanden)\b/,
-    /\b(alle checks bestanden|checks bestanden|alle checks erfolgreich|checks erfolgreich)\b/,
-    /\b(build erfolgreich|erfolgreich kompiliert|kompiliert erfolgreich|fehlerfrei durch)\b/,
-  ];
-  if (verificationPatterns.some((pattern) => pattern.test(normalized))) {
-    return true;
-  }
-
-  const hasVerificationContext = /\b(verification|verified|validated|tests?|checks?|build|lint|typecheck|working tree|verifikation|verifizierung|verifiziert|validiert|tests?|checks?|build|lint|typecheck|nachgewiesen|bestatigt|fehlerfrei)\b/.test(normalized);
-  const hasPassingIndicator = /\b(exit code 0|exit 0|all checks passed|compiled successfully|tests? \d+ passed|test suites? \d+ passed|alle checks bestanden|tests? \d+ bestanden|fehlerfrei)\b/.test(normalized);
-  const hasRepoCleanIndicator = /\b(working tree clean|ahead 0 behind 0|keine codeänderungen|keine codeanderungen|arbeitsbaum sauber|working tree sauber)\b/.test(normalized);
-
-  return (hasVerificationContext && hasPassingIndicator) || (hasRepoCleanIndicator && (hasVerificationContext || hasPassingIndicator));
-}
-
-export function evaluateAutoStopGuard(input: AutoStopGuardInput): AutoStopGuardResult {
-  const blockers: AutoStopBlocker[] = [];
-
-  if (input.goalStatus !== "met") {
-    blockers.push("goal-not-met");
-  }
-
-  if (input.requiresCompletionGate && !input.completionGateMet) {
-    blockers.push("completion-gate-not-met");
-  }
-
-  if (input.verifyCommandConfigured) {
-    if (!input.verifyCommandPassed) {
-      blockers.push("verification-failed");
-    }
-  } else if (!hasConcreteVerificationEvidence(input.workerAssistantText)) {
-    blockers.push("verification-missing");
-  }
-
-  if (input.git) {
-    if (input.commitPolicy !== "none" && input.git.dirty) {
-      blockers.push("commit-required");
-    }
-    if (input.pushPolicy !== "never" && input.git.hasUpstream && (input.git.ahead ?? 0) > 0) {
-      blockers.push("push-required");
-    }
-    if (input.pushPolicy !== "never" && input.git.hasUpstream && (input.git.behind ?? 0) > 0) {
-      blockers.push("sync-required");
-    }
-  }
-
-  return {
-    allowed: blockers.length === 0,
-    blockers,
-  };
-}
-
-export function describeAutoStopBlocker(blocker: AutoStopBlocker, verifyCommand: string | undefined): string {
-  switch (blocker) {
-    case "goal-not-met":
-      return "the active goal is not yet verified as met";
-    case "completion-gate-not-met":
-      return "the completion gate is not yet verified as met";
-    case "verification-missing":
-      return "verification evidence is still missing";
-    case "verification-failed":
-      return verifyCommand
-        ? `the verification command is still failing (${verifyCommand})`
-        : "verification is still failing";
-    case "commit-required":
-      return "a final commit is still required";
-    case "push-required":
-      return "a push to upstream is still required";
-    case "sync-required":
-      return "the branch is not yet synchronized with upstream";
-  }
-}
-
-function buildStopOverridePrompt(blockers: AutoStopBlocker[], verifyCommand: string | undefined): string {
-  if (blockers.includes("goal-not-met")) {
-    return "Do not conclude yet. The active goal is not yet verified as fully met. Inspect the current repository state, identify the highest-value remaining gap, close it, and verify the result before considering completion.";
-  }
-
-  if (blockers.includes("completion-gate-not-met")) {
-    return "Do not conclude yet. The completion gate is not yet verified as met. Focus on the remaining gate gap, run the most relevant verification for it, and only then consider the task complete.";
-  }
-
-  if (blockers.includes("verification-failed")) {
-    return verifyCommand
-      ? `Do not conclude yet. The configured verification command failed (${verifyCommand}). Fix the remaining issues, rerun the verification command until it passes, and only then consider the task complete.`
-      : "Do not conclude yet. Verification is still failing. Fix the remaining issues, rerun the relevant verification until it passes, and only then consider the task complete.";
-  }
-
-  const actions: string[] = [];
-  if (blockers.includes("verification-missing")) {
-    actions.push("Run the most relevant available verification from the current repository state, summarize the concrete passing evidence, and only then consider the task complete.");
-  }
-  if (blockers.includes("commit-required")) {
-    actions.push("Create an atomic commit for the completed work.");
-  }
-  if (blockers.includes("push-required")) {
-    actions.push("Push the current branch so it is in sync with upstream.");
-  }
-  if (blockers.includes("sync-required")) {
-    actions.push("Bring the branch back in sync with upstream before stopping.");
-  }
-
-  return actions.join(" ");
-}
-
-export function buildAutoStopOverrideDecision(input: AutoStopOverrideDecisionInput): ContinueDecision | undefined {
-  if (input.stopGuard.allowed) {
-    return undefined;
-  }
-
-  const blockerSummary = input.stopGuard.blockers.map((blocker) => describeAutoStopBlocker(blocker, input.verifyCommand)).join("; ");
-  const hasGoalGap = input.stopGuard.blockers.includes("goal-not-met") || input.stopGuard.blockers.includes("completion-gate-not-met");
-  const hasFinalizationOnlyBlockers = input.stopGuard.blockers.every(
-    (blocker) => blocker === "verification-missing" || blocker === "commit-required" || blocker === "push-required" || blocker === "sync-required",
-  );
-
-  return {
-    action: "continue",
-    reason: `Stop overridden: ${blockerSummary}.`,
-    updatedSummary: truncateControllerSummary(
-      `Stop overridden. Remaining blockers: ${blockerSummary}. Previous stop reason: ${input.decision.reason}. ${input.decision.updatedSummary}`,
-    ),
-    goalStatus: hasGoalGap ? "in_progress" : hasFinalizationOnlyBlockers ? "likely_met" : input.decision.goalStatus,
-    completionGateMet: input.stopGuard.blockers.includes("completion-gate-not-met") ? false : input.decision.completionGateMet,
-    progressPercent: Math.min(input.decision.progressPercent, hasGoalGap ? 95 : 99),
-    commitRecommendation: input.stopGuard.blockers.includes("commit-required") || input.stopGuard.blockers.includes("push-required") || input.stopGuard.blockers.includes("sync-required")
-      ? "finalize"
-      : input.decision.commitRecommendation,
-    nextPrompt: buildStopOverridePrompt(input.stopGuard.blockers, input.verifyCommand),
-  };
-}
-
-export function applyControllerStopOverrideRefinement(input: AutoStopOverrideRefinementInput): AutoStopOverrideFollowUpDecision {
-  const decision = input.controllerDecision;
-  if (!decision) {
-    return input.fallbackDecision;
-  }
-
-  if (decision.action === "pause") {
-    return {
-      action: "pause",
-      reason: `${input.fallbackDecision.reason} Controller requested pause instead of another repeated follow-up: ${decision.reason}`,
-      updatedSummary: truncateControllerSummary(
-        `${input.fallbackDecision.updatedSummary}\n\nController refinement requested a pause: ${decision.updatedSummary}`,
-      ),
-      goalStatus: decision.goalStatus === "blocked" || decision.goalStatus === "stalled" ? decision.goalStatus : input.fallbackDecision.goalStatus,
-      completionGateMet: input.fallbackDecision.completionGateMet && decision.completionGateMet,
-      progressPercent: Math.min(input.fallbackDecision.progressPercent, decision.progressPercent),
-      commitRecommendation: input.fallbackDecision.commitRecommendation,
-    };
-  }
-
-  if (decision.action !== "continue") {
-    return input.fallbackDecision;
-  }
-
-  const nextPrompt = decision.nextPrompt.trim();
-  if (!nextPrompt) {
-    return input.fallbackDecision;
-  }
-
-  return {
-    ...input.fallbackDecision,
-    updatedSummary: truncateControllerSummary(
-      `${input.fallbackDecision.updatedSummary}\n\nController refinement: ${decision.updatedSummary}`,
-    ),
-    nextPrompt,
-  };
-}
-
-export function applyControllerContinueRepetitionRefinement(
-  input: AutoContinueRepetitionRefinementInput,
-): AutoContinueRepetitionFollowUpDecision {
-  const decision = input.controllerDecision;
-  if (!decision) {
-    return input.repeatedDecision;
-  }
-
-  if (decision.action === "pause") {
-    return {
-      action: "pause",
-      reason: `${input.repeatedDecision.reason} Controller requested pause instead of another repeated continue prompt: ${decision.reason}`,
-      updatedSummary: truncateControllerSummary(
-        `${input.repeatedDecision.updatedSummary}\n\nController repetition refinement requested a pause: ${decision.updatedSummary}`,
-      ),
-      goalStatus: decision.goalStatus === "blocked" || decision.goalStatus === "stalled" ? decision.goalStatus : input.repeatedDecision.goalStatus,
-      completionGateMet: input.repeatedDecision.completionGateMet && decision.completionGateMet,
-      progressPercent: Math.min(input.repeatedDecision.progressPercent, decision.progressPercent),
-      commitRecommendation: input.repeatedDecision.commitRecommendation,
-    };
-  }
-
-  if (decision.action !== "continue") {
-    return input.repeatedDecision;
-  }
-
-  const nextPrompt = decision.nextPrompt.trim();
-  if (!nextPrompt) {
-    return input.repeatedDecision;
-  }
-
-  return {
-    ...input.repeatedDecision,
-    updatedSummary: truncateControllerSummary(
-      `${input.repeatedDecision.updatedSummary}\n\nController repetition refinement: ${decision.updatedSummary}`,
-    ),
-    nextPrompt,
-  };
-}
-
-export function shouldAttemptAutoAdjacentContinuation(input: {
-  completionPolicy: CompletionPolicy;
-  goalStatus: GoalStatus;
-  currentIteration: number;
-  maxIterations: number;
-  adjacentContinuationCount: number;
-  maxAdjacentContinuations: number;
-}): boolean {
-  return input.completionPolicy === "continue-similar"
-    && input.goalStatus === "met"
-    && input.currentIteration < input.maxIterations
-    && input.adjacentContinuationCount < input.maxAdjacentContinuations;
-}
-
-export function deriveAutoContinueProgressState(input: AutoContinueProgressInput): AutoContinueProgressState {
-  const preservedState = {
-    primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration,
-    primaryGoalCompletionSummary: input.primaryGoalCompletionSummary,
-  };
-
-  if (input.completionPolicy !== "continue-similar") {
-    return {
-      phase: "primary",
-      adjacentContinuationCount: 0,
-      ...preservedState,
-    };
-  }
-
-  if (input.adjacentContinuationTriggered) {
-    if (input.goalStatus !== "met") {
-      return {
-        phase: "primary",
-        adjacentContinuationCount: 0,
-        ...preservedState,
-      };
-    }
-
-    return {
-      phase: "adjacent",
-      primaryGoalVerifiedAtIteration: input.primaryGoalVerifiedAtIteration ?? input.currentIteration,
-      adjacentContinuationCount: input.phase === "adjacent" ? input.adjacentContinuationCount + 1 : 1,
-      primaryGoalCompletionSummary: input.primaryGoalCompletionSummary ?? truncateControllerSummary(input.updatedSummary),
-    };
-  }
-
-  if (input.phase === "adjacent" && input.goalStatus !== "met") {
-    return {
-      phase: "primary",
-      adjacentContinuationCount: 0,
-      ...preservedState,
-    };
-  }
-
-  return {
-    phase: input.phase,
-    adjacentContinuationCount: input.phase === "adjacent" ? input.adjacentContinuationCount : 0,
-    ...preservedState,
-  };
-}
-
-export function planAutoFollowUp(input: AutoFollowUpPlanInput): AutoFollowUpPlan {
-  if (input.currentIteration >= input.maxIterations) {
-    return {
-      action: "pause",
-      reason: input.budgetPauseReason,
-      nextStagnationCount: input.consecutiveStagnationCount,
-    };
-  }
-
-  const nextStagnationCount = areAutoPromptsEquivalent(input.lastAutoPrompt, input.nextPrompt)
-    ? input.consecutiveStagnationCount + 1
-    : 0;
-
-  if (nextStagnationCount >= (input.stagnationLimit ?? DEFAULT_STAGNATION_LIMIT)) {
-    return {
-      action: "pause",
-      reason: input.stagnationPauseReason ?? "controller produced the same next prompt repeatedly",
-      nextStagnationCount,
-    };
-  }
-
-  if (input.consecutiveNoChangeCount >= (input.noChangeLimit ?? DEFAULT_NO_CHANGE_LIMIT)) {
-    return {
-      action: "pause",
-      reason: input.noChangePauseReason ?? "repository state has not changed across several iterations",
-      nextStagnationCount,
-    };
-  }
-
-  return {
-    action: "send",
-    nextPrompt: input.nextPrompt,
-    nextIteration: input.currentIteration + 1,
-    nextStagnationCount,
-  };
-}
-
-export function decideAutoModeSessionStart(input: SessionStartDecisionInput): SessionStartDecision {
-  const autoResume = shouldAutoResumeOnSessionStart(
-    input.reason,
-    input.autoResumeFlag,
-    input.persistedResumePolicy ?? "restore-paused",
-  );
-
-  if (input.reason === "startup" && input.autoStartConfigState === "valid") {
-    return { action: "start-from-flags", autoResume: false };
-  }
-
-  if (input.hasPersistedSnapshot) {
-    return {
-      action: "restore",
-      autoResume,
-      warning: input.autoStartConfigState === "invalid" ? input.autoStartError : undefined,
-    };
-  }
-
-  if (input.autoStartConfigState === "invalid") {
-    return {
-      action: "noop",
-      autoResume: false,
-      warning: input.autoStartError,
-    };
-  }
-
-  return { action: "noop", autoResume: false };
-}
-
-function isCommitPolicy(value: string): value is CommitPolicy {
-  return value === "none" || value === "milestones" || value === "final-or-milestone";
-}
-
-function isPushPolicy(value: string): value is PushPolicy {
-  return value === "never" || value === "if-upstream" || value === "final-or-milestone-if-upstream";
-}
-
-function isCompletionPolicy(value: string): value is CompletionPolicy {
-  return value === "stop" || value === "continue-similar";
-}
-
-function isGoalStatus(value: string): value is GoalStatus {
-  return value === "in_progress" || value === "likely_met" || value === "met" || value === "blocked" || value === "stalled";
-}
-
-function isCommitRecommendation(value: string): value is CommitRecommendation {
-  return value === "none" || value === "milestone" || value === "finalize";
-}
-
-function isProbeKind(value: string): value is ProbeKind {
-  return value === "git_status" || value === "git_diff_names" || value === "git_head" || value === "verify_command";
-}
-
 function resolveAutoMode(iterations: number | undefined, untilPrompt: string | undefined): { mode: AutoMode; maxIterations: number } {
   if (untilPrompt && iterations) {
     return { mode: "hybrid", maxIterations: iterations };
@@ -1057,6 +654,15 @@ function resolveAutoMode(iterations: number | undefined, untilPrompt: string | u
   return { mode: "iterations", maxIterations: iterations ?? DEFAULT_AUTO_ITERATIONS };
 }
 
+function pushDeprecatedWarning(warnings: string[], flag: string): void {
+  warnings.push(`${flag} is deprecated in auto-mode V2 and is ignored.`);
+}
+
+function parseAssuranceMode(value: string | undefined): AssuranceMode | undefined {
+  if (!value) return undefined;
+  return isAssuranceMode(value) ? value : undefined;
+}
+
 function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
   let iterations: number | undefined;
   let untilPrompt: string | undefined;
@@ -1064,10 +670,8 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
   let verifyCommand: string | undefined;
   let commitPolicy: CommitPolicy = "final-or-milestone";
   let pushPolicy: PushPolicy = "final-or-milestone-if-upstream";
-  let completionPolicy: CompletionPolicy = "stop";
-  let maxAdjacentContinuations = DEFAULT_MAX_ADJACENT_CONTINUATIONS;
-  let allowControllerProbes = true;
-  let workerReflectionEnabled = false;
+  let assuranceMode: AssuranceMode = "pragmatic";
+  const warnings: string[] = [];
   const goalTokens: string[] = [];
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -1135,34 +739,40 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       continue;
     }
 
-    if (token === "--completion-policy") {
+    if (token === "--assurance") {
       const value = tokens[index + 1];
-      if (!value || !isCompletionPolicy(value)) {
-        return { error: "--completion-policy must be one of: stop, continue-similar" };
+      const parsed = value ? parseAssuranceMode(value) : undefined;
+      if (!parsed) {
+        return { error: "--assurance must be one of: pragmatic, strict" };
       }
-      completionPolicy = value;
+      assuranceMode = parsed;
       index += 1;
+      continue;
+    }
+
+    if (token === "--completion-policy") {
+      pushDeprecatedWarning(warnings, "--completion-policy");
+      if (tokens[index + 1] && !tokens[index + 1]!.startsWith("--")) {
+        index += 1;
+      }
       continue;
     }
 
     if (token === "--max-adjacent-continuations") {
-      const value = tokens[index + 1];
-      const parsed = value ? parsePositiveInteger(value) : undefined;
-      if (!parsed) {
-        return { error: `--max-adjacent-continuations must be an integer between 1 and ${DEFAULT_MAX_ITERATIONS_LIMIT}` };
+      pushDeprecatedWarning(warnings, "--max-adjacent-continuations");
+      if (tokens[index + 1] && !tokens[index + 1]!.startsWith("--")) {
+        index += 1;
       }
-      maxAdjacentContinuations = parsed;
-      index += 1;
       continue;
     }
 
     if (token === "--no-controller-probes") {
-      allowControllerProbes = false;
+      pushDeprecatedWarning(warnings, "--no-controller-probes");
       continue;
     }
 
     if (token === "--worker-reflection") {
-      workerReflectionEnabled = true;
+      pushDeprecatedWarning(warnings, "--worker-reflection");
       continue;
     }
 
@@ -1179,6 +789,10 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
     return { error: "Usage: /auto on [flags] <goal>" };
   }
 
+  if (assuranceMode === "strict" && !verifyCommand) {
+    return { error: "--assurance strict requires --verify <cmd>" };
+  }
+
   const { mode, maxIterations } = resolveAutoMode(iterations, untilPrompt);
   return {
     kind: "on",
@@ -1191,12 +805,10 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
       verifyCommand,
       commitPolicy,
       pushPolicy,
-      completionPolicy,
-      maxAdjacentContinuations,
-      allowControllerProbes,
-      workerReflectionEnabled,
+      assuranceMode,
       resumeOnSessionStart: false,
     },
+    warnings,
   };
 }
 
@@ -1235,21 +847,26 @@ export function parseAutoCommandArgs(args: string): AutoCommandParseResult {
   }
 }
 
-export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartConfig | { error: string } | undefined {
+export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartConfigBuildResult {
   if (typeof flags.goal !== "string") return undefined;
   const goal = flags.goal.trim();
   if (!goal) {
     return { error: "--auto-goal must be a non-empty string" };
   }
 
+  const warnings: string[] = [];
   const iterationsFlag = parseStringFlag(flags.iterations);
   const untilPrompt = parseStringFlag(flags.until);
   const controllerModelFlag = parseStringFlag(flags.controllerModel);
   const verifyCommand = parseStringFlag(flags.verify);
   const commitPolicyFlag = parseStringFlag(flags.commitPolicy);
   const pushPolicyFlag = parseStringFlag(flags.pushPolicy);
-  const completionPolicyFlag = parseStringFlag(flags.completionPolicy);
-  const maxAdjacentContinuationsFlag = parseStringFlag(flags.maxAdjacentContinuations);
+  const assuranceFlag = parseStringFlag(flags.assurance);
+
+  if (flags.completionPolicy !== undefined) pushDeprecatedWarning(warnings, "--auto-completion-policy");
+  if (flags.maxAdjacentContinuations !== undefined) pushDeprecatedWarning(warnings, "--auto-max-adjacent-continuations");
+  if (flags.allowControllerProbes !== undefined) pushDeprecatedWarning(warnings, "--auto-allow-controller-probes");
+  if (flags.workerReflection !== undefined) pushDeprecatedWarning(warnings, "--auto-worker-reflection");
 
   const iterations = iterationsFlag ? parsePositiveInteger(iterationsFlag) : undefined;
   if (iterationsFlag && !iterations) {
@@ -1277,38 +894,33 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
     pushPolicy = pushPolicyFlag;
   }
 
-  let completionPolicy: CompletionPolicy = "stop";
-  if (completionPolicyFlag) {
-    if (!isCompletionPolicy(completionPolicyFlag)) {
-      return { error: "--auto-completion-policy must be one of: stop, continue-similar" };
+  let assuranceMode: AssuranceMode = "pragmatic";
+  if (assuranceFlag) {
+    if (!isAssuranceMode(assuranceFlag)) {
+      return { error: "--auto-assurance must be one of: pragmatic, strict" };
     }
-    completionPolicy = completionPolicyFlag;
+    assuranceMode = assuranceFlag;
   }
 
-  let maxAdjacentContinuations = DEFAULT_MAX_ADJACENT_CONTINUATIONS;
-  if (maxAdjacentContinuationsFlag) {
-    const parsed = parsePositiveInteger(maxAdjacentContinuationsFlag);
-    if (!parsed) {
-      return { error: `--auto-max-adjacent-continuations must be an integer between 1 and ${DEFAULT_MAX_ITERATIONS_LIMIT}` };
-    }
-    maxAdjacentContinuations = parsed;
+  if (assuranceMode === "strict" && !verifyCommand) {
+    return { error: "--auto-assurance strict requires --auto-verify <cmd>" };
   }
 
   const { mode, maxIterations } = resolveAutoMode(iterations, untilPrompt);
   return {
-    goal,
-    untilPrompt,
-    mode,
-    maxIterations,
-    controllerModel,
-    verifyCommand,
-    commitPolicy,
-    pushPolicy,
-    completionPolicy,
-    maxAdjacentContinuations,
-    allowControllerProbes: parseBooleanFlag(flags.allowControllerProbes, true),
-    workerReflectionEnabled: parseBooleanFlag(flags.workerReflection, false),
-    resumeOnSessionStart: parseBooleanFlag(flags.resume, false),
+    config: {
+      goal,
+      untilPrompt,
+      mode,
+      maxIterations,
+      controllerModel,
+      verifyCommand,
+      commitPolicy,
+      pushPolicy,
+      assuranceMode,
+      resumeOnSessionStart: parseBooleanFlag(flags.resume, false),
+    },
+    warnings,
   };
 }
 
@@ -1351,25 +963,10 @@ export function parseControllerDecision(rawText: string): ControllerDecision | u
           : typeof parsed.qualityGoalMet === "boolean"
             ? parsed.qualityGoalMet
             : undefined;
-      const progressRaw = typeof parsed.progressPercent === "number" ? parsed.progressPercent : undefined;
-      const commitRecommendation = typeof parsed.commitRecommendation === "string" && isCommitRecommendation(parsed.commitRecommendation)
-        ? parsed.commitRecommendation
-        : undefined;
 
-      if (!action || !reason || !updatedSummary || !goalStatus || completionGateMet === undefined || progressRaw === undefined || !commitRecommendation) {
+      if (!action || !reason || !updatedSummary || !goalStatus || completionGateMet === undefined) {
         continue;
       }
-
-      const progressPercent = Math.max(0, Math.min(100, Math.round(progressRaw)));
-      const base = {
-        action: action as ControllerAction,
-        reason,
-        updatedSummary,
-        goalStatus,
-        completionGateMet,
-        progressPercent,
-        commitRecommendation,
-      };
 
       if (action === "continue") {
         const nextPrompt =
@@ -1380,35 +977,33 @@ export function parseControllerDecision(rawText: string): ControllerDecision | u
               : "";
         if (!nextPrompt) continue;
         return {
-          ...base,
           action: "continue",
+          reason,
+          updatedSummary,
+          goalStatus,
+          completionGateMet,
           nextPrompt,
         };
       }
 
       if (action === "stop") {
         return {
-          ...base,
           action: "stop",
+          reason,
+          updatedSummary,
+          goalStatus,
+          completionGateMet,
           finalMessage: typeof parsed.finalMessage === "string" ? parsed.finalMessage.trim() || undefined : undefined,
         };
       }
 
       if (action === "pause") {
         return {
-          ...base,
           action: "pause",
-        };
-      }
-
-      if (action === "probe") {
-        const probe = isRecord(parsed.probe) ? parsed.probe : undefined;
-        const kind = probe && typeof probe.kind === "string" && isProbeKind(probe.kind) ? probe.kind : undefined;
-        if (!kind) continue;
-        return {
-          ...base,
-          action: "probe",
-          probe: { kind },
+          reason,
+          updatedSummary,
+          goalStatus,
+          completionGateMet,
         };
       }
     } catch {
@@ -1492,4 +1087,230 @@ export function truncateControllerSummary(summary: string, maxChars = DEFAULT_CO
   const normalized = summary.trim();
   if (!normalized) return "";
   return truncateWithEllipsis(normalized, maxChars);
+}
+
+export function summarizeGoal(goal: string, maxLength = DEFAULT_STATUS_GOAL_MAX_CHARS): string {
+  return truncateWithEllipsis(collapseWhitespace(goal), maxLength);
+}
+
+export function normalizeComparableText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+export function areAutoPromptsEquivalent(previousPrompt: string | undefined, nextPrompt: string | undefined): boolean {
+  if (!previousPrompt || !nextPrompt) return false;
+  return normalizeComparableText(previousPrompt) === normalizeComparableText(nextPrompt);
+}
+
+export function shouldPreRunVerifyCommand(input: VerifyPreflightInput): boolean {
+  if (!input.verifyCommandConfigured) return false;
+  if (input.stopReason === "stop") return true;
+  return input.currentIteration >= input.maxIterations;
+}
+
+export function shouldAutoResumeOnSessionStart(
+  reason: AutoSessionStartReason,
+  autoResumeFlag: boolean,
+  resumePolicy: ResumePolicy,
+): boolean {
+  return reason === "startup" && (autoResumeFlag || resumePolicy === "restore-running");
+}
+
+export function buildStartPrompt(input: StartPromptInput): string {
+  return input.goal.trim();
+}
+
+export function buildResumePrompt(input: ResumePromptInput): string {
+  const sections = [
+    "Resume the active goal from the current repository state.",
+    `Goal: ${input.goal}`,
+    input.controllerSummary ? `Controller summary:\n${input.controllerSummary}` : undefined,
+  ].filter((value): value is string => !!value);
+
+  return sections.join("\n\n");
+}
+
+export function buildAutoWorkerSystemPrompt(input: AutoWorkerPromptInput): string {
+  return renderAutoModeSystemPromptTemplateSection(
+    "worker",
+    buildAutoWorkerSystemPromptTemplateVariables(input),
+  );
+}
+
+export function buildAutoControllerSystemPrompt(): string {
+  return renderAutoModeSystemPromptTemplateSection("controller");
+}
+
+export function evaluateAutoStopGuard(input: AutoStopGuardInput): AutoStopGuardResult {
+  const blockers: AutoStopBlocker[] = [];
+
+  if (input.goalStatus !== "met") {
+    blockers.push("goal-not-met");
+  }
+
+  if (input.requiresCompletionGate && !input.completionGateMet) {
+    blockers.push("completion-gate-not-met");
+  }
+
+  if (input.verifyCommandConfigured && !input.verifyCommandPassed) {
+    blockers.push("verification-failed");
+  }
+
+  if (input.git) {
+    if (input.commitPolicy !== "none" && input.git.dirty) {
+      blockers.push("commit-required");
+    }
+    if (input.pushPolicy !== "never" && input.git.hasUpstream && (input.git.ahead ?? 0) > 0) {
+      blockers.push("push-required");
+    }
+    if (input.pushPolicy !== "never" && input.git.hasUpstream && (input.git.behind ?? 0) > 0) {
+      blockers.push("sync-required");
+    }
+  }
+
+  return {
+    allowed: blockers.length === 0,
+    blockers,
+  };
+}
+
+export function describeAutoStopBlocker(blocker: AutoStopBlocker, verifyCommand: string | undefined): string {
+  switch (blocker) {
+    case "goal-not-met":
+      return "the active goal is not yet verified as met";
+    case "completion-gate-not-met":
+      return "the completion gate is not yet verified as met";
+    case "verification-failed":
+      return verifyCommand
+        ? `the verification command is still failing (${verifyCommand})`
+        : "verification is still failing";
+    case "commit-required":
+      return "a final commit is still required";
+    case "push-required":
+      return "a push to upstream is still required";
+    case "sync-required":
+      return "the branch is not yet synchronized with upstream";
+  }
+}
+
+export function buildBlockedStopFollowUp(input: BlockedStopFollowUpInput): string {
+  const orderedBlockers: AutoStopBlocker[] = [
+    "goal-not-met",
+    "completion-gate-not-met",
+    "verification-failed",
+    "commit-required",
+    "sync-required",
+    "push-required",
+  ];
+
+  const actions: string[] = [];
+  for (const blocker of orderedBlockers) {
+    if (!input.blockers.includes(blocker)) continue;
+
+    if (blocker === "goal-not-met") {
+      actions.push("Inspect the current state, close the highest-value remaining gap toward the goal, and then reassess.");
+      continue;
+    }
+
+    if (blocker === "completion-gate-not-met") {
+      actions.push(input.untilPrompt
+        ? `Satisfy this completion gate before stopping: ${input.untilPrompt}`
+        : "Satisfy the remaining completion gate requirement before stopping.");
+      continue;
+    }
+
+    if (blocker === "verification-failed") {
+      actions.push(input.verifyCommand
+        ? `Run ${input.verifyCommand} until it passes, then report the exact passing result.`
+        : "Run the relevant verification until it passes, then report the exact passing result.");
+      continue;
+    }
+
+    if (blocker === "commit-required") {
+      actions.push("Create the final atomic commit and confirm the working tree is clean.");
+      continue;
+    }
+
+    if (blocker === "sync-required") {
+      actions.push("Bring the current branch back in sync with upstream before stopping.");
+      continue;
+    }
+
+    if (blocker === "push-required") {
+      actions.push("Push the current branch to upstream and confirm it is in sync.");
+    }
+  }
+
+  return actions.join(" ");
+}
+
+export function planAutoFollowUp(input: AutoFollowUpPlanInput): AutoFollowUpPlan {
+  if (input.currentIteration >= input.maxIterations) {
+    return {
+      action: "pause",
+      reason: input.budgetPauseReason,
+      nextStagnationCount: input.consecutiveStagnationCount,
+    };
+  }
+
+  const nextStagnationCount = areAutoPromptsEquivalent(input.lastAutoPrompt, input.nextPrompt)
+    ? input.consecutiveStagnationCount + 1
+    : 0;
+
+  if (nextStagnationCount >= (input.stagnationLimit ?? DEFAULT_STAGNATION_LIMIT)) {
+    return {
+      action: "pause",
+      reason: input.stagnationPauseReason ?? "controller produced the same next prompt repeatedly",
+      nextStagnationCount,
+    };
+  }
+
+  if (input.consecutiveNoChangeCount >= (input.noChangeLimit ?? DEFAULT_NO_CHANGE_LIMIT)) {
+    return {
+      action: "pause",
+      reason: input.noChangePauseReason ?? "repository state has not changed across several iterations",
+      nextStagnationCount,
+    };
+  }
+
+  return {
+    action: "send",
+    nextPrompt: input.nextPrompt,
+    nextIteration: input.currentIteration + 1,
+    nextStagnationCount,
+  };
+}
+
+export function decideAutoModeSessionStart(input: SessionStartDecisionInput): SessionStartDecision {
+  const autoResume = shouldAutoResumeOnSessionStart(
+    input.reason,
+    input.autoResumeFlag,
+    input.persistedResumePolicy ?? "restore-paused",
+  );
+
+  if (input.reason === "startup" && input.autoStartConfigState === "valid") {
+    return { action: "start-from-flags", autoResume: false };
+  }
+
+  if (input.hasPersistedSnapshot) {
+    return {
+      action: "restore",
+      autoResume,
+      warning: input.autoStartConfigState === "invalid" ? input.autoStartError : undefined,
+    };
+  }
+
+  if (input.autoStartConfigState === "invalid") {
+    return {
+      action: "noop",
+      autoResume: false,
+      warning: input.autoStartError,
+    };
+  }
+
+  return { action: "noop", autoResume: false };
 }
