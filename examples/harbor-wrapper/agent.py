@@ -346,9 +346,13 @@ class PiAgent(BaseAgent):
             timeout_sec=300,
         )
         await environment.exec(
-            "HUSKY=0 npm install --no-fund --no-audit",
+            "HUSKY=0 npm install --include=dev --no-fund --no-audit",
             cwd=_REMOTE_REPO_DIR,
             timeout_sec=900,
+        )
+        await environment.exec(
+            f"test -x {shlex.quote(_REMOTE_REPO_DIR)}/node_modules/.bin/tsx",
+            timeout_sec=10,
         )
 
     async def setup(self, environment: BaseEnvironment) -> None:

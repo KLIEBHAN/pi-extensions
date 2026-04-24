@@ -100,6 +100,70 @@ harbor run \
   -n 20
 ```
 
+## Hello World smoke test for GPT-5.5 xhigh
+
+A tiny local Harbor task is included at `hello-world-task/` to validate the
+wrapper, model/auth wiring, `--terminal-bench` activation, log capture, and
+verifier flow before launching a full Terminal-Bench run.
+
+Run the prepared smoke test from this directory:
+
+```bash
+./run-hello-world-gpt55-xhigh.sh
+```
+
+The script defaults to:
+
+- model: `openai-codex/gpt-5.5`
+- thinking: `xhigh`
+- environment: `docker`
+- jobs directory: `/tmp/pi-extensions-hello-world-gpt55-xhigh`
+- trace capture: enabled via `PI_HARBOR_TRACE_JSONL=1`
+
+Override defaults without editing the script:
+
+```bash
+PI_HARBOR_MODEL=openai-codex/gpt-5.5 \
+PI_HARBOR_THINKING=xhigh \
+PI_HARBOR_ENV=docker \
+PI_HARBOR_TASK_TIMEOUT_SEC=900 \
+./run-hello-world-gpt55-xhigh.sh
+```
+
+Equivalent explicit command:
+
+```bash
+PI_HARBOR_THINKING=xhigh \
+PI_HARBOR_TASK_TIMEOUT_SEC=900 \
+PI_HARBOR_TRACE_JSONL=1 \
+harbor run \
+  --agent-import-path agent:PiAgent \
+  --path ./hello-world-task \
+  -m openai-codex/gpt-5.5 \
+  -e docker \
+  -n 1 \
+  --n-attempts 1 \
+  --jobs-dir /tmp/pi-extensions-hello-world-gpt55-xhigh
+```
+
+If the smoke test passes, a full GPT-5.5/xhigh Terminal-Bench run can use the
+same wrapper settings, for example. For closest comparison with the 2026-04-11
+benchmark notes, prepend `PI_HARBOR_PI_SOURCE=local` and, if needed,
+`PI_HARBOR_LOCAL_REPO=/path/to/pi-mono`.
+
+```bash
+PI_HARBOR_THINKING=xhigh \
+PI_HARBOR_TASK_TIMEOUT_SEC=3600 \
+harbor run \
+  --agent-import-path agent:PiAgent \
+  -d terminal-bench@2.0 \
+  -m openai-codex/gpt-5.5 \
+  -e docker \
+  -n 1 \
+  --n-attempts 1 \
+  --jobs-dir /tmp/pi-extensions-full-gpt55-xhigh
+```
+
 ## Debugging
 
 Each Harbor trial stores pi process logs under the trial's `agent/` directory:
