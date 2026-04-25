@@ -125,31 +125,94 @@ not listed as reward-zero or pure-error in that document are treated as
 | `torch-tensor-parallelism` | known ML/distributed semantic failure | 0 | 0 | `AgentTimeoutError` | Row-parallel failures for `world_size > 1` |
 | `gpt2-codegolf` | volatile low-level/model task | 0 | 0 | `AgentTimeoutError` | Wrong sampled output; note GPT-5.4 focus rerun had passed this task |
 
-Corrected subset comparison:
+Corrected subset comparison before increasing Harbor's task-level agent timeout:
 
 | Model/run | Reward on these 10 selected tasks |
 |---|---:|
 | GPT-5.4 xhigh full-run baseline | 4/10 |
 | GPT-5.5 xhigh representative run | 4/10 |
 
-## First impression
+## Timeout-multiplier rerun
 
-On this deliberately mixed subset, `gpt-5.5`/`xhigh` does **not** show an early
-reward improvement over the prior `gpt-5.4`/`xhigh` full-run baseline. It kept
-the four calibration passes, but did not flip any of the selected known
-`gpt-5.4` reward-zero tasks.
+The same 10-task set was rerun with `--agent-timeout-multiplier 4` to remove the
+900-second Harbor task-level agent timeout as a major confounder.
+
+Additional command option:
+
+```bash
+--agent-timeout-multiplier 4
+```
+
+Artifacts:
+
+- Job directory: `/tmp/pi-extensions-10-gpt55-xhigh-timeout4/10-representative-gpt55-xhigh-timeout4-2026-04-24`
+- Top-level result: `/tmp/pi-extensions-10-gpt55-xhigh-timeout4/10-representative-gpt55-xhigh-timeout4-2026-04-24/result.json`
+- Wall-clock runtime: `1:34:13`
+
+Summary:
+
+| Metric | Value |
+|---|---:|
+| Total tasks | 10 |
+| Reward = 1 | 7 |
+| Reward = 0 | 3 |
+| Mean reward | 0.700 |
+| Reported errors | 0 |
+
+Per-task timeout-multiplier results:
+
+| Task | GPT-5.4 xhigh full-run baseline | GPT-5.5 xhigh, normal timeout | GPT-5.5 xhigh, timeout x4 | Timeout x4 note |
+|---|---:|---:|---:|---|
+| `write-compressor` | 1 | 1 | 1 | Passed |
+| `build-cython-ext` | 1 | 1 | 1 | Passed without timeout error |
+| `fix-git` | 1 | 1 | 1 | Passed |
+| `code-from-image` | 1 | 1 | 1 | Passed |
+| `configure-git-webserver` | 0 | 0 | 0 | Still HTTP 404 final-state failure |
+| `filter-js-from-html` | 0 | 0 | 0 | XSS and clean-HTML tests still failed |
+| `gcode-to-text` | 0 | 0 | 0 | Produced `using gcode is cheating`, expected `flag{gc0d3_iz_ch4LLenGiNg}` |
+| `adaptive-rejection-sampler` | 0 | 0 | 1 | Flipped to pass |
+| `torch-tensor-parallelism` | 0 | 0 | 1 | Flipped to pass |
+| `gpt2-codegolf` | 0 | 0 | 1 | Flipped to pass; note GPT-5.4 focus rerun had also passed this volatile task |
+
+Agent execution durations in the timeout-multiplier run:
+
+| Task | Agent duration |
+|---|---:|
+| `adaptive-rejection-sampler` | 0:11:18 |
+| `build-cython-ext` | 0:07:00 |
+| `code-from-image` | 0:00:39 |
+| `configure-git-webserver` | 0:06:20 |
+| `filter-js-from-html` | 0:07:19 |
+| `fix-git` | 0:01:40 |
+| `gcode-to-text` | 0:08:06 |
+| `gpt2-codegolf` | 0:12:01 |
+| `torch-tensor-parallelism` | 0:07:05 |
+| `write-compressor` | 0:02:45 |
+
+## Updated first impression
+
+With Harbor's task-level timeout ambiguity reduced, `gpt-5.5`/`xhigh` looks
+materially better on this small representative subset: `7/10` versus the
+`4/10` GPT-5.4 full-run baseline on the same selected tasks.
+
+The improvement comes from three flips relative to the GPT-5.4 full-run
+baseline and the first GPT-5.5 normal-timeout run:
+
+- `adaptive-rejection-sampler`
+- `torch-tensor-parallelism`
+- `gpt2-codegolf`
 
 Caveats:
 
-- This is only 10 tasks and includes several previously known hard failures, so
-  it is not a full-distribution estimate.
-- Several failures are timeout-influenced at Harbor's task-level agent timeout
-  (`900s` for many tasks), even though the wrapper's in-container pi timeout was
-  set to `3600s`.
-- `gpt2-codegolf` was volatile in the 2026-04-11 notes: it failed in the full
-  GPT-5.4 run but passed a focused trace rerun. Its GPT-5.5 failure here should
-  not be over-weighted.
+- This is still only 10 tasks and intentionally includes several previously
+  known hard failures, so it is not a full-distribution estimate.
+- The comparison is against the prior GPT-5.4 full-run baseline, not a fresh
+  GPT-5.4 rerun with the same `--agent-timeout-multiplier 4` setting.
+- `gpt2-codegolf` is known volatile from the 2026-04-11 notes: it failed in the
+  full GPT-5.4 run but passed a focused trace rerun.
+- Three selected failures remain stable for GPT-5.5 here:
+  `configure-git-webserver`, `filter-js-from-html`, and `gcode-to-text`.
 
-Recommendation: if we continue, run either the same subset with
-`--agent-timeout-multiplier 4` to reduce timeout ambiguity, or proceed to a
-larger 30-task run before making claims about GPT-5.5 vs GPT-5.4.
+Recommendation: run a larger 30-task GPT-5.5/xhigh sample with
+`--agent-timeout-multiplier 4` before deciding whether a full 89-task GPT-5.5
+run is worth the cost.
