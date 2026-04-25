@@ -148,6 +148,30 @@ function stripRepeatedDraftPrefix(draft: string, suggestion: string): string {
   return suggestion;
 }
 
+function getTrailingWordFragment(text: string): string {
+  return /([\p{L}\p{M}\p{N}_]+)$/u.exec(text)?.[1] ?? "";
+}
+
+function startsWithCaseInsensitivePrefix(text: string, prefix: string): boolean {
+  if (text.length < prefix.length) return false;
+  return text.slice(0, prefix.length).toLocaleLowerCase() === prefix.toLocaleLowerCase();
+}
+
+function stripRepeatedCurrentWordPrefix(draft: string, suggestion: string): string {
+  const currentWord = getTrailingWordFragment(draft);
+  if (!currentWord) return suggestion;
+
+  // If the model returns the expanded current word instead of only the suffix
+  // (e.g. draft "Schrei" -> suggestion "Schreibe ..."), keep only the text
+  // that is still missing at the cursor. This prevents accepting the suggestion
+  // from duplicating or separating the partially typed word.
+  if (startsWithCaseInsensitivePrefix(suggestion, currentWord)) {
+    return suggestion.slice(currentWord.length);
+  }
+
+  return suggestion;
+}
+
 function normalizeLeadingBoundarySpacing(draft: string, suggestion: string): string {
   if (!suggestion) return suggestion;
 
@@ -180,7 +204,19 @@ function maybePrefixSpace(draft: string, suggestion: string): string {
   if (/[({\["'`/\\-]/.test(lastChar)) return suggestion;
   if (/^[,.;:!?)}\]]/.test(suggestion)) return suggestion;
 
-  if (/[A-Za-z0-9\])]/.test(lastChar) && /^[A-Za-z0-9([{"']/.test(suggestion)) {
+  // Do not infer a missing word boundary between two word characters. The
+  // cursor may be inside a partially typed word ("Schrei" + "be ..."), and
+  // adding a space would corrupt the accepted completion. For word-to-word
+  // continuations we rely on the model-provided leading whitespace instead.
+  if (/[A-Za-z0-9]/.test(lastChar) && /^[A-Za-z0-9]/.test(suggestion)) {
+    return suggestion;
+  }
+
+  if (/[A-Za-z0-9\])]/.test(lastChar) && /^[([{"']/.test(suggestion)) {
+    return ` ${suggestion}`;
+  }
+
+  if (/[\])]/.test(lastChar) && /^[A-Za-z0-9([{"']/.test(suggestion)) {
     return ` ${suggestion}`;
   }
 
@@ -397,6 +433,7 @@ export function normalizePromptSuggestion(
   suggestion = stripRepeatedDraftPrefix(draft, suggestion);
   suggestion = suggestion.replace(/^\u200b+/, "");
   suggestion = suggestion.replace(/\t/g, "    ");
+  suggestion = stripRepeatedCurrentWordPrefix(draft, suggestion);
   suggestion = suggestion.trimEnd();
 
   if (!suggestion.trim()) return undefined;

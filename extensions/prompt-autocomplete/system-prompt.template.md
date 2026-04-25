@@ -5,6 +5,7 @@ Return ONLY valid JSON with exactly this shape:
 
 Rules:
 - If the current draft is non-empty, each item must be the exact continuation to insert at the cursor.
+- If the draft ends inside a partially typed word, complete that word directly without a leading space.
 - If the current draft is empty, each item must be a complete next prompt the user could send now.
 - Return 0 to the requested number of ranked alternatives.
 - Use the top-level key `{{RESPONSE_KEY}}`.

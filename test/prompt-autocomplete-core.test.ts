@@ -129,6 +129,21 @@ test("normalizePromptSuggestion does not add an extra leading space when draft a
   );
 });
 
+test("normalizePromptSuggestion completes partial words without inserting a separator", () => {
+  assert.equal(
+    normalizePromptSuggestion("Schrei", "be eine Antwort"),
+    "be eine Antwort",
+  );
+  assert.equal(
+    normalizePromptSuggestion("Bitte schrei", "Bitte schreibe eine Antwort"),
+    "be eine Antwort",
+  );
+  assert.equal(
+    normalizePromptSuggestion("Bitte schrei", "Schreibe eine Antwort"),
+    "be eine Antwort",
+  );
+});
+
 test("normalizePromptSuggestion removes leading horizontal whitespace for empty drafts", () => {
   assert.equal(normalizePromptSuggestion("", "   Bitte fasse die letzten Änderungen zusammen"), "Bitte fasse die letzten Änderungen zusammen");
 });
