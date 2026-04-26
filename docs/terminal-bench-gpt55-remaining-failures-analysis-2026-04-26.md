@@ -268,3 +268,100 @@ Updated near-term score expectations:
 | If two Batch-2 tasks flip | `78/89 = 0.8764` |
 | If four Batch-2/tasks or steered near-misses flip | `80/89 = 0.8989` |
 | 90% threshold | `81/89 = 0.9101` |
+
+## Batch 2 trace rerun results
+
+Batch 2 was rerun with trace logging enabled.
+
+Artifacts:
+
+- Job directory: `/tmp/pi-extensions-rerun-gpt55-priority2-trace/rerun-gpt55-priority2-trace-2026-04-26`
+- Top-level result: `/tmp/pi-extensions-rerun-gpt55-priority2-trace/rerun-gpt55-priority2-trace-2026-04-26/result.json`
+
+Run settings:
+
+- `pi-extensions`: `10b6a9d` at run start
+- `pi-mono`: `af11780f` on `feat/terminal-bench-optimizations`
+- `PI_HARBOR_TRACE_JSONL=1`
+- `PI_HARBOR_TASK_TIMEOUT_SEC=7200`
+- `--agent-timeout-multiplier 4`
+- Model: `openai-codex/gpt-5.5`
+- Thinking: `xhigh`
+
+Summary:
+
+| Metric | Value |
+|---|---:|
+| Tasks | 6 |
+| Reward = 1 | 0 |
+| Reward = 0 | 6 |
+| Errors | 0 |
+| Mean | 0.000 |
+| Runtime | 1:19:46 |
+
+Per-task results:
+
+| Task | Result | Trace lines | Trace size | Root-cause update from trace/logs |
+|---|---:|---:|---:|---|
+| `install-windows-3.11` | 0 | 35,068 | 356.9 MB | Improved relative to the full run: `network_status`, QEMU params, and image verification passed. Only keyboard visual feedback failed because the verifier expects HMP at `/tmp/qemu-monitor.sock`; agent created `/tmp/qemu-win311-hmp.sock` and TCP monitors instead. Very near final-state/socket-name miss. |
+| `make-doom-for-mips` | 0 | 25,646 | 608.8 MB | Agent verified exact stdout and correct frame during its own run, but left `/tmp/frame.bmp` in place. The verifier's `test_vm_execution` starts `node vm.js` and waits only until `/tmp/frame.bmp` exists; because it already existed, verifier terminated too early and missed the expected stdout. High-confidence final-state side-effect miss. |
+| `make-mips-interpreter` | 0 | 19,511 | 781.8 MB | Same pattern as `make-doom-for-mips`: valid frame and matching image, but `/tmp/frame.bmp` was left pre-existing, so verifier killed the new run before stdout reached `I_InitGraphics: DOOM screen size: w x h: 320 x 200`. High-confidence final-state side-effect miss. |
+| `dna-insert` | 0 | 7,236 | 55.4 MB | Still failed Tm delta, now `5.7477 > 5`. Agent's own Tm calculation used intended shorter annealed regions (`61.24` and `61.96`), but the official parser found a different/longer forward annealed region and computed `66.27` vs `60.53`. Official-parser mismatch. |
+| `db-wal-recovery` | 0 | 6,703 | 74.4 MB | Still recovered 11 rows, but values for ids 1/2 remained base values `100/200` instead of WAL-updated `150/250`. Trace shows extensive WAL exploration but final JSON still lacks update application. Partial recovery, not enough. |
+| `video-processing` | 0 | 12,497 | 283.0 MB | Example video passed; hidden test video failed with takeoff frame `329`, expected `[219,223]`. Trace shows the agent only verified against `/app/example_video.mp4`; no hidden-video access during agent run. Stable hidden-generalization failure. |
+
+Score update after Batch 2:
+
+```text
+Before Batch 2 adjusted score: 76/89 = 0.8539
+Batch 2 additional passes: +0
+After Batch 2 adjusted score: 76/89 = 0.8539
+```
+
+### Batch 2 interpretation
+
+Plain Batch-2 reruns did not recover any additional tasks. The traces are still
+useful because they identify several high-confidence, task-specific final-state
+or verifier-contract misses:
+
+- `install-windows-3.11` is now one socket-name away from passing the observed
+  verifier: create/keep HMP at `/tmp/qemu-monitor.sock` specifically.
+- `make-doom-for-mips` and `make-mips-interpreter` likely need `/tmp/frame.bmp`
+  removed before final answer so the verifier waits for the fresh run and
+  captures the expected stdout.
+- `dna-insert` needs validation against the official parser's
+  `primers_concat.find(insert)` and resulting annealed regions, not against the
+  agent's intended shorter annealing regions.
+- `db-wal-recovery` needs the WAL update semantics applied for ids 1 and 2;
+  insertion recovery alone is insufficient.
+- `video-processing` remains a genuine hidden-generalization failure and is a
+  poor plain-rerun target.
+
+### Updated next-action priority after Batch 2
+
+Plain stochastic reruns have low expected value for these tasks. If steered or
+case-specific reruns are allowed, prioritize:
+
+1. `make-doom-for-mips` — very likely recoverable by removing `/tmp/frame.bmp`
+   before finish while leaving `doomgeneric_mips` intact.
+2. `make-mips-interpreter` — same `/tmp/frame.bmp` pre-existence issue.
+3. `install-windows-3.11` — create the exact verifier-expected Unix HMP socket
+   `/tmp/qemu-monitor.sock` in addition to any other monitor sockets.
+4. `polyglot-rust-c` — from Batch 1; remove `/app/polyglot/main` and
+   `/app/polyglot/cmain` before finish.
+5. `sam-cell-seg` — from Batch 1; serialize coordinate columns as list literals,
+   not tuple literals.
+6. `torch-tensor-parallelism` — from Batch 1; fix `RowParallelLinear.forward()`
+   to accept already-scattered rank-local input.
+7. `dna-insert` / `dna-assembly` — use exact official parser logic when checking
+   Tm and overhangs.
+8. `db-wal-recovery` — apply WAL-updated values for ids 1 and 2.
+
+Updated score expectations remain:
+
+| Accounting | Score |
+|---|---:|
+| Current conservative adjusted score | `76/89 = 0.8539` |
+| +2 high-confidence steered final-state fixes | `78/89 = 0.8764` |
+| +4 high-confidence steered fixes | `80/89 = 0.8989` |
+| 90% threshold | `81/89 = 0.9101` |
