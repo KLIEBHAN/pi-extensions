@@ -240,6 +240,16 @@ You can also override the wrapper's in-container pi timeout per run:
 PI_HARBOR_TASK_TIMEOUT_SEC=3600 harbor run ...
 ```
 
+For diagnostic reruns only, you can append extra steering text to the task
+instruction without editing the task package:
+
+```bash
+PI_HARBOR_EXTRA_INSTRUCTION='Additional note for this diagnostic rerun...' harbor run ...
+PI_HARBOR_EXTRA_INSTRUCTION_FILE=/path/to/hints.md harbor run ...
+```
+
+Use this only for focused analysis, not for official benchmark numbers.
+
 Edit `agent.py` only if you want to change other defaults such as:
 
 - available tools

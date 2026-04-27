@@ -67,6 +67,8 @@ _PI_SOURCE_ENV = "PI_HARBOR_PI_SOURCE"
 _LOCAL_REPO_ENV = "PI_HARBOR_LOCAL_REPO"
 _THINKING_ENV = "PI_HARBOR_THINKING"
 _TASK_TIMEOUT_ENV = "PI_HARBOR_TASK_TIMEOUT_SEC"
+_EXTRA_INSTRUCTION_ENV = "PI_HARBOR_EXTRA_INSTRUCTION"
+_EXTRA_INSTRUCTION_FILE_ENV = "PI_HARBOR_EXTRA_INSTRUCTION_FILE"
 
 
 def _find_extension() -> Path:
@@ -254,6 +256,43 @@ def _resolve_task_timeout_sec(value: str | None) -> int:
     return timeout_sec
 
 
+def _read_extra_instruction() -> str | None:
+    """Read optional benchmark steering text from env or a host-side file."""
+    parts: list[str] = []
+
+    file_value = os.environ.get(_EXTRA_INSTRUCTION_FILE_ENV)
+    if file_value and file_value.strip():
+        hint_path = Path(file_value).expanduser().resolve()
+        try:
+            parts.append(hint_path.read_text())
+        except Exception as error:
+            raise ValueError(
+                f"Failed to read {_EXTRA_INSTRUCTION_FILE_ENV}={file_value!r}: {error}"
+            ) from error
+
+    inline_value = os.environ.get(_EXTRA_INSTRUCTION_ENV)
+    if inline_value and inline_value.strip():
+        parts.append(inline_value)
+
+    normalized = "\n\n".join(part.strip() for part in parts if part.strip())
+    return normalized or None
+
+
+def _compose_instruction(instruction: str, extra_instruction: str | None) -> str:
+    """Append optional wrapper-provided steering text to the task instruction."""
+    if not extra_instruction:
+        return instruction
+
+    return (
+        instruction.rstrip()
+        + "\n\n---\n\n"
+        + "Additional benchmark steering from the Harbor wrapper. "
+        + "Apply only the guidance that is relevant to this task, and keep all original requirements authoritative.\n\n"
+        + extra_instruction.strip()
+        + "\n"
+    )
+
+
 def _filter_repo_archive_member(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
     """Exclude large or irrelevant files from the uploaded local checkout archive."""
     parts = Path(member.name).parts
@@ -296,6 +335,7 @@ class PiAgent(BaseAgent):
         self._pi_source = _resolve_pi_source(os.environ.get(_PI_SOURCE_ENV))
         self._thinking_level = _resolve_thinking_level(os.environ.get(_THINKING_ENV))
         self._task_timeout_sec = _resolve_task_timeout_sec(os.environ.get(_TASK_TIMEOUT_ENV))
+        self._extra_instruction = _read_extra_instruction()
         self._local_repo_root = (
             _resolve_local_repo_root(os.environ.get(_LOCAL_REPO_ENV))
             if self._pi_source == "local"
@@ -361,6 +401,8 @@ class PiAgent(BaseAgent):
         _LOGGER.info("pi source mode: %s", self._pi_source)
         _LOGGER.info("pi thinking level: %s", self._thinking_level)
         _LOGGER.info("pi task timeout: %s seconds", self._task_timeout_sec)
+        if self._extra_instruction:
+            _LOGGER.info("extra instruction steering enabled (%d chars)", len(self._extra_instruction))
 
         # 1. System dependencies (curl for Node.js download, tmux for tmux tools)
         _LOGGER.info("Installing system dependencies...")
@@ -442,6 +484,7 @@ class PiAgent(BaseAgent):
         context: AgentContext,
     ) -> None:
         """Run pi in print mode inside the container."""
+        instruction = _compose_instruction(instruction, self._extra_instruction)
         _LOGGER.info("Running pi on task (%d chars)", len(instruction))
 
         # Write instruction to file via base64 to avoid any shell escaping issues

@@ -365,3 +365,138 @@ Updated score expectations remain:
 | +2 high-confidence steered final-state fixes | `78/89 = 0.8764` |
 | +4 high-confidence steered fixes | `80/89 = 0.8989` |
 | 90% threshold | `81/89 = 0.9101` |
+
+## Steered recoverable-task reruns
+
+After Batch 1/2 trace analysis, the Harbor wrapper was extended locally to allow
+optional extra steering text via:
+
+- `PI_HARBOR_EXTRA_INSTRUCTION`
+- `PI_HARBOR_EXTRA_INSTRUCTION_FILE`
+
+This is a diagnostic mechanism. Scores below are **steered** and should not be
+reported as an official benchmark score. They estimate which failures are
+recoverable when the agent is explicitly told the observed verifier-contract
+miss.
+
+### Steered recoverable batch
+
+Artifacts:
+
+- Job directory: `/tmp/pi-extensions-steered-recoverable-gpt55-xhigh/steered-recoverable-gpt55-xhigh-2026-04-26`
+- Top-level result: `/tmp/pi-extensions-steered-recoverable-gpt55-xhigh/steered-recoverable-gpt55-xhigh-2026-04-26/result.json`
+
+Run settings:
+
+- `PI_HARBOR_EXTRA_INSTRUCTION_FILE=/tmp/pi-gpt55-steered-recoverable-hints-2026-04-26.md`
+- `PI_HARBOR_TRACE_JSONL=0`
+- `PI_HARBOR_TASK_TIMEOUT_SEC=7200`
+- `--agent-timeout-multiplier 4`
+- Model: `openai-codex/gpt-5.5`
+- Thinking: `xhigh`
+
+Summary:
+
+| Metric | Value |
+|---|---:|
+| Tasks | 9 |
+| Reward = 1 | 7 |
+| Reward = 0 | 2 |
+| Errors | 0 |
+| Mean | 0.7778 |
+| Runtime | 1:29:20 |
+
+Results:
+
+| Task | Result | Note |
+|---|---:|---|
+| `torch-tensor-parallelism` | 1 | Row-parallel already-scattered input hint worked |
+| `polyglot-rust-c` | 1 | Final-state cleanup hint worked |
+| `db-wal-recovery` | 1 | WAL update semantics hint worked |
+| `install-windows-3.11` | 1 | Exact `/tmp/qemu-monitor.sock` hint worked |
+| `make-mips-interpreter` | 1 | Remove stale `/tmp/frame.bmp` hint worked |
+| `sam-cell-seg` | 1 | List-literal coordinate serialization hint worked |
+| `dna-assembly` | 1 | Official parser/overhang hint worked |
+| `make-doom-for-mips` | 0 | Stdout/frame freshness fixed, but saved BMP was `320x200`; verifier expected `640x400` |
+| `dna-insert` | 0 | Still failed Tm delta; official parser saw `66.27` vs `59.74` |
+
+### Follow-up steered batch
+
+The two remaining failures from the steered recoverable batch were rerun with
+more precise hints.
+
+Artifacts:
+
+- Job directory: `/tmp/pi-extensions-steered-followup-gpt55-xhigh/steered-followup-gpt55-xhigh-2026-04-27`
+- Top-level result: `/tmp/pi-extensions-steered-followup-gpt55-xhigh/steered-followup-gpt55-xhigh-2026-04-27/result.json`
+
+Run settings:
+
+- `PI_HARBOR_EXTRA_INSTRUCTION_FILE=/tmp/pi-gpt55-steered-followup-hints-2026-04-27.md`
+- `PI_HARBOR_TRACE_JSONL=0`
+- `PI_HARBOR_TASK_TIMEOUT_SEC=7200`
+- `--agent-timeout-multiplier 4`
+- Model: `openai-codex/gpt-5.5`
+- Thinking: `xhigh`
+
+Summary:
+
+| Metric | Value |
+|---|---:|
+| Tasks | 2 |
+| Reward = 1 | 2 |
+| Reward = 0 | 0 |
+| Errors | 0 |
+| Mean | 1.000 |
+| Runtime | 0:08:40 |
+
+Results:
+
+| Task | Result | Note |
+|---|---:|---|
+| `make-doom-for-mips` | 1 | Explicitly preserved 640x400 BMP while keeping internal stdout line |
+| `dna-insert` | 1 | Explicit official-parser primer construction passed |
+
+## Steered diagnostic score estimate
+
+Combining focused/steered recoveries with the official GPT-5.5 full-run result:
+
+Recovered after official full run:
+
+- `write-compressor` focused rerun
+- `mcmc-sampling-stan` trace rerun
+- `torch-tensor-parallelism` steered rerun
+- `polyglot-rust-c` steered rerun
+- `db-wal-recovery` steered rerun
+- `install-windows-3.11` steered rerun
+- `make-doom-for-mips` steered follow-up
+- `make-mips-interpreter` steered rerun
+- `sam-cell-seg` steered rerun
+- `dna-insert` steered follow-up
+- `dna-assembly` steered rerun
+
+Conservative diagnostic accounting:
+
+```text
+Official full run:                         74/89 = 0.8315
+Adjusted after unsteered focused reruns:   76/89 = 0.8539
+Steered diagnostic upper estimate:         85/89 = 0.9551
+```
+
+Remaining unresolved after steered recovery:
+
+- `video-processing`
+- `filter-js-from-html`
+- `model-extraction-relu-logits`
+- `train-fasttext`
+
+Interpretation:
+
+- The broad model/harness appears capable of solving almost all remaining
+  non-policy, non-heavy-timeout tasks when given precise verifier-contract
+  steering.
+- The official, non-steered score remains the appropriate headline benchmark
+  number.
+- The steered `85/89` estimate is useful as a ceiling/diagnostic: most of the
+  remaining gap was due to exact contract/final-state misses, not deep
+  impossibility.
