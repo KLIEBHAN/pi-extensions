@@ -25,6 +25,9 @@ const GHOST_TEXT_STYLE = "\x1b[2m";
 const GHOST_INDICATOR_STYLE = "\x1b[90m";
 const RESET = "\x1b[0m";
 const CURSOR_TOKEN = "\x1b[7m \x1b[0m";
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+const SPINNER_INTERVAL_MS = 80;
+const SPINNER_LABEL = "Generating suggestion";
 const REQUEST_MAX_TOKENS = 192;
 const FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_CACHE_TTL_MS = 60_000;
@@ -98,6 +101,7 @@ interface PromptAutocompleteSharedState {
   inFlightRequests: Map<string, Promise<PromptAutocompleteCacheEntry>>;
   refreshEditor?: (options?: SuggestionRefreshOptions) => void;
   setStatusText?: (text: string | undefined) => void;
+  setSpinnerActive?: (active: boolean) => void;
 }
 
 interface SuggestionRequest {
@@ -639,11 +643,13 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     if (this.pendingRequestKey === request.cacheKey || this.shared.inFlightRequests.has(request.cacheKey)) {
       updateDebugState(this.shared, "requesting", `Awaiting cached in-flight request for ${request.modelLabel}`);
+      this.shared.setSpinnerActive?.(true);
       return;
     }
 
     this.cancelPendingRequest();
     this.pendingRequestKey = request.cacheKey;
+    this.shared.setSpinnerActive?.(true);
 
     const debounceMs = options.immediate ? 0 : this.shared.config.debounceMs;
     if (debounceMs <= 0) {
@@ -732,6 +738,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       }
       if (this.pendingRequestKey === request.cacheKey) {
         this.pendingRequestKey = undefined;
+        this.shared.setSpinnerActive?.(false);
       }
     }
   }
@@ -861,6 +868,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.abortController?.abort();
     this.abortController = undefined;
     this.pendingRequestKey = undefined;
+    this.shared.setSpinnerActive?.(false);
   }
 }
 
@@ -874,6 +882,38 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
       { placement: "belowEditor" },
     );
   };
+
+  let spinnerFrame = 0;
+  let spinnerTimer: ReturnType<typeof setInterval> | undefined;
+  const renderSpinner = () => {
+    const frame = SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length];
+    ctx.ui.setWidget(
+      "prompt-autocomplete-spinner",
+      [`${GHOST_INDICATOR_STYLE}${frame} ${SPINNER_LABEL}…${RESET}`],
+      { placement: "belowEditor" },
+    );
+  };
+  const clearSpinnerWidget = () => {
+    ctx.ui.setWidget("prompt-autocomplete-spinner", undefined, { placement: "belowEditor" });
+  };
+  shared.setSpinnerActive = (active) => {
+    if (active) {
+      if (spinnerTimer) return;
+      spinnerFrame = 0;
+      renderSpinner();
+      spinnerTimer = setInterval(() => {
+        spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
+        renderSpinner();
+      }, SPINNER_INTERVAL_MS);
+      return;
+    }
+
+    if (!spinnerTimer) return;
+    clearInterval(spinnerTimer);
+    spinnerTimer = undefined;
+    clearSpinnerWidget();
+  };
+
   ctx.ui.setEditorComponent((tui, theme, keybindings) => {
     const editor = new PromptAutocompleteEditor(tui, theme, keybindings, shared, activationId);
     shared.refreshEditor = (options) => {
@@ -887,10 +927,12 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
 
 function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
   shared.activationId += 1;
+  shared.setSpinnerActive?.(false);
   ctx.ui.setEditorComponent(undefined);
   clearDebugUi(shared);
   shared.refreshEditor = undefined;
   shared.setStatusText = undefined;
+  shared.setSpinnerActive = undefined;
 }
 
 function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
