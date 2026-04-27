@@ -12,7 +12,8 @@
     "test:auto-mode": "node --experimental-strip-types --test test/auto-mode-core.test.ts test/auto-mode-index.test.ts"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions"],
+    "themes": ["./themes"]
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
