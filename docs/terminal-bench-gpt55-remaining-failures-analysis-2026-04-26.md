@@ -500,3 +500,78 @@ Interpretation:
 - The steered `85/89` estimate is useful as a ceiling/diagnostic: most of the
   remaining gap was due to exact contract/final-state misses, not deep
   impossibility.
+
+## Unsteered validation rerun of recovered tasks
+
+The recovered-task set was rerun **without** `PI_HARBOR_EXTRA_INSTRUCTION` or
+`PI_HARBOR_EXTRA_INSTRUCTION_FILE`, with trace logging enabled. This validates
+which recoveries hold without task-specific steering.
+
+Artifacts:
+
+- Job directory: `/tmp/pi-extensions-unsteered-validation-recovered-gpt55-xhigh-trace/unsteered-validation-recovered-gpt55-xhigh-trace-2026-04-27`
+- Top-level result: `/tmp/pi-extensions-unsteered-validation-recovered-gpt55-xhigh-trace/unsteered-validation-recovered-gpt55-xhigh-trace-2026-04-27/result.json`
+
+Run settings:
+
+- `PI_HARBOR_TRACE_JSONL=1`
+- no extra steering env vars
+- `PI_HARBOR_TASK_TIMEOUT_SEC=7200`
+- `--agent-timeout-multiplier 4`
+- Model: `openai-codex/gpt-5.5`
+- Thinking: `xhigh`
+
+Summary:
+
+| Metric | Value |
+|---|---:|
+| Tasks | 11 |
+| Reward = 1 | 3 |
+| Reward = 0 | 8 |
+| Errors | 0 |
+| Mean | 0.2727 |
+| Runtime | 3:43:49 |
+
+Per-task results:
+
+| Task | Result | Trace lines | Trace size | Validation interpretation |
+|---|---:|---:|---:|---|
+| `write-compressor` | 1 | 3,348 | 104.9 MB | Confirmed unsteered; prior full-run failure was verifier/network noise |
+| `torch-tensor-parallelism` | 1 | 8,827 | 333.8 MB | Confirmed unsteered in this validation run; remains somewhat volatile historically |
+| `dna-assembly` | 1 | 10,201 | 110.5 MB | Confirmed unsteered in this validation run |
+| `polyglot-rust-c` | 0 | 4,893 | 37.8 MB | Repeated final-state miss: agent left `main` and `cmain`; verifier expects only `main.rs` |
+| `db-wal-recovery` | 0 | 15,246 | 215.2 MB | Repeated partial WAL recovery: 11 rows present, but id 1 remained `100` instead of `150` |
+| `install-windows-3.11` | 0 | 11,456 | 93.8 MB | Repeated exact socket miss: verifier expects `/tmp/qemu-monitor.sock`; agent exposed other monitors |
+| `make-doom-for-mips` | 0 | 35,082 | 686.4 MB | Repeated stdout/fresh-frame timing issue: frame was correct, stdout lacked exact line before verifier killed run |
+| `make-mips-interpreter` | 0 | 28,113 | 1,538.3 MB | Same stdout/fresh-frame timing issue as DOOM task |
+| `mcmc-sampling-stan` | 0 | 19,940 | 219.3 MB | Volatile: posterior values passed, but `Rscript` output lacked `SAMPLING FOR MODEL`/`Chain`/`Elapsed Time` |
+| `sam-cell-seg` | 0 | 17,588 | 807.3 MB | Repeated tuple-vs-list serialization bug in `coords_x`/`coords_y` |
+| `dna-insert` | 0 | 3,090 | 22.3 MB | Repeated official-parser Tm mismatch; agent used intended annealing regions, verifier parsed a longer forward region |
+
+Conservative unsteered-validation accounting:
+
+```text
+Official full run:                         74/89 = 0.8315
+Unsteered validation confirmed additions:  +3
+Unsteered-validation adjusted estimate:    77/89 = 0.8652
+```
+
+If also counting the earlier unsteered `mcmc-sampling-stan` pass despite this
+validation failure, the less conservative unsteered-ever-passed estimate would
+be:
+
+```text
+78/89 = 0.8764
+```
+
+Interpretation:
+
+- The steered diagnostic ceiling (`85/89`) is not reproduced by plain unsteered
+  validation.
+- Three recoveries appear unsteered-valid in this validation run:
+  `write-compressor`, `torch-tensor-parallelism`, and `dna-assembly`.
+- Most exact-contract/final-state misses repeat without explicit steering,
+  especially `polyglot-rust-c`, Windows monitor socket, MIPS frame/stdout timing,
+  SAM coordinate serialization, and DNA insert parser/Tm handling.
+- `mcmc-sampling-stan` is volatile: numerics are stable, but verifier-visible
+  sampling output is not reliably emitted.
