@@ -1,8 +1,8 @@
 # pi-extensions
 
-Reusable [pi](https://github.com/badlogic/pi-mono) extensions collected in a standalone GitHub repository.
+Reusable [pi](https://github.com/badlogic/pi-mono) extensions and themes collected in a standalone GitHub repository.
 
-The repository is also a valid pi package, so you can either load individual extensions directly with `-e` or install the whole repository via `pi install`.
+The repository is also a valid pi package, so you can either load individual extensions directly with `-e` or install the whole repository via `pi install` to make bundled extensions and themes available.
 
 ## Quick start
 
@@ -27,6 +27,14 @@ pi install git:github.com/KLIEBHAN/pi-extensions
 ```
 
 After package installation, enabled extensions are auto-discovered by pi. The `terminal-bench` and `prompt-autocomplete` extensions are safe to keep installed because they only activate when their flags are passed (or, for prompt autocomplete, when enabled via its slash command).
+
+The bundled themes are also available after installation. Select `hermes-dark` in `/settings` or set it in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "theme": "hermes-dark"
+}
+```
 
 ## Permanently enable an extension via the user folder
 
@@ -83,6 +91,21 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 | `ralphy-loop/` | Repeats the same task with autonomous prompts, AI completion verification, and per-iteration context pruning | `/ralphy-loop 5 harden edge cases` |
 | `session-name.ts` | Adds `/session-name <name>` to label the current session | `/session-name auth-refactor` |
 | `terminal-bench.ts` | Migrated from `feat/terminal-bench-optimizations`; adds Terminal-Bench prompt rules, tmux tools, environment bootstrapping, and completion verification | `pi -e ./extensions/terminal-bench.ts --terminal-bench` |
+
+## Included themes
+
+| Theme | Purpose | Activation |
+|---|---|---|
+| `hermes-dark` | Dark Hermes-inspired theme with navy background, gold accents, warm bronze borders, and cream text. | Select `hermes-dark` in `/settings` or set `"theme": "hermes-dark"` in `~/.pi/agent/settings.json`. |
+
+For the closest visual match to the Hermes Agent look, set your terminal background to approximately `#1e1e2d`.
+
+If you want to use the theme without installing this repository as a package, copy it into pi's global theme folder:
+
+```bash
+mkdir -p ~/.pi/agent/themes
+cp ./themes/hermes-dark.json ~/.pi/agent/themes/hermes-dark.json
+```
 
 ## Auto-mode extension
 
@@ -398,6 +421,8 @@ pi-extensions/
 │   │   └── index.ts
 │   ├── session-name.ts
 │   └── terminal-bench.ts
+├── themes/
+│   └── hermes-dark.json
 ├── .gitignore
 ├── LICENSE
 ├── package.json
@@ -406,7 +431,7 @@ pi-extensions/
 
 ## Development
 
-Place additional extensions in `extensions/`.
+Place additional extensions in `extensions/` and additional themes in `themes/`.
 
 Each extension should export a default function:
 
