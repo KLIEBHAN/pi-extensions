@@ -11,6 +11,7 @@ Load an individual extension from the repository:
 ```bash
 pi -e ./extensions/hello.ts
 pi -e ./extensions/notify.ts
+pi -e ./extensions/copy-prompt.ts
 pi -e ./extensions/permission-gate.ts
 pi -e ./extensions/auto-mode --auto-goal "improve onboarding robustness"
 pi -e ./extensions/prompt-autocomplete --prompt-autocomplete
@@ -26,7 +27,7 @@ pi install ../pi-extensions
 pi install git:github.com/KLIEBHAN/pi-extensions
 ```
 
-After package installation, enabled extensions are auto-discovered by pi. The `terminal-bench` and `prompt-autocomplete` extensions are safe to keep installed because they only activate when their flags are passed (or, for prompt autocomplete, when enabled via its slash command).
+After package installation, enabled extensions are auto-discovered by pi. The `copy-prompt` extension stays passive until `Alt+C` is pressed. The `terminal-bench` and `prompt-autocomplete` extensions are safe to keep installed because they only activate when their flags are passed (or, for prompt autocomplete, when enabled via its slash command).
 
 The bundled themes are also available after installation. Select `hermes-dark` in `/settings` or set it in `~/.pi/agent/settings.json`:
 
@@ -85,6 +86,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 |---|---|---|
 | `hello.ts` | Minimal custom tool example | `pi -e ./extensions/hello.ts` |
 | `notify.ts` | Adds `/notify` for lightweight in-app notifications | `/notify build finished` |
+| `copy-prompt.ts` | Adds `Alt+C` to copy the current prompt draft to the system clipboard | `pi -e ./extensions/copy-prompt.ts` |
 | `permission-gate.ts` | Asks for confirmation before dangerous bash commands | `pi -e ./extensions/permission-gate.ts` |
 | `auto-mode/` | Controller-driven autonomous improvement loop that keeps iterating with transparent follow-up prompts | `/auto on --iterations 8 improve onboarding robustness` |
 | `prompt-autocomplete/` | Copilot/Cursor-style inline AI autocomplete for the prompt editor with Tab accept and Escape dismiss | `pi -e ./extensions/prompt-autocomplete --prompt-autocomplete` |
@@ -411,6 +413,7 @@ pi-extensions/
 │   │   └── system-prompt.template.md
 │   ├── hello.ts
 │   ├── notify.ts
+│   ├── copy-prompt.ts
 │   ├── permission-gate.ts
 │   ├── prompt-autocomplete/
 │   │   ├── core.ts
