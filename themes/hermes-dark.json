@@ -43,8 +43,8 @@
     "thinkingText": "oliveGold",
 
     "selectedBg": "selection",
-    "userMessageBg": "ink",
-    "userMessageText": "lavenderText",
+    "userMessageBg": "selectionSoft",
+    "userMessageText": "gold",
     "customMessageBg": "panel",
     "customMessageText": "cream",
     "customMessageLabel": "gold",
