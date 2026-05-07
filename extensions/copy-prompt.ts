@@ -13,6 +13,14 @@ function clearMacOptionCFallback(): void {
   unsubscribeMacOptionCFallback = undefined;
 }
 
+function countLines(text: string): number {
+  let lines = 1;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\n") lines += 1;
+  }
+  return lines;
+}
+
 async function copyPromptDraft(ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
 
@@ -24,7 +32,7 @@ async function copyPromptDraft(ctx: ExtensionContext): Promise<void> {
 
   try {
     await copyToClipboard(text);
-    const lineCount = text.split("\n").length;
+    const lineCount = countLines(text);
     const lineLabel = lineCount === 1 ? "line" : "lines";
     ctx.ui.notify(`Copied prompt draft (${lineCount} ${lineLabel})`, "info");
   } catch (error) {
@@ -55,5 +63,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     installMacOptionCFallback(ctx);
+  });
+
+  pi.on("session_shutdown", async () => {
+    clearMacOptionCFallback();
   });
 }

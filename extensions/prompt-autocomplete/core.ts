@@ -55,7 +55,7 @@ export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT = renderMiniTemplate(
 
 export const DEFAULT_PREFERRED_MODEL = "current active model";
 export const DEFAULT_DEBOUNCE_MS = 350;
-export const DEFAULT_MIN_PROMPT_CHARS = 0;
+export const DEFAULT_MIN_PROMPT_CHARS = 1;
 export const DEFAULT_MAX_SUGGESTION_CHARS = 160;
 export const DEFAULT_MAX_ALTERNATIVES = 2;
 export const MAX_DRAFT_CONTEXT_CHARS = 2_000;
@@ -334,21 +334,41 @@ export function parseBoundedIntFlag(
   return Math.max(min, Math.min(max, parsed));
 }
 
-export function extractMessageText(content: unknown): string {
+export function extractMessageText(content: unknown, maxChars = Number.POSITIVE_INFINITY): string {
   if (typeof content === "string") {
-    return content.trim();
+    const trimmed = content.trim();
+    return Number.isFinite(maxChars) ? truncateMiddle(trimmed, maxChars) : trimmed;
   }
 
   if (!Array.isArray(content)) {
     return "";
   }
 
-  return content
-    .filter((block): block is { type?: unknown; text?: unknown } => isRecord(block))
-    .filter((block) => block.type === "text" && typeof block.text === "string")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
+  const parts: string[] = [];
+  let remaining = maxChars;
+  let truncated = false;
+
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+    const text = block.text;
+    if (Number.isFinite(maxChars)) {
+      if (remaining <= 0) {
+        truncated = true;
+        break;
+      }
+      if (text.length > remaining) {
+        parts.push(text.slice(0, remaining));
+        truncated = true;
+        break;
+      }
+      remaining -= text.length + 1;
+    }
+    parts.push(text);
+  }
+
+  const joined = parts.join("\n").trim();
+  if (!Number.isFinite(maxChars)) return joined;
+  return truncated ? truncateWithEllipsis(joined, maxChars) : joined;
 }
 
 export function buildRecentConversationContext(
@@ -368,7 +388,7 @@ export function buildRecentConversationContext(
     const role = message.role;
     if (role !== "user" && role !== "assistant") continue;
 
-    const text = extractMessageText(message.content);
+    const text = extractMessageText(message.content, maxCharsPerMessage * 4);
     if (!text) continue;
 
     const prefix = role === "user" ? "User" : "Assistant";
@@ -391,7 +411,7 @@ function buildLatestRoleMessageContext(
     const message = entry.message;
     if (!isRecord(message) || message.role !== role) continue;
 
-    const text = extractMessageText(message.content);
+    const text = extractMessageText(message.content, maxChars * 2);
     if (!text) continue;
 
     return truncateMiddle(text.trim(), maxChars);

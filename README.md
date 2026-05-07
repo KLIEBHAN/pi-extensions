@@ -180,11 +180,11 @@ pi -e ./extensions/auto-mode \
 
 ### Repository fingerprint and untracked files
 
-Auto-mode uses a repository fingerprint to detect no-change loops and pauses after repeated unchanged iterations. The fingerprint includes `git status`, the diff against `HEAD`, and untracked files. To keep this cheap on large workspaces, untracked files use tiered fingerprints:
+Auto-mode uses a repository fingerprint to detect no-change loops and pauses after repeated unchanged iterations. The fingerprint includes bounded `git status` data plus tiered tracked/untracked file fingerprints instead of materializing the full diff into memory each turn.
 
-- more than 2000 untracked files: use path-list only
-- otherwise, up to 100 untracked regular files, up to 5 MiB total, and up to 32k path characters: hash file contents with `git hash-object`
-- remaining cases, such as 101-2000 files, more than 5 MiB total, too many path characters, or symlinks: use path + size + mtime metadata
+- more than 2000 changed/untracked files: use path-list digest only
+- otherwise, up to 100 regular files, up to 5 MiB total, and up to 32k path characters: hash file contents with `git hash-object`
+- remaining cases, such as 101-2000 files, more than 5 MiB total, too many path characters, deleted files, or symlinks: use path + size + mtime metadata
 
 The fallback tiers intentionally trade precision for performance. In metadata mode, same-size/same-mtime content edits may be missed. In path-only mode, content and metadata edits may be missed until paths change. These fallbacks only affect the no-change pause heuristic; git finalization gates still use the actual git status.
 
@@ -210,7 +210,7 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 
 ### What it adds
 
-- ghost-text style prompt suggestions directly in the editor, including when the draft is still empty
+- ghost-text style prompt suggestions directly in the editor once the draft reaches the configured minimum length
 - shows 2 alternatives by default, with configurable limit via flag
 - `Tab` accepts the whole current suggestion
 - `Ctrl+Space` accepts the next word/chunk from the current suggestion
@@ -260,7 +260,7 @@ pi -e ./extensions/prompt-autocomplete \
 
 ### Notes
 
-- The extension suggests as soon as the cursor is at the end of the current draft, even if the draft is still empty.
+- The extension suggests as soon as the cursor is at the end of the current draft and the draft reaches `--prompt-autocomplete-min-chars` (default: 1). Set it to `0` if you explicitly want empty-draft next-prompt suggestions.
 - Built-in slash-command and file/path autocomplete keep working.
 - By default it pauses while the main agent is streaming so it can use the finished conversation context. Override with `--prompt-autocomplete-while-streaming` if you really want live suggestions while the agent is still working.
 - Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling.

@@ -48,6 +48,17 @@ const MAX_UNTRACKED_CONTENT_HASH_FILES = 100;
 const MAX_UNTRACKED_CONTENT_HASH_BYTES = 5 * 1024 * 1024;
 const MAX_UNTRACKED_CONTENT_HASH_PATH_CHARS = 32_000;
 const MAX_UNTRACKED_METADATA_FILES = 2_000;
+const MAX_TRACKED_CONTENT_HASH_FILES = 100;
+const MAX_TRACKED_CONTENT_HASH_BYTES = 5 * 1024 * 1024;
+const MAX_TRACKED_CONTENT_HASH_PATH_CHARS = 32_000;
+const MAX_TRACKED_METADATA_FILES = 2_000;
+const MAX_CONTROLLER_ASSISTANT_TEXT_CHARS = 12_000;
+const MAX_CONTROLLER_PROMPT_FIELD_CHARS = 4_000;
+const MAX_CONTROLLER_REASON_CHARS = 1_500;
+const MAX_CONTROLLER_FINAL_MESSAGE_CHARS = 2_000;
+const MAX_GIT_STATUS_CHARS = 8_000;
+const MAX_GIT_CHANGED_FILES_DISPLAY = 80;
+const MAX_GIT_CHANGED_FILES_STATE = 200;
 const COMMAND_USAGE =
   "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--assurance pragmatic|strict] <goal>";
 
@@ -58,11 +69,27 @@ interface GitSnapshot {
   head?: string;
   status: string;
   changedFiles: string[];
+  changedFileCount?: number;
+  untrackedFileCount?: number;
   dirty: boolean;
   hasUpstream: boolean;
   ahead?: number;
   behind?: number;
   repoFingerprint: string;
+}
+
+interface FileFingerprint {
+  fingerprint: string;
+  total: number;
+  samplePaths: string[];
+  mode: "none" | "content" | "metadata" | "path-only";
+}
+
+interface ParsedPathList {
+  paths: string[];
+  total: number;
+  truncated: boolean;
+  rawHash: string;
 }
 
 interface UntrackedFileMetadata {
@@ -102,6 +129,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function now(): number {
   return Date.now();
+}
+
+function hashString(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function truncateMiddle(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 1) return "…";
+
+  const omitted = text.length - maxChars;
+  const marker = `\n… [${omitted} chars omitted] …\n`;
+  if (marker.length >= maxChars) {
+    return `${text.slice(0, maxChars - 1)}…`;
+  }
+
+  const remaining = maxChars - marker.length;
+  const head = Math.ceil(remaining / 2);
+  const tail = Math.floor(remaining / 2);
+  return `${text.slice(0, head)}${marker}${text.slice(-tail)}`;
+}
+
+function truncateEnd(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 1) return "…";
+  return `${text.slice(0, maxChars - 1)}…`;
+}
+
+function formatCappedList(items: string[], total: number, maxItems: number): string {
+  if (total === 0 || items.length === 0) return "(none)";
+  const shown = items.slice(0, maxItems);
+  const omitted = Math.max(0, total - shown.length);
+  return omitted > 0 ? `${shown.join(", ")}, … (${omitted} more)` : shown.join(", ");
 }
 
 function makeRunId(): string {
@@ -207,8 +267,8 @@ function buildControllerDecisionHistoryText(snapshot: AutoModeStateV2): string {
 
   return snapshot.recentDecisions
     .map((entry) => {
-      const prompt = entry.nextPrompt ? `\nNext prompt: ${entry.nextPrompt}` : "";
-      return `Iteration ${entry.iteration}: ${entry.action}\nReason: ${entry.reason}${prompt}`;
+      const prompt = entry.nextPrompt ? `\nNext prompt: ${truncateMiddle(entry.nextPrompt, MAX_CONTROLLER_PROMPT_FIELD_CHARS)}` : "";
+      return `Iteration ${entry.iteration}: ${entry.action}\nReason: ${truncateMiddle(entry.reason, MAX_CONTROLLER_REASON_CHARS)}${prompt}`;
     })
     .join("\n\n");
 }
@@ -218,6 +278,9 @@ function buildGitSnapshotText(gitSnapshot: GitSnapshot | undefined): string {
     return "Not a git repository or git state unavailable.";
   }
 
+  const changedFileCount = gitSnapshot.changedFileCount ?? gitSnapshot.changedFiles.length;
+  const status = truncateMiddle(gitSnapshot.status, MAX_GIT_STATUS_CHARS);
+
   return [
     `isGitRepo=${gitSnapshot.isGitRepo ? "yes" : "no"}`,
     gitSnapshot.head ? `head=${gitSnapshot.head}` : undefined,
@@ -225,8 +288,10 @@ function buildGitSnapshotText(gitSnapshot: GitSnapshot | undefined): string {
     `has-upstream=${gitSnapshot.hasUpstream ? "yes" : "no"}`,
     gitSnapshot.ahead !== undefined ? `ahead=${gitSnapshot.ahead}` : undefined,
     gitSnapshot.behind !== undefined ? `behind=${gitSnapshot.behind}` : undefined,
-    `changed-files=${gitSnapshot.changedFiles.length > 0 ? gitSnapshot.changedFiles.join(", ") : "(none)"}`,
-    `status:\n${gitSnapshot.status}`,
+    `changed-file-count=${changedFileCount}`,
+    gitSnapshot.untrackedFileCount !== undefined ? `untracked-file-count=${gitSnapshot.untrackedFileCount}` : undefined,
+    `changed-files-sample=${formatCappedList(gitSnapshot.changedFiles, changedFileCount, MAX_GIT_CHANGED_FILES_DISPLAY)}`,
+    `status:\n${status}`,
   ]
     .filter((value): value is string => !!value)
     .join("\n");
@@ -266,8 +331,10 @@ function buildControllerUserPrompt(
     ].join("\n"),
     `Controller summary:\n${snapshot.controllerSummary || "(empty)"}`,
     snapshot.recentDecisions.length > 0 ? `Recent controller decisions:\n${buildControllerDecisionHistoryText(snapshot)}` : undefined,
-    snapshot.lastAutoPrompt ? `Last auto prompt sent to worker:\n${snapshot.lastAutoPrompt}` : undefined,
-    `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${workerTurn.assistantText || "(no assistant text)"}`,
+    snapshot.lastAutoPrompt
+      ? `Last auto prompt sent to worker:\n${truncateMiddle(snapshot.lastAutoPrompt, MAX_CONTROLLER_PROMPT_FIELD_CHARS)}`
+      : undefined,
+    `Latest worker result:\nStop reason: ${workerTurn.stopReason}\n\n${truncateMiddle(workerTurn.assistantText || "(no assistant text)", MAX_CONTROLLER_ASSISTANT_TEXT_CHARS)}`,
     `Git snapshot:\n${buildGitSnapshotText(gitSnapshot)}`,
     verifyResult ? `Verification command result:\n${buildVerifyResultText(verifyResult)}` : undefined,
   ].filter((value): value is string => !!value);
@@ -290,23 +357,47 @@ function summarizeBashOutput(stdout: string, stderr: string, maxChars = 2_000): 
   return `${combined.slice(0, maxChars - 1)}…`;
 }
 
-function buildGitRepoFingerprint(statusText: string, diffText: string, untrackedFilesText: string): string {
+function buildGitRepoFingerprint(statusText: string, trackedFilesText: string, untrackedFilesText: string): string {
   return createHash("sha256")
     .update("status\0")
     .update(statusText)
-    .update("\0diff\0")
-    .update(diffText)
+    .update("\0tracked\0")
+    .update(trackedFilesText)
     .update("\0untracked\0")
     .update(untrackedFilesText)
     .digest("hex");
 }
 
-function parseNulSeparatedGitOutput(output: string): string[] {
-  return output.split("\0").filter((value) => value.length > 0);
+function emptyFileFingerprint(): FileFingerprint {
+  return { fingerprint: "", total: 0, samplePaths: [], mode: "none" };
 }
 
-function collectUntrackedFileMetadata(cwd: string, paths: string[]): UntrackedFileMetadata[] | undefined {
-  if (paths.length > MAX_UNTRACKED_METADATA_FILES) {
+function parseNulSeparatedGitOutput(output: string, sampleLimit: number): ParsedPathList {
+  const paths: string[] = [];
+  let total = 0;
+  let start = 0;
+
+  for (let index = 0; index <= output.length; index += 1) {
+    if (index < output.length && output[index] !== "\0") continue;
+    const value = output.slice(start, index);
+    start = index + 1;
+    if (!value) continue;
+    total += 1;
+    if (paths.length < sampleLimit) {
+      paths.push(value);
+    }
+  }
+
+  return {
+    paths,
+    total,
+    truncated: total > paths.length,
+    rawHash: hashString(output),
+  };
+}
+
+function collectFileMetadata(cwd: string, paths: string[], maxMetadataFiles: number): UntrackedFileMetadata[] | undefined {
+  if (paths.length > maxMetadataFiles) {
     return undefined;
   }
 
@@ -325,69 +416,166 @@ function collectUntrackedFileMetadata(cwd: string, paths: string[]): UntrackedFi
   });
 }
 
-function formatUntrackedPathFingerprint(paths: string[]): string {
-  return [`path-only\t${paths.length}`, ...paths].join("\0");
+function formatPathOnlyFingerprint(label: string, parsed: ParsedPathList): string {
+  return hashString(`${label}\tpath-only\t${parsed.total}\t${parsed.rawHash}`);
 }
 
-function formatUntrackedMetadataFingerprint(metadata: UntrackedFileMetadata[]): string {
-  return metadata
-    .map((entry) => `metadata\t${entry.size}\t${entry.mtimeMs}\t${entry.isSymbolicLink ? "symlink" : "file"}\t${entry.path}`)
-    .join("\0");
+function formatMetadataFingerprint(label: string, metadata: UntrackedFileMetadata[]): string {
+  return hashString(
+    metadata
+      .map((entry) => `${label}\tmetadata\t${entry.size}\t${entry.mtimeMs}\t${entry.isSymbolicLink ? "symlink" : "file"}\t${entry.path}`)
+      .join("\0"),
+  );
 }
 
-function shouldHashUntrackedFileContents(metadata: UntrackedFileMetadata[]): boolean {
-  if (metadata.some((entry) => entry.isSymbolicLink)) {
+function shouldHashFileContents(
+  metadata: UntrackedFileMetadata[],
+  maxFiles: number,
+  maxBytes: number,
+  maxPathChars: number,
+): boolean {
+  if (metadata.some((entry) => entry.isSymbolicLink || entry.size < 0)) {
     return false;
   }
 
-  if (metadata.length > MAX_UNTRACKED_CONTENT_HASH_FILES) {
+  if (metadata.length > maxFiles) {
     return false;
   }
 
   const totalBytes = metadata.reduce((sum, entry) => sum + Math.max(0, entry.size), 0);
-  if (totalBytes > MAX_UNTRACKED_CONTENT_HASH_BYTES) {
+  if (totalBytes > maxBytes) {
     return false;
   }
 
   const totalPathChars = metadata.reduce((sum, entry) => sum + entry.path.length, 0);
-  return totalPathChars <= MAX_UNTRACKED_CONTENT_HASH_PATH_CHARS;
+  return totalPathChars <= maxPathChars;
 }
 
-async function getUntrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Promise<string> {
+async function buildFilesFingerprint(
+  pi: ExtensionAPI,
+  cwd: string,
+  label: "tracked" | "untracked",
+  parsed: ParsedPathList,
+  limits: {
+    maxMetadataFiles: number;
+    maxContentHashFiles: number;
+    maxContentHashBytes: number;
+    maxContentHashPathChars: number;
+  },
+): Promise<FileFingerprint> {
+  if (parsed.total === 0) {
+    return emptyFileFingerprint();
+  }
+
+  const samplePaths = parsed.paths.slice(0, MAX_GIT_CHANGED_FILES_STATE);
+  if (parsed.truncated || parsed.total > limits.maxMetadataFiles) {
+    return {
+      fingerprint: formatPathOnlyFingerprint(label, parsed),
+      total: parsed.total,
+      samplePaths,
+      mode: "path-only",
+    };
+  }
+
+  const metadata = collectFileMetadata(cwd, parsed.paths, limits.maxMetadataFiles);
+  if (!metadata) {
+    return {
+      fingerprint: formatPathOnlyFingerprint(label, parsed),
+      total: parsed.total,
+      samplePaths,
+      mode: "path-only",
+    };
+  }
+
+  if (!shouldHashFileContents(
+    metadata,
+    limits.maxContentHashFiles,
+    limits.maxContentHashBytes,
+    limits.maxContentHashPathChars,
+  )) {
+    return {
+      fingerprint: formatMetadataFingerprint(label, metadata),
+      total: parsed.total,
+      samplePaths,
+      mode: "metadata",
+    };
+  }
+
+  const hashes = await pi.exec("git", ["hash-object", "--no-filters", "--", ...parsed.paths], {
+    cwd,
+    timeout: GIT_DIFF_TIMEOUT_MS,
+  });
+  if (hashes.code !== 0) {
+    return {
+      fingerprint: formatMetadataFingerprint(label, metadata),
+      total: parsed.total,
+      samplePaths,
+      mode: "metadata",
+    };
+  }
+
+  const contentHashes = hashes.stdout.trim().split(/\r?\n/);
+  return {
+    fingerprint: hashString(
+      parsed.paths
+        .map((path, index) => `${label}\tcontent\t${contentHashes[index] ?? "missing"}\t${path}`)
+        .join("\0"),
+    ),
+    total: parsed.total,
+    samplePaths,
+    mode: "content",
+  };
+}
+
+async function getUntrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Promise<FileFingerprint> {
   const untrackedFiles = await pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
     cwd,
     timeout: GIT_DIFF_TIMEOUT_MS,
   });
   if (untrackedFiles.code !== 0 || !untrackedFiles.stdout) {
-    return "";
+    return emptyFileFingerprint();
   }
 
-  const paths = parseNulSeparatedGitOutput(untrackedFiles.stdout);
-  if (paths.length === 0) {
-    return "";
-  }
+  const parsed = parseNulSeparatedGitOutput(untrackedFiles.stdout, MAX_UNTRACKED_METADATA_FILES + 1);
+  return buildFilesFingerprint(pi, cwd, "untracked", parsed, {
+    maxMetadataFiles: MAX_UNTRACKED_METADATA_FILES,
+    maxContentHashFiles: MAX_UNTRACKED_CONTENT_HASH_FILES,
+    maxContentHashBytes: MAX_UNTRACKED_CONTENT_HASH_BYTES,
+    maxContentHashPathChars: MAX_UNTRACKED_CONTENT_HASH_PATH_CHARS,
+  });
+}
 
-  const metadata = collectUntrackedFileMetadata(cwd, paths);
-  if (!metadata) {
-    return formatUntrackedPathFingerprint(paths);
-  }
-
-  if (!shouldHashUntrackedFileContents(metadata)) {
-    return formatUntrackedMetadataFingerprint(metadata);
-  }
-
-  const hashes = await pi.exec("git", ["hash-object", "--no-filters", "--", ...paths], {
+async function getTrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Promise<FileFingerprint> {
+  const trackedFiles = await pi.exec("git", ["diff", "--name-only", "-z", "HEAD", "--"], {
     cwd,
     timeout: GIT_DIFF_TIMEOUT_MS,
   });
-  if (hashes.code !== 0) {
-    return formatUntrackedMetadataFingerprint(metadata);
+  if (trackedFiles.code !== 0 || !trackedFiles.stdout) {
+    return emptyFileFingerprint();
   }
 
-  const contentHashes = hashes.stdout.trim().split(/\r?\n/);
-  return paths
-    .map((path, index) => `content\t${contentHashes[index] ?? "missing"}\t${path}`)
-    .join("\0");
+  const parsed = parseNulSeparatedGitOutput(trackedFiles.stdout, MAX_TRACKED_METADATA_FILES + 1);
+  return buildFilesFingerprint(pi, cwd, "tracked", parsed, {
+    maxMetadataFiles: MAX_TRACKED_METADATA_FILES,
+    maxContentHashFiles: MAX_TRACKED_CONTENT_HASH_FILES,
+    maxContentHashBytes: MAX_TRACKED_CONTENT_HASH_BYTES,
+    maxContentHashPathChars: MAX_TRACKED_CONTENT_HASH_PATH_CHARS,
+  });
+}
+
+function parseGitStatusChangedFiles(statusText: string): { files: string[]; total: number } {
+  const files: string[] = [];
+  let total = 0;
+  const lines = statusText.split("\n");
+  for (let index = 1; index < lines.length; index += 1) {
+    const path = lines[index]!.slice(3).trim();
+    if (!path) continue;
+    total += 1;
+    if (files.length < MAX_GIT_CHANGED_FILES_STATE) {
+      files.push(path);
+    }
+  }
+  return { files, total };
 }
 
 async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapshot | undefined> {
@@ -396,11 +584,11 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
     return undefined;
   }
 
-  const [head, status, upstream, diffAgainstHead, untrackedFilesFingerprint] = await Promise.all([
+  const [head, status, upstream, trackedFilesFingerprint, untrackedFilesFingerprint] = await Promise.all([
     pi.exec("git", ["rev-parse", "HEAD"], { cwd }),
-    pi.exec("git", ["status", "--short", "--branch"], { cwd }),
+    pi.exec("git", ["status", "--short", "--branch", "--untracked-files=no"], { cwd }),
     pi.exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd }),
-    pi.exec("git", ["diff", "--no-ext-diff", "--no-color", "HEAD", "--"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
+    getTrackedFilesFingerprint(pi, cwd),
     getUntrackedFilesFingerprint(pi, cwd),
   ]);
 
@@ -418,19 +606,36 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
   }
 
   const statusText = status.stdout.trim() || "working tree clean";
-  const changedFiles = statusText
-    .split("\n")
-    .slice(1)
-    .map((line) => line.slice(3).trim())
-    .filter(Boolean);
-  const repoFingerprint = buildGitRepoFingerprint(statusText, diffAgainstHead.stdout || "", untrackedFilesFingerprint);
+  const trackedChanged = parseGitStatusChangedFiles(statusText);
+  const changedFileCount = trackedChanged.total + untrackedFilesFingerprint.total;
+  const changedFiles = [
+    ...trackedChanged.files,
+    ...untrackedFilesFingerprint.samplePaths.map((path) => `?? ${path}`),
+  ].slice(0, MAX_GIT_CHANGED_FILES_STATE);
+  const statusSections = [
+    statusText,
+    untrackedFilesFingerprint.total > 0
+      ? `Untracked files (${untrackedFilesFingerprint.total}, ${untrackedFilesFingerprint.mode} fingerprint): ${formatCappedList(
+        untrackedFilesFingerprint.samplePaths,
+        untrackedFilesFingerprint.total,
+        MAX_GIT_CHANGED_FILES_DISPLAY,
+      )}`
+      : undefined,
+  ].filter((value): value is string => !!value);
+  const repoFingerprint = buildGitRepoFingerprint(
+    statusText,
+    trackedFilesFingerprint.fingerprint,
+    untrackedFilesFingerprint.fingerprint,
+  );
 
   return {
     isGitRepo: true,
     head: head.code === 0 ? head.stdout.trim() : undefined,
-    status: statusText,
+    status: truncateMiddle(statusSections.join("\n"), MAX_GIT_STATUS_CHARS),
     changedFiles,
-    dirty: changedFiles.length > 0,
+    changedFileCount,
+    untrackedFileCount: untrackedFilesFingerprint.total,
+    dirty: changedFileCount > 0,
     hasUpstream,
     ahead,
     behind,
@@ -548,6 +753,37 @@ function updateNoChangeCounters(snapshot: AutoModeStateV2, gitSnapshot: GitSnaps
   snapshot.lastSeenRepoFingerprint = nextFingerprint;
 }
 
+function sanitizeControllerDecision(decision: ControllerDecision): ControllerDecision {
+  const base = {
+    ...decision,
+    reason: truncateEnd(decision.reason, MAX_CONTROLLER_REASON_CHARS),
+    updatedSummary: truncateControllerSummary(decision.updatedSummary),
+  };
+
+  if (decision.action === "continue") {
+    return {
+      ...base,
+      action: "continue",
+      nextPrompt: truncateEnd(decision.nextPrompt, MAX_CONTROLLER_PROMPT_FIELD_CHARS),
+    };
+  }
+
+  if (decision.action === "stop") {
+    return {
+      ...base,
+      action: "stop",
+      finalMessage: decision.finalMessage
+        ? truncateEnd(decision.finalMessage, MAX_CONTROLLER_FINAL_MESSAGE_CHARS)
+        : undefined,
+    };
+  }
+
+  return {
+    ...base,
+    action: "pause",
+  };
+}
+
 function recordControllerDecision(snapshot: AutoModeStateV2, decision: ControllerDecision): void {
   snapshot.lastControllerAt = now();
   snapshot.controllerSummary = truncateControllerSummary(decision.updatedSummary);
@@ -556,8 +792,8 @@ function recordControllerDecision(snapshot: AutoModeStateV2, decision: Controlle
     {
       iteration: snapshot.currentIteration,
       action: decision.action,
-      reason: decision.reason,
-      nextPrompt: decision.action === "continue" ? decision.nextPrompt : undefined,
+      reason: truncateEnd(decision.reason, MAX_CONTROLLER_REASON_CHARS),
+      nextPrompt: decision.action === "continue" ? truncateEnd(decision.nextPrompt, MAX_CONTROLLER_PROMPT_FIELD_CHARS) : undefined,
       timestamp: now(),
     },
     DEFAULT_DECISION_HISTORY_LIMIT,
@@ -569,7 +805,7 @@ function getLastAssistantTurn(event: { messages?: unknown[] }): WorkerTurnSnapsh
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (!isRecord(message) || message.role !== "assistant") continue;
-    const assistantText = extractMessageText(message.content);
+    const assistantText = extractMessageText(message.content, MAX_CONTROLLER_ASSISTANT_TEXT_CHARS * 2);
     const stopReason = typeof message.stopReason === "string" ? message.stopReason : "stop";
     return { assistantText, stopReason };
   }
@@ -652,7 +888,6 @@ async function startAutoMode(
   const snapshot = buildInitialState(config, summary);
   runtime.snapshot = snapshot;
   setStatus(ctx, snapshot);
-  persistSnapshot(pi, snapshot);
 
   if (!pi.getSessionName()) {
     pi.setSessionName(`Auto: ${summarizeGoal(snapshot.goal, 56)}`);
@@ -1122,6 +1357,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
         }
 
         snapshot.consecutiveControllerFailures = 0;
+        decision = sanitizeControllerDecision(decision);
 
         if (decision.action === "continue") {
           recordControllerDecision(snapshot, decision);
@@ -1169,7 +1405,6 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
         }
 
         recordControllerDecision(snapshot, decision);
-        persistSnapshot(pi, snapshot);
         disableSnapshot(pi, ctx, runtime, decision.finalMessage || decision.reason, decision.completionGateMet ? "info" : "warning");
       } finally {
         runtime.controllerBusy = false;

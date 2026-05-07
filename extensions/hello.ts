@@ -1,6 +1,13 @@
 import { Type } from "@mariozechner/pi-ai";
 import { defineTool, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+const MAX_NAME_CHARS = 200;
+
+function truncateName(name: string): string {
+  if (name.length <= MAX_NAME_CHARS) return name;
+  return `${name.slice(0, MAX_NAME_CHARS - 1)}…`;
+}
+
 const helloTool = defineTool({
   name: "hello",
   label: "Hello",
@@ -9,9 +16,10 @@ const helloTool = defineTool({
     name: Type.String({ description: "Name to greet" }),
   }),
   async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    const name = truncateName(params.name);
     return {
-      content: [{ type: "text", text: `Hello, ${params.name}!` }],
-      details: { greeted: params.name },
+      content: [{ type: "text", text: `Hello, ${name}!` }],
+      details: { greeted: name },
     };
   },
 });

@@ -22,7 +22,7 @@ interface ParsedVerificationPayload {
 }
 
 export const DEFAULT_REPEAT = 1;
-export const MAX_REPEAT = 10_000;
+export const MAX_REPEAT = 1_000;
 export const MAX_VERIFICATION_NUDGES = 3;
 export const RALPHY_VERIFIER_FALLBACK_CONTINUE_PROMPT =
   "Completion verification was inconclusive. Continue working on the same task now. Re-check requirements, repository state, tests, git status, commit, and push. Do not ask the user anything. Only stop when the task is fully complete.";
@@ -94,17 +94,38 @@ export function parseLoopArgs(args: string): ParsedLoopArgs | { error: string } 
   return { task, repeat, continueOnFailure };
 }
 
-export function extractAssistantText(content: unknown): string {
+export function extractAssistantText(content: unknown, maxChars = Number.POSITIVE_INFINITY): string {
   if (!Array.isArray(content)) {
     return "";
   }
 
-  return content
-    .filter((block): block is TextBlock => typeof block === "object" && block !== null && "type" in block)
-    .filter((block) => block.type === "text" && typeof block.text === "string")
-    .map((block) => block.text ?? "")
-    .join("\n")
-    .trim();
+  const parts: string[] = [];
+  let remaining = maxChars;
+  let truncated = false;
+
+  for (const block of content) {
+    if (typeof block !== "object" || block === null || !("type" in block)) continue;
+    if ((block as TextBlock).type !== "text" || typeof (block as TextBlock).text !== "string") continue;
+    const text = (block as TextBlock).text ?? "";
+    if (Number.isFinite(maxChars)) {
+      if (remaining <= 0) {
+        truncated = true;
+        break;
+      }
+      if (text.length > remaining) {
+        parts.push(text.slice(0, remaining));
+        truncated = true;
+        break;
+      }
+      remaining -= text.length + 1;
+    }
+    parts.push(text);
+  }
+
+  const joined = parts.join("\n").trim();
+  if (!Number.isFinite(maxChars) || !truncated) return joined;
+  if (maxChars <= 1) return "…";
+  return `${joined.slice(0, maxChars - 1)}…`;
 }
 
 export function parseVerificationResponse(text: string): CompletionVerificationResult | undefined {

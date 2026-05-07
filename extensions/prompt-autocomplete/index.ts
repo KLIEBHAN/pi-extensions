@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { completeSimple, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@mariozechner/pi-coding-agent";
 import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@mariozechner/pi-tui";
@@ -100,6 +101,7 @@ interface PromptAutocompleteSharedState {
   requestCache: Map<string, PromptAutocompleteCacheEntry>;
   inFlightRequests: Map<string, Promise<PromptAutocompleteCacheEntry>>;
   refreshEditor?: (options?: SuggestionRefreshOptions) => void;
+  cancelActiveRequest?: () => void;
   setStatusText?: (text: string | undefined) => void;
   setSpinnerActive?: (active: boolean) => void;
 }
@@ -127,6 +129,10 @@ function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
 
 function formatPrimaryKey(keys: readonly KeyId[]): string {
   return keys[0] ?? "";
+}
+
+function hashText(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
 function resolveSuggestionModel(shared: PromptAutocompleteSharedState): Model<Api> | undefined {
@@ -216,8 +222,8 @@ function shouldSkipPromptAutocomplete(text: string): boolean {
   const trimmedStart = text.trimStart();
   if (trimmedStart.startsWith("/") || trimmedStart.startsWith("!")) return true;
 
-  const lastLine = text.split("\n").pop() ?? "";
-  const textBeforeCursor = lastLine;
+  const lastNewline = text.lastIndexOf("\n");
+  const textBeforeCursor = lastNewline === -1 ? text : text.slice(lastNewline + 1);
 
   if (/(?:^|[ \t])@(?:"[^"]*|[^\s]*)$/.test(textBeforeCursor)) return true;
   if (/(?:^|[ \t])(?:~\/|\.\.?\/|\/)[^\s]*$/.test(textBeforeCursor)) return true;
@@ -667,8 +673,6 @@ class PromptAutocompleteEditor extends CustomEditor {
   }
 
   private buildRequest(): SuggestionRequest | undefined {
-    if (this.getSuppressionReason()) return undefined;
-
     const model = resolveSuggestionModel(this.shared);
     if (!model) return undefined;
 
@@ -687,7 +691,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       draftTail,
       model,
       modelLabel,
-      cacheKey: `${leafId}|${modelLabel}|alts=${this.shared.config.maxAlternatives}|${draft}`,
+      cacheKey: `${leafId}|${modelLabel}|alts=${this.shared.config.maxAlternatives}|len=${draft.length}|sha=${hashText(draft)}`,
       maxAlternatives: this.shared.config.maxAlternatives,
       latestAssistantContext,
       latestUserContext,
@@ -860,6 +864,12 @@ class PromptAutocompleteEditor extends CustomEditor {
     return formatModelLabel(currentModel) === request.modelLabel;
   }
 
+  cancelActiveRequest(): void {
+    this.requestSeq += 1;
+    this.cancelPendingRequest();
+    this.setSuggestions([]);
+  }
+
   private cancelPendingRequest(): void {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
@@ -920,22 +930,30 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
       if (activationId !== shared.activationId) return;
       editor.refreshFromExternalChange(options);
     };
+    shared.cancelActiveRequest = () => {
+      if (activationId !== shared.activationId) return;
+      editor.cancelActiveRequest();
+    };
     return editor;
   });
   updateDebugState(shared, "mounted", "Editor extension attached");
 }
 
 function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
+  shared.cancelActiveRequest?.();
   shared.activationId += 1;
   shared.setSpinnerActive?.(false);
   ctx.ui.setEditorComponent(undefined);
   clearDebugUi(shared);
   shared.refreshEditor = undefined;
+  shared.cancelActiveRequest = undefined;
   shared.setStatusText = undefined;
   shared.setSpinnerActive = undefined;
 }
 
 function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
+  shared.cancelActiveRequest?.();
+  shared.cancelActiveRequest = undefined;
   shared.enabled = pi.getFlag("prompt-autocomplete") === true;
   shared.config = parseConfig(pi);
   shared.lastError = undefined;
@@ -1062,7 +1080,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("prompt-autocomplete", {
     description: "Enable inline AI prompt autocomplete in the editor",
     type: "boolean",
-    default: true,
+    default: false,
   });
   pi.registerFlag("prompt-autocomplete-model", {
     description: "Optional provider/model override for prompt autocomplete, e.g. openai/gpt-5.4-mini",
@@ -1116,6 +1134,16 @@ export default function (pi: ExtensionAPI) {
 
     if (!ctx.hasUI || !shared.enabled) return;
     mountEditor(ctx, shared);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    shared.enabled = false;
+    shared.cancelActiveRequest?.();
+    shared.requestCache.clear();
+    shared.inFlightRequests.clear();
+    if (ctx.hasUI) {
+      unmountEditor(ctx, shared);
+    }
   });
 
   pi.on("model_select", async (event, ctx) => {

@@ -537,13 +537,13 @@ test("default git snapshot fingerprints untracked file contents for no-change de
       if (gitCommand === "rev-parse HEAD") {
         return { code: 0, stdout: "head-untracked\n", stderr: "" };
       }
-      if (gitCommand === "status --short --branch") {
-        return { code: 0, stdout: "## main\n?? draft.txt\n", stderr: "" };
+      if (gitCommand === "status --short --branch --untracked-files=no") {
+        return { code: 0, stdout: "## main\n", stderr: "" };
       }
       if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
         return { code: 1, stdout: "", stderr: "no upstream" };
       }
-      if (gitCommand === "diff --no-ext-diff --no-color HEAD --") {
+      if (gitCommand === "diff --name-only -z HEAD --") {
         return { code: 0, stdout: "", stderr: "" };
       }
       if (gitCommand === "ls-files --others --exclude-standard -z") {
@@ -615,17 +615,17 @@ test("default git snapshot uses metadata fallback for many untracked files", asy
       if (gitCommand === "rev-parse HEAD") {
         return { code: 0, stdout: "head-many-untracked\n", stderr: "" };
       }
-      if (gitCommand === "status --short --branch") {
+      if (gitCommand === "status --short --branch --untracked-files=no") {
         return {
           code: 0,
-          stdout: `## main\n${untrackedPaths.map((path) => `?? ${path}`).join("\n")}\n`,
+          stdout: "## main\n",
           stderr: "",
         };
       }
       if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
         return { code: 1, stdout: "", stderr: "no upstream" };
       }
-      if (gitCommand === "diff --no-ext-diff --no-color HEAD --") {
+      if (gitCommand === "diff --name-only -z HEAD --") {
         return { code: 0, stdout: "", stderr: "" };
       }
       if (gitCommand === "ls-files --others --exclude-standard -z") {
@@ -697,17 +697,17 @@ test("default git snapshot uses path-only fallback for very large untracked sets
       if (gitCommand === "rev-parse HEAD") {
         return { code: 0, stdout: "head-path-only-untracked\n", stderr: "" };
       }
-      if (gitCommand === "status --short --branch") {
+      if (gitCommand === "status --short --branch --untracked-files=no") {
         return {
           code: 0,
-          stdout: `## main\n${untrackedPaths.map((path) => `?? ${path}`).join("\n")}\n`,
+          stdout: "## main\n",
           stderr: "",
         };
       }
       if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
         return { code: 1, stdout: "", stderr: "no upstream" };
       }
-      if (gitCommand === "diff --no-ext-diff --no-color HEAD --") {
+      if (gitCommand === "diff --name-only -z HEAD --") {
         return { code: 0, stdout: "", stderr: "" };
       }
       if (gitCommand === "ls-files --others --exclude-standard -z") {

@@ -62,6 +62,27 @@ Return JSON only in this shape:
 {"done":boolean,"reason":string,"continuePrompt":string}
 
 When done=false, continuePrompt must be a direct instruction telling the agent to continue the same task autonomously now, without asking the user anything.`;
+const MAX_VERIFIER_TASK_CHARS = 4_000;
+const MAX_VERIFIER_ASSISTANT_CHARS = 12_000;
+const MAX_VERIFIER_GIT_STATUS_CHARS = 4_000;
+const MAX_VERIFIER_CONTINUE_PROMPT_CHARS = 2_000;
+
+function truncateMiddle(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 1) return "…";
+  const marker = `\n… [${text.length - maxChars} chars omitted] …\n`;
+  if (marker.length >= maxChars) return `${text.slice(0, maxChars - 1)}…`;
+  const remaining = maxChars - marker.length;
+  const head = Math.ceil(remaining / 2);
+  const tail = Math.floor(remaining / 2);
+  return `${text.slice(0, head)}${marker}${text.slice(-tail)}`;
+}
+
+function truncateEnd(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 1) return "…";
+  return `${text.slice(0, maxChars - 1)}…`;
+}
 
 function setStatus(ctx: ExtensionContext | ExtensionCommandContext, state: LoopState | undefined): void {
   if (!state?.active) {
@@ -158,7 +179,7 @@ async function getGitSummary(pi: ExtensionAPI, cwd: string): Promise<GitSummary 
   }
 
   const text = status.stdout.trim();
-  return { status: text.length > 0 ? text : "working tree clean" };
+  return { status: text.length > 0 ? truncateMiddle(text, MAX_VERIFIER_GIT_STATUS_CHARS) : "working tree clean" };
 }
 
 async function getGitVerification(pi: ExtensionAPI, cwd: string): Promise<GitVerificationResult | undefined> {
@@ -223,12 +244,12 @@ async function verifyIterationCompletion(
   }
 
   const promptSections = [
-    `Task:\n${task}`,
-    `Final assistant response:\n${assistantText || "(no assistant text)"}`,
+    `Task:\n${truncateMiddle(task, MAX_VERIFIER_TASK_CHARS)}`,
+    `Final assistant response:\n${truncateMiddle(assistantText || "(no assistant text)", MAX_VERIFIER_ASSISTANT_CHARS)}`,
   ];
 
   if (gitSummary) {
-    promptSections.push(`Git status:\n${gitSummary.status}`);
+    promptSections.push(`Git status:\n${truncateMiddle(gitSummary.status, MAX_VERIFIER_GIT_STATUS_CHARS)}`);
   }
 
   const userMessage: UserMessage = {
@@ -344,7 +365,7 @@ export default function (pi: ExtensionAPI) {
 
       const failureMode = state.continueOnFailure ? "continue-on-failure" : "fail-fast";
       ctx.ui.notify(
-        `Ralphy ${state.currentIteration}/${state.totalIterations} (${failureMode}): ${state.task}`,
+        `Ralphy ${state.currentIteration}/${state.totalIterations} (${failureMode}): ${summarizeTask(state.task, 160)}`,
         "info",
       );
     },
@@ -427,7 +448,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (!state.iterationHadError) {
-        const assistantText = extractAssistantText(event.message.content);
+        const assistantText = extractAssistantText(event.message.content, MAX_VERIFIER_ASSISTANT_CHARS * 2);
         const verification = await verifyIterationCompletion(
           pi,
           ctx,
@@ -456,7 +477,7 @@ export default function (pi: ExtensionAPI) {
           } else {
             ctx.ui.notify(`Ralphy verifier requested more work: ${verification.reason}`, "warning");
             const continuePrompt = verification.continuePrompt || RALPHY_VERIFIER_FALLBACK_CONTINUE_PROMPT;
-            pi.sendUserMessage(continuePrompt, { deliverAs: "followUp" });
+            pi.sendUserMessage(truncateEnd(continuePrompt, MAX_VERIFIER_CONTINUE_PROMPT_CHARS), { deliverAs: "followUp" });
             return;
           }
         }

@@ -13,7 +13,7 @@ import {
 test("parsePositiveInteger accepts valid positive integers", () => {
   assert.equal(parsePositiveInteger("1"), 1);
   assert.equal(parsePositiveInteger("42"), 42);
-  assert.equal(parsePositiveInteger("10000"), 10000);
+  assert.equal(parsePositiveInteger("1000"), 1000);
 });
 
 test("parsePositiveInteger rejects invalid values", () => {
@@ -21,7 +21,7 @@ test("parsePositiveInteger rejects invalid values", () => {
   assert.equal(parsePositiveInteger("-1"), undefined);
   assert.equal(parsePositiveInteger("1.5"), undefined);
   assert.equal(parsePositiveInteger("abc"), undefined);
-  assert.equal(parsePositiveInteger("10001"), undefined);
+  assert.equal(parsePositiveInteger("1001"), undefined);
 });
 
 test("parseLoopArgs parses positional repeat and task", () => {
@@ -42,7 +42,7 @@ test("parseLoopArgs parses explicit flags", () => {
 
 test("parseLoopArgs reports invalid repeat values", () => {
   assert.deepEqual(parseLoopArgs("--repeat nope task"), {
-    error: "--repeat must be an integer between 1 and 10000",
+    error: "--repeat must be an integer between 1 and 1000",
   });
 });
 

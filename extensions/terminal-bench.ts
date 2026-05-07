@@ -126,7 +126,7 @@ If everything is DONE, proceed. If any item is TODO, fix it first.
 
 const BOOTSTRAP_COMMAND = [
   "echo '@@PWD@@'; pwd",
-  "echo '@@LS@@'; ls -la 2>/dev/null || true",
+  "echo '@@LS@@'; (ls -la 2>/dev/null | sed -n '1,31p') || true",
   "echo '@@LANG@@'",
   "(python3 --version 2>&1 || echo 'python3: not found')",
   "(gcc --version 2>&1 | head -1 || echo 'gcc: not found')",
@@ -387,17 +387,22 @@ function truncateOutput(output: string, maxBytes: number, maxLines: number): str
   return kept.join("\n");
 }
 
-function stripMarkerLines(output: string, markers: Set<string>): string {
-  if (markers.size === 0) return output;
+function stripMarkerLines(output: string): string {
   return output
     .split("\n")
-    .filter((line) => {
-      for (const marker of markers) {
-        if (line.includes(marker)) return false;
-      }
-      return true;
-    })
+    .filter((line) => !line.includes(TMUX_MARKER_PREFIX))
     .join("\n");
+}
+
+function countLinesUpTo(text: string, maxLines: number): number {
+  let lines = 1;
+  let index = -1;
+  while (lines <= maxLines) {
+    index = text.indexOf("\n", index + 1);
+    if (index === -1) break;
+    lines += 1;
+  }
+  return lines;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -415,16 +420,28 @@ export default function (pi: ExtensionAPI) {
   let markerSeq = 0;
   let recentToolActions: string[] = [];
 
-  pi.on("session_start", async (_event, ctx) => {
-    enabled = pi.getFlag("terminal-bench") === true;
-    if (!enabled) return;
-
+  function resetRuntimeState(): void {
     envSnapshot = "";
     completionPending = false;
     lastBashOutput = "";
-    tmuxSession = "";
     markerSeq = 0;
     recentToolActions = [];
+  }
+
+  async function cleanupTmuxSession(): Promise<void> {
+    const session = tmuxSession;
+    tmuxSession = "";
+    if (!session) return;
+    await pi.exec("tmux", ["kill-session", "-t", session], {
+      timeout: TMUX_KILL_TIMEOUT_MS,
+    }).catch(() => {});
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    await cleanupTmuxSession();
+    resetRuntimeState();
+    enabled = pi.getFlag("terminal-bench") === true;
+    if (!enabled) return;
 
     try {
       const result = await pi.exec("bash", ["-c", BOOTSTRAP_COMMAND], {
@@ -453,6 +470,12 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("session_shutdown", async () => {
+    enabled = false;
+    resetRuntimeState();
+    await cleanupTmuxSession();
+  });
+
   pi.on("before_agent_start", async (event) => {
     if (!enabled) return;
 
@@ -470,8 +493,9 @@ export default function (pi: ExtensionAPI) {
     return { systemPrompt };
   });
 
-  pi.registerTool({
-    name: "tmux_send",
+  if (pi.getFlag("terminal-bench") === true) {
+    pi.registerTool({
+      name: "tmux_send",
     label: "tmux Send",
     description:
       "Send keystrokes to the tmux terminal session and return the resulting output. " +
@@ -498,6 +522,9 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, signal) {
+      if (!enabled) {
+        throw new Error("Terminal-Bench mode is not enabled.");
+      }
       if (!tmuxSession) {
         throw new Error("No tmux session available. Is tmux installed?");
       }
@@ -529,7 +556,7 @@ export default function (pi: ExtensionAPI) {
       while (Date.now() - startTime < deadlineMs) {
         if (signal?.aborted) break;
 
-        const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+        const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", `-${TBENCH_MAX_LINES}`], {
           timeout: TMUX_CAPTURE_TIMEOUT_MS,
         });
         paneContent = captureResult.stdout || "";
@@ -541,16 +568,12 @@ export default function (pi: ExtensionAPI) {
         await sleep(500, signal);
       }
 
-      const finalCapture = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+      const finalCapture = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", `-${TBENCH_MAX_LINES}`], {
         timeout: TMUX_CAPTURE_TIMEOUT_MS,
       });
       paneContent = finalCapture.stdout || "";
 
-      const markers = new Set<string>();
-      for (let i = 1; i <= markerSeq; i++) {
-        markers.add(`${TMUX_MARKER_PREFIX}${i}`);
-      }
-      const cleanOutput = stripMarkerLines(paneContent, markers).trim();
+      const cleanOutput = stripMarkerLines(paneContent).trim();
       const truncated = truncateOutput(cleanOutput, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);
 
       return {
@@ -570,6 +593,9 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Read current tmux terminal content without sending input",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, signal) {
+      if (!enabled) {
+        throw new Error("Terminal-Bench mode is not enabled.");
+      }
       if (!tmuxSession) {
         throw new Error("No tmux session available. Is tmux installed?");
       }
@@ -577,7 +603,7 @@ export default function (pi: ExtensionAPI) {
         throw new Error("Aborted");
       }
 
-      const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
+      const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", `-${TBENCH_MAX_LINES}`], {
         timeout: TMUX_CAPTURE_TIMEOUT_MS,
       });
 
@@ -585,11 +611,7 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`tmux capture-pane failed: ${captureResult.stderr || "unknown error"}`);
       }
 
-      const markers = new Set<string>();
-      for (let i = 1; i <= markerSeq; i++) {
-        markers.add(`${TMUX_MARKER_PREFIX}${i}`);
-      }
-      const cleanOutput = stripMarkerLines(captureResult.stdout || "", markers).trim();
+      const cleanOutput = stripMarkerLines(captureResult.stdout || "").trim();
       const truncated = truncateOutput(cleanOutput, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);
 
       return {
@@ -598,6 +620,8 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+
+  }
 
   pi.on("tool_execution_start", async (event) => {
     if (!enabled) return;
@@ -614,14 +638,15 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName === "bash" && !event.isError) {
       const textBlocks = event.content.filter((content): content is { type: "text"; text: string } => content.type === "text");
 
-      const fullText = textBlocks.map((block) => block.text).join("\n");
-      if (fullText) {
-        lastBashOutput = fullText.slice(-2000);
+      for (const block of textBlocks) {
+        if (block.text) {
+          lastBashOutput = `${lastBashOutput}\n${block.text}`.slice(-2000);
+        }
       }
 
       for (const block of textBlocks) {
         const bytes = Buffer.byteLength(block.text, "utf-8");
-        const lines = block.text.split("\n").length;
+        const lines = countLinesUpTo(block.text, TBENCH_MAX_LINES + 1);
 
         if (bytes > TBENCH_MAX_BYTES || lines > TBENCH_MAX_LINES) {
           block.text = truncateOutput(block.text, TBENCH_MAX_BYTES, TBENCH_MAX_LINES);

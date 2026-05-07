@@ -546,6 +546,17 @@ function truncateWithEllipsis(text: string, maxLength: number): string {
   return `${text.slice(0, maxLength - 1)}…`;
 }
 
+function truncateMiddle(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  if (maxLength <= 5) return truncateWithEllipsis(text, maxLength);
+
+  const separator = "\n…\n";
+  const remaining = maxLength - separator.length;
+  const head = Math.ceil(remaining / 2);
+  const tail = Math.floor(remaining / 2);
+  return `${text.slice(0, head)}${separator}${text.slice(-tail)}`;
+}
+
 function tokenizeArgs(input: string): string[] | { error: string } {
   const trimmed = input.trim();
   if (!trimmed) return [];
@@ -1014,21 +1025,41 @@ export function parseControllerDecision(rawText: string): ControllerDecision | u
   return undefined;
 }
 
-export function extractMessageText(content: unknown): string {
+export function extractMessageText(content: unknown, maxChars = Number.POSITIVE_INFINITY): string {
   if (typeof content === "string") {
-    return content.trim();
+    const trimmed = content.trim();
+    return Number.isFinite(maxChars) ? truncateMiddle(trimmed, maxChars) : trimmed;
   }
 
   if (!Array.isArray(content)) {
     return "";
   }
 
-  return content
-    .filter((block): block is { type?: unknown; text?: unknown } => isRecord(block))
-    .filter((block) => block.type === "text" && typeof block.text === "string")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
+  const parts: string[] = [];
+  let remaining = maxChars;
+  let truncated = false;
+
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+    const text = block.text;
+    if (Number.isFinite(maxChars)) {
+      if (remaining <= 0) {
+        truncated = true;
+        break;
+      }
+      if (text.length > remaining) {
+        parts.push(text.slice(0, remaining));
+        truncated = true;
+        break;
+      }
+      remaining -= text.length + 1;
+    }
+    parts.push(text);
+  }
+
+  const joined = parts.join("\n").trim();
+  if (!Number.isFinite(maxChars)) return joined;
+  return truncated ? truncateMiddle(joined, maxChars) : joined;
 }
 
 export function buildRecentConversationContext(branch: unknown[], maxMessages = 8, maxCharsPerMessage = 400): string {
@@ -1042,7 +1073,7 @@ export function buildRecentConversationContext(branch: unknown[], maxMessages = 
     const role = message.role;
     if (role !== "user" && role !== "assistant") continue;
 
-    const text = extractMessageText(message.content);
+    const text = extractMessageText(message.content, maxCharsPerMessage * 4);
     if (!text) continue;
 
     const prefix = role === "user" ? "User" : "Assistant";
@@ -1059,7 +1090,7 @@ function buildLatestRoleMessageContext(branch: unknown[], role: "user" | "assist
     const message = entry.message;
     if (!isRecord(message) || message.role !== role) continue;
 
-    const text = extractMessageText(message.content);
+    const text = extractMessageText(message.content, maxChars * 2);
     if (!text) continue;
     return truncateWithEllipsis(text, maxChars);
   }

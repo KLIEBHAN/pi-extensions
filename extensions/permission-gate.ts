@@ -9,6 +9,12 @@ const DANGEROUS_COMMAND_PATTERNS = [
   "mkfs",
   "dd if=",
 ];
+const MAX_COMMAND_PREVIEW_CHARS = 2_000;
+
+function truncatePreview(text: string): string {
+  if (text.length <= MAX_COMMAND_PREVIEW_CHARS) return text;
+  return `${text.slice(0, MAX_COMMAND_PREVIEW_CHARS - 1)}…`;
+}
 
 export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
@@ -20,7 +26,7 @@ export default function (pi: ExtensionAPI) {
 
     const ok = await ctx.ui.confirm(
       "Dangerous bash command",
-      `Allow this command?\n\n${command}`,
+      `Allow this command?\n\n${truncatePreview(command)}`,
     );
     if (!ok) {
       return { block: true, reason: `Blocked by permission-gate: ${dangerousPattern}` };
