@@ -277,8 +277,47 @@ function summarizeBashOutput(stdout: string, stderr: string, maxChars = 2_000): 
   return `${combined.slice(0, maxChars - 1)}…`;
 }
 
-function buildGitRepoFingerprint(statusText: string, diffText: string): string {
-  return createHash("sha256").update(statusText).update("\n---\n").update(diffText).digest("hex");
+function buildGitRepoFingerprint(statusText: string, diffText: string, untrackedFilesText: string): string {
+  return createHash("sha256")
+    .update("status\0")
+    .update(statusText)
+    .update("\0diff\0")
+    .update(diffText)
+    .update("\0untracked\0")
+    .update(untrackedFilesText)
+    .digest("hex");
+}
+
+function parseNulSeparatedGitOutput(output: string): string[] {
+  return output.split("\0").filter((value) => value.length > 0);
+}
+
+async function getUntrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Promise<string> {
+  const untrackedFiles = await pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    cwd,
+    timeout: GIT_DIFF_TIMEOUT_MS,
+  });
+  if (untrackedFiles.code !== 0 || !untrackedFiles.stdout) {
+    return "";
+  }
+
+  const paths = parseNulSeparatedGitOutput(untrackedFiles.stdout);
+  if (paths.length === 0) {
+    return "";
+  }
+
+  const hashes = await pi.exec("git", ["hash-object", "--no-filters", "--", ...paths], {
+    cwd,
+    timeout: GIT_DIFF_TIMEOUT_MS,
+  });
+  if (hashes.code !== 0) {
+    return paths.map((path) => `untracked\t${path}`).join("\0");
+  }
+
+  const contentHashes = hashes.stdout.trim().split(/\r?\n/);
+  return paths
+    .map((path, index) => `${contentHashes[index] ?? "missing"}\t${path}`)
+    .join("\0");
 }
 
 async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapshot | undefined> {
@@ -287,11 +326,12 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
     return undefined;
   }
 
-  const [head, status, upstream, diffAgainstHead] = await Promise.all([
+  const [head, status, upstream, diffAgainstHead, untrackedFilesFingerprint] = await Promise.all([
     pi.exec("git", ["rev-parse", "HEAD"], { cwd }),
     pi.exec("git", ["status", "--short", "--branch"], { cwd }),
     pi.exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd }),
     pi.exec("git", ["diff", "--no-ext-diff", "--no-color", "HEAD", "--"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
+    getUntrackedFilesFingerprint(pi, cwd),
   ]);
 
   let ahead: number | undefined;
@@ -313,7 +353,7 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
     .slice(1)
     .map((line) => line.slice(3).trim())
     .filter(Boolean);
-  const repoFingerprint = buildGitRepoFingerprint(statusText, diffAgainstHead.stdout || "");
+  const repoFingerprint = buildGitRepoFingerprint(statusText, diffAgainstHead.stdout || "", untrackedFilesFingerprint);
 
   return {
     isGitRepo: true,

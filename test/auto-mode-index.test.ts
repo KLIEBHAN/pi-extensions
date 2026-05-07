@@ -43,6 +43,11 @@ async function loadAutoModeModule() {
 function createHarness(
   initialFlags: Record<string, boolean | string | undefined> = {},
   initialEntries: unknown[] = [],
+  execImpl?: (
+    command: string,
+    args: string[],
+    options: Record<string, unknown> | undefined,
+  ) => Promise<{ code: number; stdout: string; stderr: string }>,
 ) {
   const flags = new Map(Object.entries(initialFlags));
   const handlers = new Map<string, Function>();
@@ -87,7 +92,7 @@ function createHarness(
     },
     exec: async (command: string, args: string[], options?: Record<string, unknown>) => {
       execCalls.push({ command, args, options });
-      return { code: 0, stdout: "", stderr: "" };
+      return execImpl?.(command, args, options) ?? { code: 0, stdout: "", stderr: "" };
     },
   };
 
@@ -508,6 +513,78 @@ test("agent_end pauses when repository state does not change across several iter
   const latestState = getLatestAutoState(harness.entries);
   assert.equal(latestState?.paused, true);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("repository state has not changed across several iterations")));
+});
+
+test("default git snapshot fingerprints untracked file contents for no-change detection", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  let untrackedHash = "hash-a";
+  let promptIndex = 0;
+  const harness = createHarness(
+    {
+      "auto-goal": "improve onboarding robustness",
+      "auto-iterations": "8",
+    },
+    [],
+    async (command, args) => {
+      const gitCommand = args.join(" ");
+      if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
+
+      if (gitCommand === "rev-parse --is-inside-work-tree") {
+        return { code: 0, stdout: "true\n", stderr: "" };
+      }
+      if (gitCommand === "rev-parse HEAD") {
+        return { code: 0, stdout: "head-untracked\n", stderr: "" };
+      }
+      if (gitCommand === "status --short --branch") {
+        return { code: 0, stdout: "## main\n?? draft.txt\n", stderr: "" };
+      }
+      if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
+        return { code: 1, stdout: "", stderr: "no upstream" };
+      }
+      if (gitCommand === "diff --no-ext-diff --no-color HEAD --") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (gitCommand === "ls-files --others --exclude-standard -z") {
+        return { code: 0, stdout: "draft.txt\0", stderr: "" };
+      }
+      if (gitCommand === "hash-object --no-filters -- draft.txt") {
+        return { code: 0, stdout: `${untrackedHash}\n`, stderr: "" };
+      }
+
+      throw new Error(`Unexpected git command: ${gitCommand}`);
+    },
+  );
+
+  createAutoModeExtension({
+    decideControllerAction: async () => ({
+      action: "continue",
+      reason: "A concrete next step remains",
+      updatedSummary: "The controller keeps finding concrete local steps.",
+      goalStatus: "in_progress",
+      completionGateMet: false,
+      nextPrompt: `continue-${promptIndex++}`,
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "worker turn 1", stopReason: "stop" }],
+  }, harness.ctx);
+  assert.equal(getLatestAutoState(harness.entries)?.consecutiveNoChangeCount, 0);
+
+  untrackedHash = "hash-b";
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "worker turn 2", stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(getLatestAutoState(harness.entries)?.consecutiveNoChangeCount, 0);
+  assert.equal(
+    harness.execCalls.filter((call) => call.command === "git" && call.args[0] === "hash-object").length,
+    2,
+  );
 });
 
 test("agent_end pauses after repeated inconclusive controller results", async () => {
