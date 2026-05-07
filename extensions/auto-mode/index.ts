@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { lstatSync } from "node:fs";
+import { join } from "node:path";
 import { complete, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -42,6 +44,10 @@ import {
 const STATUS_KEY = "auto-mode";
 const GIT_DIFF_TIMEOUT_MS = 120_000;
 const VERIFY_COMMAND_TIMEOUT_MS = 600_000;
+const MAX_UNTRACKED_CONTENT_HASH_FILES = 100;
+const MAX_UNTRACKED_CONTENT_HASH_BYTES = 5 * 1024 * 1024;
+const MAX_UNTRACKED_CONTENT_HASH_PATH_CHARS = 32_000;
+const MAX_UNTRACKED_METADATA_FILES = 2_000;
 const COMMAND_USAGE =
   "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--assurance pragmatic|strict] <goal>";
 
@@ -57,6 +63,13 @@ interface GitSnapshot {
   ahead?: number;
   behind?: number;
   repoFingerprint: string;
+}
+
+interface UntrackedFileMetadata {
+  path: string;
+  size: number;
+  mtimeMs: number;
+  isSymbolicLink: boolean;
 }
 
 interface VerifyCommandResult {
@@ -292,6 +305,54 @@ function parseNulSeparatedGitOutput(output: string): string[] {
   return output.split("\0").filter((value) => value.length > 0);
 }
 
+function collectUntrackedFileMetadata(cwd: string, paths: string[]): UntrackedFileMetadata[] | undefined {
+  if (paths.length > MAX_UNTRACKED_METADATA_FILES) {
+    return undefined;
+  }
+
+  return paths.map((path) => {
+    try {
+      const stats = lstatSync(join(cwd, path));
+      return {
+        path,
+        size: stats.size,
+        mtimeMs: Math.trunc(stats.mtimeMs),
+        isSymbolicLink: stats.isSymbolicLink(),
+      };
+    } catch {
+      return { path, size: -1, mtimeMs: -1, isSymbolicLink: false };
+    }
+  });
+}
+
+function formatUntrackedPathFingerprint(paths: string[]): string {
+  return [`path-only\t${paths.length}`, ...paths].join("\0");
+}
+
+function formatUntrackedMetadataFingerprint(metadata: UntrackedFileMetadata[]): string {
+  return metadata
+    .map((entry) => `metadata\t${entry.size}\t${entry.mtimeMs}\t${entry.isSymbolicLink ? "symlink" : "file"}\t${entry.path}`)
+    .join("\0");
+}
+
+function shouldHashUntrackedFileContents(metadata: UntrackedFileMetadata[]): boolean {
+  if (metadata.some((entry) => entry.isSymbolicLink)) {
+    return false;
+  }
+
+  if (metadata.length > MAX_UNTRACKED_CONTENT_HASH_FILES) {
+    return false;
+  }
+
+  const totalBytes = metadata.reduce((sum, entry) => sum + Math.max(0, entry.size), 0);
+  if (totalBytes > MAX_UNTRACKED_CONTENT_HASH_BYTES) {
+    return false;
+  }
+
+  const totalPathChars = metadata.reduce((sum, entry) => sum + entry.path.length, 0);
+  return totalPathChars <= MAX_UNTRACKED_CONTENT_HASH_PATH_CHARS;
+}
+
 async function getUntrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Promise<string> {
   const untrackedFiles = await pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
     cwd,
@@ -306,17 +367,26 @@ async function getUntrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Prom
     return "";
   }
 
+  const metadata = collectUntrackedFileMetadata(cwd, paths);
+  if (!metadata) {
+    return formatUntrackedPathFingerprint(paths);
+  }
+
+  if (!shouldHashUntrackedFileContents(metadata)) {
+    return formatUntrackedMetadataFingerprint(metadata);
+  }
+
   const hashes = await pi.exec("git", ["hash-object", "--no-filters", "--", ...paths], {
     cwd,
     timeout: GIT_DIFF_TIMEOUT_MS,
   });
   if (hashes.code !== 0) {
-    return paths.map((path) => `untracked\t${path}`).join("\0");
+    return formatUntrackedMetadataFingerprint(metadata);
   }
 
   const contentHashes = hashes.stdout.trim().split(/\r?\n/);
   return paths
-    .map((path, index) => `${contentHashes[index] ?? "missing"}\t${path}`)
+    .map((path, index) => `content\t${contentHashes[index] ?? "missing"}\t${path}`)
     .join("\0");
 }
 

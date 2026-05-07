@@ -517,6 +517,8 @@ test("agent_end pauses when repository state does not change across several iter
 
 test("default git snapshot fingerprints untracked file contents for no-change detection", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
+  const tempDir = mkdtempSync(join(tmpdir(), "auto-mode-untracked-content-"));
+  writeFileSync(join(tempDir, "draft.txt"), "draft-a");
   let untrackedHash = "hash-a";
   let promptIndex = 0;
   const harness = createHarness(
@@ -554,6 +556,7 @@ test("default git snapshot fingerprints untracked file contents for no-change de
       throw new Error(`Unexpected git command: ${gitCommand}`);
     },
   );
+  harness.ctx.cwd = tempDir;
 
   createAutoModeExtension({
     decideControllerAction: async () => ({
@@ -585,6 +588,78 @@ test("default git snapshot fingerprints untracked file contents for no-change de
     harness.execCalls.filter((call) => call.command === "git" && call.args[0] === "hash-object").length,
     2,
   );
+});
+
+test("default git snapshot skips content hashing for many untracked files", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const tempDir = mkdtempSync(join(tmpdir(), "auto-mode-untracked-many-"));
+  const untrackedPaths = Array.from({ length: 101 }, (_, index) => `draft-${index}.txt`);
+  for (const path of untrackedPaths) {
+    writeFileSync(join(tempDir, path), "draft");
+  }
+
+  const harness = createHarness(
+    {
+      "auto-goal": "improve onboarding robustness",
+      "auto-iterations": "8",
+    },
+    [],
+    async (command, args) => {
+      const gitCommand = args.join(" ");
+      if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
+
+      if (gitCommand === "rev-parse --is-inside-work-tree") {
+        return { code: 0, stdout: "true\n", stderr: "" };
+      }
+      if (gitCommand === "rev-parse HEAD") {
+        return { code: 0, stdout: "head-many-untracked\n", stderr: "" };
+      }
+      if (gitCommand === "status --short --branch") {
+        return {
+          code: 0,
+          stdout: `## main\n${untrackedPaths.map((path) => `?? ${path}`).join("\n")}\n`,
+          stderr: "",
+        };
+      }
+      if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
+        return { code: 1, stdout: "", stderr: "no upstream" };
+      }
+      if (gitCommand === "diff --no-ext-diff --no-color HEAD --") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (gitCommand === "ls-files --others --exclude-standard -z") {
+        return { code: 0, stdout: `${untrackedPaths.join("\0")}\0`, stderr: "" };
+      }
+      if (gitCommand.startsWith("hash-object ")) {
+        throw new Error("hash-object should not be called for many untracked files");
+      }
+
+      throw new Error(`Unexpected git command: ${gitCommand}`);
+    },
+  );
+  harness.ctx.cwd = tempDir;
+
+  createAutoModeExtension({
+    decideControllerAction: async () => ({
+      action: "continue",
+      reason: "A concrete next step remains",
+      updatedSummary: "The controller keeps finding concrete local steps.",
+      goalStatus: "in_progress",
+      completionGateMet: false,
+      nextPrompt: "continue after many untracked files",
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "worker turn", stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(
+    harness.execCalls.filter((call) => call.command === "git" && call.args[0] === "hash-object").length,
+    0,
+  );
+  assert.equal(getLatestAutoState(harness.entries)?.consecutiveNoChangeCount, 0);
 });
 
 test("agent_end pauses after repeated inconclusive controller results", async () => {
