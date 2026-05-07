@@ -178,6 +178,16 @@ pi -e ./extensions/auto-mode \
   --auto-verify "npm test"
 ```
 
+### Repository fingerprint and untracked files
+
+Auto-mode uses a repository fingerprint to detect no-change loops and pauses after repeated unchanged iterations. The fingerprint includes `git status`, the diff against `HEAD`, and untracked files. To keep this cheap on large workspaces, untracked files use tiered fingerprints:
+
+- more than 2000 untracked files: use path-list only
+- otherwise, up to 100 untracked regular files, up to 5 MiB total, and up to 32k path characters: hash file contents with `git hash-object`
+- remaining cases, such as 101-2000 files, more than 5 MiB total, too many path characters, or symlinks: use path + size + mtime metadata
+
+The fallback tiers intentionally trade precision for performance. In metadata mode, same-size/same-mtime content edits may be missed. In path-only mode, content and metadata edits may be missed until paths change. These fallbacks only affect the no-change pause heuristic; git finalization gates still use the actual git status.
+
 ### Deprecated V1 options
 
 The following V1 options are still accepted for compatibility, but auto-mode V2 warns and ignores them:

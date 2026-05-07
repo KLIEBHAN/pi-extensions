@@ -122,6 +122,24 @@ Blocked stops produce deterministic short prompts such as:
 - repeated equivalent continue prompts: 3 → pause
 - unchanged repository fingerprint across iterations: 3 → pause
 
+## Repository fingerprint
+
+The no-change detector fingerprints repository state from:
+
+- `git status --short --branch`
+- `git diff --no-ext-diff --no-color HEAD --`
+- untracked files from `git ls-files --others --exclude-standard -z`
+
+Untracked files use bounded fallback tiers so large generated directories do not make every auto-mode iteration expensive:
+
+| Untracked set | Fingerprint detail | Tradeoff |
+|---|---|---|
+| >2000 files | path-list only | content/metadata-only edits can be missed |
+| ≤100 regular files, ≤5 MiB total, ≤32k path chars | content hashes via `git hash-object --no-filters` | most precise |
+| remaining cases, such as 101-2000 files, >5 MiB total, too many path chars, or any symlink | path + size + mtime metadata | same-size/same-mtime content edits can be missed |
+
+These tiers only affect the no-change pause heuristic. Stop/finalization guards still inspect the actual git status and do not rely on this fingerprint alone.
+
 ## Deprecated V1 behavior
 
 The following V1 features are deprecated in V2 and ignored in the default runtime path:
