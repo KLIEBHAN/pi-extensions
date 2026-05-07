@@ -217,8 +217,8 @@ async function verifyIterationCompletion(
     return undefined;
   }
 
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(verifierModel);
-  if (!auth.ok || !auth.apiKey) {
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(verifierModel).catch(() => undefined);
+  if (!auth?.ok || !auth.apiKey) {
     return undefined;
   }
 
@@ -241,9 +241,9 @@ async function verifyIterationCompletion(
     verifierModel,
     { systemPrompt: RALPHY_VERIFIER_SYSTEM_PROMPT, messages: [userMessage] },
     { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal, reasoningEffort: "minimal" },
-  );
+  ).catch(() => undefined);
 
-  if (response.stopReason !== "stop") {
+  if (!response || response.stopReason !== "stop") {
     return undefined;
   }
 

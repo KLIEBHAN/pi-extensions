@@ -140,9 +140,9 @@ function stripRepeatedDraftPrefix(draft: string, suggestion: string): string {
     return suggestion.slice(draft.length);
   }
 
-  const trimmedSuggestion = suggestion.trimStart();
-  if (trimmedSuggestion.startsWith(draft)) {
-    return trimmedSuggestion.slice(draft.length);
+  const horizontallyTrimmedSuggestion = suggestion.replace(/^[ \t]+/, "");
+  if (horizontallyTrimmedSuggestion.startsWith(draft)) {
+    return horizontallyTrimmedSuggestion.slice(draft.length);
   }
 
   return suggestion;
@@ -165,8 +165,9 @@ function stripRepeatedCurrentWordPrefix(draft: string, suggestion: string): stri
   // (e.g. draft "Schrei" -> suggestion "Schreibe ..."), keep only the text
   // that is still missing at the cursor. This prevents accepting the suggestion
   // from duplicating or separating the partially typed word.
-  if (startsWithCaseInsensitivePrefix(suggestion, currentWord)) {
-    return suggestion.slice(currentWord.length);
+  const horizontallyTrimmedSuggestion = suggestion.replace(/^[ \t]+/, "");
+  if (startsWithCaseInsensitivePrefix(horizontallyTrimmedSuggestion, currentWord)) {
+    return horizontallyTrimmedSuggestion.slice(currentWord.length);
   }
 
   return suggestion;

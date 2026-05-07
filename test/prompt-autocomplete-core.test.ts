@@ -142,10 +142,18 @@ test("normalizePromptSuggestion completes partial words without inserting a sepa
     normalizePromptSuggestion("Bitte schrei", "Schreibe eine Antwort"),
     "be eine Antwort",
   );
+  assert.equal(
+    normalizePromptSuggestion("Bitte schrei", " schreibe eine Antwort"),
+    "be eine Antwort",
+  );
 });
 
 test("normalizePromptSuggestion removes leading horizontal whitespace for empty drafts", () => {
   assert.equal(normalizePromptSuggestion("", "   Bitte fasse die letzten Änderungen zusammen"), "Bitte fasse die letzten Änderungen zusammen");
+});
+
+test("normalizePromptSuggestion preserves newline-prefixed multiline suggestions", () => {
+  assert.equal(normalizePromptSuggestion("foo", "\nfoo bar"), "\nfoo bar");
 });
 
 test("normalizePromptSuggestions parses JSON alternatives and deduplicates them", () => {

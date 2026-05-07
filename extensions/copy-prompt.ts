@@ -1,6 +1,17 @@
 import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 
-const COPY_PROMPT_SHORTCUT = "alt+c";
+const COPY_PROMPT_SHORTCUTS = ["alt+c", "ctrl+alt+c"] as const;
+
+// macOS Terminal/iTerm often insert a composed character for Option+C unless
+// the user explicitly enables "Option as Meta". Treat the common layouts as the
+// same shortcut so the extension works with default macOS terminal settings.
+const MAC_OPTION_C_INPUTS = new Set(["ç", "Ç", "©"]);
+let unsubscribeMacOptionCFallback: (() => void) | undefined;
+
+function clearMacOptionCFallback(): void {
+  unsubscribeMacOptionCFallback?.();
+  unsubscribeMacOptionCFallback = undefined;
+}
 
 async function copyPromptDraft(ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
@@ -22,9 +33,27 @@ async function copyPromptDraft(ctx: ExtensionContext): Promise<void> {
   }
 }
 
+function installMacOptionCFallback(ctx: ExtensionContext): void {
+  clearMacOptionCFallback();
+  if (process.platform !== "darwin" || !ctx.hasUI) return;
+
+  unsubscribeMacOptionCFallback = ctx.ui.onTerminalInput((data) => {
+    if (!MAC_OPTION_C_INPUTS.has(data)) return undefined;
+
+    void copyPromptDraft(ctx);
+    return { consume: true };
+  });
+}
+
 export default function (pi: ExtensionAPI) {
-  pi.registerShortcut(COPY_PROMPT_SHORTCUT, {
-    description: "Copy the current prompt draft to the clipboard",
-    handler: copyPromptDraft,
+  for (const shortcut of COPY_PROMPT_SHORTCUTS) {
+    pi.registerShortcut(shortcut, {
+      description: "Copy the current prompt draft to the clipboard",
+      handler: copyPromptDraft,
+    });
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    installMacOptionCFallback(ctx);
   });
 }

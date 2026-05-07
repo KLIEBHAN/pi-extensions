@@ -40,6 +40,12 @@ import { Type } from "@sinclair/typebox";
 
 const TBENCH_MAX_BYTES = 30 * 1024;
 const TBENCH_MAX_LINES = 1500;
+const BOOTSTRAP_TIMEOUT_MS = 15_000;
+const TMUX_KILL_TIMEOUT_MS = 3_000;
+const TMUX_START_TIMEOUT_MS = 5_000;
+const TMUX_CAPTURE_TIMEOUT_MS = 5_000;
+const TMUX_MARKER_SEND_TIMEOUT_MS = 5_000;
+const TMUX_SEND_TIMEOUT_MS = 10_000;
 const TMUX_MARKER_PREFIX = "__PI_TBENCH_END__";
 const MAX_CONTRACT_ITEMS = 10;
 const MAX_RECENT_TOOL_ACTIONS = 8;
@@ -370,6 +376,11 @@ function truncateOutput(output: string, maxBytes: number, maxLines: number): str
   const totalLines = lines.length;
   const shownLines = kept.length;
 
+  if (shownLines === 0 && output) {
+    const tail = Buffer.from(output, "utf-8").subarray(-maxBytes).toString("utf-8");
+    return `[Showing last ${Buffer.byteLength(tail, "utf-8")} bytes of oversized output]\n${tail}`;
+  }
+
   if (shownLines < totalLines) {
     return `[Showing last ${shownLines} of ${totalLines} lines]\n${kept.join("\n")}`;
   }
@@ -404,7 +415,7 @@ export default function (pi: ExtensionAPI) {
   let markerSeq = 0;
   let recentToolActions: string[] = [];
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
     enabled = pi.getFlag("terminal-bench") === true;
     if (!enabled) return;
 
@@ -417,7 +428,8 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const result = await pi.exec("bash", ["-c", BOOTSTRAP_COMMAND], {
-        timeout: 15000,
+        cwd: ctx.cwd,
+        timeout: BOOTSTRAP_TIMEOUT_MS,
       });
       if (result.code === 0 && result.stdout) {
         const sections = parseBootstrapOutput(result.stdout);
@@ -426,15 +438,14 @@ export default function (pi: ExtensionAPI) {
     } catch {
     }
 
-    const cwd = process.cwd();
     const sessionName = `pi-tbench-${process.pid}`;
     try {
       await pi.exec("tmux", ["kill-session", "-t", sessionName], {
-        timeout: 3000,
+        timeout: TMUX_KILL_TIMEOUT_MS,
       }).catch(() => {});
 
-      await pi.exec("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", "-c", cwd], {
-        timeout: 5000,
+      await pi.exec("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", "-c", ctx.cwd], {
+        timeout: TMUX_START_TIMEOUT_MS,
       });
       tmuxSession = sessionName;
       await sleep(200);
@@ -497,7 +508,7 @@ export default function (pi: ExtensionAPI) {
       const waitSeconds = Math.min(Math.max(params.wait_seconds ?? 1.0, 0.05), 30);
 
       const sendResult = await pi.exec("tmux", ["send-keys", "-t", tmuxSession, params.keys], {
-        timeout: 10000,
+        timeout: TMUX_SEND_TIMEOUT_MS,
       });
       if (sendResult.code !== 0) {
         throw new Error(`tmux send-keys failed: ${sendResult.stderr || "unknown error"}`);
@@ -506,7 +517,7 @@ export default function (pi: ExtensionAPI) {
       markerSeq++;
       const marker = `${TMUX_MARKER_PREFIX}${markerSeq}`;
       await pi.exec("tmux", ["send-keys", "-t", tmuxSession, `echo '${marker}'`, "Enter"], {
-        timeout: 5000,
+        timeout: TMUX_MARKER_SEND_TIMEOUT_MS,
       });
 
       const startTime = Date.now();
@@ -519,7 +530,7 @@ export default function (pi: ExtensionAPI) {
         if (signal?.aborted) break;
 
         const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
-          timeout: 5000,
+          timeout: TMUX_CAPTURE_TIMEOUT_MS,
         });
         paneContent = captureResult.stdout || "";
 
@@ -531,7 +542,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const finalCapture = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
-        timeout: 5000,
+        timeout: TMUX_CAPTURE_TIMEOUT_MS,
       });
       paneContent = finalCapture.stdout || "";
 
@@ -567,7 +578,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const captureResult = await pi.exec("tmux", ["capture-pane", "-t", tmuxSession, "-p", "-S", "-200"], {
-        timeout: 5000,
+        timeout: TMUX_CAPTURE_TIMEOUT_MS,
       });
 
       if (captureResult.code !== 0) {
@@ -684,18 +695,21 @@ export default function (pi: ExtensionAPI) {
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    if (signal) {
-      const onAbort = () => {
-        clearTimeout(timer);
-        resolve();
-      };
-      if (signal.aborted) {
-        clearTimeout(timer);
-        resolve();
-      } else {
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+
+    if (signal?.aborted) {
+      finish();
+      return;
     }
+
+    signal?.addEventListener("abort", finish, { once: true });
   });
 }

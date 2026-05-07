@@ -51,6 +51,7 @@ function createHarness(
   const sentMessages: Array<{ text: string; options?: unknown }> = [];
   const notifications: Array<{ message: string; level?: string }> = [];
   const statuses: Array<{ key: string; value: string | undefined }> = [];
+  const execCalls: Array<{ command: string; args: string[]; options?: Record<string, unknown> }> = [];
   let sessionName: string | undefined;
   let aborted = false;
 
@@ -84,7 +85,10 @@ function createHarness(
     setSessionName(value: string) {
       sessionName = value;
     },
-    exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+    exec: async (command: string, args: string[], options?: Record<string, unknown>) => {
+      execCalls.push({ command, args, options });
+      return { code: 0, stdout: "", stderr: "" };
+    },
   };
 
   const ctx = {
@@ -109,7 +113,7 @@ function createHarness(
     },
   };
 
-  return { pi, handlers, commands, entries, sentMessages, notifications, statuses, ctx, get aborted() { return aborted; } };
+  return { pi, handlers, commands, entries, sentMessages, notifications, statuses, execCalls, ctx, get aborted() { return aborted; } };
 }
 
 function getLatestAutoState(entries: unknown[]) {
@@ -262,6 +266,116 @@ test("failed strict verification produces a short deterministic follow-up instea
   assert.match(harness.sentMessages.at(-1)?.text ?? "", /Run npm test until it passes/);
   assert.doesNotMatch(harness.sentMessages.at(-1)?.text ?? "", /git show/i);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode finalization pass requested")));
+});
+
+test("default verify command runner uses a long-running timeout", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+    "auto-verify": "npm test",
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-verify-timeout",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: true,
+      ahead: 0,
+      behind: 0,
+      repoFingerprint: "fingerprint-verify-timeout",
+    }),
+    decideControllerAction: async () => ({
+      action: "stop",
+      reason: "Goal is complete",
+      updatedSummary: "The goal is complete.",
+      goalStatus: "met",
+      completionGateMet: true,
+      finalMessage: "Done.",
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "The fix is complete.", stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.deepEqual(harness.execCalls.at(-1), {
+    command: "bash",
+    args: ["-lc", "npm test"],
+    options: { cwd: "/repo", timeout: 600_000 },
+  });
+});
+
+test("thrown controller decisions are counted like inconclusive controller results", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-throwing-controller",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "fingerprint-throwing-controller",
+    }),
+    decideControllerAction: async () => {
+      throw new Error("provider unavailable");
+    },
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "worker turn 1", stopReason: "stop" }],
+  }, harness.ctx);
+  await agentEnd?.({
+    messages: [{ role: "assistant", content: "worker turn 2", stopReason: "stop" }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.paused, true);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("controller failed 2 times in a row")));
+});
+
+test("git snapshot errors pause auto-mode instead of bypassing finalization guards", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => {
+      throw new Error("git timed out");
+    },
+    decideControllerAction: async () => ({
+      action: "stop",
+      reason: "Goal is complete",
+      updatedSummary: "The goal is complete.",
+      goalStatus: "met",
+      completionGateMet: true,
+      finalMessage: "Done.",
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "The fix is complete.", stopReason: "stop" }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.enabled, true);
+  assert.equal(latestState?.paused, true);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("git state unavailable: git timed out")));
+  assert.equal(harness.sentMessages.length, 1);
 });
 
 test("dirty git state triggers a short deterministic commit follow-up", async () => {

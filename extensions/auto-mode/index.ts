@@ -40,6 +40,8 @@ import {
 } from "./core.ts";
 
 const STATUS_KEY = "auto-mode";
+const GIT_DIFF_TIMEOUT_MS = 120_000;
+const VERIFY_COMMAND_TIMEOUT_MS = 600_000;
 const COMMAND_USAGE =
   "Usage: /auto on [--iterations N] [--until \"completion gate\"] [--controller-model provider/model] [--verify \"cmd\"] [--assurance pragmatic|strict] <goal>";
 
@@ -264,6 +266,10 @@ function shouldTreatWorkerFailure(stopReason: string): boolean {
   return stopReason === "error" || stopReason === "aborted" || stopReason === "length";
 }
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function summarizeBashOutput(stdout: string, stderr: string, maxChars = 2_000): string {
   const combined = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n\n");
   if (!combined) return "(no output)";
@@ -285,7 +291,7 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
     pi.exec("git", ["rev-parse", "HEAD"], { cwd }),
     pi.exec("git", ["status", "--short", "--branch"], { cwd }),
     pi.exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd }),
-    pi.exec("git", ["diff", "--no-ext-diff", "--no-color", "HEAD", "--"], { cwd, timeout: 120 }),
+    pi.exec("git", ["diff", "--no-ext-diff", "--no-color", "HEAD", "--"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
   ]);
 
   let ahead: number | undefined;
@@ -323,7 +329,7 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
 }
 
 async function runVerifyCommand(pi: ExtensionAPI, cwd: string, command: string): Promise<VerifyCommandResult> {
-  const result = await pi.exec("bash", ["-lc", command], { cwd, timeout: 600 });
+  const result = await pi.exec("bash", ["-lc", command], { cwd, timeout: VERIFY_COMMAND_TIMEOUT_MS });
   return {
     command,
     ok: result.code === 0,
@@ -957,20 +963,42 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           snapshot.consecutiveWorkerFailures = 0;
         }
 
-        const gitSnapshot = await getGitSnapshotImpl(pi, ctx.cwd);
+        let gitSnapshot: GitSnapshot | undefined;
+        try {
+          gitSnapshot = await getGitSnapshotImpl(pi, ctx.cwd);
+        } catch (error) {
+          pauseSnapshot(pi, ctx, runtime, `git state unavailable: ${getErrorMessage(error)}`);
+          return;
+        }
         updateNoChangeCounters(snapshot, gitSnapshot);
         persistSnapshot(pi, snapshot);
 
-        const verifyResult = shouldPreRunVerifyCommand({
+        let verifyResult: VerifyCommandResult | undefined;
+        if (shouldPreRunVerifyCommand({
           verifyCommandConfigured: !!snapshot.verifyCommand,
           stopReason: workerTurn.stopReason,
           currentIteration: snapshot.currentIteration,
           maxIterations: snapshot.maxIterations,
-        }) && snapshot.verifyCommand
-          ? await runVerifyCommandImpl(pi, ctx.cwd, snapshot.verifyCommand)
-          : undefined;
+        }) && snapshot.verifyCommand) {
+          try {
+            verifyResult = await runVerifyCommandImpl(pi, ctx.cwd, snapshot.verifyCommand);
+          } catch (error) {
+            verifyResult = {
+              command: snapshot.verifyCommand,
+              ok: false,
+              exitCode: -1,
+              stdout: "",
+              stderr: getErrorMessage(error),
+            };
+          }
+        }
 
-        const decision = await decideControllerActionImpl(ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
+        let decision: ControllerDecision | undefined;
+        try {
+          decision = await decideControllerActionImpl(ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
+        } catch {
+          decision = undefined;
+        }
 
         if (!decision) {
           snapshot.consecutiveControllerFailures += 1;
