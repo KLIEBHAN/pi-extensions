@@ -41,7 +41,7 @@ test("prompt-autocomplete index no longer hardcodes a provider/model default", (
   const source = readFileSync(new URL("../extensions/prompt-autocomplete/index.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /default:\s*"openai\/[^"]+"/);
   assert.match(source, /Optional provider\/model override for prompt autocomplete/);
-  assert.match(source, /description: "Enable inline AI prompt autocomplete in the editor",\n    type: "boolean",\n    default: false,/);
+  assert.match(source, /description: "Enable inline AI prompt autocomplete in the editor",\n    type: "boolean",\n    default: true,/);
   assert.match(source, /default:\s*DEFAULT_PREFERRED_MODEL/);
 });
 

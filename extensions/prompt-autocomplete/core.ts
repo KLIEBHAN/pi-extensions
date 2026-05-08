@@ -55,7 +55,7 @@ export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT = renderMiniTemplate(
 
 export const DEFAULT_PREFERRED_MODEL = "current active model";
 export const DEFAULT_DEBOUNCE_MS = 350;
-export const DEFAULT_MIN_PROMPT_CHARS = 1;
+export const DEFAULT_MIN_PROMPT_CHARS = 0;
 export const DEFAULT_MAX_SUGGESTION_CHARS = 160;
 export const DEFAULT_MAX_ALTERNATIVES = 2;
 export const MAX_DRAFT_CONTEXT_CHARS = 2_000;

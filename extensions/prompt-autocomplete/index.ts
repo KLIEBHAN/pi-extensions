@@ -1080,7 +1080,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("prompt-autocomplete", {
     description: "Enable inline AI prompt autocomplete in the editor",
     type: "boolean",
-    default: false,
+    default: true,
   });
   pi.registerFlag("prompt-autocomplete-model", {
     description: "Optional provider/model override for prompt autocomplete, e.g. openai/gpt-5.4-mini",

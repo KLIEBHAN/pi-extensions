@@ -27,7 +27,7 @@ pi install ../pi-extensions
 pi install git:github.com/KLIEBHAN/pi-extensions
 ```
 
-After package installation, enabled extensions are auto-discovered by pi. The `copy-prompt` extension stays passive until `Alt+C` or `Ctrl+Alt+C` is pressed. On macOS it also handles the common default-terminal `Option+C` composed-character fallback when Option is not configured as Meta. The `terminal-bench` and `prompt-autocomplete` extensions are safe to keep installed because they only activate when their flags are passed (or, for prompt autocomplete, when enabled via its slash command).
+After package installation, enabled extensions are auto-discovered by pi. The `copy-prompt` extension stays passive until `Alt+C` or `Ctrl+Alt+C` is pressed. On macOS it also handles the common default-terminal `Option+C` composed-character fallback when Option is not configured as Meta. The `terminal-bench` extension only activates when its flag is passed. The `prompt-autocomplete` extension is enabled by default and can be toggled per session with `/prompt-autocomplete on|off|toggle`.
 
 The bundled themes are also available after installation. Select `hermes-dark` in `/settings` or set it in `~/.pi/agent/settings.json`:
 
@@ -210,7 +210,7 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 
 ### What it adds
 
-- ghost-text style prompt suggestions directly in the editor once the draft reaches the configured minimum length
+- ghost-text style prompt suggestions directly in the editor, including when the draft is still empty by default
 - shows 2 alternatives by default, with configurable limit via flag
 - `Tab` accepts the whole current suggestion
 - `Ctrl+Space` accepts the next word/chunk from the current suggestion
@@ -260,7 +260,7 @@ pi -e ./extensions/prompt-autocomplete \
 
 ### Notes
 
-- The extension suggests as soon as the cursor is at the end of the current draft and the draft reaches `--prompt-autocomplete-min-chars` (default: 1). Set it to `0` if you explicitly want empty-draft next-prompt suggestions.
+- The extension suggests as soon as the cursor is at the end of the current draft, even if the draft is still empty by default (`--prompt-autocomplete-min-chars 0`). Raise `--prompt-autocomplete-min-chars` if you want to avoid empty-draft next-prompt suggestions.
 - Built-in slash-command and file/path autocomplete keep working.
 - By default it pauses while the main agent is streaming so it can use the finished conversation context. Override with `--prompt-autocomplete-while-streaming` if you really want live suggestions while the agent is still working.
 - Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling.
