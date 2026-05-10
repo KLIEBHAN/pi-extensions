@@ -1357,7 +1357,6 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
 
         if (shouldTreatWorkerFailure(workerTurn.stopReason)) {
           snapshot.consecutiveWorkerFailures += 1;
-          persistSnapshot(pi, snapshot);
           if (snapshot.consecutiveWorkerFailures >= DEFAULT_WORKER_FAILURE_LIMIT) {
             pauseSnapshot(pi, ctx, runtime, `worker failed ${snapshot.consecutiveWorkerFailures} times in a row`);
             return;
@@ -1379,7 +1378,6 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
         if (!loadedGitSnapshot.ok) return;
         let gitSnapshot = loadedGitSnapshot.snapshot;
         updateNoChangeCounters(snapshot, gitSnapshot);
-        persistSnapshot(pi, snapshot);
 
         let verifyResult: VerifyCommandResult | undefined;
         let verifyRan = false;
@@ -1402,7 +1400,6 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
 
         if (!decision) {
           snapshot.consecutiveControllerFailures += 1;
-          persistSnapshot(pi, snapshot);
           if (snapshot.consecutiveControllerFailures >= DEFAULT_CONTROLLER_FAILURE_LIMIT) {
             pauseSnapshot(pi, ctx, runtime, `controller failed ${snapshot.consecutiveControllerFailures} times in a row`);
           } else {
