@@ -1,11 +1,12 @@
-import { createHash } from "node:crypto";
 import { completeSimple, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@mariozechner/pi-coding-agent";
 import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@mariozechner/pi-tui";
 import {
+  acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
   buildLatestUserMessageContext,
   buildRecentConversationContext,
+  cancelAllCoalescedRequests,
   DEFAULT_DEBOUNCE_MS,
   DEFAULT_MAX_ALTERNATIVES,
   DEFAULT_MAX_SUGGESTION_CHARS,
@@ -18,7 +19,10 @@ import {
   parseBoundedIntFlag,
   parseModelRef,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+  shouldSkipPromptAutocomplete,
   truncateDraftTail,
+  type CoalescedRequestEntry,
+  type CoalescedRequestSubscription,
   type ModelRef,
 } from "./core.ts";
 
@@ -29,7 +33,13 @@ const CURSOR_TOKEN = "\x1b[7m \x1b[0m";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 const SPINNER_INTERVAL_MS = 80;
 const SPINNER_LABEL = "Generating suggestion";
+// Keep the completion budget just large enough for a small JSON array of short alternatives.
 const REQUEST_MAX_TOKENS = 192;
+// Inline autocomplete should fail fast instead of inheriting long provider retry/timeout defaults.
+const REQUEST_TIMEOUT_MS = 8_000;
+const REQUEST_MAX_RETRIES = 0;
+const REQUEST_MAX_RETRY_DELAY_MS = 2_000;
+// Brief cooldown avoids hammering providers after transient auth/network failures while keeping the UI responsive.
 const FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_CACHE_TTL_MS = 60_000;
 const REQUEST_CACHE_MAX_ENTRIES = 128;
@@ -99,11 +109,12 @@ interface PromptAutocompleteSharedState {
   lastError?: string;
   lastRawResponse?: string;
   requestCache: Map<string, PromptAutocompleteCacheEntry>;
-  inFlightRequests: Map<string, Promise<PromptAutocompleteCacheEntry>>;
+  inFlightRequests: Map<string, CoalescedRequestEntry<PromptAutocompleteCacheEntry>>;
   refreshEditor?: (options?: SuggestionRefreshOptions) => void;
   cancelActiveRequest?: () => void;
   setStatusText?: (text: string | undefined) => void;
-  setSpinnerActive?: (active: boolean) => void;
+  setSpinnerActive?: (owner: string, active: boolean) => void;
+  clearSpinner?: () => void;
 }
 
 interface SuggestionRequest {
@@ -132,7 +143,16 @@ function formatPrimaryKey(keys: readonly KeyId[]): string {
 }
 
 function hashText(text: string): string {
-  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+  let first = 0x811c9dc5;
+  let second = 0x811c9dc5 ^ text.length;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const codeUnit = text.charCodeAt(i);
+    first = Math.imul(first ^ codeUnit, 0x01000193) >>> 0;
+    second = Math.imul(second ^ codeUnit, 0x01000193) >>> 0;
+  }
+
+  return `${first.toString(16).padStart(8, "0")}${second.toString(16).padStart(8, "0")}`;
 }
 
 function resolveSuggestionModel(shared: PromptAutocompleteSharedState): Model<Api> | undefined {
@@ -218,19 +238,6 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     .join(" | ");
 }
 
-function shouldSkipPromptAutocomplete(text: string): boolean {
-  const trimmedStart = text.trimStart();
-  if (trimmedStart.startsWith("/") || trimmedStart.startsWith("!")) return true;
-
-  const lastNewline = text.lastIndexOf("\n");
-  const textBeforeCursor = lastNewline === -1 ? text : text.slice(lastNewline + 1);
-
-  if (/(?:^|[ \t])@(?:"[^"]*|[^\s]*)$/.test(textBeforeCursor)) return true;
-  if (/(?:^|[ \t])(?:~\/|\.\.?\/|\/)[^\s]*$/.test(textBeforeCursor)) return true;
-
-  return false;
-}
-
 function pruneRequestCache(shared: PromptAutocompleteSharedState): void {
   const now = Date.now();
   for (const [key, entry] of shared.requestCache) {
@@ -250,9 +257,13 @@ function getCachedRequest(
   shared: PromptAutocompleteSharedState,
   cacheKey: string,
 ): PromptAutocompleteCacheEntry | undefined {
-  pruneRequestCache(shared);
   const entry = shared.requestCache.get(cacheKey);
   if (!entry) return undefined;
+
+  if (entry.expiresAt <= Date.now()) {
+    shared.requestCache.delete(cacheKey);
+    return undefined;
+  }
 
   shared.requestCache.delete(cacheKey);
   shared.requestCache.set(cacheKey, entry);
@@ -292,7 +303,8 @@ class PromptAutocompleteEditor extends CustomEditor {
   private debounceTimer?: ReturnType<typeof setTimeout>;
   private requestSeq = 0;
   private pendingRequestKey?: string;
-  private abortController?: AbortController;
+  private activeRequestSubscription?: CoalescedRequestSubscription<PromptAutocompleteCacheEntry>;
+  private activeSpinnerOwner?: string;
   private suspendedUntil = 0;
   private lastResolvedKey = "";
   private lastResolvedSuggestions: string[] = [];
@@ -419,6 +431,31 @@ class PromptAutocompleteEditor extends CustomEditor {
       clearExisting: options.clearExisting ?? true,
       immediate: options.immediate ?? true,
     });
+  }
+
+  private makeRequestSubscriberId(seq: number): string {
+    return `${this.activationId}:${seq}`;
+  }
+
+  private makeSpinnerOwner(request: SuggestionRequest, seq: number): string {
+    return `${this.activationId}:${seq}:${request.cacheKey}`;
+  }
+
+  private activateSpinner(owner: string): void {
+    if (this.activeSpinnerOwner && this.activeSpinnerOwner !== owner) {
+      this.shared.setSpinnerActive?.(this.activeSpinnerOwner, false);
+    }
+
+    this.activeSpinnerOwner = owner;
+    this.shared.setSpinnerActive?.(owner, true);
+  }
+
+  private deactivateSpinner(owner = this.activeSpinnerOwner): void {
+    if (!owner) return;
+    this.shared.setSpinnerActive?.(owner, false);
+    if (this.activeSpinnerOwner === owner) {
+      this.activeSpinnerOwner = undefined;
+    }
   }
 
   private getActiveSuggestion(): string | undefined {
@@ -647,28 +684,36 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
-    if (this.pendingRequestKey === request.cacheKey || this.shared.inFlightRequests.has(request.cacheKey)) {
-      updateDebugState(this.shared, "requesting", `Awaiting cached in-flight request for ${request.modelLabel}`);
-      this.shared.setSpinnerActive?.(true);
+    if (this.pendingRequestKey === request.cacheKey) {
+      updateDebugState(this.shared, "requesting", `Awaiting pending request for ${request.modelLabel}`);
       return;
     }
 
+    const shouldJoinInFlight = this.shared.inFlightRequests.has(request.cacheKey);
     this.cancelPendingRequest();
-    this.pendingRequestKey = request.cacheKey;
-    this.shared.setSpinnerActive?.(true);
 
-    const debounceMs = options.immediate ? 0 : this.shared.config.debounceMs;
+    const seq = ++this.requestSeq;
+    const spinnerOwner = this.makeSpinnerOwner(request, seq);
+    this.pendingRequestKey = request.cacheKey;
+    this.activateSpinner(spinnerOwner);
+
+    const debounceMs = shouldJoinInFlight || options.immediate ? 0 : this.shared.config.debounceMs;
     if (debounceMs <= 0) {
-      updateDebugState(this.shared, "requesting", `Immediate request to ${request.modelLabel}`);
-      void this.fetchSuggestion(request, ++this.requestSeq);
+      updateDebugState(
+        this.shared,
+        "requesting",
+        shouldJoinInFlight
+          ? `Joining in-flight request for ${request.modelLabel}`
+          : `Immediate request to ${request.modelLabel}`,
+      );
+      void this.fetchSuggestion(request, seq, spinnerOwner);
       return;
     }
 
     updateDebugState(this.shared, "debouncing", `${debounceMs}ms before request to ${request.modelLabel}`);
-    const seq = ++this.requestSeq;
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = undefined;
-      void this.fetchSuggestion(request, seq);
+      void this.fetchSuggestion(request, seq, spinnerOwner);
     }, debounceMs);
   }
 
@@ -699,20 +744,34 @@ class PromptAutocompleteEditor extends CustomEditor {
     };
   }
 
-  private async fetchSuggestion(request: SuggestionRequest, seq: number): Promise<void> {
-    if (!this.isRequestStillCurrent(request, seq)) return;
-
-    let inFlight = this.shared.inFlightRequests.get(request.cacheKey);
-    if (!inFlight) {
-      updateDebugState(this.shared, "requesting", `Requesting suggestions from ${request.modelLabel}`);
-      inFlight = this.fetchSuggestionUncached(request);
-      this.shared.inFlightRequests.set(request.cacheKey, inFlight);
-    } else {
-      updateDebugState(this.shared, "requesting", `Awaiting cached in-flight request for ${request.modelLabel}`);
+  private async fetchSuggestion(request: SuggestionRequest, seq: number, spinnerOwner: string): Promise<void> {
+    if (!this.isRequestStillCurrent(request, seq)) {
+      if (this.pendingRequestKey === request.cacheKey) {
+        this.pendingRequestKey = undefined;
+      }
+      this.deactivateSpinner(spinnerOwner);
+      return;
     }
 
+    const subscriberId = this.makeRequestSubscriberId(seq);
+    const subscription = acquireCoalescedRequest(
+      this.shared.inFlightRequests,
+      request.cacheKey,
+      subscriberId,
+      (signal) => this.fetchSuggestionUncached(request, signal),
+    );
+
+    this.activeRequestSubscription = subscription;
+    updateDebugState(
+      this.shared,
+      "requesting",
+      subscription.created
+        ? `Requesting suggestions from ${request.modelLabel}`
+        : `Awaiting shared in-flight request for ${request.modelLabel}`,
+    );
+
     try {
-      const entry = await inFlight;
+      const entry = await subscription.promise;
       if (!this.isRequestStillCurrent(request, seq)) {
         return;
       }
@@ -737,17 +796,21 @@ class PromptAutocompleteEditor extends CustomEditor {
         this.setSuggestions([]);
       }
     } finally {
-      if (this.shared.inFlightRequests.get(request.cacheKey) === inFlight) {
-        this.shared.inFlightRequests.delete(request.cacheKey);
+      subscription.release();
+      if (this.activeRequestSubscription === subscription) {
+        this.activeRequestSubscription = undefined;
       }
       if (this.pendingRequestKey === request.cacheKey) {
         this.pendingRequestKey = undefined;
-        this.shared.setSpinnerActive?.(false);
       }
+      this.deactivateSpinner(spinnerOwner);
     }
   }
 
-  private async fetchSuggestionUncached(request: SuggestionRequest): Promise<PromptAutocompleteCacheEntry> {
+  private async fetchSuggestionUncached(
+    request: SuggestionRequest,
+    signal: AbortSignal,
+  ): Promise<PromptAutocompleteCacheEntry> {
     if (!this.shared.modelRegistry) {
       throw new Error("No model registry available");
     }
@@ -756,99 +819,98 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (!auth.ok || !auth.apiKey) {
       throw new Error(auth.ok ? `No API key for ${request.modelLabel}` : auth.error);
     }
-
-    const controller = new AbortController();
-    this.abortController = controller;
-
-    try {
-      const sections: string[] = [];
-      if (request.latestAssistantContext) {
-        sections.push(`Latest assistant message (primary context):\n${request.latestAssistantContext}`);
-      }
-      if (request.latestUserContext) {
-        sections.push(`Latest user message:\n${request.latestUserContext}`);
-      }
-      if (request.recentContext) {
-        sections.push(`Recent conversation summary:\n${request.recentContext}`);
-      }
-
-      if (request.draft.length === 0) {
-        sections.push(
-          "Current draft is empty. Suggest the best full next prompts the user could send now.",
-        );
-      } else if (request.draftTail.length < request.draft.length) {
-        sections.push(
-          `Current draft tail (the real draft is longer; the cursor is at the end of the full draft):\n${request.draftTail}`,
-        );
-      } else {
-        sections.push(`Current draft (cursor at end):\n${request.draft}`);
-      }
-
-      sections.push(
-        `Return up to ${request.maxAlternatives} ranked alternatives as JSON with shape {\"completions\":[...]}.`,
-      );
-      sections.push(
-        request.draft.length === 0
-          ? "Each item should be a complete next prompt, not a continuation fragment."
-          : "Each item should be only the continuation to insert at the cursor.",
-      );
-
-      const userMessage: UserMessage = {
-        role: "user",
-        content: [{ type: "text", text: sections.join("\n\n") }],
-        timestamp: Date.now(),
-      };
-
-      const response = await completeSimple(
-        request.model,
-        {
-          systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
-          messages: [userMessage],
-        },
-        {
-          apiKey: auth.apiKey,
-          headers: auth.headers,
-          signal: controller.signal,
-          maxTokens: REQUEST_MAX_TOKENS,
-          maxRetryDelayMs: 2_000,
-        },
-      );
-
-      const contentTypes = response.content.map((block) => block.type).join(", ") || "(none)";
-      const text = response.content
-        .filter((block): block is { type: "text"; text: string } => block.type === "text")
-        .map((block) => block.text)
-        .join("");
-
-      const responseError = response.errorMessage?.trim();
-      const rawResponse = text || responseError || `[types=${contentTypes}; stopReason=${response.stopReason}]`;
-
-      if (response.stopReason === "error" || response.stopReason === "aborted") {
-        throw new Error(responseError || `Provider returned stopReason=${response.stopReason}`);
-      }
-
-      const normalized = normalizePromptSuggestions(
-        request.draft,
-        text,
-        this.shared.config.maxSuggestionChars,
-        request.maxAlternatives,
-      );
-
-      const debugState =
-        normalized.length === 0
-          ? text || `No text blocks returned (types: ${contentTypes}; stopReason: ${response.stopReason})`
-          : `${normalized.length} suggestion(s) ready`;
-
-      return storeCachedRequest(this.shared, request.cacheKey, {
-        suggestions: normalized,
-        rawResponse,
-        debugState,
-      });
-    } finally {
-      if (this.abortController === controller) {
-        this.abortController = undefined;
-      }
+    if (signal.aborted) {
+      throw new Error("Request was aborted");
     }
+
+    const sections: string[] = [];
+    if (request.latestAssistantContext) {
+      sections.push(`Latest assistant message (primary context):\n${request.latestAssistantContext}`);
+    }
+    if (request.latestUserContext) {
+      sections.push(`Latest user message:\n${request.latestUserContext}`);
+    }
+    if (request.recentContext) {
+      sections.push(`Recent conversation summary:\n${request.recentContext}`);
+    }
+
+    if (request.draft.length === 0) {
+      sections.push(
+        "Current draft is empty. Suggest the best full next prompts the user could send now.",
+      );
+    } else if (request.draftTail.length < request.draft.length) {
+      sections.push(
+        `Current draft tail (the real draft is longer; the cursor is at the end of the full draft):\n${request.draftTail}`,
+      );
+    } else {
+      sections.push(`Current draft (cursor at end):\n${request.draft}`);
+    }
+
+    sections.push(
+      `Return up to ${request.maxAlternatives} ranked alternatives as JSON with shape {\"completions\":[...]}.`,
+    );
+    sections.push(
+      request.draft.length === 0
+        ? "Each item should be a complete next prompt, not a continuation fragment."
+        : "Each item should be only the continuation to insert at the cursor.",
+    );
+
+    const userMessage: UserMessage = {
+      role: "user",
+      content: [{ type: "text", text: sections.join("\n\n") }],
+      timestamp: Date.now(),
+    };
+
+    const response = await completeSimple(
+      request.model,
+      {
+        systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+        messages: [userMessage],
+      },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        signal,
+        maxTokens: REQUEST_MAX_TOKENS,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+        maxRetries: REQUEST_MAX_RETRIES,
+        maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
+      },
+    );
+
+    const contentTypes = response.content.map((block) => block.type).join(", ") || "(none)";
+    const text = response.content
+      .filter((block): block is { type: "text"; text: string } => block.type === "text")
+      .map((block) => block.text)
+      .join("");
+
+    const responseError = response.errorMessage?.trim();
+    const rawResponse = text || responseError || `[types=${contentTypes}; stopReason=${response.stopReason}]`;
+
+    if (response.stopReason === "error" || response.stopReason === "aborted") {
+      throw new Error(responseError || `Provider returned stopReason=${response.stopReason}`);
+    }
+    if (signal.aborted) {
+      throw new Error("Request was aborted");
+    }
+
+    const normalized = normalizePromptSuggestions(
+      request.draft,
+      text,
+      this.shared.config.maxSuggestionChars,
+      request.maxAlternatives,
+    );
+
+    const debugState =
+      normalized.length === 0
+        ? text || `No text blocks returned (types: ${contentTypes}; stopReason: ${response.stopReason})`
+        : `${normalized.length} suggestion(s) ready`;
+
+    return storeCachedRequest(this.shared, request.cacheKey, {
+      suggestions: normalized,
+      rawResponse,
+      debugState,
+    });
   }
 
   private isRequestStillCurrent(request: SuggestionRequest, seq: number): boolean {
@@ -865,20 +927,22 @@ class PromptAutocompleteEditor extends CustomEditor {
   }
 
   cancelActiveRequest(): void {
-    this.requestSeq += 1;
     this.cancelPendingRequest();
     this.setSuggestions([]);
   }
 
   private cancelPendingRequest(): void {
+    this.requestSeq += 1;
+
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = undefined;
     }
-    this.abortController?.abort();
-    this.abortController = undefined;
+
+    this.activeRequestSubscription?.release();
+    this.activeRequestSubscription = undefined;
     this.pendingRequestKey = undefined;
-    this.shared.setSpinnerActive?.(false);
+    this.deactivateSpinner();
   }
 }
 
@@ -895,6 +959,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
 
   let spinnerFrame = 0;
   let spinnerTimer: ReturnType<typeof setInterval> | undefined;
+  const spinnerOwners = new Set<string>();
   const renderSpinner = () => {
     const frame = SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length];
     ctx.ui.setWidget(
@@ -906,8 +971,15 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
   const clearSpinnerWidget = () => {
     ctx.ui.setWidget("prompt-autocomplete-spinner", undefined, { placement: "belowEditor" });
   };
-  shared.setSpinnerActive = (active) => {
+  const stopSpinnerTimer = () => {
+    if (!spinnerTimer) return;
+    clearInterval(spinnerTimer);
+    spinnerTimer = undefined;
+    clearSpinnerWidget();
+  };
+  shared.setSpinnerActive = (owner, active) => {
     if (active) {
+      spinnerOwners.add(owner);
       if (spinnerTimer) return;
       spinnerFrame = 0;
       renderSpinner();
@@ -918,10 +990,13 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
       return;
     }
 
-    if (!spinnerTimer) return;
-    clearInterval(spinnerTimer);
-    spinnerTimer = undefined;
-    clearSpinnerWidget();
+    spinnerOwners.delete(owner);
+    if (spinnerOwners.size > 0) return;
+    stopSpinnerTimer();
+  };
+  shared.clearSpinner = () => {
+    spinnerOwners.clear();
+    stopSpinnerTimer();
   };
 
   ctx.ui.setEditorComponent((tui, theme, keybindings) => {
@@ -942,13 +1017,14 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
 function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
   shared.cancelActiveRequest?.();
   shared.activationId += 1;
-  shared.setSpinnerActive?.(false);
+  shared.clearSpinner?.();
   ctx.ui.setEditorComponent(undefined);
   clearDebugUi(shared);
   shared.refreshEditor = undefined;
   shared.cancelActiveRequest = undefined;
   shared.setStatusText = undefined;
   shared.setSpinnerActive = undefined;
+  shared.clearSpinner = undefined;
 }
 
 function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
@@ -959,7 +1035,7 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.lastError = undefined;
   shared.lastRawResponse = undefined;
   shared.requestCache.clear();
-  shared.inFlightRequests.clear();
+  cancelAllCoalescedRequests(shared.inFlightRequests);
   shared.debugState = shared.enabled ? "configured" : "disabled";
 }
 
@@ -1140,7 +1216,7 @@ export default function (pi: ExtensionAPI) {
     shared.enabled = false;
     shared.cancelActiveRequest?.();
     shared.requestCache.clear();
-    shared.inFlightRequests.clear();
+    cancelAllCoalescedRequests(shared.inFlightRequests);
     if (ctx.hasUI) {
       unmountEditor(ctx, shared);
     }

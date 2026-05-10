@@ -69,6 +69,96 @@ export interface ModelRef {
   id: string;
 }
 
+export interface CoalescedRequestEntry<T> {
+  promise: Promise<T>;
+  controller: AbortController;
+  subscribers: Set<string>;
+  settled: boolean;
+}
+
+export interface CoalescedRequestSubscription<T> {
+  promise: Promise<T>;
+  created: boolean;
+  release: () => void;
+  subscriberCount: () => number;
+}
+
+export function acquireCoalescedRequest<T>(
+  inFlightRequests: Map<string, CoalescedRequestEntry<T>>,
+  key: string,
+  subscriberId: string,
+  start: (signal: AbortSignal) => Promise<T>,
+): CoalescedRequestSubscription<T> {
+  let entry = inFlightRequests.get(key);
+  let created = false;
+
+  if (!entry) {
+    const controller = new AbortController();
+    const subscribers = new Set<string>();
+    let runStart: () => void = () => undefined;
+    const promise = new Promise<T>((resolve, reject) => {
+      runStart = () => {
+        try {
+          Promise.resolve(start(controller.signal)).then(resolve, reject);
+        } catch (error) {
+          reject(error);
+        }
+      };
+    });
+    let entryForFinally: CoalescedRequestEntry<T> | undefined;
+    const settledPromise = promise.finally(() => {
+      if (!entryForFinally) return;
+      entryForFinally.settled = true;
+      if (inFlightRequests.get(key) === entryForFinally) {
+        inFlightRequests.delete(key);
+      }
+    });
+    const nextEntry: CoalescedRequestEntry<T> = {
+      controller,
+      subscribers,
+      settled: false,
+      promise: settledPromise,
+    };
+    entryForFinally = nextEntry;
+
+    entry = nextEntry;
+    inFlightRequests.set(key, entry);
+    created = true;
+    runStart();
+  }
+
+  entry.subscribers.add(subscriberId);
+  let released = false;
+
+  return {
+    promise: entry.promise,
+    created,
+    subscriberCount: () => entry.subscribers.size,
+    release: () => {
+      if (released) return;
+      released = true;
+
+      const current = inFlightRequests.get(key);
+      if (current !== entry) return;
+
+      current.subscribers.delete(subscriberId);
+      if (current.subscribers.size === 0 && !current.settled) {
+        current.controller.abort();
+        inFlightRequests.delete(key);
+      }
+    },
+  };
+}
+
+export function cancelAllCoalescedRequests<T>(inFlightRequests: Map<string, CoalescedRequestEntry<T>>): void {
+  for (const entry of inFlightRequests.values()) {
+    if (!entry.settled) {
+      entry.controller.abort();
+    }
+  }
+  inFlightRequests.clear();
+}
+
 interface SuggestionPayload {
   completions?: unknown;
   suggestions?: unknown;
@@ -90,6 +180,12 @@ function trimAndCollapse(text: string): string {
 function truncateWithEllipsis(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   if (maxChars <= 1) return "…";
+  return `${text.slice(0, maxChars - 1)}…`;
+}
+
+function truncateWithForcedEllipsis(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (maxChars === 1) return "…";
   return `${text.slice(0, maxChars - 1)}…`;
 }
 
@@ -351,24 +447,30 @@ export function extractMessageText(content: unknown, maxChars = Number.POSITIVE_
   for (const block of content) {
     if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
     const text = block.text;
+
     if (Number.isFinite(maxChars)) {
-      if (remaining <= 0) {
+      const separatorLength = parts.length > 0 ? 1 : 0;
+      if (remaining <= separatorLength) {
         truncated = true;
         break;
       }
-      if (text.length > remaining) {
-        parts.push(text.slice(0, remaining));
+
+      const availableForText = Math.max(0, remaining - separatorLength);
+      if (text.length > availableForText) {
+        parts.push(text.slice(0, availableForText));
         truncated = true;
         break;
       }
-      remaining -= text.length + 1;
+
+      remaining -= separatorLength + text.length;
     }
+
     parts.push(text);
   }
 
   const joined = parts.join("\n").trim();
   if (!Number.isFinite(maxChars)) return joined;
-  return truncated ? truncateWithEllipsis(joined, maxChars) : joined;
+  return truncated ? truncateWithForcedEllipsis(joined, maxChars) : joined;
 }
 
 export function buildRecentConversationContext(
@@ -437,6 +539,19 @@ export function buildLatestUserMessageContext(
 export function truncateDraftTail(draft: string, maxChars = MAX_DRAFT_CONTEXT_CHARS): string {
   if (draft.length <= maxChars) return draft;
   return draft.slice(-maxChars);
+}
+
+export function shouldSkipPromptAutocomplete(text: string): boolean {
+  const trimmedStart = text.trimStart();
+  if (trimmedStart.startsWith("/") || trimmedStart.startsWith("!")) return true;
+
+  const lastNewline = text.lastIndexOf("\n");
+  const textBeforeCursor = lastNewline === -1 ? text : text.slice(lastNewline + 1);
+
+  if (/(?:^|[ \t])[@#](?:"[^"]*|[^\s]*)$/.test(textBeforeCursor)) return true;
+  if (/(?:^|[ \t])(?:~\/|\.\.?\/|\/)[^\s]*$/.test(textBeforeCursor)) return true;
+
+  return false;
 }
 
 export function normalizePromptSuggestion(
