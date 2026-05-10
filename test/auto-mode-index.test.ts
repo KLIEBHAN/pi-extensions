@@ -48,6 +48,7 @@ function createHarness(
     args: string[],
     options: Record<string, unknown> | undefined,
   ) => Promise<{ code: number; stdout: string; stderr: string; killed?: boolean }>,
+  appendEntryImpl?: (customType: string, data: unknown) => void,
 ) {
   const flags = new Map(Object.entries(initialFlags));
   const handlers = new Map<string, Function>();
@@ -69,6 +70,10 @@ function createHarness(
       handlers.set(event, handler);
     },
     appendEntry(customType: string, data: unknown) {
+      if (appendEntryImpl) {
+        appendEntryImpl(customType, data);
+        return;
+      }
       entries.push({ type: "custom", customType, data });
     },
     sendUserMessage(text: string, options?: unknown) {
@@ -174,6 +179,68 @@ test("session_start keeps the completion gate controller-only while before_agent
   assert.match(result?.systemPrompt ?? "", /Auto-mode worker rules:/);
   assert.match(result?.systemPrompt ?? "", /Goal: improve onboarding robustness/);
   assert.doesNotMatch(result?.systemPrompt ?? "", /Completion gate:/);
+});
+
+test("session_start pauses fail-closed when auto-mode state cannot be persisted", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness(
+    {
+      "auto-goal": "improve onboarding robustness",
+    },
+    [],
+    undefined,
+    () => {
+      throw new Error("disk full");
+    },
+  );
+
+  createAutoModeExtension()(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+
+  assert.equal(harness.sentMessages.length, 0);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("state persistence failed")));
+  assert.ok(harness.statuses.some((entry) => entry.key === "auto-mode" && entry.value?.includes("paused")));
+});
+
+test("/auto off persistence failure leaves the run paused instead of silently disabled", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const initialState = {
+    version: 2,
+    enabled: true,
+    paused: true,
+    runId: "auto-persist-fail-off",
+    goal: "improve onboarding robustness",
+    mode: "iterations",
+    maxIterations: 8,
+    currentIteration: 2,
+    startedAt: 1,
+    commitPolicy: "final-or-milestone",
+    pushPolicy: "final-or-milestone-if-upstream",
+    assuranceMode: "pragmatic",
+    controllerSummary: "restored",
+    recentDecisions: [],
+    consecutiveControllerFailures: 0,
+    consecutiveWorkerFailures: 0,
+    consecutiveStagnationCount: 0,
+    consecutiveNoChangeCount: 0,
+    resumePolicy: "restore-paused",
+  };
+  const harness = createHarness(
+    {},
+    [{ type: "custom", customType: AUTO_MODE_STATE_TYPE, data: initialState }],
+    undefined,
+    () => {
+      throw new Error("disk full");
+    },
+  );
+
+  createAutoModeExtension()(harness.pi as never);
+  await harness.handlers.get("session_start")?.({ reason: "reload" }, harness.ctx);
+  await harness.commands.get("auto")?.handler("off", harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("state persistence failed")));
+  assert.ok(harness.statuses.at(-1)?.value?.includes("paused"));
 });
 
 test("agent_end stops cleanly in pragmatic mode when the controller says the goal is met", async () => {
@@ -451,23 +518,8 @@ test("default git snapshot treats killed git commands as unavailable", async () 
       const gitCommand = args.join(" ");
       if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
 
-      if (gitCommand === "rev-parse --is-inside-work-tree") {
-        return { code: 0, stdout: "true\n", stderr: "" };
-      }
-      if (gitCommand === "rev-parse HEAD") {
-        return { code: 0, stdout: "head-before-timeout\n", stderr: "" };
-      }
-      if (gitCommand === "status --short --branch --untracked-files=no") {
+      if (gitCommand === "status --porcelain=v2 --branch --untracked-files=all -z") {
         return { code: 0, stdout: "", stderr: "", killed: true };
-      }
-      if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
-        return { code: 1, stdout: "", stderr: "no upstream" };
-      }
-      if (gitCommand === "diff --name-only -z HEAD --") {
-        return { code: 0, stdout: "", stderr: "" };
-      }
-      if (gitCommand === "ls-files --others --exclude-standard -z") {
-        return { code: 0, stdout: "", stderr: "" };
       }
 
       throw new Error(`Unexpected git command: ${gitCommand}`);
@@ -706,23 +758,8 @@ test("default git snapshot fingerprints untracked file contents for no-change de
       const gitCommand = args.join(" ");
       if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
 
-      if (gitCommand === "rev-parse --is-inside-work-tree") {
-        return { code: 0, stdout: "true\n", stderr: "" };
-      }
-      if (gitCommand === "rev-parse HEAD") {
-        return { code: 0, stdout: "head-untracked\n", stderr: "" };
-      }
-      if (gitCommand === "status --short --branch --untracked-files=no") {
-        return { code: 0, stdout: "## main\n", stderr: "" };
-      }
-      if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
-        return { code: 1, stdout: "", stderr: "no upstream" };
-      }
-      if (gitCommand === "diff --name-only -z HEAD --") {
-        return { code: 0, stdout: "", stderr: "" };
-      }
-      if (gitCommand === "ls-files --others --exclude-standard -z") {
-        return { code: 0, stdout: "draft.txt\0", stderr: "" };
+      if (gitCommand === "status --porcelain=v2 --branch --untracked-files=all -z") {
+        return { code: 0, stdout: "# branch.oid head-untracked\0# branch.head main\0? draft.txt\0", stderr: "" };
       }
       if (gitCommand === "hash-object --no-filters -- draft.txt") {
         return { code: 0, stdout: `${untrackedHash}\n`, stderr: "" };
@@ -784,27 +821,12 @@ test("default git snapshot uses metadata fallback for many untracked files", asy
       const gitCommand = args.join(" ");
       if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
 
-      if (gitCommand === "rev-parse --is-inside-work-tree") {
-        return { code: 0, stdout: "true\n", stderr: "" };
-      }
-      if (gitCommand === "rev-parse HEAD") {
-        return { code: 0, stdout: "head-many-untracked\n", stderr: "" };
-      }
-      if (gitCommand === "status --short --branch --untracked-files=no") {
+      if (gitCommand === "status --porcelain=v2 --branch --untracked-files=all -z") {
         return {
           code: 0,
-          stdout: "## main\n",
+          stdout: `# branch.oid head-many-untracked\0# branch.head main\0${untrackedPaths.map((path) => `? ${path}`).join("\0")}\0`,
           stderr: "",
         };
-      }
-      if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
-        return { code: 1, stdout: "", stderr: "no upstream" };
-      }
-      if (gitCommand === "diff --name-only -z HEAD --") {
-        return { code: 0, stdout: "", stderr: "" };
-      }
-      if (gitCommand === "ls-files --others --exclude-standard -z") {
-        return { code: 0, stdout: `${untrackedPaths.join("\0")}\0`, stderr: "" };
       }
       if (gitCommand.startsWith("hash-object ")) {
         throw new Error("hash-object should not be called for metadata-fallback untracked files");
@@ -866,27 +888,12 @@ test("default git snapshot uses path-only fallback for very large untracked sets
       const gitCommand = args.join(" ");
       if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
 
-      if (gitCommand === "rev-parse --is-inside-work-tree") {
-        return { code: 0, stdout: "true\n", stderr: "" };
-      }
-      if (gitCommand === "rev-parse HEAD") {
-        return { code: 0, stdout: "head-path-only-untracked\n", stderr: "" };
-      }
-      if (gitCommand === "status --short --branch --untracked-files=no") {
+      if (gitCommand === "status --porcelain=v2 --branch --untracked-files=all -z") {
         return {
           code: 0,
-          stdout: "## main\n",
+          stdout: `# branch.oid head-path-only-untracked\0# branch.head main\0${untrackedPaths.map((path) => `? ${path}`).join("\0")}\0`,
           stderr: "",
         };
-      }
-      if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
-        return { code: 1, stdout: "", stderr: "no upstream" };
-      }
-      if (gitCommand === "diff --name-only -z HEAD --") {
-        return { code: 0, stdout: "", stderr: "" };
-      }
-      if (gitCommand === "ls-files --others --exclude-standard -z") {
-        return { code: 0, stdout: `${untrackedPaths.join("\0")}\0`, stderr: "" };
       }
       if (gitCommand.startsWith("hash-object ")) {
         throw new Error("hash-object should not be called for path-only untracked files");

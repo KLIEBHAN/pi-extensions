@@ -43,6 +43,7 @@ import {
 
 const STATUS_KEY = "auto-mode";
 const GIT_DIFF_TIMEOUT_MS = 120_000;
+const CONTROLLER_DECISION_TIMEOUT_MS = 120_000;
 const VERIFY_COMMAND_TIMEOUT_MS = 600_000;
 const MAX_UNTRACKED_CONTENT_HASH_FILES = 100;
 const MAX_UNTRACKED_CONTENT_HASH_BYTES = 5 * 1024 * 1024;
@@ -92,6 +93,17 @@ interface ParsedPathList {
   total: number;
   truncated: boolean;
   rawHash: string;
+}
+
+interface ParsedGitStatusV2 {
+  head?: string;
+  branchHead?: string;
+  upstream?: string;
+  ahead?: number;
+  behind?: number;
+  statusLines: string[];
+  trackedPaths: string[];
+  untrackedPaths: string[];
 }
 
 interface UntrackedFileMetadata {
@@ -198,8 +210,27 @@ function setStatus(ctx: ExtensionContext | ExtensionCommandContext, snapshot: Au
   );
 }
 
-function persistSnapshot(pi: ExtensionAPI, snapshot: AutoModeStateV2): void {
-  pi.appendEntry(AUTO_MODE_STATE_TYPE, snapshot);
+function persistSnapshot(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext | ExtensionCommandContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV2,
+): boolean {
+  try {
+    pi.appendEntry(AUTO_MODE_STATE_TYPE, snapshot);
+    return true;
+  } catch (error) {
+    snapshot.enabled = true;
+    snapshot.paused = true;
+    snapshot.lastStopReason = "state persistence failed";
+    runtime.snapshot = snapshot;
+    setStatus(ctx, snapshot);
+    ctx.ui.notify(
+      `Auto-mode paused: state persistence failed (${getErrorMessage(error)})`,
+      "warning",
+    );
+    return false;
+  }
 }
 
 function restorePersistedSnapshot(ctx: ExtensionContext): AutoModeStateV2 | undefined {
@@ -371,12 +402,6 @@ function formatGitCommandFailure(label: string, result: ExecLikeResult): string 
   return `${label} ${reason}: ${summarizeBashOutput(result.stdout, result.stderr, 500)}`;
 }
 
-function ensureGitCommandSucceeded(label: string, result: ExecLikeResult): void {
-  if (result.killed === true || result.code !== 0) {
-    throw new Error(formatGitCommandFailure(label, result));
-  }
-}
-
 function buildGitRepoFingerprint(statusText: string, trackedFilesText: string, untrackedFilesText: string): string {
   return createHash("sha256")
     .update("status\0")
@@ -392,27 +417,12 @@ function emptyFileFingerprint(): FileFingerprint {
   return { fingerprint: "", total: 0, samplePaths: [], mode: "none" };
 }
 
-function parseNulSeparatedGitOutput(output: string, sampleLimit: number): ParsedPathList {
-  const paths: string[] = [];
-  let total = 0;
-  let start = 0;
-
-  for (let index = 0; index <= output.length; index += 1) {
-    if (index < output.length && output[index] !== "\0") continue;
-    const value = output.slice(start, index);
-    start = index + 1;
-    if (!value) continue;
-    total += 1;
-    if (paths.length < sampleLimit) {
-      paths.push(value);
-    }
-  }
-
+function buildParsedPathList(paths: string[], sampleLimit: number): ParsedPathList {
   return {
-    paths,
-    total,
-    truncated: total > paths.length,
-    rawHash: hashString(output),
+    paths: paths.slice(0, sampleLimit),
+    total: paths.length,
+    truncated: paths.length > sampleLimit,
+    rawHash: hashString(paths.join("\0")),
   };
 }
 
@@ -547,104 +557,160 @@ async function buildFilesFingerprint(
   };
 }
 
-async function getUntrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Promise<FileFingerprint> {
-  const untrackedFiles = await pi.exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
-    cwd,
-    timeout: GIT_DIFF_TIMEOUT_MS,
-  });
-  ensureGitCommandSucceeded("git ls-files --others", untrackedFiles);
-  if (!untrackedFiles.stdout) {
-    return emptyFileFingerprint();
-  }
-
-  const parsed = parseNulSeparatedGitOutput(untrackedFiles.stdout, MAX_UNTRACKED_METADATA_FILES + 1);
-  return buildFilesFingerprint(pi, cwd, "untracked", parsed, {
-    maxMetadataFiles: MAX_UNTRACKED_METADATA_FILES,
-    maxContentHashFiles: MAX_UNTRACKED_CONTENT_HASH_FILES,
-    maxContentHashBytes: MAX_UNTRACKED_CONTENT_HASH_BYTES,
-    maxContentHashPathChars: MAX_UNTRACKED_CONTENT_HASH_PATH_CHARS,
-  });
-}
-
-async function getTrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Promise<FileFingerprint> {
-  const trackedFiles = await pi.exec("git", ["diff", "--name-only", "-z", "HEAD", "--"], {
-    cwd,
-    timeout: GIT_DIFF_TIMEOUT_MS,
-  });
-  ensureGitCommandSucceeded("git diff --name-only", trackedFiles);
-  if (!trackedFiles.stdout) {
-    return emptyFileFingerprint();
-  }
-
-  const parsed = parseNulSeparatedGitOutput(trackedFiles.stdout, MAX_TRACKED_METADATA_FILES + 1);
-  return buildFilesFingerprint(pi, cwd, "tracked", parsed, {
-    maxMetadataFiles: MAX_TRACKED_METADATA_FILES,
-    maxContentHashFiles: MAX_TRACKED_CONTENT_HASH_FILES,
-    maxContentHashBytes: MAX_TRACKED_CONTENT_HASH_BYTES,
-    maxContentHashPathChars: MAX_TRACKED_CONTENT_HASH_PATH_CHARS,
-  });
-}
-
-function parseGitStatusChangedFiles(statusText: string): { files: string[]; total: number } {
-  const files: string[] = [];
-  let total = 0;
-  const lines = statusText.split("\n");
-  for (let index = 1; index < lines.length; index += 1) {
-    const path = lines[index]!.slice(3).trim();
-    if (!path) continue;
-    total += 1;
-    if (files.length < MAX_GIT_CHANGED_FILES_STATE) {
-      files.push(path);
+function fieldAfterSpaces(record: string, spacesBeforeField: number): string {
+  let spaces = 0;
+  for (let index = 0; index < record.length; index += 1) {
+    if (record[index] !== " ") continue;
+    spaces += 1;
+    if (spaces === spacesBeforeField) {
+      return record.slice(index + 1);
     }
   }
-  return { files, total };
+  return "";
+}
+
+function parseGitStatusV2(output: string): ParsedGitStatusV2 {
+  const parsed: ParsedGitStatusV2 = {
+    statusLines: [],
+    trackedPaths: [],
+    untrackedPaths: [],
+  };
+  const entries = output.split("\0").filter(Boolean);
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!;
+
+    if (entry.startsWith("# branch.oid ")) {
+      const oid = entry.slice("# branch.oid ".length).trim();
+      parsed.head = oid && oid !== "(initial)" ? oid : undefined;
+      continue;
+    }
+
+    if (entry.startsWith("# branch.head ")) {
+      parsed.branchHead = entry.slice("# branch.head ".length).trim() || undefined;
+      continue;
+    }
+
+    if (entry.startsWith("# branch.upstream ")) {
+      parsed.upstream = entry.slice("# branch.upstream ".length).trim() || undefined;
+      continue;
+    }
+
+    if (entry.startsWith("# branch.ab ")) {
+      const match = /\+(\d+)\s+-(\d+)/.exec(entry);
+      if (match) {
+        parsed.ahead = Number(match[1]);
+        parsed.behind = Number(match[2]);
+      }
+      continue;
+    }
+
+    const recordType = entry[0];
+    if (recordType === "1") {
+      const path = fieldAfterSpaces(entry, 8);
+      if (!path) continue;
+      const xy = entry.slice(2, 4).replace(/\./g, " ");
+      parsed.trackedPaths.push(path);
+      parsed.statusLines.push(`${xy} ${path}`);
+      continue;
+    }
+
+    if (recordType === "2") {
+      const path = fieldAfterSpaces(entry, 9);
+      if (!path) continue;
+      const xy = entry.slice(2, 4).replace(/\./g, " ");
+      const originalPath = entries[index + 1];
+      parsed.trackedPaths.push(path);
+      parsed.statusLines.push(`${xy} ${originalPath ? `${originalPath} -> ${path}` : path}`);
+      if (originalPath) {
+        index += 1; // porcelain v2 -z stores the original rename path in the next record.
+      }
+      continue;
+    }
+
+    if (recordType === "u") {
+      const path = fieldAfterSpaces(entry, 10);
+      if (!path) continue;
+      const xy = entry.slice(2, 4).replace(/\./g, " ");
+      parsed.trackedPaths.push(path);
+      parsed.statusLines.push(`${xy} ${path}`);
+      continue;
+    }
+
+    if (recordType === "?") {
+      const path = entry.slice(2);
+      if (!path) continue;
+      parsed.untrackedPaths.push(path);
+      parsed.statusLines.push(`?? ${path}`);
+    }
+  }
+
+  return parsed;
+}
+
+function buildGitStatusText(status: ParsedGitStatusV2): string {
+  const branchLabel = status.branchHead && status.branchHead !== "(detached)"
+    ? status.branchHead
+    : status.head
+      ? `HEAD ${status.head.slice(0, 12)}`
+      : "HEAD";
+  const upstream = status.upstream ? `...${status.upstream}` : "";
+  const divergence = [
+    (status.ahead ?? 0) > 0 ? `ahead ${status.ahead}` : undefined,
+    (status.behind ?? 0) > 0 ? `behind ${status.behind}` : undefined,
+  ].filter((value): value is string => !!value);
+  const branchLine = `## ${branchLabel}${upstream}${divergence.length > 0 ? ` [${divergence.join(", ")}]` : ""}`;
+  return [branchLine, ...status.statusLines].join("\n").trim() || "working tree clean";
 }
 
 async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapshot | undefined> {
-  const isRepo = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS });
-  if (isRepo.killed === true) {
-    throw new Error(formatGitCommandFailure("git rev-parse --is-inside-work-tree", isRepo));
-  }
-  if (isRepo.code !== 0 || !isRepo.stdout.includes("true")) {
-    return undefined;
-  }
+  const statusResult = await pi.exec("git", ["status", "--porcelain=v2", "--branch", "--untracked-files=all", "-z"], {
+    cwd,
+    timeout: GIT_DIFF_TIMEOUT_MS,
+  });
 
-  const [head, status, upstream, trackedFilesFingerprint, untrackedFilesFingerprint] = await Promise.all([
-    pi.exec("git", ["rev-parse", "HEAD"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
-    pi.exec("git", ["status", "--short", "--branch", "--untracked-files=no"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
-    pi.exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
-    getTrackedFilesFingerprint(pi, cwd),
-    getUntrackedFilesFingerprint(pi, cwd),
-  ]);
-
-  if (head.killed === true) {
-    throw new Error(formatGitCommandFailure("git rev-parse HEAD", head));
-  }
-  ensureGitCommandSucceeded("git status --short --branch --untracked-files=no", status);
-  if (upstream.killed === true) {
-    throw new Error(formatGitCommandFailure("git rev-parse @{upstream}", upstream));
+  if (statusResult.killed === true) {
+    throw new Error(formatGitCommandFailure("git status --porcelain=v2 --branch -z", statusResult));
   }
 
-  let ahead: number | undefined;
-  let behind: number | undefined;
-  const hasUpstream = upstream.code === 0 && upstream.stdout.trim().length > 0;
-
-  if (hasUpstream) {
-    const divergence = await pi.exec("git", ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS });
-    ensureGitCommandSucceeded("git rev-list @{upstream}...HEAD", divergence);
-    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(divergence.stdout.trim());
-    if (!match) {
-      throw new Error(`git rev-list @{upstream}...HEAD returned unexpected output: ${summarizeBashOutput(divergence.stdout, divergence.stderr, 500)}`);
+  if (statusResult.code !== 0) {
+    const output = `${statusResult.stdout}\n${statusResult.stderr}`.toLowerCase();
+    if (output.includes("not a git repository") || output.includes("not a git repo")) {
+      return undefined;
     }
-    behind = Number(match[1]);
-    ahead = Number(match[2]);
+    throw new Error(formatGitCommandFailure("git status --porcelain=v2 --branch -z", statusResult));
   }
 
-  const statusText = status.stdout.trim() || "working tree clean";
-  const trackedChanged = parseGitStatusChangedFiles(statusText);
-  const changedFileCount = trackedChanged.total + untrackedFilesFingerprint.total;
+  const status = parseGitStatusV2(statusResult.stdout);
+  const trackedFilesFingerprint = await buildFilesFingerprint(
+    pi,
+    cwd,
+    "tracked",
+    buildParsedPathList(status.trackedPaths, MAX_TRACKED_METADATA_FILES + 1),
+    {
+      maxMetadataFiles: MAX_TRACKED_METADATA_FILES,
+      maxContentHashFiles: MAX_TRACKED_CONTENT_HASH_FILES,
+      maxContentHashBytes: MAX_TRACKED_CONTENT_HASH_BYTES,
+      maxContentHashPathChars: MAX_TRACKED_CONTENT_HASH_PATH_CHARS,
+    },
+  );
+  const untrackedFilesFingerprint = await buildFilesFingerprint(
+    pi,
+    cwd,
+    "untracked",
+    buildParsedPathList(status.untrackedPaths, MAX_UNTRACKED_METADATA_FILES + 1),
+    {
+      maxMetadataFiles: MAX_UNTRACKED_METADATA_FILES,
+      maxContentHashFiles: MAX_UNTRACKED_CONTENT_HASH_FILES,
+      maxContentHashBytes: MAX_UNTRACKED_CONTENT_HASH_BYTES,
+      maxContentHashPathChars: MAX_UNTRACKED_CONTENT_HASH_PATH_CHARS,
+    },
+  );
+
+  const statusText = buildGitStatusText(status);
+  const changedFileCount = trackedFilesFingerprint.total + untrackedFilesFingerprint.total;
   const changedFiles = [
-    ...trackedChanged.files,
+    ...trackedFilesFingerprint.samplePaths,
     ...untrackedFilesFingerprint.samplePaths.map((path) => `?? ${path}`),
   ].slice(0, MAX_GIT_CHANGED_FILES_STATE);
   const statusSections = [
@@ -665,15 +731,15 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
 
   return {
     isGitRepo: true,
-    head: head.code === 0 ? head.stdout.trim() : undefined,
+    head: status.head,
     status: truncateMiddle(statusSections.join("\n"), MAX_GIT_STATUS_CHARS),
     changedFiles,
     changedFileCount,
     untrackedFileCount: untrackedFilesFingerprint.total,
     dirty: changedFileCount > 0,
-    hasUpstream,
-    ahead,
-    behind,
+    hasUpstream: !!status.upstream,
+    ahead: status.ahead,
+    behind: status.behind,
     repoFingerprint,
   };
 }
@@ -725,6 +791,39 @@ function resolveControllerModel(snapshot: AutoModeStateV2, ctx: ExtensionContext
   return undefined;
 }
 
+async function withControllerTimeout<T>(ctx: ExtensionContext, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  if (ctx.signal.aborted) {
+    throw new Error("controller decision aborted before start");
+  }
+
+  const controller = new AbortController();
+  let rejectWait: ((error: Error) => void) | undefined;
+  const timeout = setTimeout(() => {
+    const error = new Error(`controller decision timed out after ${CONTROLLER_DECISION_TIMEOUT_MS}ms`);
+    controller.abort(error);
+    rejectWait?.(error);
+  }, CONTROLLER_DECISION_TIMEOUT_MS);
+  const abortFromParent = () => {
+    const error = ctx.signal.reason instanceof Error
+      ? ctx.signal.reason
+      : new Error("controller decision aborted");
+    controller.abort(ctx.signal.reason);
+    rejectWait?.(error);
+  };
+  const waitForAbort = new Promise<never>((_resolve, reject) => {
+    rejectWait = reject;
+  });
+  ctx.signal.addEventListener("abort", abortFromParent, { once: true });
+
+  try {
+    return await Promise.race([run(controller.signal), waitForAbort]);
+  } finally {
+    clearTimeout(timeout);
+    ctx.signal.removeEventListener("abort", abortFromParent);
+    rejectWait = undefined;
+  }
+}
+
 async function completeControllerDecision(
   ctx: ExtensionContext,
   snapshot: AutoModeStateV2,
@@ -746,7 +845,7 @@ async function completeControllerDecision(
     timestamp: now(),
   };
 
-  const response = await complete(
+  const response = await withControllerTimeout(ctx, (signal) => complete(
     model,
     {
       systemPrompt: AUTO_CONTROLLER_SYSTEM_PROMPT,
@@ -755,10 +854,10 @@ async function completeControllerDecision(
     {
       apiKey: auth.apiKey,
       headers: auth.headers,
-      signal: ctx.signal,
+      signal,
       reasoningEffort: "minimal",
     },
-  );
+  ));
 
   if (response.stopReason !== "stop") {
     return undefined;
@@ -788,7 +887,6 @@ async function decideControllerAction(
 
 function updateNoChangeCounters(snapshot: AutoModeStateV2, gitSnapshot: GitSnapshot | undefined): void {
   const nextHead = gitSnapshot?.head;
-  const nextFiles = gitSnapshot?.changedFiles ?? [];
   const nextFingerprint = gitSnapshot?.repoFingerprint;
   const previousHead = snapshot.lastSeenHead;
   const previousFingerprint = snapshot.lastSeenRepoFingerprint;
@@ -803,7 +901,6 @@ function updateNoChangeCounters(snapshot: AutoModeStateV2, gitSnapshot: GitSnaps
   }
 
   snapshot.lastSeenHead = nextHead;
-  snapshot.lastSeenChangedFiles = [...nextFiles];
   snapshot.lastSeenRepoFingerprint = nextFingerprint;
 }
 
@@ -872,14 +969,17 @@ function pauseSnapshot(
   runtime: AutoRuntimeState,
   reason: string,
   level: "info" | "warning" = "warning",
-): void {
+): boolean {
   const snapshot = runtime.snapshot;
-  if (!snapshot) return;
+  if (!snapshot) return false;
   snapshot.paused = true;
   snapshot.lastStopReason = reason;
-  persistSnapshot(pi, snapshot);
+  const persisted = persistSnapshot(pi, ctx, runtime, snapshot);
   setStatus(ctx, snapshot);
-  ctx.ui.notify(`Auto-mode paused: ${reason}`, level);
+  if (persisted) {
+    ctx.ui.notify(`Auto-mode paused: ${reason}`, level);
+  }
+  return persisted;
 }
 
 function disableSnapshot(
@@ -888,15 +988,18 @@ function disableSnapshot(
   runtime: AutoRuntimeState,
   reason: string,
   level: "info" | "warning" = "info",
-): void {
+): boolean {
   const snapshot = runtime.snapshot;
-  if (!snapshot) return;
+  if (!snapshot) return false;
   snapshot.enabled = false;
   snapshot.paused = false;
   snapshot.lastStopReason = reason;
-  persistSnapshot(pi, snapshot);
-  setStatus(ctx, undefined);
-  ctx.ui.notify(`Auto-mode stopped: ${reason}`, level);
+  const persisted = persistSnapshot(pi, ctx, runtime, snapshot);
+  setStatus(ctx, persisted ? undefined : snapshot);
+  if (persisted) {
+    ctx.ui.notify(`Auto-mode stopped: ${reason}`, level);
+  }
+  return persisted;
 }
 
 function ensureModelAvailable(ctx: ExtensionContext | ExtensionCommandContext): string | undefined {
@@ -949,7 +1052,9 @@ async function startAutoMode(
 
   const startPrompt = getStartPrompt(snapshot);
   snapshot.lastAutoPrompt = startPrompt;
-  persistSnapshot(pi, snapshot);
+  if (!persistSnapshot(pi, ctx, runtime, snapshot)) {
+    return;
+  }
 
   ctx.ui.notify(
     `Auto-mode started (${snapshot.mode}, ${snapshot.assuranceMode}, ${snapshot.currentIteration}/${snapshot.maxIterations})`,
@@ -998,7 +1103,9 @@ function restoreSnapshotOnSessionStart(
   }
 
   if (restored.paused !== previousPaused || hadMigrationWarnings) {
-    persistSnapshot(pi, restored);
+    if (!persistSnapshot(pi, ctx, runtime, restored)) {
+      return { resumed: false };
+    }
   }
 
   setStatus(ctx, restored);
@@ -1025,7 +1132,9 @@ async function resumeAutoMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, ru
   snapshot.paused = false;
   const resumePrompt = getResumePrompt(snapshot);
   snapshot.lastAutoPrompt = resumePrompt;
-  persistSnapshot(pi, snapshot);
+  if (!persistSnapshot(pi, ctx, runtime, snapshot)) {
+    return;
+  }
   setStatus(ctx, snapshot);
   ctx.ui.notify("Auto-mode resumed", "info");
   pi.sendUserMessage(resumePrompt);
@@ -1147,10 +1256,197 @@ function queueContinueLikeFollowUp(
 
   snapshot.lastAutoPrompt = followUpPlan.nextPrompt;
   snapshot.currentIteration = followUpPlan.nextIteration;
-  persistSnapshot(pi, snapshot);
+  if (!persistSnapshot(pi, ctx, runtime, snapshot)) {
+    return;
+  }
   setStatus(ctx, snapshot);
   ctx.ui.notify(options.notifyMessage, options.notifyLevel ?? "info");
   pi.sendUserMessage(followUpPlan.nextPrompt);
+}
+
+type GitSnapshotLoadResult = { ok: true; snapshot: GitSnapshot | undefined } | { ok: false };
+
+type AutoEvidenceResult =
+  | {
+      ok: true;
+      gitSnapshot: GitSnapshot | undefined;
+      verifyResult: VerifyCommandResult | undefined;
+      verifyRan: boolean;
+    }
+  | { ok: false };
+
+function recordWorkerOutcome(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV2,
+  workerTurn: WorkerTurnSnapshot,
+): boolean {
+  snapshot.lastWorkerFinishedAt = now();
+
+  if (!shouldTreatWorkerFailure(workerTurn.stopReason)) {
+    snapshot.consecutiveWorkerFailures = 0;
+    return true;
+  }
+
+  snapshot.consecutiveWorkerFailures += 1;
+  if (snapshot.consecutiveWorkerFailures < DEFAULT_WORKER_FAILURE_LIMIT) {
+    return true;
+  }
+
+  pauseSnapshot(pi, ctx, runtime, `worker failed ${snapshot.consecutiveWorkerFailures} times in a row`);
+  return false;
+}
+
+async function loadGitSnapshotOrPause(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutoRuntimeState,
+  getGitSnapshotImpl: typeof getGitSnapshot,
+): Promise<GitSnapshotLoadResult> {
+  try {
+    return { ok: true, snapshot: await getGitSnapshotImpl(pi, ctx.cwd) };
+  } catch (error) {
+    pauseSnapshot(pi, ctx, runtime, `git state unavailable: ${getErrorMessage(error)}`);
+    return { ok: false };
+  }
+}
+
+async function gatherEvidence(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV2,
+  workerTurn: WorkerTurnSnapshot,
+  getGitSnapshotImpl: typeof getGitSnapshot,
+  runVerifyCommandImpl: typeof runVerifyCommand,
+): Promise<AutoEvidenceResult> {
+  const loadedGitSnapshot = await loadGitSnapshotOrPause(pi, ctx, runtime, getGitSnapshotImpl);
+  if (!loadedGitSnapshot.ok) return { ok: false };
+
+  const gitSnapshot = loadedGitSnapshot.snapshot;
+  updateNoChangeCounters(snapshot, gitSnapshot);
+
+  let verifyResult: VerifyCommandResult | undefined;
+  let verifyRan = false;
+  if (shouldPreRunVerifyCommand({
+    verifyCommandConfigured: !!snapshot.verifyCommand,
+    stopReason: workerTurn.stopReason,
+    currentIteration: snapshot.currentIteration,
+    maxIterations: snapshot.maxIterations,
+  }) && snapshot.verifyCommand) {
+    verifyResult = await runVerifyCommandSafely(runVerifyCommandImpl, pi, ctx.cwd, snapshot.verifyCommand);
+    verifyRan = true;
+  }
+
+  return { ok: true, gitSnapshot, verifyResult, verifyRan };
+}
+
+async function decideControllerActionSafely(
+  ctx: ExtensionContext,
+  snapshot: AutoModeStateV2,
+  workerTurn: WorkerTurnSnapshot,
+  gitSnapshot: GitSnapshot | undefined,
+  verifyResult: VerifyCommandResult | undefined,
+  decideControllerActionImpl: typeof decideControllerAction,
+): Promise<ControllerDecision | undefined> {
+  try {
+    return await decideControllerActionImpl(ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
+  } catch {
+    return undefined;
+  }
+}
+
+function handleInconclusiveControllerDecision(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV2,
+): void {
+  snapshot.consecutiveControllerFailures += 1;
+  if (snapshot.consecutiveControllerFailures >= DEFAULT_CONTROLLER_FAILURE_LIMIT) {
+    pauseSnapshot(pi, ctx, runtime, `controller failed ${snapshot.consecutiveControllerFailures} times in a row`);
+    return;
+  }
+
+  if (persistSnapshot(pi, ctx, runtime, snapshot)) {
+    ctx.ui.notify("Auto-mode controller was inconclusive; waiting for the next worker turn.", "warning");
+  }
+}
+
+function applyContinueDecision(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV2,
+  decision: ContinueDecision,
+): void {
+  recordControllerDecision(snapshot, decision);
+  queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, decision, {
+    budgetPauseReason: "iteration budget exhausted",
+    notifyMessage: `Auto-mode continuing (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
+    notifyLevel: "info",
+  });
+}
+
+async function applyStopDecision(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV2,
+  decision: Extract<ControllerDecision, { action: "stop" }>,
+  evidence: Extract<AutoEvidenceResult, { ok: true }>,
+  getGitSnapshotImpl: typeof getGitSnapshot,
+  runVerifyCommandImpl: typeof runVerifyCommand,
+): Promise<void> {
+  let gitSnapshot = evidence.gitSnapshot;
+  let verifyResult = evidence.verifyResult;
+  let gitSnapshotMayBeStale = evidence.verifyRan;
+
+  if (snapshot.verifyCommand && !verifyResult) {
+    verifyResult = await runVerifyCommandSafely(runVerifyCommandImpl, pi, ctx.cwd, snapshot.verifyCommand);
+    gitSnapshotMayBeStale = true;
+  }
+
+  // Verification commands can write coverage, snapshots, lockfiles, or other artifacts.
+  // Refresh before finalization guards whenever verification ran after the initial git read.
+  if (gitSnapshotMayBeStale) {
+    const loadedGitSnapshot = await loadGitSnapshotOrPause(pi, ctx, runtime, getGitSnapshotImpl);
+    if (!loadedGitSnapshot.ok) return;
+    gitSnapshot = loadedGitSnapshot.snapshot;
+  }
+
+  const stopGuard = evaluateAutoStopGuard({
+    goalStatus: decision.goalStatus,
+    requiresCompletionGate: !!snapshot.untilPrompt,
+    completionGateMet: decision.completionGateMet,
+    verifyCommandConfigured: !!snapshot.verifyCommand,
+    verifyCommandPassed: snapshot.verifyCommand ? !!verifyResult?.ok : false,
+    commitPolicy: snapshot.commitPolicy,
+    pushPolicy: snapshot.pushPolicy,
+    git: gitSnapshot
+      ? {
+          dirty: gitSnapshot.dirty,
+          hasUpstream: gitSnapshot.hasUpstream,
+          ahead: gitSnapshot.ahead,
+          behind: gitSnapshot.behind,
+        }
+      : undefined,
+  });
+
+  if (!stopGuard.allowed) {
+    const blockedDecision = buildBlockedStopDecision(snapshot, decision, stopGuard);
+    recordControllerDecision(snapshot, blockedDecision);
+    queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, blockedDecision, {
+      budgetPauseReason: `iteration budget exhausted before completion: ${decision.reason}`,
+      notifyMessage: `Auto-mode finalization pass requested: ${blockedDecision.reason}`,
+      notifyLevel: "warning",
+    });
+    return;
+  }
+
+  recordControllerDecision(snapshot, decision);
+  disableSnapshot(pi, ctx, runtime, decision.finalMessage || decision.reason, decision.completionGateMet ? "info" : "warning");
 }
 
 export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
@@ -1275,7 +1571,9 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
             runtime.snapshot.controllerSummary = truncateControllerSummary(
               `${runtime.snapshot.controllerSummary}\n\nUser nudge: ${parsed.text}`,
             );
-            persistSnapshot(pi, runtime.snapshot);
+            if (!persistSnapshot(pi, ctx, runtime, runtime.snapshot)) {
+              return;
+            }
             ctx.ui.notify("Auto-mode nudge recorded", "info");
             if (ctx.isIdle() && !runtime.snapshot.paused) {
               pi.sendUserMessage(`Additional direction while continuing the same goal: ${parsed.text}`);
@@ -1323,8 +1621,9 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
         if (restoreResult.resumed && runtime.snapshot && ctx.isIdle()) {
           const resumePrompt = getResumePrompt(runtime.snapshot);
           runtime.snapshot.lastAutoPrompt = resumePrompt;
-          persistSnapshot(pi, runtime.snapshot);
-          pi.sendUserMessage(resumePrompt);
+          if (persistSnapshot(pi, ctx, runtime, runtime.snapshot)) {
+            pi.sendUserMessage(resumePrompt);
+          }
         }
         return;
       }
@@ -1353,72 +1652,38 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
       runtime.controllerBusy = true;
 
       try {
-        snapshot.lastWorkerFinishedAt = now();
+        if (!recordWorkerOutcome(pi, ctx, runtime, snapshot, workerTurn)) return;
 
-        if (shouldTreatWorkerFailure(workerTurn.stopReason)) {
-          snapshot.consecutiveWorkerFailures += 1;
-          if (snapshot.consecutiveWorkerFailures >= DEFAULT_WORKER_FAILURE_LIMIT) {
-            pauseSnapshot(pi, ctx, runtime, `worker failed ${snapshot.consecutiveWorkerFailures} times in a row`);
-            return;
-          }
-        } else {
-          snapshot.consecutiveWorkerFailures = 0;
-        }
+        const evidence = await gatherEvidence(
+          pi,
+          ctx,
+          runtime,
+          snapshot,
+          workerTurn,
+          getGitSnapshotImpl,
+          runVerifyCommandImpl,
+        );
+        if (!evidence.ok) return;
 
-        const loadGitSnapshot = async (): Promise<{ ok: true; snapshot: GitSnapshot | undefined } | { ok: false }> => {
-          try {
-            return { ok: true, snapshot: await getGitSnapshotImpl(pi, ctx.cwd) };
-          } catch (error) {
-            pauseSnapshot(pi, ctx, runtime, `git state unavailable: ${getErrorMessage(error)}`);
-            return { ok: false };
-          }
-        };
+        const rawDecision = await decideControllerActionSafely(
+          ctx,
+          snapshot,
+          workerTurn,
+          evidence.gitSnapshot,
+          evidence.verifyResult,
+          decideControllerActionImpl,
+        );
 
-        let loadedGitSnapshot = await loadGitSnapshot();
-        if (!loadedGitSnapshot.ok) return;
-        let gitSnapshot = loadedGitSnapshot.snapshot;
-        updateNoChangeCounters(snapshot, gitSnapshot);
-
-        let verifyResult: VerifyCommandResult | undefined;
-        let verifyRan = false;
-        if (shouldPreRunVerifyCommand({
-          verifyCommandConfigured: !!snapshot.verifyCommand,
-          stopReason: workerTurn.stopReason,
-          currentIteration: snapshot.currentIteration,
-          maxIterations: snapshot.maxIterations,
-        }) && snapshot.verifyCommand) {
-          verifyResult = await runVerifyCommandSafely(runVerifyCommandImpl, pi, ctx.cwd, snapshot.verifyCommand);
-          verifyRan = true;
-        }
-
-        let decision: ControllerDecision | undefined;
-        try {
-          decision = await decideControllerActionImpl(ctx, snapshot, workerTurn, gitSnapshot, verifyResult);
-        } catch {
-          decision = undefined;
-        }
-
-        if (!decision) {
-          snapshot.consecutiveControllerFailures += 1;
-          if (snapshot.consecutiveControllerFailures >= DEFAULT_CONTROLLER_FAILURE_LIMIT) {
-            pauseSnapshot(pi, ctx, runtime, `controller failed ${snapshot.consecutiveControllerFailures} times in a row`);
-          } else {
-            persistSnapshot(pi, snapshot);
-            ctx.ui.notify("Auto-mode controller was inconclusive; waiting for the next worker turn.", "warning");
-          }
+        if (!rawDecision) {
+          handleInconclusiveControllerDecision(pi, ctx, runtime, snapshot);
           return;
         }
 
         snapshot.consecutiveControllerFailures = 0;
-        decision = sanitizeControllerDecision(decision);
+        const decision = sanitizeControllerDecision(rawDecision);
 
         if (decision.action === "continue") {
-          recordControllerDecision(snapshot, decision);
-          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, decision, {
-            budgetPauseReason: "iteration budget exhausted",
-            notifyMessage: `Auto-mode continuing (${Math.min(snapshot.currentIteration + 1, snapshot.maxIterations)}/${snapshot.maxIterations})`,
-            notifyLevel: "info",
-          });
+          applyContinueDecision(pi, ctx, runtime, snapshot, decision);
           return;
         }
 
@@ -1428,48 +1693,16 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           return;
         }
 
-        if (snapshot.verifyCommand && !verifyResult) {
-          verifyResult = await runVerifyCommandSafely(runVerifyCommandImpl, pi, ctx.cwd, snapshot.verifyCommand);
-          verifyRan = true;
-        }
-
-        if (verifyRan) {
-          loadedGitSnapshot = await loadGitSnapshot();
-          if (!loadedGitSnapshot.ok) return;
-          gitSnapshot = loadedGitSnapshot.snapshot;
-        }
-
-        const stopGuard = evaluateAutoStopGuard({
-          goalStatus: decision.goalStatus,
-          requiresCompletionGate: !!snapshot.untilPrompt,
-          completionGateMet: decision.completionGateMet,
-          verifyCommandConfigured: !!snapshot.verifyCommand,
-          verifyCommandPassed: snapshot.verifyCommand ? !!verifyResult?.ok : false,
-          commitPolicy: snapshot.commitPolicy,
-          pushPolicy: snapshot.pushPolicy,
-          git: gitSnapshot
-            ? {
-                dirty: gitSnapshot.dirty,
-                hasUpstream: gitSnapshot.hasUpstream,
-                ahead: gitSnapshot.ahead,
-                behind: gitSnapshot.behind,
-              }
-            : undefined,
-        });
-
-        if (!stopGuard.allowed) {
-          const blockedDecision = buildBlockedStopDecision(snapshot, decision, stopGuard);
-          recordControllerDecision(snapshot, blockedDecision);
-          queueContinueLikeFollowUp(pi, ctx, runtime, snapshot, blockedDecision, {
-            budgetPauseReason: `iteration budget exhausted before completion: ${decision.reason}`,
-            notifyMessage: `Auto-mode finalization pass requested: ${blockedDecision.reason}`,
-            notifyLevel: "warning",
-          });
-          return;
-        }
-
-        recordControllerDecision(snapshot, decision);
-        disableSnapshot(pi, ctx, runtime, decision.finalMessage || decision.reason, decision.completionGateMet ? "info" : "warning");
+        await applyStopDecision(
+          pi,
+          ctx,
+          runtime,
+          snapshot,
+          decision,
+          evidence,
+          getGitSnapshotImpl,
+          runVerifyCommandImpl,
+        );
       } finally {
         runtime.controllerBusy = false;
       }

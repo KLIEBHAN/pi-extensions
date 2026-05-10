@@ -129,6 +129,12 @@ test("parseAutoCommandArgs rejects strict mode without verify", () => {
   });
 });
 
+test("parseAutoCommandArgs reports invalid known flags before missing-goal usage", () => {
+  assert.deepEqual(parseAutoCommandArgs("on --iterations nope"), {
+    error: "--iterations must be an integer between 1 and 1000",
+  });
+});
+
 test("buildAutoStartConfigFromFlags parses defaults and warnings", () => {
   const parsed = buildAutoStartConfigFromFlags({
     goal: "improve settings UX",
@@ -177,6 +183,17 @@ test("parseControllerDecision parses continue and stop decisions and ignores ext
   if (!stopDecision || stopDecision.action !== "stop") return;
   assert.equal(stopDecision.completionGateMet, true);
   assert.equal(stopDecision.finalMessage, "Stopping now.");
+});
+
+test("parseControllerDecision scans balanced JSON objects after invalid brace examples", () => {
+  const decision = parseControllerDecision(`Here is an invalid example first: "Object { action: continue }.
+
+Actual decision:
+{"action":"pause","reason":"Blocked by repeated failures with {details} in text","updatedSummary":"Paused after controller review.","goalStatus":"blocked","completionGateMet":false}`);
+
+  assert.ok(decision);
+  assert.equal(decision?.action, "pause");
+  assert.equal(decision?.reason, "Blocked by repeated failures with {details} in text");
 });
 
 test("shouldPreRunVerifyCommand runs near stop when verify is configured", () => {

@@ -82,7 +82,6 @@ export interface AutoModeStateV2 {
   consecutiveStagnationCount: number;
   consecutiveNoChangeCount: number;
   lastSeenHead?: string;
-  lastSeenChangedFiles?: string[];
   lastSeenRepoFingerprint?: string;
   resumePolicy: ResumePolicy;
   migrationWarnings?: string[];
@@ -121,7 +120,6 @@ export interface AutoModeStateV1Like {
   consecutiveStagnationCount?: unknown;
   consecutiveNoChangeCount?: unknown;
   lastSeenHead?: unknown;
-  lastSeenChangedFiles?: unknown;
   lastSeenRepoFingerprint?: unknown;
   resumePolicy?: unknown;
 }
@@ -512,9 +510,6 @@ function migrateLegacyState(snapshot: AutoModeStateV1Like): AutoModeStateV2 {
     consecutiveNoChangeCount:
       typeof snapshot.consecutiveNoChangeCount === "number" ? snapshot.consecutiveNoChangeCount : 0,
     lastSeenHead: typeof snapshot.lastSeenHead === "string" ? snapshot.lastSeenHead : undefined,
-    lastSeenChangedFiles: Array.isArray(snapshot.lastSeenChangedFiles)
-      ? snapshot.lastSeenChangedFiles.filter((value): value is string => typeof value === "string")
-      : undefined,
     lastSeenRepoFingerprint: typeof snapshot.lastSeenRepoFingerprint === "string" ? snapshot.lastSeenRepoFingerprint : undefined,
     resumePolicy: isResumePolicy(snapshot.resumePolicy) ? snapshot.resumePolicy : "restore-paused",
     migrationWarnings: warnings,
@@ -669,19 +664,112 @@ function pushDeprecatedWarning(warnings: string[], flag: string): void {
   warnings.push(`${flag} is deprecated in auto-mode V2 and is ignored.`);
 }
 
-function parseAssuranceMode(value: string | undefined): AssuranceMode | undefined {
-  if (!value) return undefined;
-  return isAssuranceMode(value) ? value : undefined;
+interface AutoConfigValidationLabels {
+  iterations: string;
+  controllerModel: string;
+  commitPolicy: string;
+  pushPolicy: string;
+  assurance: string;
+  verifyRequirement: string;
+}
+
+interface RawAutoConfigValues {
+  goal: string;
+  iterations?: string;
+  untilPrompt?: string;
+  controllerModel?: string;
+  verifyCommand?: string;
+  commitPolicy?: string;
+  pushPolicy?: string;
+  assurance?: string;
+  resumeOnSessionStart: boolean;
+  warnings: string[];
+  labels: AutoConfigValidationLabels;
+}
+
+const SLASH_AUTO_CONFIG_LABELS: AutoConfigValidationLabels = {
+  iterations: "--iterations",
+  controllerModel: "--controller-model",
+  commitPolicy: "--commit-policy",
+  pushPolicy: "--push-policy",
+  assurance: "--assurance",
+  verifyRequirement: "--verify <cmd>",
+};
+
+const CLI_AUTO_CONFIG_LABELS: AutoConfigValidationLabels = {
+  iterations: "--auto-iterations",
+  controllerModel: "--auto-controller-model",
+  commitPolicy: "--auto-commit-policy",
+  pushPolicy: "--auto-push-policy",
+  assurance: "--auto-assurance",
+  verifyRequirement: "--auto-verify <cmd>",
+};
+
+function validateAutoStartConfig(raw: RawAutoConfigValues): AutoStartConfigBuildSuccess | { error: string } {
+  const iterations = raw.iterations ? parsePositiveInteger(raw.iterations) : undefined;
+  if (raw.iterations && !iterations) {
+    return { error: `${raw.labels.iterations} must be an integer between 1 and ${DEFAULT_MAX_ITERATIONS_LIMIT}` };
+  }
+
+  const controllerModel = raw.controllerModel ? parseModelRef(raw.controllerModel) : undefined;
+  if (raw.controllerModel && !controllerModel) {
+    return { error: `${raw.labels.controllerModel} must be in provider/model form` };
+  }
+
+  let commitPolicy: CommitPolicy = "final-or-milestone";
+  if (raw.commitPolicy) {
+    if (!isCommitPolicy(raw.commitPolicy)) {
+      return { error: `${raw.labels.commitPolicy} must be one of: none, milestones, final-or-milestone` };
+    }
+    commitPolicy = raw.commitPolicy;
+  }
+
+  let pushPolicy: PushPolicy = "final-or-milestone-if-upstream";
+  if (raw.pushPolicy) {
+    if (!isPushPolicy(raw.pushPolicy)) {
+      return { error: `${raw.labels.pushPolicy} must be one of: never, if-upstream, final-or-milestone-if-upstream` };
+    }
+    pushPolicy = raw.pushPolicy;
+  }
+
+  let assuranceMode: AssuranceMode = "pragmatic";
+  if (raw.assurance) {
+    if (!isAssuranceMode(raw.assurance)) {
+      return { error: `${raw.labels.assurance} must be one of: pragmatic, strict` };
+    }
+    assuranceMode = raw.assurance;
+  }
+
+  if (assuranceMode === "strict" && !raw.verifyCommand) {
+    return { error: `${raw.labels.assurance} strict requires ${raw.labels.verifyRequirement}` };
+  }
+
+  const { mode, maxIterations } = resolveAutoMode(iterations, raw.untilPrompt);
+  return {
+    config: {
+      goal: raw.goal,
+      untilPrompt: raw.untilPrompt,
+      mode,
+      maxIterations,
+      controllerModel,
+      verifyCommand: raw.verifyCommand,
+      commitPolicy,
+      pushPolicy,
+      assuranceMode,
+      resumeOnSessionStart: raw.resumeOnSessionStart,
+    },
+    warnings: raw.warnings,
+  };
 }
 
 function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
-  let iterations: number | undefined;
+  let iterations: string | undefined;
   let untilPrompt: string | undefined;
-  let controllerModel: ModelRef | undefined;
+  let controllerModel: string | undefined;
   let verifyCommand: string | undefined;
-  let commitPolicy: CommitPolicy = "final-or-milestone";
-  let pushPolicy: PushPolicy = "final-or-milestone-if-upstream";
-  let assuranceMode: AssuranceMode = "pragmatic";
+  let commitPolicy: string | undefined;
+  let pushPolicy: string | undefined;
+  let assurance: string | undefined;
   const warnings: string[] = [];
   const goalTokens: string[] = [];
 
@@ -690,11 +778,10 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
 
     if (token === "--iterations") {
       const value = tokens[index + 1];
-      const parsed = value ? parsePositiveInteger(value) : undefined;
-      if (!parsed) {
+      if (!value) {
         return { error: `--iterations must be an integer between 1 and ${DEFAULT_MAX_ITERATIONS_LIMIT}` };
       }
-      iterations = parsed;
+      iterations = value;
       index += 1;
       continue;
     }
@@ -711,11 +798,10 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
 
     if (token === "--controller-model") {
       const value = tokens[index + 1];
-      const parsed = value ? parseModelRef(value) : undefined;
-      if (!parsed) {
+      if (!value) {
         return { error: "--controller-model must be in provider/model form" };
       }
-      controllerModel = parsed;
+      controllerModel = value;
       index += 1;
       continue;
     }
@@ -732,7 +818,7 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
 
     if (token === "--commit-policy") {
       const value = tokens[index + 1];
-      if (!value || !isCommitPolicy(value)) {
+      if (!value) {
         return { error: "--commit-policy must be one of: none, milestones, final-or-milestone" };
       }
       commitPolicy = value;
@@ -742,7 +828,7 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
 
     if (token === "--push-policy") {
       const value = tokens[index + 1];
-      if (!value || !isPushPolicy(value)) {
+      if (!value) {
         return { error: "--push-policy must be one of: never, if-upstream, final-or-milestone-if-upstream" };
       }
       pushPolicy = value;
@@ -752,11 +838,10 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
 
     if (token === "--assurance") {
       const value = tokens[index + 1];
-      const parsed = value ? parseAssuranceMode(value) : undefined;
-      if (!parsed) {
+      if (!value) {
         return { error: "--assurance must be one of: pragmatic, strict" };
       }
-      assuranceMode = parsed;
+      assurance = value;
       index += 1;
       continue;
     }
@@ -796,31 +881,27 @@ function parseOnConfigFromTokens(tokens: string[]): AutoCommandParseResult {
   }
 
   const goal = goalTokens.join(" ").trim();
+  const validated = validateAutoStartConfig({
+    goal,
+    iterations,
+    untilPrompt,
+    controllerModel,
+    verifyCommand,
+    commitPolicy,
+    pushPolicy,
+    assurance,
+    resumeOnSessionStart: false,
+    warnings,
+    labels: SLASH_AUTO_CONFIG_LABELS,
+  });
+  if ("error" in validated) {
+    return validated;
+  }
   if (!goal) {
     return { error: "Usage: /auto on [flags] <goal>" };
   }
 
-  if (assuranceMode === "strict" && !verifyCommand) {
-    return { error: "--assurance strict requires --verify <cmd>" };
-  }
-
-  const { mode, maxIterations } = resolveAutoMode(iterations, untilPrompt);
-  return {
-    kind: "on",
-    config: {
-      goal,
-      untilPrompt,
-      mode,
-      maxIterations,
-      controllerModel,
-      verifyCommand,
-      commitPolicy,
-      pushPolicy,
-      assuranceMode,
-      resumeOnSessionStart: false,
-    },
-    warnings,
-  };
+  return { kind: "on", ...validated };
 }
 
 export function parseAutoCommandArgs(args: string): AutoCommandParseResult {
@@ -866,73 +947,24 @@ export function buildAutoStartConfigFromFlags(flags: AutoFlagValues): AutoStartC
   }
 
   const warnings: string[] = [];
-  const iterationsFlag = parseStringFlag(flags.iterations);
-  const untilPrompt = parseStringFlag(flags.until);
-  const controllerModelFlag = parseStringFlag(flags.controllerModel);
-  const verifyCommand = parseStringFlag(flags.verify);
-  const commitPolicyFlag = parseStringFlag(flags.commitPolicy);
-  const pushPolicyFlag = parseStringFlag(flags.pushPolicy);
-  const assuranceFlag = parseStringFlag(flags.assurance);
-
   if (flags.completionPolicy !== undefined) pushDeprecatedWarning(warnings, "--auto-completion-policy");
   if (flags.maxAdjacentContinuations !== undefined) pushDeprecatedWarning(warnings, "--auto-max-adjacent-continuations");
   if (flags.allowControllerProbes !== undefined) pushDeprecatedWarning(warnings, "--auto-allow-controller-probes");
   if (flags.workerReflection !== undefined) pushDeprecatedWarning(warnings, "--auto-worker-reflection");
 
-  const iterations = iterationsFlag ? parsePositiveInteger(iterationsFlag) : undefined;
-  if (iterationsFlag && !iterations) {
-    return { error: `--auto-iterations must be an integer between 1 and ${DEFAULT_MAX_ITERATIONS_LIMIT}` };
-  }
-
-  const controllerModel = controllerModelFlag ? parseModelRef(controllerModelFlag) : undefined;
-  if (controllerModelFlag && !controllerModel) {
-    return { error: "--auto-controller-model must be in provider/model form" };
-  }
-
-  let commitPolicy: CommitPolicy = "final-or-milestone";
-  if (commitPolicyFlag) {
-    if (!isCommitPolicy(commitPolicyFlag)) {
-      return { error: "--auto-commit-policy must be one of: none, milestones, final-or-milestone" };
-    }
-    commitPolicy = commitPolicyFlag;
-  }
-
-  let pushPolicy: PushPolicy = "final-or-milestone-if-upstream";
-  if (pushPolicyFlag) {
-    if (!isPushPolicy(pushPolicyFlag)) {
-      return { error: "--auto-push-policy must be one of: never, if-upstream, final-or-milestone-if-upstream" };
-    }
-    pushPolicy = pushPolicyFlag;
-  }
-
-  let assuranceMode: AssuranceMode = "pragmatic";
-  if (assuranceFlag) {
-    if (!isAssuranceMode(assuranceFlag)) {
-      return { error: "--auto-assurance must be one of: pragmatic, strict" };
-    }
-    assuranceMode = assuranceFlag;
-  }
-
-  if (assuranceMode === "strict" && !verifyCommand) {
-    return { error: "--auto-assurance strict requires --auto-verify <cmd>" };
-  }
-
-  const { mode, maxIterations } = resolveAutoMode(iterations, untilPrompt);
-  return {
-    config: {
-      goal,
-      untilPrompt,
-      mode,
-      maxIterations,
-      controllerModel,
-      verifyCommand,
-      commitPolicy,
-      pushPolicy,
-      assuranceMode,
-      resumeOnSessionStart: parseBooleanFlag(flags.resume, false),
-    },
+  return validateAutoStartConfig({
+    goal,
+    iterations: parseStringFlag(flags.iterations),
+    untilPrompt: parseStringFlag(flags.until),
+    controllerModel: parseStringFlag(flags.controllerModel),
+    verifyCommand: parseStringFlag(flags.verify),
+    commitPolicy: parseStringFlag(flags.commitPolicy),
+    pushPolicy: parseStringFlag(flags.pushPolicy),
+    assurance: parseStringFlag(flags.assurance),
+    resumeOnSessionStart: parseBooleanFlag(flags.resume, false),
     warnings,
-  };
+    labels: CLI_AUTO_CONFIG_LABELS,
+  });
 }
 
 function getJsonCandidates(rawText: string): string[] {
@@ -942,10 +974,49 @@ function getJsonCandidates(rawText: string): string[] {
   const candidates = new Set<string>();
   candidates.add(text);
 
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    candidates.add(text.slice(firstBrace, lastBrace + 1));
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < rawText.length; index += 1) {
+    const char = rawText[index]!;
+
+    if (depth > 0 && inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (depth > 0 && char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") {
+      if (depth === 0) {
+        start = index;
+      }
+      depth += 1;
+      continue;
+    }
+
+    if (char === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        candidates.add(rawText.slice(start, index + 1));
+        start = -1;
+      }
+    }
   }
 
   return [...candidates];
@@ -959,6 +1030,9 @@ export function parseControllerDecision(rawText: string): ControllerDecision | u
 
       const action = typeof parsed.action === "string" ? parsed.action : undefined;
       const reason = typeof parsed.reason === "string" ? parsed.reason.trim() : undefined;
+      // `summary` and `qualityGoalMet` are accepted for compatibility with
+      // persisted/older controller payloads, but V2 prompts ask for the canonical
+      // `updatedSummary` and `completionGateMet` fields.
       const updatedSummary =
         typeof parsed.updatedSummary === "string"
           ? parsed.updatedSummary.trim()
