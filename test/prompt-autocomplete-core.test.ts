@@ -6,6 +6,7 @@ import {
   buildLatestAssistantMessageContext,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
+  createOwnerRefCounter,
   DEFAULT_PREFERRED_MODEL,
   extractMessageText,
   extractNextSuggestionChunk,
@@ -333,6 +334,64 @@ test("coalesced requests turn synchronous start failures into rejected promises"
 
   await assert.rejects(subscription.promise, /boom/);
   assert.equal(inFlight.size, 0);
+});
+
+test("cancelAllCoalescedRequests tolerates active promises settling after clear", async () => {
+  const inFlight = new Map<string, CoalescedRequestEntry<string>>();
+  let resolveLate: ((value: string) => void) | undefined;
+  let rejectLate: ((error: Error) => void) | undefined;
+
+  const resolving = acquireCoalescedRequest(inFlight, "resolve-late", "subscriber-a", async () => {
+    return await new Promise<string>((resolve) => {
+      resolveLate = resolve;
+    });
+  });
+  const rejecting = acquireCoalescedRequest(inFlight, "reject-late", "subscriber-b", async () => {
+    return await new Promise<string>((_resolve, reject) => {
+      rejectLate = reject;
+    });
+  });
+
+  assert.equal(inFlight.size, 2);
+  cancelAllCoalescedRequests(inFlight);
+  assert.equal(inFlight.size, 0);
+
+  resolveLate?.("late success");
+  rejectLate?.(new Error("late failure"));
+
+  assert.equal(await resolving.promise, "late success");
+  await assert.rejects(rejecting.promise, /late failure/);
+  assert.equal(inFlight.size, 0);
+});
+
+test("owner ref counter keeps shared UI state active until the final owner releases", () => {
+  const owners = createOwnerRefCounter();
+
+  assert.equal(owners.activate("request-a"), true);
+  assert.equal(owners.activate("request-a"), false, "duplicate owner should not create a new transition");
+  assert.equal(owners.activate("request-b"), false);
+  assert.equal(owners.size(), 2);
+  assert.equal(owners.has("request-a"), true);
+
+  assert.equal(owners.deactivate("missing"), false);
+  assert.equal(owners.deactivate("request-a"), false);
+  assert.equal(owners.size(), 1);
+  assert.equal(owners.deactivate("request-b"), true);
+  assert.equal(owners.size(), 0);
+});
+
+test("owner ref counter clear resets remount-style leaked owners", () => {
+  const owners = createOwnerRefCounter();
+
+  owners.activate("old-activation-a");
+  owners.activate("old-activation-b");
+  assert.equal(owners.clear(), true);
+  assert.equal(owners.size(), 0);
+  assert.equal(owners.has("old-activation-a"), false);
+  assert.equal(owners.clear(), false);
+
+  assert.equal(owners.activate("new-activation"), true);
+  assert.equal(owners.deactivate("new-activation"), true);
 });
 
 test("buildLatestAssistantMessageContext returns the newest assistant text", () => {

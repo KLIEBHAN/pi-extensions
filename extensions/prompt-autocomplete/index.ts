@@ -7,6 +7,7 @@ import {
   buildLatestUserMessageContext,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
+  createOwnerRefCounter,
   DEFAULT_DEBOUNCE_MS,
   DEFAULT_MAX_ALTERNATIVES,
   DEFAULT_MAX_SUGGESTION_CHARS,
@@ -304,6 +305,8 @@ class PromptAutocompleteEditor extends CustomEditor {
   private requestSeq = 0;
   private pendingRequestKey?: string;
   private activeRequestSubscription?: CoalescedRequestSubscription<PromptAutocompleteCacheEntry>;
+  // One owner token per editor instance; the mount-level refcounter keeps the
+  // shared spinner alive until every active owner has released it.
   private activeSpinnerOwner?: string;
   private suspendedUntil = 0;
   private lastResolvedKey = "";
@@ -959,7 +962,9 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
 
   let spinnerFrame = 0;
   let spinnerTimer: ReturnType<typeof setInterval> | undefined;
-  const spinnerOwners = new Set<string>();
+  // Mount-scoped owner refcount: multiple request subscribers can share one
+  // spinner, while clearSpinner resets all ownership during unmount/remount.
+  const spinnerOwners = createOwnerRefCounter();
   const renderSpinner = () => {
     const frame = SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length];
     ctx.ui.setWidget(
@@ -979,7 +984,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
   };
   shared.setSpinnerActive = (owner, active) => {
     if (active) {
-      spinnerOwners.add(owner);
+      spinnerOwners.activate(owner);
       if (spinnerTimer) return;
       spinnerFrame = 0;
       renderSpinner();
@@ -990,8 +995,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
       return;
     }
 
-    spinnerOwners.delete(owner);
-    if (spinnerOwners.size > 0) return;
+    if (!spinnerOwners.deactivate(owner)) return;
     stopSpinnerTimer();
   };
   shared.clearSpinner = () => {

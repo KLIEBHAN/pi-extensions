@@ -83,6 +83,37 @@ export interface CoalescedRequestSubscription<T> {
   subscriberCount: () => number;
 }
 
+export interface OwnerRefCounter {
+  activate: (owner: string) => boolean;
+  deactivate: (owner: string) => boolean;
+  clear: () => boolean;
+  has: (owner: string) => boolean;
+  size: () => number;
+}
+
+export function createOwnerRefCounter(): OwnerRefCounter {
+  const owners = new Set<string>();
+
+  return {
+    activate: (owner) => {
+      const wasEmpty = owners.size === 0;
+      owners.add(owner);
+      return wasEmpty && owners.size > 0;
+    },
+    deactivate: (owner) => {
+      const deleted = owners.delete(owner);
+      return deleted && owners.size === 0;
+    },
+    clear: () => {
+      const hadOwners = owners.size > 0;
+      owners.clear();
+      return hadOwners;
+    },
+    has: (owner) => owners.has(owner),
+    size: () => owners.size,
+  };
+}
+
 export function acquireCoalescedRequest<T>(
   inFlightRequests: Map<string, CoalescedRequestEntry<T>>,
   key: string,
@@ -124,6 +155,8 @@ export function acquireCoalescedRequest<T>(
     entry = nextEntry;
     inFlightRequests.set(key, entry);
     created = true;
+    // Start only after the entry is visible in the map, so synchronous start
+    // failures still settle through the shared promise and clean up the map.
     runStart();
   }
 
@@ -135,6 +168,8 @@ export function acquireCoalescedRequest<T>(
     created,
     subscriberCount: () => entry.subscribers.size,
     release: () => {
+      // Idempotent because callers may release during cancellation and again in
+      // their async finally block after the shared promise settles.
       if (released) return;
       released = true;
 
