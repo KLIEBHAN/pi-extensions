@@ -579,15 +579,15 @@ function parseGitStatusChangedFiles(statusText: string): { files: string[]; tota
 }
 
 async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapshot | undefined> {
-  const isRepo = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd });
+  const isRepo = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS });
   if (isRepo.code !== 0 || !isRepo.stdout.includes("true")) {
     return undefined;
   }
 
   const [head, status, upstream, trackedFilesFingerprint, untrackedFilesFingerprint] = await Promise.all([
-    pi.exec("git", ["rev-parse", "HEAD"], { cwd }),
-    pi.exec("git", ["status", "--short", "--branch", "--untracked-files=no"], { cwd }),
-    pi.exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd }),
+    pi.exec("git", ["rev-parse", "HEAD"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
+    pi.exec("git", ["status", "--short", "--branch", "--untracked-files=no"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
+    pi.exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS }),
     getTrackedFilesFingerprint(pi, cwd),
     getUntrackedFilesFingerprint(pi, cwd),
   ]);
@@ -597,7 +597,7 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
   const hasUpstream = upstream.code === 0 && upstream.stdout.trim().length > 0;
 
   if (hasUpstream) {
-    const divergence = await pi.exec("git", ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], { cwd });
+    const divergence = await pi.exec("git", ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS });
     const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(divergence.stdout.trim());
     if (divergence.code === 0 && match) {
       behind = Number(match[1]);
