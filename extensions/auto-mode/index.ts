@@ -241,6 +241,17 @@ function persistSnapshot(
   }
 }
 
+function persistSnapshotAndSetStatus(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext | ExtensionCommandContext,
+  runtime: AutoRuntimeState,
+  snapshot: AutoModeStateV2,
+): boolean {
+  const persisted = persistSnapshot(pi, ctx, runtime, snapshot);
+  setStatus(ctx, snapshot);
+  return persisted;
+}
+
 function restorePersistedSnapshot(ctx: ExtensionContext): AutoModeStateV2 | undefined {
   return extractLatestAutoModeState(ctx.sessionManager.getBranch());
 }
@@ -1090,7 +1101,6 @@ async function startAutoMode(
   const summary = buildInitialControllerSummary(ctx as ExtensionContext, config);
   const snapshot = buildInitialState(config, summary);
   runtime.snapshot = snapshot;
-  setStatus(ctx, snapshot);
 
   if (!pi.getSessionName()) {
     pi.setSessionName(`Auto: ${summarizeGoal(snapshot.goal, 56)}`);
@@ -1098,8 +1108,7 @@ async function startAutoMode(
 
   const startPrompt = getStartPrompt(snapshot);
   snapshot.lastAutoPrompt = startPrompt;
-  if (!persistSnapshot(pi, ctx, runtime, snapshot)) {
-    setStatus(ctx, snapshot);
+  if (!persistSnapshotAndSetStatus(pi, ctx, runtime, snapshot)) {
     return;
   }
 
@@ -1150,13 +1159,12 @@ function restoreSnapshotOnSessionStart(
   }
 
   if (restored.paused !== previousPaused || hadMigrationWarnings) {
-    if (!persistSnapshot(pi, ctx, runtime, restored)) {
-      setStatus(ctx, restored);
+    if (!persistSnapshotAndSetStatus(pi, ctx, runtime, restored)) {
       return { resumed: false };
     }
+  } else {
+    setStatus(ctx, restored);
   }
-
-  setStatus(ctx, restored);
   return { resumed: shouldResume };
 }
 
@@ -1180,11 +1188,9 @@ async function resumeAutoMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, ru
   snapshot.paused = false;
   const resumePrompt = getResumePrompt(snapshot);
   snapshot.lastAutoPrompt = resumePrompt;
-  if (!persistSnapshot(pi, ctx, runtime, snapshot)) {
-    setStatus(ctx, snapshot);
+  if (!persistSnapshotAndSetStatus(pi, ctx, runtime, snapshot)) {
     return;
   }
-  setStatus(ctx, snapshot);
   ctx.ui.notify("Auto-mode resumed", "info");
   pi.sendUserMessage(resumePrompt);
 }
@@ -1305,11 +1311,9 @@ function queueContinueLikeFollowUp(
 
   snapshot.lastAutoPrompt = followUpPlan.nextPrompt;
   snapshot.currentIteration = followUpPlan.nextIteration;
-  if (!persistSnapshot(pi, ctx, runtime, snapshot)) {
-    setStatus(ctx, snapshot);
+  if (!persistSnapshotAndSetStatus(pi, ctx, runtime, snapshot)) {
     return;
   }
-  setStatus(ctx, snapshot);
   ctx.ui.notify(options.notifyMessage, options.notifyLevel ?? "info");
   pi.sendUserMessage(followUpPlan.nextPrompt);
 }
@@ -1434,10 +1438,8 @@ function handleInconclusiveControllerDecision(
     return;
   }
 
-  if (persistSnapshot(pi, ctx, runtime, snapshot)) {
+  if (persistSnapshotAndSetStatus(pi, ctx, runtime, snapshot)) {
     ctx.ui.notify("Auto-mode controller was inconclusive; waiting for the next worker turn.", "warning");
-  } else {
-    setStatus(ctx, snapshot);
   }
 }
 
@@ -1456,6 +1458,8 @@ function applyContinueDecision(
   });
 }
 
+// Stop guards only need dirty/upstream/ahead/behind, so this path refreshes
+// the lightweight finalization snapshot instead of the full fingerprinted git snapshot.
 async function applyStopDecision(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -1510,14 +1514,31 @@ async function applyStopDecision(
   disableSnapshot(pi, ctx, runtime, decision.finalMessage || decision.reason, decision.completionGateMet ? "info" : "warning");
 }
 
+function resolveFinalizationSnapshotProvider(
+  deps: AutoModeDependencies,
+  getGitSnapshotImpl: typeof getGitSnapshot,
+): typeof getGitFinalizationSnapshot {
+  if (deps.getGitFinalizationSnapshot) {
+    return deps.getGitFinalizationSnapshot;
+  }
+
+  // Backwards compatibility for tests/extensions that override the full git snapshot
+  // provider only: derive the lightweight finalization state from that override so
+  // stop guards observe the same mocked repository state.
+  if (deps.getGitSnapshot) {
+    return async (piArg: ExtensionAPI, cwd: string) => gitSnapshotToFinalizationSnapshot(await getGitSnapshotImpl(piArg, cwd));
+  }
+
+  return getGitFinalizationSnapshot;
+}
+
 export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
   return function (pi: ExtensionAPI) {
     const runtime: AutoRuntimeState = {
       controllerBusy: false,
     };
     const getGitSnapshotImpl = deps.getGitSnapshot ?? getGitSnapshot;
-    const getGitFinalizationSnapshotImpl = deps.getGitFinalizationSnapshot
-      ?? (deps.getGitSnapshot ? async (piArg: ExtensionAPI, cwd: string) => gitSnapshotToFinalizationSnapshot(await getGitSnapshotImpl(piArg, cwd)) : getGitFinalizationSnapshot);
+    const getGitFinalizationSnapshotImpl = resolveFinalizationSnapshotProvider(deps, getGitSnapshotImpl);
     const decideControllerActionImpl = deps.decideControllerAction ?? decideControllerAction;
     const runVerifyCommandImpl = deps.runVerifyCommand ?? runVerifyCommand;
 
@@ -1634,8 +1655,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
             runtime.snapshot.controllerSummary = truncateControllerSummary(
               `${runtime.snapshot.controllerSummary}\n\nUser nudge: ${parsed.text}`,
             );
-            if (!persistSnapshot(pi, ctx, runtime, runtime.snapshot)) {
-              setStatus(ctx, runtime.snapshot);
+            if (!persistSnapshotAndSetStatus(pi, ctx, runtime, runtime.snapshot)) {
               return;
             }
             ctx.ui.notify("Auto-mode nudge recorded", "info");
@@ -1685,10 +1705,8 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
         if (restoreResult.resumed && runtime.snapshot && ctx.isIdle()) {
           const resumePrompt = getResumePrompt(runtime.snapshot);
           runtime.snapshot.lastAutoPrompt = resumePrompt;
-          if (persistSnapshot(pi, ctx, runtime, runtime.snapshot)) {
+          if (persistSnapshotAndSetStatus(pi, ctx, runtime, runtime.snapshot)) {
             pi.sendUserMessage(resumePrompt);
-          } else {
-            setStatus(ctx, runtime.snapshot);
           }
         }
         return;
