@@ -131,6 +131,13 @@ function getLatestAutoState(entries: unknown[]) {
   return undefined;
 }
 
+function countAutoStateEntries(entries: unknown[]): number {
+  return entries.filter((entry) => {
+    const customEntry = entry as { type?: unknown; customType?: unknown };
+    return customEntry.type === "custom" && customEntry.customType === AUTO_MODE_STATE_TYPE;
+  }).length;
+}
+
 test("default export is a callable extension entry", async () => {
   const autoModeModule = await loadAutoModeModule();
   assert.equal(typeof autoModeModule.default, "function");
@@ -208,7 +215,7 @@ test("agent_end stops cleanly in pragmatic mode when the controller says the goa
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode stopped: Done.")));
 });
 
-test("agent_end appends at most one snapshot per worker turn on the continue path", async () => {
+test("agent_end appends exactly one snapshot per worker turn on the continue path", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({
     "auto-goal": "improve onboarding robustness",
@@ -242,24 +249,20 @@ test("agent_end appends at most one snapshot per worker turn on the continue pat
   })(harness.pi as never);
 
   await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
-  const snapshotsAfterStart = harness.entries.filter(
-    (entry) => (entry as { customType?: unknown }).customType === AUTO_MODE_STATE_TYPE,
-  ).length;
 
   const agentEnd = harness.handlers.get("agent_end");
   assert.ok(agentEnd);
 
+  let previousSnapshotCount = countAutoStateEntries(harness.entries);
   for (let index = 0; index < 3; index += 1) {
     await agentEnd?.({
       messages: [{ role: "assistant", content: `worker turn ${index}`, stopReason: "stop" }],
     }, harness.ctx);
+
+    const nextSnapshotCount = countAutoStateEntries(harness.entries);
+    assert.equal(nextSnapshotCount - previousSnapshotCount, 1);
+    previousSnapshotCount = nextSnapshotCount;
   }
-
-  const snapshotsAfterTurns = harness.entries.filter(
-    (entry) => (entry as { customType?: unknown }).customType === AUTO_MODE_STATE_TYPE,
-  ).length;
-
-  assert.equal(snapshotsAfterTurns - snapshotsAfterStart, 3);
 });
 
 test("session_start rejects strict mode without a verify command", async () => {
@@ -924,6 +927,41 @@ test("default git snapshot uses path-only fallback for very large untracked sets
     harness.execCalls.filter((call) => call.command === "git" && call.args[0] === "hash-object").length,
     0,
   );
+});
+
+test("agent_end persists below-threshold inconclusive controller state once", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-inconclusive-once",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "fingerprint-inconclusive-once",
+    }),
+    decideControllerAction: async () => undefined,
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const snapshotsAfterStart = countAutoStateEntries(harness.entries);
+
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "worker turn 1", stopReason: "stop" }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(countAutoStateEntries(harness.entries) - snapshotsAfterStart, 1);
+  assert.equal(latestState?.paused, false);
+  assert.equal(latestState?.consecutiveControllerFailures, 1);
+  assert.equal(latestState?.lastSeenHead, "head-inconclusive-once");
+  assert.equal(latestState?.lastSeenRepoFingerprint, "fingerprint-inconclusive-once");
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("controller was inconclusive")));
 });
 
 test("agent_end pauses after repeated inconclusive controller results", async () => {

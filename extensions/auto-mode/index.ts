@@ -1403,6 +1403,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           if (snapshot.consecutiveControllerFailures >= DEFAULT_CONTROLLER_FAILURE_LIMIT) {
             pauseSnapshot(pi, ctx, runtime, `controller failed ${snapshot.consecutiveControllerFailures} times in a row`);
           } else {
+            persistSnapshot(pi, snapshot);
             ctx.ui.notify("Auto-mode controller was inconclusive; waiting for the next worker turn.", "warning");
           }
           return;
