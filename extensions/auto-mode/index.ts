@@ -109,6 +109,13 @@ interface VerifyCommandResult {
   stderr: string;
 }
 
+interface ExecLikeResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  killed?: boolean;
+}
+
 interface WorkerTurnSnapshot {
   assistantText: string;
   stopReason: string;
@@ -359,6 +366,17 @@ function summarizeBashOutput(stdout: string, stderr: string, maxChars = 2_000): 
   return `${combined.slice(0, maxChars - 1)}…`;
 }
 
+function formatGitCommandFailure(label: string, result: ExecLikeResult): string {
+  const reason = result.killed === true ? "was killed or timed out" : `failed with exit code ${result.code}`;
+  return `${label} ${reason}: ${summarizeBashOutput(result.stdout, result.stderr, 500)}`;
+}
+
+function ensureGitCommandSucceeded(label: string, result: ExecLikeResult): void {
+  if (result.killed === true || result.code !== 0) {
+    throw new Error(formatGitCommandFailure(label, result));
+  }
+}
+
 function buildGitRepoFingerprint(statusText: string, trackedFilesText: string, untrackedFilesText: string): string {
   return createHash("sha256")
     .update("status\0")
@@ -534,7 +552,8 @@ async function getUntrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Prom
     cwd,
     timeout: GIT_DIFF_TIMEOUT_MS,
   });
-  if (untrackedFiles.code !== 0 || !untrackedFiles.stdout) {
+  ensureGitCommandSucceeded("git ls-files --others", untrackedFiles);
+  if (!untrackedFiles.stdout) {
     return emptyFileFingerprint();
   }
 
@@ -552,7 +571,8 @@ async function getTrackedFilesFingerprint(pi: ExtensionAPI, cwd: string): Promis
     cwd,
     timeout: GIT_DIFF_TIMEOUT_MS,
   });
-  if (trackedFiles.code !== 0 || !trackedFiles.stdout) {
+  ensureGitCommandSucceeded("git diff --name-only", trackedFiles);
+  if (!trackedFiles.stdout) {
     return emptyFileFingerprint();
   }
 
@@ -582,6 +602,9 @@ function parseGitStatusChangedFiles(statusText: string): { files: string[]; tota
 
 async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapshot | undefined> {
   const isRepo = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS });
+  if (isRepo.killed === true) {
+    throw new Error(formatGitCommandFailure("git rev-parse --is-inside-work-tree", isRepo));
+  }
   if (isRepo.code !== 0 || !isRepo.stdout.includes("true")) {
     return undefined;
   }
@@ -594,17 +617,27 @@ async function getGitSnapshot(pi: ExtensionAPI, cwd: string): Promise<GitSnapsho
     getUntrackedFilesFingerprint(pi, cwd),
   ]);
 
+  if (head.killed === true) {
+    throw new Error(formatGitCommandFailure("git rev-parse HEAD", head));
+  }
+  ensureGitCommandSucceeded("git status --short --branch --untracked-files=no", status);
+  if (upstream.killed === true) {
+    throw new Error(formatGitCommandFailure("git rev-parse @{upstream}", upstream));
+  }
+
   let ahead: number | undefined;
   let behind: number | undefined;
   const hasUpstream = upstream.code === 0 && upstream.stdout.trim().length > 0;
 
   if (hasUpstream) {
     const divergence = await pi.exec("git", ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], { cwd, timeout: GIT_DIFF_TIMEOUT_MS });
+    ensureGitCommandSucceeded("git rev-list @{upstream}...HEAD", divergence);
     const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(divergence.stdout.trim());
-    if (divergence.code === 0 && match) {
-      behind = Number(match[1]);
-      ahead = Number(match[2]);
+    if (!match) {
+      throw new Error(`git rev-list @{upstream}...HEAD returned unexpected output: ${summarizeBashOutput(divergence.stdout, divergence.stderr, 500)}`);
     }
+    behind = Number(match[1]);
+    ahead = Number(match[2]);
   }
 
   const statusText = status.stdout.trim() || "working tree clean";
@@ -1329,17 +1362,23 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           snapshot.consecutiveWorkerFailures = 0;
         }
 
-        let gitSnapshot: GitSnapshot | undefined;
-        try {
-          gitSnapshot = await getGitSnapshotImpl(pi, ctx.cwd);
-        } catch (error) {
-          pauseSnapshot(pi, ctx, runtime, `git state unavailable: ${getErrorMessage(error)}`);
-          return;
-        }
+        const loadGitSnapshot = async (): Promise<{ ok: true; snapshot: GitSnapshot | undefined } | { ok: false }> => {
+          try {
+            return { ok: true, snapshot: await getGitSnapshotImpl(pi, ctx.cwd) };
+          } catch (error) {
+            pauseSnapshot(pi, ctx, runtime, `git state unavailable: ${getErrorMessage(error)}`);
+            return { ok: false };
+          }
+        };
+
+        let loadedGitSnapshot = await loadGitSnapshot();
+        if (!loadedGitSnapshot.ok) return;
+        let gitSnapshot = loadedGitSnapshot.snapshot;
         updateNoChangeCounters(snapshot, gitSnapshot);
         persistSnapshot(pi, snapshot);
 
         let verifyResult: VerifyCommandResult | undefined;
+        let verifyRan = false;
         if (shouldPreRunVerifyCommand({
           verifyCommandConfigured: !!snapshot.verifyCommand,
           stopReason: workerTurn.stopReason,
@@ -1347,6 +1386,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           maxIterations: snapshot.maxIterations,
         }) && snapshot.verifyCommand) {
           verifyResult = await runVerifyCommandSafely(runVerifyCommandImpl, pi, ctx.cwd, snapshot.verifyCommand);
+          verifyRan = true;
         }
 
         let decision: ControllerDecision | undefined;
@@ -1388,6 +1428,13 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
 
         if (snapshot.verifyCommand && !verifyResult) {
           verifyResult = await runVerifyCommandSafely(runVerifyCommandImpl, pi, ctx.cwd, snapshot.verifyCommand);
+          verifyRan = true;
+        }
+
+        if (verifyRan) {
+          loadedGitSnapshot = await loadGitSnapshot();
+          if (!loadedGitSnapshot.ok) return;
+          gitSnapshot = loadedGitSnapshot.snapshot;
         }
 
         const stopGuard = evaluateAutoStopGuard({

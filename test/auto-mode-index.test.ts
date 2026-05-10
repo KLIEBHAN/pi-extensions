@@ -47,7 +47,7 @@ function createHarness(
     command: string,
     args: string[],
     options: Record<string, unknown> | undefined,
-  ) => Promise<{ code: number; stdout: string; stderr: string }>,
+  ) => Promise<{ code: number; stdout: string; stderr: string; killed?: boolean }>,
 ) {
   const flags = new Map(Object.entries(initialFlags));
   const handlers = new Map<string, Function>();
@@ -381,6 +381,124 @@ test("git snapshot errors pause auto-mode instead of bypassing finalization guar
   assert.equal(latestState?.paused, true);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("git state unavailable: git timed out")));
   assert.equal(harness.sentMessages.length, 1);
+});
+
+test("default git snapshot treats killed git commands as unavailable", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness(
+    {
+      "auto-goal": "improve onboarding robustness",
+    },
+    [],
+    async (command, args) => {
+      const gitCommand = args.join(" ");
+      if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
+
+      if (gitCommand === "rev-parse --is-inside-work-tree") {
+        return { code: 0, stdout: "true\n", stderr: "" };
+      }
+      if (gitCommand === "rev-parse HEAD") {
+        return { code: 0, stdout: "head-before-timeout\n", stderr: "" };
+      }
+      if (gitCommand === "status --short --branch --untracked-files=no") {
+        return { code: 0, stdout: "", stderr: "", killed: true };
+      }
+      if (gitCommand === "rev-parse --abbrev-ref --symbolic-full-name @{upstream}") {
+        return { code: 1, stdout: "", stderr: "no upstream" };
+      }
+      if (gitCommand === "diff --name-only -z HEAD --") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (gitCommand === "ls-files --others --exclude-standard -z") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+
+      throw new Error(`Unexpected git command: ${gitCommand}`);
+    },
+  );
+
+  createAutoModeExtension({
+    decideControllerAction: async () => ({
+      action: "stop",
+      reason: "Goal is complete",
+      updatedSummary: "The goal is complete.",
+      goalStatus: "met",
+      completionGateMet: true,
+      finalMessage: "Done.",
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "The fix is complete.", stopReason: "stop" }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.enabled, true);
+  assert.equal(latestState?.paused, true);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("git state unavailable: git status")));
+  assert.equal(harness.sentMessages.length, 1);
+});
+
+test("stop guard refreshes git snapshot after verification mutates the working tree", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+    "auto-verify": "npm test",
+  });
+  let gitSnapshotCalls = 0;
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => {
+      gitSnapshotCalls += 1;
+      if (gitSnapshotCalls === 1) {
+        return {
+          isGitRepo: true,
+          head: "head-before-verify",
+          status: "## main",
+          changedFiles: [],
+          dirty: false,
+          hasUpstream: false,
+          repoFingerprint: "fingerprint-before-verify",
+        };
+      }
+      return {
+        isGitRepo: true,
+        head: "head-after-verify",
+        status: "## main\n M coverage/summary.json",
+        changedFiles: ["coverage/summary.json"],
+        dirty: true,
+        hasUpstream: false,
+        repoFingerprint: "fingerprint-after-verify",
+      };
+    },
+    runVerifyCommand: async () => ({
+      command: "npm test",
+      ok: true,
+      exitCode: 0,
+      stdout: "tests passed and coverage updated",
+      stderr: "",
+    }),
+    decideControllerAction: async () => ({
+      action: "stop",
+      reason: "Goal is complete",
+      updatedSummary: "The goal is complete and tests pass.",
+      goalStatus: "met",
+      completionGateMet: true,
+      finalMessage: "Done.",
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "The fix is complete.", stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(gitSnapshotCalls, 2);
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /Create the final atomic commit/);
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.enabled, true);
+  assert.equal(latestState?.currentIteration, 2);
 });
 
 test("dirty git state triggers a short deterministic commit follow-up", async () => {
