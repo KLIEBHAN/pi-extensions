@@ -9,34 +9,43 @@ import { AUTO_MODE_STATE_TYPE } from "../extensions/auto-mode/core.ts";
 
 let autoModeModulePromise: Promise<{ default: Function; createAutoModeExtension: Function }> | undefined;
 
+async function loadAutoModeModuleFromSource(options: {
+  piAiStubSource?: string;
+  transformSource?: (source: string) => string;
+} = {}) {
+  const rawSource = readFileSync(new URL("../extensions/auto-mode/index.ts", import.meta.url), "utf8");
+  const source = options.transformSource ? options.transformSource(rawSource) : rawSource;
+  const transpiled = typescript.transpileModule(source, {
+    compilerOptions: {
+      module: typescript.ModuleKind.ES2022,
+      target: typescript.ScriptTarget.ES2022,
+      moduleResolution: typescript.ModuleResolutionKind.Bundler,
+      allowImportingTsExtensions: true,
+      verbatimModuleSyntax: true,
+    },
+    fileName: "index.ts",
+  }).outputText;
+
+  const tempDir = mkdtempSync(join(tmpdir(), "auto-mode-index-test-"));
+  const piAiStubPath = join(tempDir, "pi-ai.mjs");
+  writeFileSync(
+    piAiStubPath,
+    options.piAiStubSource
+      ?? 'export async function complete() { throw new Error("complete should not be called in auto-mode index tests"); }\n',
+  );
+
+  const coreUrl = new URL("../extensions/auto-mode/core.ts", import.meta.url).href;
+  const rewritten = transpiled
+    .replace(/@mariozechner\/pi-ai/g, pathToFileURL(piAiStubPath).href)
+    .replace(/\.\/core\.ts/g, coreUrl);
+
+  const modulePath = join(tempDir, "index.mjs");
+  writeFileSync(modulePath, rewritten);
+  return import(`${pathToFileURL(modulePath).href}?t=${Date.now()}`) as Promise<{ default: Function; createAutoModeExtension: Function }>;
+}
+
 async function loadAutoModeModule() {
-  autoModeModulePromise ??= (async () => {
-    const source = readFileSync(new URL("../extensions/auto-mode/index.ts", import.meta.url), "utf8");
-    const transpiled = typescript.transpileModule(source, {
-      compilerOptions: {
-        module: typescript.ModuleKind.ES2022,
-        target: typescript.ScriptTarget.ES2022,
-        moduleResolution: typescript.ModuleResolutionKind.Bundler,
-        allowImportingTsExtensions: true,
-        verbatimModuleSyntax: true,
-      },
-      fileName: "index.ts",
-    }).outputText;
-
-    const tempDir = mkdtempSync(join(tmpdir(), "auto-mode-index-test-"));
-    const piAiStubPath = join(tempDir, "pi-ai.mjs");
-    writeFileSync(piAiStubPath, 'export async function complete() { throw new Error("complete should not be called in auto-mode index tests"); }\n');
-
-    const coreUrl = new URL("../extensions/auto-mode/core.ts", import.meta.url).href;
-    const rewritten = transpiled
-      .replace(/@mariozechner\/pi-ai/g, pathToFileURL(piAiStubPath).href)
-      .replace(/\.\/core\.ts/g, coreUrl);
-
-    const modulePath = join(tempDir, "index.mjs");
-    writeFileSync(modulePath, rewritten);
-    return import(`${pathToFileURL(modulePath).href}?t=${Date.now()}`) as Promise<{ default: Function; createAutoModeExtension: Function }>;
-  })();
-
+  autoModeModulePromise ??= loadAutoModeModuleFromSource();
   return autoModeModulePromise;
 }
 
@@ -438,6 +447,37 @@ test("default verify command runner uses a long-running timeout", async () => {
   });
 });
 
+test("controller model calls time out as inconclusive controller results", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModuleFromSource({
+    piAiStubSource: "export async function complete() { return new Promise(() => {}); }\n",
+    transformSource: (source) => source.replace("const CONTROLLER_DECISION_TIMEOUT_MS = 120_000;", "const CONTROLLER_DECISION_TIMEOUT_MS = 5;"),
+  });
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+  });
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: "head-controller-timeout",
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: "fingerprint-controller-timeout",
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "worker turn", stopReason: "stop" }],
+  }, harness.ctx);
+
+  const latestState = getLatestAutoState(harness.entries);
+  assert.equal(latestState?.consecutiveControllerFailures, 1);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("controller was inconclusive")));
+});
+
 test("thrown controller decisions are counted like inconclusive controller results", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({
@@ -800,6 +840,157 @@ test("default git snapshot fingerprints untracked file contents for no-change de
     harness.execCalls.filter((call) => call.command === "git" && call.args[0] === "hash-object").length,
     2,
   );
+});
+
+test("default git snapshot preserves porcelain v2 rename source paths", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const tempDir = mkdtempSync(join(tmpdir(), "auto-mode-rename-status-"));
+  writeFileSync(join(tempDir, "new-name.ts"), "renamed content");
+  let capturedGitSnapshot: Record<string, unknown> | undefined;
+  const harness = createHarness(
+    {
+      "auto-goal": "improve onboarding robustness",
+    },
+    [],
+    async (command, args) => {
+      const gitCommand = args.join(" ");
+      if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
+
+      if (gitCommand === "status --porcelain=v2 --branch --untracked-files=all -z") {
+        return {
+          code: 0,
+          stdout: "# branch.oid head-rename\0# branch.head main\0" + "2 R. N... 100644 100644 100644 oldhash newhash R100 new-name.ts\0old-name.ts\0",
+          stderr: "",
+        };
+      }
+      if (gitCommand === "hash-object --no-filters -- new-name.ts") {
+        return { code: 0, stdout: "newhash\n", stderr: "" };
+      }
+
+      throw new Error(`Unexpected git command: ${gitCommand}`);
+    },
+  );
+  harness.ctx.cwd = tempDir;
+
+  createAutoModeExtension({
+    decideControllerAction: async (_ctx: unknown, _snapshot: unknown, _worker: unknown, gitSnapshot: Record<string, unknown> | undefined) => {
+      capturedGitSnapshot = gitSnapshot;
+      return {
+        action: "pause",
+        reason: "reviewed rename status",
+        updatedSummary: "Rename status reviewed.",
+        goalStatus: "blocked",
+        completionGateMet: false,
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "worker turn", stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.match(String(capturedGitSnapshot?.status ?? ""), /old-name\.ts -> new-name\.ts/);
+  assert.deepEqual(capturedGitSnapshot?.changedFiles, ["new-name.ts"]);
+});
+
+test("default git snapshot includes unknown porcelain v2 records in dirty status", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  let capturedGitSnapshot: Record<string, unknown> | undefined;
+  const harness = createHarness(
+    {
+      "auto-goal": "improve onboarding robustness",
+    },
+    [],
+    async (command, args) => {
+      const gitCommand = args.join(" ");
+      if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
+
+      if (gitCommand === "status --porcelain=v2 --branch --untracked-files=all -z") {
+        return { code: 0, stdout: "# branch.oid head-unknown\0# branch.head main\0x future status payload\0", stderr: "" };
+      }
+
+      throw new Error(`Unexpected git command: ${gitCommand}`);
+    },
+  );
+
+  createAutoModeExtension({
+    decideControllerAction: async (_ctx: unknown, _snapshot: unknown, _worker: unknown, gitSnapshot: Record<string, unknown> | undefined) => {
+      capturedGitSnapshot = gitSnapshot;
+      return {
+        action: "pause",
+        reason: "reviewed unknown status",
+        updatedSummary: "Unknown status reviewed.",
+        goalStatus: "blocked",
+        completionGateMet: false,
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "worker turn", stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(capturedGitSnapshot?.dirty, true);
+  assert.match(String(capturedGitSnapshot?.status ?? ""), /!! x future status payload/);
+  assert.deepEqual(capturedGitSnapshot?.changedFiles, ["!! x future status payload"]);
+});
+
+test("stop guard refresh after verification uses lightweight git status without fingerprinting", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness(
+    {
+      "auto-goal": "improve onboarding robustness",
+      "auto-verify": "npm test",
+    },
+    [],
+    async (command, args) => {
+      const gitCommand = args.join(" ");
+      if (command === "bash") {
+        assert.deepEqual(args, ["-lc", "npm test"]);
+        return { code: 0, stdout: "tests passed", stderr: "" };
+      }
+      if (command !== "git") throw new Error(`Unexpected command: ${command} ${gitCommand}`);
+
+      if (gitCommand === "status --porcelain=v2 --branch --untracked-files=all -z") {
+        const statusCallCount = harness.execCalls.filter((call) => call.command === "git" && call.args[0] === "status").length;
+        if (statusCallCount === 1) {
+          return { code: 0, stdout: "# branch.oid head-light-finalization\0# branch.head main\0", stderr: "" };
+        }
+        return {
+          code: 0,
+          stdout: "# branch.oid head-light-finalization\0# branch.head main\0" + "1 .M N... 100644 100644 100644 hash hash coverage/summary.json\0",
+          stderr: "",
+        };
+      }
+      if (gitCommand.startsWith("hash-object ")) {
+        throw new Error("hash-object should not be called for lightweight finalization refresh");
+      }
+
+      throw new Error(`Unexpected git command: ${gitCommand}`);
+    },
+  );
+
+  createAutoModeExtension({
+    decideControllerAction: async () => ({
+      action: "stop",
+      reason: "Goal is complete",
+      updatedSummary: "The goal is complete and tests pass.",
+      goalStatus: "met",
+      completionGateMet: true,
+      finalMessage: "Done.",
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: "The fix is complete.", stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.match(harness.sentMessages.at(-1)?.text ?? "", /Create the final atomic commit/);
+  assert.equal(harness.execCalls.filter((call) => call.command === "git" && call.args[0] === "hash-object").length, 0);
+  assert.equal(harness.execCalls.filter((call) => call.command === "git" && call.args[0] === "status").length, 2);
 });
 
 test("default git snapshot uses metadata fallback for many untracked files", async () => {
