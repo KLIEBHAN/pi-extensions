@@ -52,11 +52,13 @@ const MAX_TRACKED_CONTENT_HASH_FILES = 100;
 const MAX_TRACKED_CONTENT_HASH_BYTES = 5 * 1024 * 1024;
 const MAX_TRACKED_CONTENT_HASH_PATH_CHARS = 32_000;
 const MAX_TRACKED_METADATA_FILES = 2_000;
-const MAX_CONTROLLER_ASSISTANT_TEXT_CHARS = 12_000;
+const MAX_CONTROLLER_ASSISTANT_TEXT_CHARS = 6_000;
 const MAX_CONTROLLER_PROMPT_FIELD_CHARS = 4_000;
 const MAX_CONTROLLER_REASON_CHARS = 1_500;
 const MAX_CONTROLLER_FINAL_MESSAGE_CHARS = 2_000;
-const MAX_GIT_STATUS_CHARS = 8_000;
+const MAX_HISTORY_REASON_CHARS = 400;
+const MAX_HISTORY_PROMPT_CHARS = 600;
+const MAX_GIT_STATUS_CHARS = 3_000;
 const MAX_GIT_CHANGED_FILES_DISPLAY = 80;
 const MAX_GIT_CHANGED_FILES_STATE = 200;
 const COMMAND_USAGE =
@@ -267,8 +269,8 @@ function buildControllerDecisionHistoryText(snapshot: AutoModeStateV2): string {
 
   return snapshot.recentDecisions
     .map((entry) => {
-      const prompt = entry.nextPrompt ? `\nNext prompt: ${truncateMiddle(entry.nextPrompt, MAX_CONTROLLER_PROMPT_FIELD_CHARS)}` : "";
-      return `Iteration ${entry.iteration}: ${entry.action}\nReason: ${truncateMiddle(entry.reason, MAX_CONTROLLER_REASON_CHARS)}${prompt}`;
+      const prompt = entry.nextPrompt ? `\nNext prompt: ${truncateEnd(entry.nextPrompt, MAX_HISTORY_PROMPT_CHARS)}` : "";
+      return `Iteration ${entry.iteration}: ${entry.action}\nReason: ${truncateEnd(entry.reason, MAX_HISTORY_REASON_CHARS)}${prompt}`;
     })
     .join("\n\n");
 }
