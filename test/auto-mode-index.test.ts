@@ -208,6 +208,60 @@ test("agent_end stops cleanly in pragmatic mode when the controller says the goa
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Auto-mode stopped: Done.")));
 });
 
+test("agent_end appends at most one snapshot per worker turn on the continue path", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({
+    "auto-goal": "improve onboarding robustness",
+    "auto-iterations": "8",
+  });
+  let promptIndex = 0;
+  const prompts = [
+    "Inspect the next concrete gap.",
+    "Apply the focused fix.",
+    "Run the focused regression check.",
+  ];
+
+  createAutoModeExtension({
+    getGitSnapshot: async () => ({
+      isGitRepo: true,
+      head: `head-turn-${promptIndex}`,
+      status: "## main",
+      changedFiles: [],
+      dirty: false,
+      hasUpstream: false,
+      repoFingerprint: `fingerprint-turn-${promptIndex}`,
+    }),
+    decideControllerAction: async () => ({
+      action: "continue",
+      reason: "One concrete next step remains",
+      updatedSummary: "The controller has one concrete next step.",
+      goalStatus: "in_progress",
+      completionGateMet: false,
+      nextPrompt: prompts[promptIndex++] ?? `fallback-${promptIndex}`,
+    }),
+  })(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  const snapshotsAfterStart = harness.entries.filter(
+    (entry) => (entry as { customType?: unknown }).customType === AUTO_MODE_STATE_TYPE,
+  ).length;
+
+  const agentEnd = harness.handlers.get("agent_end");
+  assert.ok(agentEnd);
+
+  for (let index = 0; index < 3; index += 1) {
+    await agentEnd?.({
+      messages: [{ role: "assistant", content: `worker turn ${index}`, stopReason: "stop" }],
+    }, harness.ctx);
+  }
+
+  const snapshotsAfterTurns = harness.entries.filter(
+    (entry) => (entry as { customType?: unknown }).customType === AUTO_MODE_STATE_TYPE,
+  ).length;
+
+  assert.equal(snapshotsAfterTurns - snapshotsAfterStart, 3);
+});
+
 test("session_start rejects strict mode without a verify command", async () => {
   const { createAutoModeExtension } = await loadAutoModeModule();
   const harness = createHarness({
