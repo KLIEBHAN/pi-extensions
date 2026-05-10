@@ -978,8 +978,12 @@ function restoreSnapshotOnSessionStart(
     return { resumed: false };
   }
 
-  const forcePausedForMigration = Array.isArray(restored.migrationWarnings) && restored.migrationWarnings.length > 0;
+  const hadMigrationWarnings = Array.isArray(restored.migrationWarnings) && restored.migrationWarnings.length > 0;
+  const forcePausedForMigration = hadMigrationWarnings;
   notifyWarnings(ctx, restored.migrationWarnings);
+  if (hadMigrationWarnings) {
+    restored.migrationWarnings = undefined;
+  }
 
   const shouldResume = forcePausedForMigration
     ? false
@@ -993,7 +997,7 @@ function restoreSnapshotOnSessionStart(
     ctx.ui.notify(`Auto-mode restored and resumed (${restored.currentIteration}/${restored.maxIterations})`, "info");
   }
 
-  if (restored.paused !== previousPaused) {
+  if (restored.paused !== previousPaused || hadMigrationWarnings) {
     persistSnapshot(pi, restored);
   }
 

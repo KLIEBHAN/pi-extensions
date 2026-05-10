@@ -945,9 +945,57 @@ test("legacy V1 state restores paused with warnings under V2 semantics", async (
   const latestState = getLatestAutoState(harness.entries);
   assert.equal(latestState?.version, 2);
   assert.equal(latestState?.paused, true);
+  assert.equal(latestState?.migrationWarnings, undefined);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("legacy auto-mode V1 state")));
   assert.ok(harness.notifications.some((entry) => entry.message.includes("restored in paused mode")));
   assert.equal(harness.sentMessages.length, 0);
+});
+
+test("migration warnings are cleared after the first restore so a reload does not show them again", async () => {
+  const { createAutoModeExtension } = await loadAutoModeModule();
+  const harness = createHarness({}, [
+    {
+      type: "custom",
+      customType: AUTO_MODE_STATE_TYPE,
+      data: {
+        version: 1,
+        enabled: true,
+        paused: false,
+        runId: "auto-v1",
+        goal: "improve onboarding robustness",
+        mode: "iterations",
+        maxIterations: 8,
+        currentIteration: 3,
+        startedAt: 1,
+        commitPolicy: "final-or-milestone",
+        pushPolicy: "final-or-milestone-if-upstream",
+        controllerSummary: "legacy summary",
+        recentDecisions: [],
+        consecutiveControllerFailures: 0,
+        consecutiveWorkerFailures: 0,
+        consecutiveStagnationCount: 0,
+        consecutiveNoChangeCount: 0,
+        resumePolicy: "restore-paused",
+      },
+    },
+  ]);
+
+  createAutoModeExtension()(harness.pi as never);
+
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+
+  const firstRestoreWarnings = harness.notifications.filter((entry) =>
+    entry.message.includes("legacy auto-mode V1 state"),
+  );
+  assert.equal(firstRestoreWarnings.length, 1);
+
+  harness.notifications.length = 0;
+  await harness.handlers.get("session_start")?.({ reason: "reload" }, harness.ctx);
+
+  const secondRestoreWarnings = harness.notifications.filter((entry) =>
+    entry.message.includes("legacy auto-mode V1 state"),
+  );
+  assert.equal(secondRestoreWarnings.length, 0);
 });
 
 test("deprecated startup flags warn but do not prevent a pragmatic start", async () => {
