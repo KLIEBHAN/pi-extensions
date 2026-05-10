@@ -654,6 +654,25 @@ async function runVerifyCommand(pi: ExtensionAPI, cwd: string, command: string):
   };
 }
 
+async function runVerifyCommandSafely(
+  runner: typeof runVerifyCommand,
+  pi: ExtensionAPI,
+  cwd: string,
+  command: string,
+): Promise<VerifyCommandResult> {
+  try {
+    return await runner(pi, cwd, command);
+  } catch (error) {
+    return {
+      command,
+      ok: false,
+      exitCode: -1,
+      stdout: "",
+      stderr: getErrorMessage(error),
+    };
+  }
+}
+
 function resolveControllerModel(snapshot: AutoModeStateV2, ctx: ExtensionContext): Model<Api> | undefined {
   const registry = ctx.modelRegistry;
   const explicit = snapshot.controllerModel;
@@ -1325,17 +1344,7 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           currentIteration: snapshot.currentIteration,
           maxIterations: snapshot.maxIterations,
         }) && snapshot.verifyCommand) {
-          try {
-            verifyResult = await runVerifyCommandImpl(pi, ctx.cwd, snapshot.verifyCommand);
-          } catch (error) {
-            verifyResult = {
-              command: snapshot.verifyCommand,
-              ok: false,
-              exitCode: -1,
-              stdout: "",
-              stderr: getErrorMessage(error),
-            };
-          }
+          verifyResult = await runVerifyCommandSafely(runVerifyCommandImpl, pi, ctx.cwd, snapshot.verifyCommand);
         }
 
         let decision: ControllerDecision | undefined;
@@ -1373,6 +1382,10 @@ export function createAutoModeExtension(deps: AutoModeDependencies = {}) {
           recordControllerDecision(snapshot, decision);
           pauseSnapshot(pi, ctx, runtime, decision.reason);
           return;
+        }
+
+        if (snapshot.verifyCommand && !verifyResult) {
+          verifyResult = await runVerifyCommandSafely(runVerifyCommandImpl, pi, ctx.cwd, snapshot.verifyCommand);
         }
 
         const stopGuard = evaluateAutoStopGuard({
