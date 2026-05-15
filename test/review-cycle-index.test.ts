@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createReviewCycleExtension } from "../extensions/review-cycle/index.ts";
+import { createReviewCycleExtension, runFreshReviewAgent } from "../extensions/review-cycle/index.ts";
 
 function createHarness(options: { cwd?: string } = {}) {
   const handlers = new Map<string, Function>();
@@ -73,6 +73,53 @@ function createHarness(options: { cwd?: string } = {}) {
     },
   };
 }
+
+test("runFreshReviewAgent spawns a guarded reviewer process and parses JSON stream", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-spawn-"));
+  try {
+    const fakePiPath = join(cwd, "fake-pi.mjs");
+    await writeFile(fakePiPath, `
+import { readFile } from "node:fs/promises";
+const args = process.argv.slice(2);
+const fail = (message) => { console.error(message); process.exit(2); };
+if (!args.includes("--mode") || !args.includes("json")) fail("missing json mode");
+if (!args.includes("--no-session")) fail("missing no-session");
+if (!args.includes("--no-extensions")) fail("missing no-extensions");
+const extensionIndex = args.indexOf("-e");
+if (extensionIndex < 0) fail("missing guard extension");
+const guardPath = args[extensionIndex + 1];
+const guardSource = await readFile(guardPath, "utf8");
+const guardModule = await import("data:text/javascript," + encodeURIComponent(guardSource));
+let toolHandler;
+guardModule.default({ on(event, handler) { if (event === "tool_call") toolHandler = handler; } });
+if (typeof toolHandler !== "function") fail("missing tool handler");
+if (toolHandler({ toolName: "bash", input: { command: "npm test" } }) !== undefined) fail("npm test should be allowed");
+if (!toolHandler({ toolName: "bash", input: { command: "rm -rf ." } })?.block) fail("rm should be blocked");
+if (!toolHandler({ toolName: "write", input: { path: "x" } })?.block) fail("write should be blocked");
+console.log(JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: "npm test" } }));
+console.log(JSON.stringify({ type: "tool_execution_end", toolName: "bash", isError: false, result: { content: "tests passed" } }));
+console.log(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "## Verdict\\n" } }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "## Verdict\\nAPPROVE\\n\\n## Findings\\nNo mandatory findings." }] } }));
+`, "utf8");
+
+    const lines: string[] = [];
+    const result = await runFreshReviewAgent({
+      cwd,
+      prompt: "review this",
+      allowedTestCommands: ["npm test"],
+      timeoutMs: 10_000,
+      invocation: { command: process.execPath, args: [fakePiPath] },
+      onLine: (line) => lines.push(line),
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.match(result.text, /APPROVE/);
+    assert.ok(lines.some((line) => line.includes("→ bash")));
+    assert.ok(lines.some((line) => line.includes("tests passed")));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 
 test("review-cycle registers /rc alias and shows command help", async () => {
   const harness = createHarness();
@@ -186,6 +233,37 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("[x] 1. HIGH"))));
 });
 
+test("review-cycle surfaces invalid structured review data and falls back to markdown", async () => {
+  const harness = createHarness();
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => ({
+      text: "## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: fallback finding\n\n## Review Data\n~~~json\n{\"verdict\":\"APPROVE\"}\n~~~",
+      exitCode: 0,
+      stderr: "",
+      messages: [],
+    }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("invalid data task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("Review Data invalid"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("fallback finding"))));
+});
+
 test("review-cycle ends without apply pass when reviewer approves", async () => {
   const harness = createHarness();
   let reviewCalls = 0;
@@ -269,6 +347,17 @@ test("review-cycle rerun reuses the previous task and honors configured test com
   assert.ok(prompts.every((prompt) => prompt.includes("implement rerun target")));
 });
 
+test("review-cycle rejects unsafe test commands before storing preferences", async () => {
+  const harness = createHarness();
+  createReviewCycleExtension()(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("tests set npm install", harness.ctx);
+  await harness.commands.get("review-cycle")?.handler("tests status", harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Unsafe reviewer test command rejected: npm install")));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("default safe test allowlist")));
+});
+
 test("review-cycle pauses on dirty workspace until continue", async () => {
   const harness = createHarness();
   createReviewCycleExtension({
@@ -293,7 +382,7 @@ test("review-cycle uses repo config, waits for manual apply, and writes artifact
     await mkdir(join(cwd, ".pi"), { recursive: true });
     await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({
       reviewerModel: "openai/gpt-review",
-      tests: ["npm test"],
+      tests: ["npm test", "rm -rf ."],
       manualApply: true,
     }), "utf8");
 
@@ -323,7 +412,7 @@ CHANGES_REQUESTED
 
 ## Review Data
 ~~~json
-{"verdict":"CHANGES_REQUESTED","findings":[{"severity":"high","title":"Needs fix","file":"src/a.ts","line":3,"mandatory":true,"suggestion":"Fix it"}]}
+{"schemaVersion":1,"verdict":"CHANGES_REQUESTED","findings":[{"severity":"high","title":"Needs fix","file":"src/a.ts","line":3,"mandatory":true,"suggestion":"Fix it"}]}
 ~~~`,
           exitCode: 0,
           stderr: "",
@@ -338,6 +427,7 @@ CHANGES_REQUESTED
     }, harness.ctx);
 
     assert.deepEqual(allowedTestCommandSnapshots[0], ["npm test"]);
+    assert.ok(harness.notifications.some((entry) => entry.message.includes("Ignored unsafe configured reviewer test command: rm -rf .")));
     assert.equal(harness.sentMessages.length, 1);
     assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("waiting for /review-cycle apply"))));
 
@@ -352,6 +442,11 @@ CHANGES_REQUESTED
     const latest = await readFile(join(cwd, ".pi", "review-cycle", "latest.md"), "utf8");
     assert.match(latest, /Stage: apply-complete/);
     assert.match(latest, /Needs fix/);
+
+    await harness.commands.get("review-cycle")?.handler("artifact", harness.ctx);
+    assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-artifact" && entry.content?.some((line) => line.includes("Stage: apply-complete"))));
+    await harness.commands.get("review-cycle")?.handler("artifact path", harness.ctx);
+    assert.ok(harness.notifications.some((entry) => entry.message.includes(".pi/review-cycle/latest.md")));
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -360,19 +455,24 @@ CHANGES_REQUESTED
 test("review-cycle until-approved reruns review after apply", async () => {
   const harness = createHarness();
   let reviewCalls = 0;
+  let snapshotCalls = 0;
 
   createReviewCycleExtension({
     getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
-    getChangeSnapshot: async () => ({
+    getChangeSnapshot: async () => {
+      snapshotCalls += 1;
+      const changed = snapshotCalls >= 2;
+      return {
       isGitRepo: true,
       baselineHead: "abc123",
-      status: "## main\n M src/a.ts",
-      diffStat: "src/a.ts | 1 +",
-      diff: "diff --git a/src/a.ts b/src/a.ts",
+      status: changed ? "## main\n M src/a.ts\n M src/b.ts" : "## main\n M src/a.ts",
+      diffStat: changed ? "src/a.ts | 1 +\nsrc/b.ts | 1 +" : "src/a.ts | 1 +",
+      diff: changed ? "diff --git a/src/a.ts b/src/a.ts\ndiff --git a/src/b.ts b/src/b.ts" : "diff --git a/src/a.ts b/src/a.ts",
       committedChanges: "",
       untrackedFiles: [],
       notes: [],
-    }),
+    };
+    },
     runFreshReviewAgent: async () => {
       reviewCalls += 1;
       return {
@@ -400,6 +500,42 @@ test("review-cycle until-approved reruns review after apply", async () => {
   assert.equal(reviewCalls, 2);
   assert.equal(harness.sentMessages.length, 2);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
+});
+
+test("review-cycle until-approved stops when apply makes no workspace changes", async () => {
+  const harness = createHarness();
+  let reviewCalls = 0;
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => {
+      reviewCalls += 1;
+      return { text: "## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: still broken", exitCode: 0, stderr: "", messages: [] };
+    },
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("--until-approved fix without changes", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+  assert.equal(reviewCalls, 1);
+
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "claimed applied" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(reviewCalls, 1);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("apply pass made no workspace changes")));
 });
 
 test("review-cycle failed reviewer can be retried", async () => {

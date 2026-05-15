@@ -52,6 +52,8 @@ test("parseReviewCycleArgs parses help, status, stop, and output visibility", ()
     command: "npm test",
   });
   assert.deepEqual(parseReviewCycleArgs("config tests clear"), { kind: "tests", action: "clear" });
+  assert.deepEqual(parseReviewCycleArgs("artifact"), { kind: "artifact", action: "show" });
+  assert.deepEqual(parseReviewCycleArgs("artifact path"), { kind: "artifact", action: "path" });
   assert.deepEqual(parseReviewCycleArgs("apply"), { kind: "apply" });
   assert.deepEqual(parseReviewCycleArgs("skip"), { kind: "skip" });
   assert.deepEqual(parseReviewCycleArgs("continue"), { kind: "continue" });
@@ -271,7 +273,7 @@ CHANGES_REQUESTED
 
 ## Review Data
 ~~~json
-{"verdict":"APPROVE_WITH_NOTES","findings":[{"severity":"low","title":"Tiny issue","file":"src/a.ts","line":7,"mandatory":false,"suggestion":"Polish it"}]}
+{"schemaVersion":1,"verdict":"APPROVE_WITH_NOTES","findings":[{"severity":"low","title":"Tiny issue","file":"src/a.ts","line":7,"mandatory":false,"suggestion":"Polish it"}]}
 ~~~`), {
     verdict: "APPROVE_WITH_NOTES",
     findingCount: 1,
@@ -287,6 +289,24 @@ CHANGES_REQUESTED
         mandatory: false,
       },
     ],
+    reviewDataSchemaVersion: 1,
+  });
+
+  assert.deepEqual(parseReviewSummary(`## Verdict
+CHANGES_REQUESTED
+
+## Findings
+- HIGH: fallback text
+
+## Review Data
+~~~json
+{"verdict":"APPROVE"}
+~~~`), {
+    verdict: "CHANGES_REQUESTED",
+    findingCount: 1,
+    severityCounts: { critical: 0, high: 1, medium: 0, low: 0, other: 0 },
+    findings: [{ severity: "high", text: "HIGH: fallback text" }],
+    reviewDataWarning: "Review Data invalid: expected schemaVersion 1; fell back to Markdown findings.",
   });
 });
 
@@ -295,6 +315,7 @@ test("reviewer system prompt describes the technical read-only git guard", () =>
   assert.match(REVIEWER_SYSTEM_PROMPT, /completely fresh context/);
   assert.match(REVIEWER_SYSTEM_PROMPT, /guarded bash for read-only git inspection, and guarded bash for common test commands/);
   assert.match(REVIEWER_SYSTEM_PROMPT, /Mutating tools, arbitrary shell execution, unsafe shell\/git arguments, and unknown\/custom tools are blocked/);
+  assert.match(REVIEWER_SYSTEM_PROMPT, /"schemaVersion": 1/);
 });
 
 test("buildApplyReviewPrompt returns reviewer feedback to the implementation agent", () => {

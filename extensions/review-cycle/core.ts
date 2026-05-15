@@ -104,6 +104,8 @@ export interface ReviewSummary {
   findingCount: number;
   severityCounts: Record<ReviewFindingSeverity, number>;
   findings: ReviewFinding[];
+  reviewDataSchemaVersion?: number;
+  reviewDataWarning?: string;
 }
 
 export interface ModelRef {
@@ -130,6 +132,7 @@ export type ReviewCycleCommand =
   | { kind: "skip" }
   | { kind: "retry"; reviewerModel?: ModelRef }
   | { kind: "rerun"; reviewerModel?: ModelRef }
+  | { kind: "artifact"; action: "show" | "path" }
   | { kind: "output"; mode: "on" | "off" | "toggle" }
   | { kind: "tests"; action: "show" | "clear" | "add" | "set"; command?: string }
   | { error: string };
@@ -205,6 +208,7 @@ Optional short positive notes or non-blocking improvements.
 A fenced JSON object for machine parsing. Use this shape exactly:
 ~~~json
 {
+  "schemaVersion": 1,
   "verdict": "APPROVE_WITH_NOTES",
   "findings": [
     {
@@ -426,6 +430,12 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
   if (command === "skip") return rest.length === 0 ? { kind: "skip" } : { error: "Usage: /review-cycle skip" };
   if (command === "retry") return parseRetryArgs(rest);
   if (command === "rerun") return parseRerunArgs(rest);
+  if (command === "artifact") {
+    const action = (rest[0] ?? "show").toLowerCase();
+    if (rest.length <= 1 && (action === "show" || action === "latest")) return { kind: "artifact", action: "show" };
+    if (rest.length <= 1 && action === "path") return { kind: "artifact", action: "path" };
+    return { error: "Usage: /review-cycle artifact [show|latest|path]" };
+  }
   if (command === "tests") return parseTestsArgs(rest);
   if (command === "config" && rest[0]?.toLowerCase() === "tests") return parseTestsArgs(rest.slice(1));
   if (command === "output") {
@@ -988,7 +998,11 @@ function emptySeverityCounts(): ReviewSummary["severityCounts"] {
   };
 }
 
-function buildReviewSummary(verdict: ReviewVerdict | undefined, findings: ReviewFinding[]): ReviewSummary {
+function buildReviewSummary(
+  verdict: ReviewVerdict | undefined,
+  findings: ReviewFinding[],
+  metadata: Pick<ReviewSummary, "reviewDataSchemaVersion" | "reviewDataWarning"> = {},
+): ReviewSummary {
   const severityCounts = emptySeverityCounts();
   for (const finding of findings) {
     severityCounts[finding.severity] += 1;
@@ -998,28 +1012,41 @@ function buildReviewSummary(verdict: ReviewVerdict | undefined, findings: Review
     findingCount: findings.length,
     severityCounts,
     findings,
+    ...metadata,
   };
 }
 
-function extractReviewDataJson(review: string): unknown | undefined {
+function extractReviewDataRaw(review: string): string | undefined {
   const section = /##\s+Review Data\s*\n([\s\S]*?)(?:\n##\s+|$)/i.exec(review)?.[1];
   if (!section) return undefined;
   const fenced = /(?:```|~~~)(?:json)?\s*\n([\s\S]*?)\n(?:```|~~~)/i.exec(section)?.[1];
-  const raw = (fenced ?? section).trim();
-  if (!raw) return undefined;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return undefined;
-  }
+  return (fenced ?? section).trim() || undefined;
 }
 
-function parseStructuredReviewSummary(review: string): ReviewSummary | undefined {
-  const data = extractReviewDataJson(review);
-  if (typeof data !== "object" || data === null) return undefined;
-  const record = data as { verdict?: unknown; findings?: unknown };
+function parseStructuredReviewSummary(review: string): { summary?: ReviewSummary; warning?: string } {
+  const raw = extractReviewDataRaw(review);
+  if (!raw) return {};
+
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { warning: "Review Data invalid: JSON parse failed; fell back to Markdown findings." };
+  }
+
+  if (typeof data !== "object" || data === null) {
+    return { warning: "Review Data invalid: expected a JSON object; fell back to Markdown findings." };
+  }
+
+  const record = data as { schemaVersion?: unknown; verdict?: unknown; findings?: unknown };
+  if (record.schemaVersion !== 1) {
+    return { warning: "Review Data invalid: expected schemaVersion 1; fell back to Markdown findings." };
+  }
+
   const verdict = isReviewVerdict(record.verdict) ? record.verdict : undefined;
-  if (!Array.isArray(record.findings)) return verdict ? buildReviewSummary(verdict, []) : undefined;
+  if (!Array.isArray(record.findings)) {
+    return { warning: "Review Data invalid: findings must be an array; fell back to Markdown findings." };
+  }
 
   const findings = record.findings
     .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
@@ -1045,12 +1072,12 @@ function parseStructuredReviewSummary(review: string): ReviewSummary | undefined
       } satisfies ReviewFinding;
     });
 
-  return buildReviewSummary(verdict, findings);
+  return { summary: buildReviewSummary(verdict, findings, { reviewDataSchemaVersion: 1 }) };
 }
 
 export function parseReviewSummary(review: string): ReviewSummary {
   const structured = parseStructuredReviewSummary(review);
-  if (structured) return structured;
+  if (structured.summary) return structured.summary;
 
   const verdictMatch = /\b(APPROVE_WITH_NOTES|CHANGES_REQUESTED|APPROVE)\b/.exec(review);
   const verdict = verdictMatch?.[1] as ReviewVerdict | undefined;
@@ -1064,7 +1091,7 @@ export function parseReviewSummary(review: string): ReviewSummary {
     .filter(Boolean)
     .map((text) => ({ severity: parseFindingSeverity(text), text }));
 
-  return buildReviewSummary(verdict, findings);
+  return buildReviewSummary(verdict, findings, structured.warning ? { reviewDataWarning: structured.warning } : {});
 }
 
 export function buildApplyReviewPrompt(input: ApplyReviewPromptInput): string {
