@@ -1131,6 +1131,7 @@ async function runReviewAndQueueApply(
   state.reviewSummary = summary;
 
   await writeReviewArtifact(ctx.cwd, state, "review-complete");
+  if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
 
   if (summary.verdict === "APPROVE") {
     updateReviewSummaryWidget(ctx, summary, "done; no apply pass needed", "handled");
@@ -1175,6 +1176,7 @@ async function skipManualApply(ctx: ExtensionCommandContext, stateRef: { current
   }
   if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "skipped by user", "handled");
   await writeReviewArtifact(ctx.cwd, state, "manual-apply-skipped");
+  if (stateRef.current !== state || !state.active || state.phase !== "manual") return;
   finishState(ctx, stateRef);
   ctx.ui.notify("Review-cycle completed: manual apply skipped", "info");
 }
@@ -1550,12 +1552,14 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       state.applySummary = truncateMiddle(assistantTurn.text, MAX_IMPLEMENTATION_SUMMARY_CHARS);
       if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "apply pass finished", "handled");
       const afterApplyChanges = await getChangeSnapshotImpl(pi, ctx.cwd, state.baseline).catch(() => undefined);
+      if (stateRef.current !== state || !state.active || state.phase !== "applying") return;
       const applyMadeNoWorkspaceChanges = !!afterApplyChanges && !!beforeApplyFingerprint && changeSnapshotFingerprint(afterApplyChanges) === beforeApplyFingerprint;
       if (afterApplyChanges) state.lastChanges = afterApplyChanges;
 
       if (state.autoRerunAfterApply && state.reviewRound < state.maxReviewRounds && applyMadeNoWorkspaceChanges) {
         if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "stopped: apply pass made no workspace changes", "handled");
         await writeReviewArtifact(ctx.cwd, state, "stopped-no-change-after-apply");
+        if (stateRef.current !== state || !state.active || state.phase !== "applying") return;
         finishState(ctx, stateRef);
         stopStatusTicker();
         ctx.ui.notify("Review-cycle stopped: apply pass made no workspace changes", "warning");
@@ -1563,6 +1567,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       }
 
       await writeReviewArtifact(ctx.cwd, state, "apply-complete");
+      if (stateRef.current !== state || !state.active || state.phase !== "applying") return;
 
       if (state.autoRerunAfterApply && state.reviewRound < state.maxReviewRounds) {
         ctx.ui.notify(`Review-cycle: rerunning fresh review (${state.reviewRound + 1}/${state.maxReviewRounds})`, "info");
