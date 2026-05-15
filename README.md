@@ -289,7 +289,7 @@ pi -e ./extensions/prompt-autocomplete \
 - The status card includes the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` either queue the apply pass or wait for `/review-cycle apply` in manual mode.
 - The reviewer also returns a structured `## Review Data` JSON block with `schemaVersion: 1`, which the extension uses for robust checklist rendering; invalid structured data is surfaced and falls back to Markdown parsing. Reviews without a recognized `APPROVE`, `APPROVE_WITH_NOTES`, or `CHANGES_REQUESTED` verdict fail closed and can be retried.
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification when needed.
-- Review artifacts are written atomically to `.pi/review-cycle/latest.md` and `.pi/review-cycle/runs/<timestamp>-<run-id>.md`; use `/review-cycle artifact` or `/review-cycle artifact path` to inspect them. Generated artifact files are ignored by git.
+- Review artifacts are written atomically to `.pi/review-cycle/latest.md` and `.pi/review-cycle/runs/<timestamp>-<run-id>.md`; use `/review-cycle artifact`, `/review-cycle artifact list`, `/review-cycle artifact show <n>`, or `/review-cycle artifact path [n]` to inspect recent runs. Generated artifact files are ignored by git.
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
 - `/review-cycle retry` retries a failed reviewer subprocess without discarding the implementation state.
 - `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands and reject unsafe/non-test commands early; `/review-cycle tests clear` restores the default safe test allowlist.
@@ -327,6 +327,8 @@ Then inside pi:
 /review-cycle retry
 /review-cycle rerun
 /review-cycle artifact
+/review-cycle artifact list
+/review-cycle artifact show 1
 /review-cycle artifact path
 /review-cycle stop
 ```

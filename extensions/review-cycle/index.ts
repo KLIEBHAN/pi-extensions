@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
@@ -44,6 +44,7 @@ const MAX_CHECKLIST_ITEMS = 12;
 const STATUS_REFRESH_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_REVIEW_ROUNDS = 2;
 const REVIEWER_KILL_GRACE_MS = 5_000;
+const MAX_ARTIFACT_LIST_ITEMS = 10;
 const REVIEW_CYCLE_CONFIG_PATH = ".pi/review-cycle.json";
 const REVIEW_CYCLE_ARTIFACT_DIR = ".pi/review-cycle";
 
@@ -136,6 +137,17 @@ interface ReviewCyclePanelAction {
   label: string;
   description: string;
   command?: string;
+}
+
+interface ReviewArtifactEntry {
+  index: number;
+  path: string;
+  fileName: string;
+  stage?: string;
+  task?: string;
+  started?: string;
+  verdict?: string;
+  findings?: string;
 }
 
 function makeRunId(): string {
@@ -379,7 +391,7 @@ function showHelp(ctx: ExtensionCommandContext): void {
       "/review-cycle status  — show phase, elapsed time, reviewer, tests, task",
       "/review-cycle rerun [--reviewer-model provider/model]  — rerun fresh review for the last task",
       "/review-cycle output off|on|toggle  — hide/show live reviewer output",
-      "/review-cycle artifact [show|path]  — show latest review artifact or its path",
+      "/review-cycle artifact [show|list|path] [n]  — inspect latest or recent review artifacts",
       "/review-cycle tests status|set <cmd>|add <cmd>|clear  — configure exact reviewer test commands",
       "Repo config: .pi/review-cycle.json with reviewerModel, tests, manualApply, autoRerunAfterApply, maxReviewRounds, allowDirty",
       "/review-cycle stop  — cancel the managed workflow",
@@ -520,6 +532,7 @@ function buildPanelActions(state: ReviewCycleState | undefined, lastRun: LastRev
 
   actions.push(
     { id: "artifact", label: "Show latest artifact", description: "Open the latest review-cycle artifact widget", command: "artifact" },
+    { id: "artifact-list", label: "List artifact history", description: "Show recent review-cycle runs", command: "artifact list" },
     { id: "artifact-path", label: "Copy/show artifact path", description: "Notify the latest artifact path", command: "artifact path" },
     { id: "close", label: "Close panel", description: "Dismiss this overlay" },
   );
@@ -1184,27 +1197,103 @@ async function writeReviewArtifact(cwd: string, state: ReviewCycleState, stage: 
   }
 }
 
-async function showReviewArtifact(ctx: ExtensionCommandContext, action: "show" | "path"): Promise<void> {
-  const latestPath = join(ctx.cwd, REVIEW_CYCLE_ARTIFACT_DIR, "latest.md");
+function parseArtifactEntry(content: string, path: string, index: number): ReviewArtifactEntry {
+  const lineValue = (pattern: RegExp) => pattern.exec(content)?.[1]?.trim();
+  return {
+    index,
+    path,
+    fileName: basename(path),
+    stage: lineValue(/^Stage:\s*(.+)$/m),
+    task: lineValue(/^Task:\s*(.+)$/m),
+    started: lineValue(/^Started:\s*(.+)$/m),
+    verdict: lineValue(/^- verdict:\s*(.+)$/m),
+    findings: lineValue(/^- findings:\s*(.+)$/m),
+  };
+}
+
+async function listReviewArtifactRunPaths(cwd: string): Promise<string[]> {
+  const runsDir = join(cwd, REVIEW_CYCLE_ARTIFACT_DIR, "runs");
+  const names = await readdir(runsDir).catch(() => []);
+  return names
+    .filter((name) => name.endsWith(".md"))
+    .sort((left, right) => right.localeCompare(left))
+    .map((name) => join(runsDir, name));
+}
+
+async function readReviewArtifactEntries(cwd: string, limit = MAX_ARTIFACT_LIST_ITEMS): Promise<ReviewArtifactEntry[]> {
+  const paths = (await listReviewArtifactRunPaths(cwd)).slice(0, limit);
+  return await Promise.all(paths.map(async (path, index) => {
+    const content = await readFile(path, "utf8").catch(() => "");
+    return parseArtifactEntry(content, path, index + 1);
+  }));
+}
+
+async function resolveReviewArtifactPath(cwd: string, runIndex: number | undefined): Promise<string | undefined> {
+  if (!runIndex) return join(cwd, REVIEW_CYCLE_ARTIFACT_DIR, "latest.md");
+  return (await listReviewArtifactRunPaths(cwd))[runIndex - 1];
+}
+
+function formatArtifactListLine(entry: ReviewArtifactEntry): string {
+  const started = entry.started ? entry.started.replace(/T/, " ").replace(/\.\d{3}Z$/, "Z") : entry.fileName;
+  const verdict = entry.verdict && entry.verdict !== "(none)" ? entry.verdict : "no verdict";
+  const findings = entry.findings ?? "0";
+  const task = entry.task ? summarizeTask(entry.task, 80) : "(unknown task)";
+  return `${entry.index}. ${started} · ${entry.stage ?? "unknown stage"} · ${verdict} · findings ${findings} · ${task}`;
+}
+
+async function showReviewArtifactList(ctx: ExtensionCommandContext): Promise<void> {
+  const entries = await readReviewArtifactEntries(ctx.cwd);
+  if (entries.length === 0) {
+    ctx.ui.notify("No review-cycle artifacts found yet", "info");
+    return;
+  }
+
+  const total = (await listReviewArtifactRunPaths(ctx.cwd)).length;
+  ctx.ui.setWidget(
+    ARTIFACT_WIDGET_KEY,
+    [
+      "Review-cycle artifact history",
+      "Newest first. Use /review-cycle artifact show <n> or /review-cycle artifact path <n>.",
+      ...entries.map(formatArtifactListLine),
+      ...(total > entries.length ? [`… (${total - entries.length} older artifacts not shown)`] : []),
+    ].map((line) => truncateLine(line)),
+    { placement: "belowEditor" },
+  );
+  ctx.ui.notify("Review-cycle artifact history shown", "info");
+}
+
+async function showReviewArtifact(ctx: ExtensionCommandContext, action: "show" | "path" | "list", runIndex?: number): Promise<void> {
+  if (action === "list") {
+    await showReviewArtifactList(ctx);
+    return;
+  }
+
+  const artifactPath = await resolveReviewArtifactPath(ctx.cwd, runIndex);
+  if (!artifactPath) {
+    ctx.ui.notify(`No review-cycle artifact #${runIndex} found`, "info");
+    return;
+  }
+
+  const label = runIndex ? `Review-cycle artifact #${runIndex}` : "Review-cycle latest artifact";
   if (action === "path") {
-    ctx.ui.notify(`Review-cycle latest artifact: ${latestPath}`, "info");
+    ctx.ui.notify(`${label}: ${artifactPath}`, "info");
     return;
   }
 
   let content: string;
   try {
-    content = await readFile(latestPath, "utf8");
+    content = await readFile(artifactPath, "utf8");
   } catch {
-    ctx.ui.notify("No review-cycle artifact found yet", "info");
+    ctx.ui.notify(runIndex ? `No review-cycle artifact #${runIndex} found` : "No review-cycle artifact found yet", "info");
     return;
   }
 
   ctx.ui.setWidget(
     ARTIFACT_WIDGET_KEY,
-    ["Review-cycle latest artifact", `Path: ${latestPath}`, ...truncateMiddle(content, 6_000).split(/\r?\n/)],
+    [label, `Path: ${artifactPath}`, ...truncateMiddle(content, 6_000).split(/\r?\n/)],
     { placement: "belowEditor" },
   );
-  ctx.ui.notify("Review-cycle latest artifact shown", "info");
+  ctx.ui.notify(`${label} shown`, "info");
 }
 
 function changeSnapshotFingerprint(snapshot: ChangeSnapshot | undefined): string | undefined {
@@ -1653,7 +1742,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       }
 
       if (parsed.kind === "artifact") {
-        await showReviewArtifact(ctx, parsed.action);
+        await showReviewArtifact(ctx, parsed.action, parsed.runIndex);
         return;
       }
 

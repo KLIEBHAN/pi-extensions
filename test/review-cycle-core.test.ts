@@ -54,7 +54,11 @@ test("parseReviewCycleArgs parses help, status, stop, and output visibility", ()
   });
   assert.deepEqual(parseReviewCycleArgs("config tests clear"), { kind: "tests", action: "clear" });
   assert.deepEqual(parseReviewCycleArgs("artifact"), { kind: "artifact", action: "show" });
+  assert.deepEqual(parseReviewCycleArgs("artifact list"), { kind: "artifact", action: "list" });
+  assert.deepEqual(parseReviewCycleArgs("artifact 2"), { kind: "artifact", action: "show", runIndex: 2 });
+  assert.deepEqual(parseReviewCycleArgs("artifact show 2"), { kind: "artifact", action: "show", runIndex: 2 });
   assert.deepEqual(parseReviewCycleArgs("artifact path"), { kind: "artifact", action: "path" });
+  assert.deepEqual(parseReviewCycleArgs("artifact path 2"), { kind: "artifact", action: "path", runIndex: 2 });
   assert.deepEqual(parseReviewCycleArgs("apply"), { kind: "apply" });
   assert.deepEqual(parseReviewCycleArgs("skip"), { kind: "skip" });
   assert.deepEqual(parseReviewCycleArgs("continue"), { kind: "continue" });

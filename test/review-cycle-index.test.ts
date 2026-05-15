@@ -642,8 +642,16 @@ CHANGES_REQUESTED
 
     await harness.commands.get("review-cycle")?.handler("artifact", harness.ctx);
     assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-artifact" && entry.content?.some((line) => line.includes("Stage: apply-complete"))));
+    await harness.commands.get("review-cycle")?.handler("artifact list", harness.ctx);
+    assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-artifact" && entry.content?.some((line) => line.includes("Review-cycle artifact history"))));
+    assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-artifact" && entry.content?.some((line) => line.includes("config driven task"))));
+    await harness.commands.get("review-cycle")?.handler("artifact show 1", harness.ctx);
+    assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-artifact" && entry.content?.some((line) => line.includes("Review-cycle artifact #1"))));
+    assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-artifact" && entry.content?.some((line) => line.includes("Stage: apply-complete"))));
     await harness.commands.get("review-cycle")?.handler("artifact path", harness.ctx);
     assert.ok(harness.notifications.some((entry) => entry.message.includes(".pi/review-cycle/latest.md")));
+    await harness.commands.get("review-cycle")?.handler("artifact path 1", harness.ctx);
+    assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle artifact #1") && entry.message.includes(".pi/review-cycle/runs/")));
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

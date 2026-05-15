@@ -133,7 +133,7 @@ export type ReviewCycleCommand =
   | { kind: "skip" }
   | { kind: "retry"; reviewerModel?: ModelRef }
   | { kind: "rerun"; reviewerModel?: ModelRef }
-  | { kind: "artifact"; action: "show" | "path" }
+  | { kind: "artifact"; action: "show" | "path" | "list"; runIndex?: number }
   | { kind: "output"; mode: "on" | "off" | "toggle" }
   | { kind: "tests"; action: "show" | "clear" | "add" | "set"; command?: string }
   | { error: string };
@@ -434,9 +434,20 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
   if (command === "rerun") return parseRerunArgs(rest);
   if (command === "artifact") {
     const action = (rest[0] ?? "show").toLowerCase();
-    if (rest.length <= 1 && (action === "show" || action === "latest")) return { kind: "artifact", action: "show" };
-    if (rest.length <= 1 && action === "path") return { kind: "artifact", action: "path" };
-    return { error: "Usage: /review-cycle artifact [show|latest|path]" };
+    if (rest.length <= 1 && (action === "list" || action === "history" || action === "runs")) return { kind: "artifact", action: "list" };
+    if (rest.length === 1) {
+      const runIndex = parsePositiveIntegerToken(action);
+      if (runIndex) return { kind: "artifact", action: "show", runIndex };
+    }
+    if (action === "show" || action === "latest") {
+      const runIndex = parsePositiveIntegerToken(rest[1]);
+      if (rest.length <= 1 || (rest.length === 2 && runIndex)) return { kind: "artifact", action: "show", ...(runIndex ? { runIndex } : {}) };
+    }
+    if (action === "path") {
+      const runIndex = parsePositiveIntegerToken(rest[1]);
+      if (rest.length <= 1 || (rest.length === 2 && runIndex)) return { kind: "artifact", action: "path", ...(runIndex ? { runIndex } : {}) };
+    }
+    return { error: "Usage: /review-cycle artifact [show|latest|list|path] [run-number]" };
   }
   if (command === "tests") return parseTestsArgs(rest);
   if (command === "config" && rest[0]?.toLowerCase() === "tests") return parseTestsArgs(rest.slice(1));
