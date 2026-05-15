@@ -33,7 +33,9 @@ test("parseReviewCycleArgs supports explicit on and reviewer model", () => {
   });
 });
 
-test("parseReviewCycleArgs parses status, stop, and output visibility", () => {
+test("parseReviewCycleArgs parses help, status, stop, and output visibility", () => {
+  assert.deepEqual(parseReviewCycleArgs("help"), { kind: "help" });
+  assert.deepEqual(parseReviewCycleArgs("--help"), { kind: "help" });
   assert.deepEqual(parseReviewCycleArgs("status"), { kind: "status" });
   assert.deepEqual(parseReviewCycleArgs("stop"), { kind: "stop" });
   assert.deepEqual(parseReviewCycleArgs("off"), { kind: "stop" });
@@ -213,11 +215,17 @@ test("parseReviewSummary extracts verdict and findings", () => {
     verdict: "APPROVE",
     findingCount: 0,
     severityCounts: { critical: 0, high: 0, medium: 0, low: 0, other: 0 },
+    findings: [],
   });
   assert.deepEqual(parseReviewSummary("## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: broken\n- medium: weak\n- nit"), {
     verdict: "CHANGES_REQUESTED",
     findingCount: 3,
     severityCounts: { critical: 0, high: 1, medium: 1, low: 0, other: 1 },
+    findings: [
+      { severity: "high", text: "HIGH: broken" },
+      { severity: "medium", text: "medium: weak" },
+      { severity: "other", text: "nit" },
+    ],
   });
 });
 

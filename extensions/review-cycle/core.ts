@@ -83,15 +83,22 @@ export const MAX_APPLY_REVIEW_CHARS = 24_000;
 export const MAX_TASK_SUMMARY_CHARS = 48;
 
 export type ReviewVerdict = "APPROVE" | "APPROVE_WITH_NOTES" | "CHANGES_REQUESTED";
+export type ReviewFindingSeverity = "critical" | "high" | "medium" | "low" | "other";
 
 export interface ReviewerGuardOptions {
   allowedTestCommands?: readonly string[];
 }
 
+export interface ReviewFinding {
+  severity: ReviewFindingSeverity;
+  text: string;
+}
+
 export interface ReviewSummary {
   verdict?: ReviewVerdict;
   findingCount: number;
-  severityCounts: Record<"critical" | "high" | "medium" | "low" | "other", number>;
+  severityCounts: Record<ReviewFindingSeverity, number>;
+  findings: ReviewFinding[];
 }
 
 export interface ModelRef {
@@ -101,6 +108,7 @@ export interface ModelRef {
 
 export type ReviewCycleCommand =
   | { kind: "start"; task: string; reviewerModel?: ModelRef }
+  | { kind: "help" }
   | { kind: "status" }
   | { kind: "stop" }
   | { kind: "rerun"; reviewerModel?: ModelRef }
@@ -148,6 +156,7 @@ export const APPLY_REVIEW_SYSTEM_PROMPT = `Review-cycle apply phase:
 - You are receiving code-review feedback from a separate fresh-context reviewer agent.
 - Apply every correct, high-value finding from the review.
 - If you intentionally reject a suggestion, state the concrete reason.
+- In your final response, include a short findings checklist that marks each mandatory finding as fixed or intentionally declined.
 - Re-run the most relevant local verification before stopping and mention the concrete result.
 - Do not ask the user for confirmation; finish the review-application pass autonomously.`;
 
@@ -301,12 +310,13 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
   const tokenized = tokenizeArgs(args);
   if (!Array.isArray(tokenized)) return { error: tokenized.error };
   if (tokenized.length === 0) {
-    return { error: "Usage: /review-cycle [on|status|stop] [--reviewer-model provider/model] <task>" };
+    return { error: "Usage: /review-cycle [help|on|status|stop] [--reviewer-model provider/model] <task>" };
   }
 
   const [first, ...rest] = tokenized;
   const command = first.toLowerCase();
 
+  if (command === "help" || command === "--help" || command === "-h") return { kind: "help" };
   if (command === "status") return { kind: "status" };
   if (command === "stop" || command === "off") return { kind: "stop" };
   if (command === "rerun") return parseRerunArgs(rest);
@@ -834,6 +844,15 @@ export function buildReviewerUserPrompt(input: ReviewerPromptInput): string {
   return sections.join("\n\n");
 }
 
+function parseFindingSeverity(text: string): ReviewFindingSeverity {
+  const normalized = text.toLowerCase();
+  if (/\bcritical\b/.test(normalized)) return "critical";
+  if (/\bhigh\b/.test(normalized)) return "high";
+  if (/\bmedium\b/.test(normalized)) return "medium";
+  if (/\blow\b/.test(normalized)) return "low";
+  return "other";
+}
+
 export function parseReviewSummary(review: string): ReviewSummary {
   const verdictMatch = /\b(APPROVE_WITH_NOTES|CHANGES_REQUESTED|APPROVE)\b/.exec(review);
   const verdict = verdictMatch?.[1] as ReviewVerdict | undefined;
@@ -846,25 +865,24 @@ export function parseReviewSummary(review: string): ReviewSummary {
   };
 
   const findingsSection = /##\s+Findings\s*\n([\s\S]*?)(?:\n##\s+|$)/i.exec(review)?.[1] ?? "";
-  const findingLines = findingsSection
+  const findings = findingsSection
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => /^[-*]\s+/.test(line))
-    .filter((line) => !/no\s+(mandatory\s+)?findings|none/i.test(line));
+    .filter((line) => !/no\s+(mandatory\s+)?findings|none/i.test(line))
+    .map((line) => line.replace(/^[-*]\s+/, "").trim())
+    .filter(Boolean)
+    .map((text) => ({ severity: parseFindingSeverity(text), text }));
 
-  for (const line of findingLines) {
-    const normalized = line.toLowerCase();
-    if (/\bcritical\b/.test(normalized)) severityCounts.critical += 1;
-    else if (/\bhigh\b/.test(normalized)) severityCounts.high += 1;
-    else if (/\bmedium\b/.test(normalized)) severityCounts.medium += 1;
-    else if (/\blow\b/.test(normalized)) severityCounts.low += 1;
-    else severityCounts.other += 1;
+  for (const finding of findings) {
+    severityCounts[finding.severity] += 1;
   }
 
   return {
     verdict,
-    findingCount: findingLines.length,
+    findingCount: findings.length,
     severityCounts,
+    findings,
   };
 }
 

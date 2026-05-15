@@ -33,8 +33,11 @@ const MAX_REVIEWER_STDERR_CHARS = 4_000;
 const MAX_IMPLEMENTATION_SUMMARY_CHARS = 8_000;
 const REVIEWER_OUTPUT_WIDGET_KEY = "review-cycle-reviewer-output";
 const REVIEWER_SUMMARY_WIDGET_KEY = "review-cycle-review-summary";
+const PREFLIGHT_WIDGET_KEY = "review-cycle-preflight";
+const HELP_WIDGET_KEY = "review-cycle-help";
 const MAX_REVIEWER_OUTPUT_LINES = 80;
 const MAX_REVIEWER_OUTPUT_LINE_CHARS = 240;
+const MAX_CHECKLIST_ITEMS = 12;
 
 interface ReviewCycleState {
   active: boolean;
@@ -46,6 +49,7 @@ interface ReviewCycleState {
   reviewerModel?: ModelRef;
   implementationSummary?: string;
   review?: string;
+  reviewSummary?: ReviewSummary;
   reviewerOutputVisible: boolean;
   reviewerOutputLines: string[];
   allowedTestCommands: string[];
@@ -107,14 +111,40 @@ function validateRequestedReviewerModel(
   return undefined;
 }
 
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  if (minutes < 60) return remainder > 0 ? `${minutes}m${remainder}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const minuteRemainder = minutes % 60;
+  return minuteRemainder > 0 ? `${hours}h${minuteRemainder}m` : `${hours}h`;
+}
+
+function getPhaseStatus(state: ReviewCycleState): { step: number; label: string } {
+  switch (state.phase) {
+    case "implementing":
+      return { step: 1, label: "implementing" };
+    case "reviewing":
+      return { step: 2, label: "reviewing" };
+    case "applying":
+      return { step: 3, label: "applying" };
+  }
+}
+
+function formatStatusLine(state: ReviewCycleState): string {
+  const phase = getPhaseStatus(state);
+  return `Review ${phase.step}/3 ${phase.label} · ${formatElapsed(Date.now() - state.startedAt)} · ${summarizeTask(state.task, 42)}`;
+}
+
 function setStatus(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState | undefined): void {
   if (!state?.active) {
     ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
     return;
   }
 
-  const phase = state.phase === "implementing" ? "implement" : state.phase === "reviewing" ? "review" : "apply";
-  ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, `Review ${phase}: ${summarizeTask(state.task, 36)}`);
+  ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, formatStatusLine(state));
 }
 
 function clearReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
@@ -125,11 +155,16 @@ function clearReviewerSummaryWidget(ctx: ExtensionContext | ExtensionCommandCont
   ctx.ui.setWidget(REVIEWER_SUMMARY_WIDGET_KEY, undefined);
 }
 
+function clearPreflightWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
+  ctx.ui.setWidget(PREFLIGHT_WIDGET_KEY, undefined);
+}
+
 function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
   stateRef.current = undefined;
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
   clearReviewerOutputWidget(ctx);
   clearReviewerSummaryWidget(ctx);
+  clearPreflightWidget(ctx);
 }
 
 function finishState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
@@ -167,6 +202,64 @@ function appendReviewerOutputChunk(state: ReviewCycleState, chunk: string): void
   }
 }
 
+function formatTestPolicy(allowedTestCommands: readonly string[]): string {
+  return allowedTestCommands.length > 0 ? allowedTestCommands.join("; ") : "default safe test allowlist";
+}
+
+function formatReviewerLabel(state: Pick<ReviewCycleState, "reviewerModel">): string {
+  return state.reviewerModel ? modelRefToCli(state.reviewerModel) : "active model at review time";
+}
+
+function updatePreflightWidget(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  state: ReviewCycleState,
+  workerModel: ModelRef | undefined,
+): void {
+  const gitLine = state.baseline.isGitRepo
+    ? `${state.baseline.dirty ? "dirty" : "clean"}${state.baseline.head ? ` · ${state.baseline.head.slice(0, 12)}` : ""}`
+    : "not a git repository";
+  const warnings = [
+    !state.baseline.isGitRepo ? "Warning: git change scoping is degraded." : undefined,
+    state.baseline.isGitRepo && state.baseline.dirty ? "Warning: workspace was already dirty before start." : undefined,
+  ].filter((line): line is string => !!line);
+
+  ctx.ui.setWidget(
+    PREFLIGHT_WIDGET_KEY,
+    [
+      "Review-cycle preflight",
+      `Task: ${summarizeTask(state.task, 140)}`,
+      `Worker: ${workerModel ? modelRefToCli(workerModel) : "selected model"}`,
+      `Reviewer: ${formatReviewerLabel(state)}`,
+      `Tests: ${formatTestPolicy(state.allowedTestCommands)}`,
+      `Git: ${gitLine}`,
+      "Mode: implement → fresh review → apply feedback unless reviewer returns APPROVE",
+      ...warnings,
+    ],
+    { placement: "belowEditor" },
+  );
+}
+
+function showHelp(ctx: ExtensionCommandContext): void {
+  ctx.ui.setWidget(
+    HELP_WIDGET_KEY,
+    [
+      "Review-cycle commands",
+      "/review-cycle <task>  — start implement → review → apply",
+      "/rc <task>            — short alias for /review-cycle",
+      "/review-cycle status  — show phase, elapsed time, reviewer, tests, task",
+      "/review-cycle rerun [--reviewer-model provider/model]  — rerun fresh review for the last task",
+      "/review-cycle output off|on|toggle  — hide/show live reviewer output",
+      "/review-cycle tests status  — show reviewer test policy",
+      "/review-cycle tests set <cmd>  — allow only this exact reviewer test command",
+      "/review-cycle tests add <cmd>  — add another exact reviewer test command",
+      "/review-cycle tests clear  — restore default safe test allowlist",
+      "/review-cycle stop  — cancel the managed workflow",
+    ],
+    { placement: "belowEditor" },
+  );
+  ctx.ui.notify("Review-cycle help shown", "info");
+}
+
 function formatReviewSummary(summary: ReviewSummary): string[] {
   const severityParts = Object.entries(summary.severityCounts)
     .filter(([, count]) => count > 0)
@@ -177,10 +270,30 @@ function formatReviewSummary(summary: ReviewSummary): string[] {
   ];
 }
 
-function updateReviewSummaryWidget(ctx: ExtensionContext | ExtensionCommandContext, summary: ReviewSummary, action: string): void {
+function formatFindingsChecklist(summary: ReviewSummary, mode: "pending" | "handled"): string[] {
+  if (summary.findings.length === 0) return ["Findings checklist: (none)"];
+  const marker = mode === "handled" ? "[x]" : "[ ]";
+  const shown = summary.findings.slice(0, MAX_CHECKLIST_ITEMS).map((finding, index) => {
+    const severity = finding.severity === "other" ? "finding" : finding.severity.toUpperCase();
+    return `${marker} ${index + 1}. ${severity}: ${truncateLine(finding.text)}`;
+  });
+  const omitted = summary.findings.length - shown.length;
+  return [
+    `Findings checklist (${mode === "handled" ? "apply pass completed" : "pending apply"}):`,
+    ...shown,
+    ...(omitted > 0 ? [`… (${omitted} more)`] : []),
+  ];
+}
+
+function updateReviewSummaryWidget(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  summary: ReviewSummary,
+  action: string,
+  checklistMode: "pending" | "handled" = "pending",
+): void {
   ctx.ui.setWidget(
     REVIEWER_SUMMARY_WIDGET_KEY,
-    ["Fresh reviewer summary", ...formatReviewSummary(summary), `Next: ${action}`],
+    ["Fresh reviewer summary", ...formatReviewSummary(summary), ...formatFindingsChecklist(summary, checklistMode), `Next: ${action}`],
     { placement: "belowEditor" },
   );
 }
@@ -195,7 +308,7 @@ function updateReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandCont
   ctx.ui.setWidget(
     REVIEWER_OUTPUT_WIDGET_KEY,
     [
-      `Fresh reviewer output — /review-cycle output off to hide (${lines.length} line${lines.length === 1 ? "" : "s"})`,
+      `Fresh reviewer output — /review-cycle output off or /rc output off to hide (${lines.length} line${lines.length === 1 ? "" : "s"})`,
       ...lines.slice(-MAX_REVIEWER_OUTPUT_LINES),
     ],
     { placement: "belowEditor" },
@@ -611,6 +724,7 @@ async function startReviewCycle(
 
   stateRef.current = state;
   setStatus(ctx, state);
+  updatePreflightWidget(ctx, state, ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined);
 
   if (!pi.getSessionName()) {
     pi.setSessionName(`Review: ${summarizeTask(task, 56)}`);
@@ -636,6 +750,7 @@ async function runReviewAndQueueApply(
 ): Promise<void> {
   state.phase = "reviewing";
   state.reviewerOutputLines = [];
+  clearPreflightWidget(ctx);
   clearReviewerSummaryWidget(ctx);
   setStatus(ctx, state);
   appendReviewerOutputLineAndRender(ctx, state, "Starting fresh-context reviewer...");
@@ -679,15 +794,16 @@ async function runReviewAndQueueApply(
   state.review = result.text.trim() || "Reviewer returned no text.";
   appendReviewerOutputLineAndRender(ctx, state, "Fresh-context reviewer finished.");
   const summary = parseReviewSummary(state.review);
+  state.reviewSummary = summary;
 
   if (summary.verdict === "APPROVE") {
-    updateReviewSummaryWidget(ctx, summary, "done; no apply pass needed");
+    updateReviewSummaryWidget(ctx, summary, "done; no apply pass needed", "handled");
     finishState(ctx, stateRef);
     ctx.ui.notify("Review-cycle: reviewer approved; no apply pass needed", "info");
     return;
   }
 
-  updateReviewSummaryWidget(ctx, summary, "applying feedback");
+  updateReviewSummaryWidget(ctx, summary, "applying feedback", "pending");
   state.phase = "applying";
   setStatus(ctx, state);
   ctx.ui.notify("Review-cycle: fresh review complete; applying feedback", "info");
@@ -746,9 +862,10 @@ function showStatus(ctx: ExtensionCommandContext, state: ReviewCycleState | unde
     return;
   }
 
-  const reviewer = state.reviewerModel ? ` reviewer=${modelRefToCli(state.reviewerModel)}` : " reviewer=active-model";
+  const reviewer = `reviewer=${formatReviewerLabel(state)}`;
+  const tests = `tests=${formatTestPolicy(state.allowedTestCommands)}`;
   ctx.ui.notify(
-    `review-cycle phase=${state.phase}${reviewer} task=${summarizeTask(state.task, 160)}`,
+    `${formatStatusLine(state)} · ${reviewer} · ${tests}`,
     "info",
   );
 }
@@ -772,12 +889,15 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     type: "string",
   });
 
-  pi.registerCommand("review-cycle", {
-    description: "Implement a task, run a fresh-context code review, then apply the feedback",
-    handler: async (args, ctx) => {
+  const handleReviewCycleCommand = async (args: string, ctx: ExtensionCommandContext) => {
       const parsed = parseReviewCycleArgs(args);
       if ("error" in parsed) {
         ctx.ui.notify(parsed.error, "warning");
+        return;
+      }
+
+      if (parsed.kind === "help") {
+        showHelp(ctx);
         return;
       }
 
@@ -848,7 +968,16 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
 
       await startReviewCycle(pi, ctx, stateRef, preferences, getGitBaselineImpl, parsed.task, parsed.reviewerModel);
       if (stateRef.current) lastRun = makeLastRunFromState(stateRef.current);
-    },
+  };
+
+  pi.registerCommand("review-cycle", {
+    description: "Implement a task, run a fresh-context code review, then apply the feedback",
+    handler: handleReviewCycleCommand,
+  });
+
+  pi.registerCommand("rc", {
+    description: "Alias for /review-cycle",
+    handler: handleReviewCycleCommand,
   });
 
   pi.on("session_start", async (event, ctx) => {
@@ -915,6 +1044,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     }
 
     if (state.phase === "applying") {
+      if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "apply pass finished", "handled");
       finishState(ctx, stateRef);
       ctx.ui.notify("Review-cycle completed: feedback application phase finished", "info");
     }

@@ -71,6 +71,19 @@ function createHarness() {
   };
 }
 
+test("review-cycle registers /rc alias and shows command help", async () => {
+  const harness = createHarness();
+  createReviewCycleExtension()(harness.pi as never);
+
+  assert.ok(harness.commands.has("review-cycle"));
+  assert.ok(harness.commands.has("rc"));
+
+  await harness.commands.get("rc")?.handler("help", harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("help shown")));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-help" && entry.content?.some((line) => line.includes("/rc <task>"))));
+});
+
 test("review-cycle streams reviewer output into a toggleable widget and queues apply prompt", async () => {
   const harness = createHarness();
   const reviewCalls: Array<{ prompt: string; cwd: string }> = [];
@@ -96,17 +109,17 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
       reviewCalls.push({ prompt: options.prompt, cwd: options.cwd });
       options.onLine?.('→ bash {"command":"npm test"}');
       options.onOutput?.("## Verdict\n");
-      options.onOutput?.("APPROVE_WITH_NOTES\n");
+      options.onOutput?.("CHANGES_REQUESTED\n");
       options.onLine?.("✓ bash");
       options.onLine?.("  tests passed");
       return {
-        text: "## Verdict\nAPPROVE_WITH_NOTES\n\n## Findings\nNo mandatory findings.",
+        text: "## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: src/auth.ts: missing null handling",
         exitCode: 0,
         stderr: "",
         messages: [
           {
             role: "assistant",
-            content: [{ type: "text", text: "## Verdict\nAPPROVE_WITH_NOTES" }],
+            content: [{ type: "text", text: "## Verdict\nCHANGES_REQUESTED" }],
           },
         ],
       };
@@ -118,7 +131,9 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.equal(harness.sentMessages.length, 1);
   assert.equal(harness.sentMessages[0]?.text, "implement auth hardening");
   assert.equal(harness.statuses.at(-1)?.key, "review-cycle");
-  assert.match(harness.statuses.at(-1)?.value ?? "", /Review implement/);
+  assert.match(harness.statuses.at(-1)?.value ?? "", /Review 1\/3 implementing/);
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-preflight" && entry.content?.some((line) => line.includes("Review-cycle preflight"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-preflight" && entry.content?.some((line) => line.includes("default safe test allowlist"))));
 
   await harness.handlers.get("agent_end")?.({
     messages: [
@@ -136,12 +151,13 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
 
   assert.equal(harness.sentMessages.length, 2);
   assert.match(harness.sentMessages[1]?.text ?? "", /Fresh-context review/);
-  assert.match(harness.sentMessages[1]?.text ?? "", /APPROVE_WITH_NOTES/);
+  assert.match(harness.sentMessages[1]?.text ?? "", /CHANGES_REQUESTED/);
 
   const visibleWidgets = harness.widgets.filter((entry) => entry.content);
   assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("Starting fresh-context reviewer"))));
-  assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("APPROVE_WITH_NOTES"))));
+  assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("CHANGES_REQUESTED"))));
   assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("tests passed"))));
+  assert.ok(visibleWidgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("[ ] 1. HIGH"))));
 
   await harness.commands.get("review-cycle")?.handler("output off", harness.ctx);
   assert.equal(harness.widgets.at(-1)?.key, "review-cycle-reviewer-output");
@@ -149,7 +165,19 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
 
   await harness.commands.get("review-cycle")?.handler("output on", harness.ctx);
   assert.equal(harness.widgets.at(-1)?.key, "review-cycle-reviewer-output");
-  assert.ok(harness.widgets.at(-1)?.content?.some((line) => line.includes("APPROVE_WITH_NOTES")));
+  assert.ok(harness.widgets.at(-1)?.content?.some((line) => line.includes("CHANGES_REQUESTED")));
+
+  await harness.handlers.get("agent_end")?.({
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Fixed finding and ran npm test." }],
+        stopReason: "stop",
+      },
+    ],
+  }, harness.ctx);
+
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("[x] 1. HIGH"))));
 });
 
 test("review-cycle ends without apply pass when reviewer approves", async () => {

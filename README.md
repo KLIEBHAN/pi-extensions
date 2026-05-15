@@ -277,17 +277,19 @@ pi -e ./extensions/prompt-autocomplete \
 
 ### What it adds
 
-- `/review-cycle <task>` starts a normal implementation request in the current agent.
+- `/review-cycle <task>` or short alias `/rc <task>` starts a normal implementation request in the current agent.
 - After the implementation turn finishes, the extension spawns a separate `pi --mode json -p --no-session` reviewer process, so the reviewer has a fresh context window.
 - The reviewer receives the original task, the implementation summary, the baseline git commit/status, and current diff/status data. It can also inspect the workspace with read-only tools.
 - The reviewer subprocess is technically guarded: `read`, `grep`, `find`, `ls`, and `bash` are available, but `bash` only permits read-only git inspection commands such as `git status`, `git diff`, `git show`, `git log`, `git blame`, and `git ls-files`, plus common test commands such as `npm test`, `pnpm test`, `yarn test`, `bun test`, `pytest`, `cargo test`, and `go test`.
 - Mutating tools, arbitrary shell execution, unsafe shell/git arguments, and unknown/custom tools are blocked in the reviewer subprocess. Auto-discovered extensions are disabled for that subprocess; only the guard extension is loaded.
+- A preflight widget appears before the implementation starts, showing task, worker/reviewer model, test policy, git baseline, and auto-apply mode.
 - Reviewer text, tool calls, and tool results stream into a live widget while the review runs; use `/review-cycle output off|on|toggle` to hide or show it.
-- A compact review summary widget shows the verdict, finding counts, and next action. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` still queue the apply pass.
+- A compact review summary widget shows the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` still queue the apply pass.
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification when needed.
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
 - `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands; `/review-cycle tests clear` restores the default safe test allowlist.
-- `/review-cycle status` shows the current phase; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow.
+- `/review-cycle status` shows a richer status line with phase step, elapsed time, reviewer, tests, and task; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow.
+- `/review-cycle help` or `/rc help` shows all commands and examples in a help widget.
 - Optional reviewer model selection via `--reviewer-model provider/model` or CLI flag `--review-cycle-reviewer-model provider/model`.
 
 ### Usage
@@ -302,7 +304,9 @@ Then inside pi:
 
 ```text
 /review-cycle add input validation to the login form
+/rc add input validation to the login form
 /review-cycle on --reviewer-model anthropic/claude-sonnet-4-5 harden auth error handling
+/review-cycle help
 /review-cycle status
 /review-cycle output off
 /review-cycle output on
