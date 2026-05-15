@@ -1,6 +1,7 @@
 export const REVIEW_CYCLE_STATUS_KEY = "review-cycle";
 export const DEFAULT_REVIEW_TIMEOUT_MS = 600_000;
-export const DEFAULT_REVIEW_TOOLS = ["read", "grep", "find", "ls", "bash"] as const;
+export const REVIEWER_ALLOWED_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
+export const DEFAULT_REVIEW_TOOLS = REVIEWER_ALLOWED_TOOL_NAMES;
 export const MAX_REVIEW_PROMPT_SECTION_CHARS = 20_000;
 export const MAX_APPLY_REVIEW_CHARS = 24_000;
 export const MAX_TASK_SUMMARY_CHARS = 48;
@@ -63,7 +64,8 @@ export const REVIEWER_SYSTEM_PROMPT = `You are a strict code-review agent runnin
 
 Rules:
 - Review only; do not modify files.
-- Use tools only for read-only inspection. Bash commands must be read-only (for example: git status, git diff, git show, grep, test commands that do not rewrite files only when safe).
+- Use tools only for read-only inspection. The review-cycle runtime technically allows only: read, grep, find, ls.
+- Mutating tools, shell execution, and unknown/custom tools are blocked by a runtime guard in the reviewer process.
 - Review all current changes in scope, including committed changes since the baseline commit, staged changes, unstaged changes, and untracked files.
 - Prioritize concrete defects over style preferences.
 - Do not ask the user questions. If something is ambiguous, state the assumption and review conservatively.
@@ -291,7 +293,7 @@ export function buildReviewerUserPrompt(input: ReviewerPromptInput): string {
     `## Original request\n${input.task.trim()}`,
     input.implementationSummary ? `## Implementation agent final message\n${truncateMiddle(input.implementationSummary, 8_000)}` : undefined,
     `## Baseline\n- git repository: ${input.baseline.isGitRepo ? "yes" : "no"}\n- baseline commit: ${input.baseline.head ?? "(none/unknown)"}\n- dirty at start: ${input.baseline.dirty ? "yes" : "no"}\n\n\`\`\`text\n${truncateMiddle(baselineStatus, 4_000)}\n\`\`\``,
-    `## Current change snapshot\n- baseline commit for diff commands: ${input.changes.baselineHead ?? input.baseline.head ?? "(none/unknown)"}\n- review command hint: ${input.changes.baselineHead ? `git diff ${input.changes.baselineHead} --` : "git diff --stat && git diff"}\n\n### Git status\n\`\`\`text\n${truncateMiddle(status, 6_000)}\n\`\`\``,
+    `## Current change snapshot\n- baseline commit for diff source: ${input.changes.baselineHead ?? input.baseline.head ?? "(none/unknown)"}\n- diff source: ${input.changes.baselineHead ? `equivalent to git diff ${input.changes.baselineHead} --; diff content is already included below` : "staged and unstaged diff content is already included below"}\n\n### Git status\n\`\`\`text\n${truncateMiddle(status, 6_000)}\n\`\`\``,
     formatOptionalSection("Committed changes since baseline", input.changes.committedChanges),
     formatOptionalSection("Diff stat", input.changes.diffStat),
     formatOptionalSection("Diff", input.changes.diff),

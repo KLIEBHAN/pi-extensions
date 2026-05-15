@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_REVIEW_TOOLS,
   buildApplyReviewPrompt,
   buildReviewerUserPrompt,
   extractAssistantText,
@@ -73,9 +74,18 @@ test("buildReviewerUserPrompt includes baseline, diff, untracked files, and fres
   assert.match(prompt, /src\/auth\.test\.ts/);
 });
 
-test("reviewer system prompt forbids modifications", () => {
+test("reviewer tool set is read-only and excludes bash", () => {
+  assert.deepEqual([...DEFAULT_REVIEW_TOOLS], ["read", "grep", "find", "ls"]);
+  assert.equal([...DEFAULT_REVIEW_TOOLS].includes("bash"), false);
+  assert.equal([...DEFAULT_REVIEW_TOOLS].includes("edit"), false);
+  assert.equal([...DEFAULT_REVIEW_TOOLS].includes("write"), false);
+});
+
+test("reviewer system prompt describes the technical read-only guard", () => {
   assert.match(REVIEWER_SYSTEM_PROMPT, /Review only; do not modify files/);
   assert.match(REVIEWER_SYSTEM_PROMPT, /completely fresh context/);
+  assert.match(REVIEWER_SYSTEM_PROMPT, /technically allows only: read, grep, find, ls/);
+  assert.match(REVIEWER_SYSTEM_PROMPT, /Mutating tools, shell execution, and unknown\/custom tools are blocked/);
 });
 
 test("buildApplyReviewPrompt returns reviewer feedback to the implementation agent", () => {

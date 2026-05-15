@@ -11,6 +11,7 @@ import {
   buildReviewerUserPrompt,
   DEFAULT_REVIEW_TIMEOUT_MS,
   DEFAULT_REVIEW_TOOLS,
+  REVIEWER_ALLOWED_TOOL_NAMES,
   extractAssistantText,
   IMPLEMENTATION_SYSTEM_PROMPT,
   parseModelRef,
@@ -227,11 +228,33 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   return { command: "pi", args };
 }
 
-async function writeReviewerSystemPrompt(): Promise<{ dir: string; path: string }> {
+function buildReviewerToolGuardExtensionSource(): string {
+  const allowedTools = JSON.stringify([...REVIEWER_ALLOWED_TOOL_NAMES]);
+  return `const ALLOWED_REVIEW_TOOLS = new Set(${allowedTools});
+
+export default function(pi) {
+  pi.on("tool_call", (event) => {
+    const toolName = typeof event.toolName === "string" ? event.toolName : "";
+    if (!ALLOWED_REVIEW_TOOLS.has(toolName)) {
+      return {
+        block: true,
+        reason: "Review-cycle reviewer is read-only. Tool \\"" + toolName + "\\" is not allowed.",
+      };
+    }
+  });
+}
+`;
+}
+
+async function writeReviewerRuntimeFiles(): Promise<{ dir: string; systemPromptPath: string; toolGuardPath: string }> {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-cycle-"));
-  const promptPath = join(dir, "reviewer-system-prompt.md");
-  await writeFile(promptPath, REVIEWER_SYSTEM_PROMPT, { encoding: "utf8", mode: 0o600 });
-  return { dir, path: promptPath };
+  const systemPromptPath = join(dir, "reviewer-system-prompt.md");
+  const toolGuardPath = join(dir, "reviewer-tool-guard.ts");
+  await Promise.all([
+    writeFile(systemPromptPath, REVIEWER_SYSTEM_PROMPT, { encoding: "utf8", mode: 0o600 }),
+    writeFile(toolGuardPath, buildReviewerToolGuardExtensionSource(), { encoding: "utf8", mode: 0o600 }),
+  ]);
+  return { dir, systemPromptPath, toolGuardPath };
 }
 
 async function runFreshReviewAgent(options: {
@@ -241,12 +264,14 @@ async function runFreshReviewAgent(options: {
   signal?: AbortSignal;
   timeoutMs?: number;
 }): Promise<FreshReviewResult> {
-  const temp = await writeReviewerSystemPrompt();
+  const temp = await writeReviewerRuntimeFiles();
   const args = [
     "--mode",
     "json",
     "-p",
     "--no-session",
+    "-e",
+    temp.toolGuardPath,
     "--tools",
     DEFAULT_REVIEW_TOOLS.join(","),
   ];
@@ -255,7 +280,7 @@ async function runFreshReviewAgent(options: {
     args.push("--model", modelRefToCli(options.reviewerModel));
   }
 
-  args.push("--append-system-prompt", temp.path, options.prompt);
+  args.push("--append-system-prompt", temp.systemPromptPath, options.prompt);
 
   try {
     return await new Promise<FreshReviewResult>((resolve, reject) => {
