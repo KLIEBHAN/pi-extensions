@@ -968,6 +968,77 @@ test("review-cycle until-approved reruns review after apply", async () => {
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
 });
 
+test("review-cycle follow-up reviewer failure does not show stale previous review data", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-stale-failure-"));
+  try {
+    const harness = createHarness({ cwd });
+    let reviewCalls = 0;
+    let snapshotCalls = 0;
+
+    createReviewCycleExtension({
+      getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+      getChangeSnapshot: async () => {
+        snapshotCalls += 1;
+        const changed = snapshotCalls >= 2;
+        return {
+          isGitRepo: true,
+          baselineHead: "abc123",
+          status: changed ? "## main\n M src/a.ts\n M src/b.ts" : "## main\n M src/a.ts",
+          diffStat: changed ? "src/a.ts | 1 +\nsrc/b.ts | 1 +" : "src/a.ts | 1 +",
+          diff: changed ? "diff --git a/src/a.ts b/src/a.ts\ndiff --git a/src/b.ts b/src/b.ts" : "diff --git a/src/a.ts b/src/a.ts",
+          committedChanges: "",
+          untrackedFiles: [],
+          notes: [],
+        };
+      },
+      runFreshReviewAgent: async () => {
+        reviewCalls += 1;
+        if (reviewCalls === 2) throw new Error("second reviewer failed before output");
+        return {
+          text: "## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: stale first-round finding",
+          exitCode: 0,
+          stderr: "",
+          messages: [],
+        };
+      },
+    })(harness.pi as never);
+    await enableReviewStatusCard(harness);
+
+    await harness.commands.get("review-cycle")?.handler("--until-approved --max-review-rounds 2 avoid stale review data", harness.ctx);
+    await harness.handlers.get("agent_end")?.({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+    }, harness.ctx);
+    assert.equal(reviewCalls, 1);
+
+    await harness.handlers.get("agent_end")?.({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "applied and changed files" }], stopReason: "stop" }],
+    }, harness.ctx);
+
+    assert.equal(reviewCalls, 2);
+    assert.ok(harness.notifications.some((entry) => entry.message.includes("failed during follow-up review") && entry.message.includes("second reviewer failed before output")));
+    const statusCardText = latestWidgetContent(harness, "review-cycle-status-card")?.join("\n") ?? "";
+    assert.match(statusCardText, /second reviewer failed before output/);
+    assert.doesNotMatch(statusCardText, /stale first-round finding|CHANGES_REQUESTED/);
+
+    const reviewerOutputText = latestWidgetContent(harness, "review-cycle-reviewer-output")?.join("\n") ?? "";
+    assert.match(reviewerOutputText, /second reviewer failed before output/);
+    assert.doesNotMatch(reviewerOutputText, /stale first-round finding|Verdict: CHANGES_REQUESTED/);
+
+    await harness.commands.get("review-cycle")?.handler("artifact", harness.ctx);
+    const artifactText = latestWidgetContent(harness, "review-cycle-artifact")?.join("\n") ?? "";
+    assert.match(artifactText, /Stage: review-failed/);
+    assert.doesNotMatch(artifactText, /stale first-round finding|CHANGES_REQUESTED/);
+
+    await harness.commands.get("review-cycle")?.handler("stop", harness.ctx);
+    await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
+    const overlayText = harness.overlays.at(-1)?.lines.join("\n") ?? "";
+    assert.match(overlayText, /Rerun target: avoid stale review data/);
+    assert.doesNotMatch(overlayText, /Last review:|stale first-round finding|CHANGES_REQUESTED/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("review-cycle until-approved stops when apply makes no workspace changes", async () => {
   const harness = createHarness();
   let reviewCalls = 0;

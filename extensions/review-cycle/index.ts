@@ -1675,6 +1675,8 @@ async function runReviewAndQueueApply(
 ): Promise<void> {
   state.phase = "reviewing";
   state.lastReviewError = undefined;
+  state.review = undefined;
+  state.reviewSummary = undefined;
   state.statusCardAction = undefined;
   state.statusCardChecklistMode = undefined;
   state.reviewRound += 1;
