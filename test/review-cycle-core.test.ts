@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_REVIEW_TOOLS,
   buildApplyReviewPrompt,
+  buildReviewerToolGuardExtensionSource,
   buildReviewerUserPrompt,
   extractAssistantText,
+  isReviewerBashCommandAllowed,
+  isReviewerToolCallAllowed,
   parseModelRef,
   parseReviewCycleArgs,
   REVIEWER_SYSTEM_PROMPT,
@@ -74,18 +77,43 @@ test("buildReviewerUserPrompt includes baseline, diff, untracked files, and fres
   assert.match(prompt, /src\/auth\.test\.ts/);
 });
 
-test("reviewer tool set is read-only and excludes bash", () => {
-  assert.deepEqual([...DEFAULT_REVIEW_TOOLS], ["read", "grep", "find", "ls"]);
-  assert.equal([...DEFAULT_REVIEW_TOOLS].includes("bash"), false);
+test("reviewer tool set includes read-only tools plus guarded bash", () => {
+  assert.deepEqual([...DEFAULT_REVIEW_TOOLS], ["read", "grep", "find", "ls", "bash"]);
   assert.equal([...DEFAULT_REVIEW_TOOLS].includes("edit"), false);
   assert.equal([...DEFAULT_REVIEW_TOOLS].includes("write"), false);
 });
 
-test("reviewer system prompt describes the technical read-only guard", () => {
+test("reviewer bash guard allows read-only git inspection and blocks mutations", () => {
+  assert.equal(isReviewerBashCommandAllowed("git status --short --branch"), true);
+  assert.equal(isReviewerBashCommandAllowed("git --no-pager diff HEAD -- src/auth.ts"), true);
+  assert.equal(isReviewerBashCommandAllowed("git log --oneline HEAD~3..HEAD"), true);
+  assert.equal(isReviewerBashCommandAllowed("git show --stat HEAD"), true);
+  assert.equal(isReviewerBashCommandAllowed("git blame src/auth.ts"), true);
+
+  assert.equal(isReviewerBashCommandAllowed("git add src/auth.ts"), false);
+  assert.equal(isReviewerBashCommandAllowed("git commit -m fix"), false);
+  assert.equal(isReviewerBashCommandAllowed("git checkout main"), false);
+  assert.equal(isReviewerBashCommandAllowed("git diff HEAD --output=/tmp/review.diff"), false);
+  assert.equal(isReviewerBashCommandAllowed("git diff HEAD > /tmp/review.diff"), false);
+  assert.equal(isReviewerBashCommandAllowed('git diff "$(touch /tmp/review-cycle-pwn)"'), false);
+  assert.equal(isReviewerBashCommandAllowed("rm -rf ."), false);
+});
+
+test("reviewer tool guard allows only direct read-only tools and safe git bash", async () => {
+  assert.equal(isReviewerToolCallAllowed("read", { path: "src/auth.ts" }), true);
+  assert.equal(isReviewerToolCallAllowed("bash", { command: "git diff HEAD -- src/auth.ts" }), true);
+  assert.equal(isReviewerToolCallAllowed("bash", { command: "npm test" }), false);
+  assert.equal(isReviewerToolCallAllowed("edit", { path: "src/auth.ts" }), false);
+
+  const source = buildReviewerToolGuardExtensionSource();
+  await import(`data:text/javascript,${encodeURIComponent(source)}`);
+});
+
+test("reviewer system prompt describes the technical read-only git guard", () => {
   assert.match(REVIEWER_SYSTEM_PROMPT, /Review only; do not modify files/);
   assert.match(REVIEWER_SYSTEM_PROMPT, /completely fresh context/);
-  assert.match(REVIEWER_SYSTEM_PROMPT, /technically allows only: read, grep, find, ls/);
-  assert.match(REVIEWER_SYSTEM_PROMPT, /Mutating tools, shell execution, and unknown\/custom tools are blocked/);
+  assert.match(REVIEWER_SYSTEM_PROMPT, /technically allows only: read, grep, find, ls, and guarded bash for read-only git inspection/);
+  assert.match(REVIEWER_SYSTEM_PROMPT, /Mutating tools, non-git shell execution, unsafe git arguments, and unknown\/custom tools are blocked/);
 });
 
 test("buildApplyReviewPrompt returns reviewer feedback to the implementation agent", () => {

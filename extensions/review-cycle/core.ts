@@ -1,6 +1,40 @@
 export const REVIEW_CYCLE_STATUS_KEY = "review-cycle";
 export const DEFAULT_REVIEW_TIMEOUT_MS = 600_000;
-export const REVIEWER_ALLOWED_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
+export const REVIEWER_ALLOWED_DIRECT_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
+export const REVIEWER_ALLOWED_BASH_TOOL_NAME = "bash";
+export const REVIEWER_ALLOWED_TOOL_NAMES = [
+  ...REVIEWER_ALLOWED_DIRECT_TOOL_NAMES,
+  REVIEWER_ALLOWED_BASH_TOOL_NAME,
+] as const;
+export const REVIEWER_ALLOWED_GIT_SUBCOMMANDS = [
+  "blame",
+  "cat-file",
+  "check-attr",
+  "check-ignore",
+  "describe",
+  "diff",
+  "for-each-ref",
+  "grep",
+  "log",
+  "ls-files",
+  "merge-base",
+  "name-rev",
+  "rev-parse",
+  "shortlog",
+  "show",
+  "status",
+] as const;
+export const REVIEWER_BLOCKED_GIT_ARGUMENTS = [
+  "--exec-path",
+  "--ext-diff",
+  "--external-diff",
+  "--git-dir",
+  "--output",
+  "--paginate",
+  "--receive-pack",
+  "--upload-pack",
+  "--work-tree",
+] as const;
 export const DEFAULT_REVIEW_TOOLS = REVIEWER_ALLOWED_TOOL_NAMES;
 export const MAX_REVIEW_PROMPT_SECTION_CHARS = 20_000;
 export const MAX_APPLY_REVIEW_CHARS = 24_000;
@@ -64,8 +98,8 @@ export const REVIEWER_SYSTEM_PROMPT = `You are a strict code-review agent runnin
 
 Rules:
 - Review only; do not modify files.
-- Use tools only for read-only inspection. The review-cycle runtime technically allows only: read, grep, find, ls.
-- Mutating tools, shell execution, and unknown/custom tools are blocked by a runtime guard in the reviewer process.
+- Use tools only for read-only inspection. The review-cycle runtime technically allows only: read, grep, find, ls, and guarded bash for read-only git inspection.
+- Mutating tools, non-git shell execution, unsafe git arguments, and unknown/custom tools are blocked by a runtime guard in the reviewer process.
 - Review all current changes in scope, including committed changes since the baseline commit, staged changes, unstaged changes, and untracked files.
 - Prioritize concrete defects over style preferences.
 - Do not ask the user questions. If something is ambiguous, state the assumption and review conservatively.
@@ -269,6 +303,195 @@ export function extractAssistantText(content: unknown, maxChars = Number.POSITIV
 
 export function shouldTreatStopReasonAsFailure(stopReason: string | undefined): boolean {
   return stopReason === "error" || stopReason === "aborted" || stopReason === "length";
+}
+
+export function tokenizeReviewerShellCommand(command: string): string[] | undefined {
+  const trimmed = command.trim();
+  if (!trimmed) return undefined;
+
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | undefined;
+  let escape = false;
+
+  for (const char of trimmed) {
+    if (escape) {
+      current += char;
+      escape = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escape = true;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else {
+        if (quote === '"' && "$`\\!".includes(char)) return undefined;
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    // Reject shell control/metacharacters instead of trying to sandbox bash.
+    if (";&|<>`$(){}[]*!?".includes(char)) {
+      return undefined;
+    }
+
+    current += char;
+  }
+
+  if (escape || quote) return undefined;
+  if (current.length > 0) tokens.push(current);
+  return tokens.length > 0 ? tokens : undefined;
+}
+
+function isBlockedGitArgument(token: string): boolean {
+  return REVIEWER_BLOCKED_GIT_ARGUMENTS.some((blocked) => token === blocked || token.startsWith(`${blocked}=`));
+}
+
+export function isReviewerBashCommandAllowed(command: string): boolean {
+  const tokens = tokenizeReviewerShellCommand(command);
+  if (!tokens || tokens[0] !== "git") return false;
+
+  let subcommandIndex = 1;
+  while (subcommandIndex < tokens.length) {
+    const token = tokens[subcommandIndex]!;
+    if (token === "--no-pager") {
+      subcommandIndex += 1;
+      continue;
+    }
+    break;
+  }
+
+  const subcommand = tokens[subcommandIndex];
+  if (!subcommand) return false;
+  if (subcommand.startsWith("-")) return false;
+  if (!REVIEWER_ALLOWED_GIT_SUBCOMMANDS.includes(subcommand as typeof REVIEWER_ALLOWED_GIT_SUBCOMMANDS[number])) {
+    return false;
+  }
+
+  return tokens.slice(1).every((token) => !isBlockedGitArgument(token));
+}
+
+export function isReviewerToolCallAllowed(toolName: string, input: unknown): boolean {
+  if ((REVIEWER_ALLOWED_DIRECT_TOOL_NAMES as readonly string[]).includes(toolName)) return true;
+  if (toolName !== REVIEWER_ALLOWED_BASH_TOOL_NAME) return false;
+  if (typeof input !== "object" || input === null) return false;
+  const command = (input as { command?: unknown }).command;
+  return typeof command === "string" && isReviewerBashCommandAllowed(command);
+}
+
+export function buildReviewerToolGuardExtensionSource(): string {
+  return `const REVIEWER_ALLOWED_DIRECT_TOOL_NAMES = new Set(${JSON.stringify([...REVIEWER_ALLOWED_DIRECT_TOOL_NAMES])});
+const REVIEWER_ALLOWED_BASH_TOOL_NAME = ${JSON.stringify(REVIEWER_ALLOWED_BASH_TOOL_NAME)};
+const REVIEWER_ALLOWED_GIT_SUBCOMMANDS = new Set(${JSON.stringify([...REVIEWER_ALLOWED_GIT_SUBCOMMANDS])});
+const REVIEWER_BLOCKED_GIT_ARGUMENTS = ${JSON.stringify([...REVIEWER_BLOCKED_GIT_ARGUMENTS])};
+const REVIEWER_BLOCKED_SHELL_CHARS = ${JSON.stringify(";&|<>`$(){}[]*!?")};
+const REVIEWER_BLOCKED_DOUBLE_QUOTE_CHARS = ${JSON.stringify("$`\\!")};
+
+function tokenizeReviewerShellCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed) return undefined;
+  const tokens = [];
+  let current = "";
+  let quote;
+  let escape = false;
+  for (const char of trimmed) {
+    if (escape) {
+      current += char;
+      escape = false;
+      continue;
+    }
+    if (char === "\\\\") {
+      escape = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else {
+        if (quote === "\\\"" && REVIEWER_BLOCKED_DOUBLE_QUOTE_CHARS.includes(char)) return undefined;
+        current += char;
+      }
+      continue;
+    }
+    if (char === "\\\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\\s/.test(char)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    if (REVIEWER_BLOCKED_SHELL_CHARS.includes(char)) return undefined;
+    current += char;
+  }
+  if (escape || quote) return undefined;
+  if (current.length > 0) tokens.push(current);
+  return tokens.length > 0 ? tokens : undefined;
+}
+
+function isBlockedGitArgument(token) {
+  return REVIEWER_BLOCKED_GIT_ARGUMENTS.some((blocked) => token === blocked || token.startsWith(blocked + "="));
+}
+
+function isReviewerBashCommandAllowed(command) {
+  const tokens = tokenizeReviewerShellCommand(command);
+  if (!tokens || tokens[0] !== "git") return false;
+  let subcommandIndex = 1;
+  while (subcommandIndex < tokens.length) {
+    const token = tokens[subcommandIndex];
+    if (token === "--no-pager") {
+      subcommandIndex += 1;
+      continue;
+    }
+    break;
+  }
+  const subcommand = tokens[subcommandIndex];
+  if (!subcommand) return false;
+  if (subcommand.startsWith("-")) return false;
+  if (!REVIEWER_ALLOWED_GIT_SUBCOMMANDS.has(subcommand)) return false;
+  return tokens.slice(1).every((token) => !isBlockedGitArgument(token));
+}
+
+function isReviewerToolCallAllowed(toolName, input) {
+  if (REVIEWER_ALLOWED_DIRECT_TOOL_NAMES.has(toolName)) return true;
+  if (toolName !== REVIEWER_ALLOWED_BASH_TOOL_NAME) return false;
+  if (!input || typeof input !== "object") return false;
+  const command = input.command;
+  return typeof command === "string" && isReviewerBashCommandAllowed(command);
+}
+
+export default function(pi) {
+  pi.on("tool_call", (event) => {
+    const toolName = typeof event.toolName === "string" ? event.toolName : "";
+    if (!isReviewerToolCallAllowed(toolName, event.input)) {
+      return {
+        block: true,
+        reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: " + toolName,
+      };
+    }
+  });
+}
+`;
 }
 
 function formatOptionalSection(title: string, body: string | undefined): string | undefined {

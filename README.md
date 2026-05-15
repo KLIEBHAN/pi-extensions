@@ -280,7 +280,8 @@ pi -e ./extensions/prompt-autocomplete \
 - `/review-cycle <task>` starts a normal implementation request in the current agent.
 - After the implementation turn finishes, the extension spawns a separate `pi --mode json -p --no-session` reviewer process, so the reviewer has a fresh context window.
 - The reviewer receives the original task, the implementation summary, the baseline git commit/status, and current diff/status data. It can also inspect the workspace with read-only tools.
-- The reviewer subprocess is technically guarded: only `read`, `grep`, `find`, and `ls` are allowed; shell execution, mutating tools, and unknown/custom tools are blocked.
+- The reviewer subprocess is technically guarded: `read`, `grep`, `find`, `ls`, and `bash` are available, but `bash` only permits read-only git inspection commands such as `git status`, `git diff`, `git show`, `git log`, `git blame`, and `git ls-files`.
+- Mutating tools, non-git shell execution, unsafe git arguments, and unknown/custom tools are blocked in the reviewer subprocess. Auto-discovered extensions are disabled for that subprocess; only the guard extension is loaded.
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification.
 - `/review-cycle status` shows the current phase; `/review-cycle stop` cancels the managed workflow.
 - Optional reviewer model selection via `--reviewer-model provider/model` or CLI flag `--review-cycle-reviewer-model provider/model`.
@@ -313,7 +314,7 @@ Notes:
 
 - For best change scoping, start from a clean git working tree. If the run starts dirty, the reviewer is warned that pre-existing changes may be included.
 - If the implementation creates commits, the review still uses the baseline commit captured at start and reviews changes since that baseline.
-- The reviewer is instructed not to modify files and the runtime also enforces this by loading a guard extension into the reviewer subprocess.
+- The reviewer is instructed not to modify files and the runtime also enforces this by disabling auto-discovered extensions and loading a guard extension into the reviewer subprocess.
 
 ## Ralphy loop extension
 

@@ -11,7 +11,7 @@ import {
   buildReviewerUserPrompt,
   DEFAULT_REVIEW_TIMEOUT_MS,
   DEFAULT_REVIEW_TOOLS,
-  REVIEWER_ALLOWED_TOOL_NAMES,
+  buildReviewerToolGuardExtensionSource,
   extractAssistantText,
   IMPLEMENTATION_SYSTEM_PROMPT,
   parseModelRef,
@@ -228,24 +228,6 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   return { command: "pi", args };
 }
 
-function buildReviewerToolGuardExtensionSource(): string {
-  const allowedTools = JSON.stringify([...REVIEWER_ALLOWED_TOOL_NAMES]);
-  return `const ALLOWED_REVIEW_TOOLS = new Set(${allowedTools});
-
-export default function(pi) {
-  pi.on("tool_call", (event) => {
-    const toolName = typeof event.toolName === "string" ? event.toolName : "";
-    if (!ALLOWED_REVIEW_TOOLS.has(toolName)) {
-      return {
-        block: true,
-        reason: "Review-cycle reviewer is read-only. Tool \\"" + toolName + "\\" is not allowed.",
-      };
-    }
-  });
-}
-`;
-}
-
 async function writeReviewerRuntimeFiles(): Promise<{ dir: string; systemPromptPath: string; toolGuardPath: string }> {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-cycle-"));
   const systemPromptPath = join(dir, "reviewer-system-prompt.md");
@@ -270,6 +252,7 @@ async function runFreshReviewAgent(options: {
     "json",
     "-p",
     "--no-session",
+    "--no-extensions",
     "-e",
     temp.toolGuardPath,
     "--tools",
