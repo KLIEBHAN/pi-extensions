@@ -493,7 +493,7 @@ function buildPanelIntroLines(state: ReviewCycleState | undefined, lastRun: Last
   }
   return [
     "No active review-cycle run.",
-    lastRun ? "Previous run available for rerun." : "Start with /review-cycle <task>.",
+    lastRun ? `Rerun target: ${summarizeTask(lastRun.task, 100)}` : "Start with /review-cycle <task>.",
   ];
 }
 

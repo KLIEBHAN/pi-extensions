@@ -201,6 +201,44 @@ test("review-cycle panel renders an overlay and dispatches the selected action",
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer output hidden")));
 });
 
+test("review-cycle inactive panel shows the rerun target", async () => {
+  const harness = createHarness({ panelInputs: ["\r"] });
+  let reviewCalls = 0;
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main",
+      diffStat: "",
+      diff: "",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => {
+      reviewCalls += 1;
+      return { text: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.", exitCode: 0, stderr: "", messages: [] };
+    },
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("rerunable inactive task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+
+  await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
+
+  const overlayText = harness.overlays.at(-1)?.lines.join("\n") ?? "";
+  assert.match(overlayText, /No active review-cycle run/);
+  assert.match(overlayText, /Rerun target: rerunable inactive task/);
+  assert.match(overlayText, /Rerun last review/);
+  assert.equal(reviewCalls, 2);
+});
+
 test("review-cycle panel refreshes actions when phase changes while open", async () => {
   const harness = createHarness();
   let resolveReview: ((value: any) => void) | undefined;
