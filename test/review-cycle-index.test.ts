@@ -400,10 +400,51 @@ test("review-cycle config doctor reports invalid config and preference entries",
     assert.match(doctorText, /invalid boolean manualApply/);
     assert.match(doctorText, /invalid maxReviewRounds/);
     assert.match(doctorText, /invalid boolean reviewerOutputVisible/);
-    assert.match(doctorText, /unknown keys: extraKey/);
+    assert.match(doctorText, /✗ unknown keys: extraKey/);
     assert.match(doctorText, /Preferences: \.pi\/review-cycle\/preferences\.json \(found\)/);
     assert.match(doctorText, /Effective defaults/);
     assert.ok(harness.notifications.some((entry) => entry.message.includes("config doctor shown") && entry.level === "warning"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("review-cycle config doctor reports unusable reviewer model", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-config-model-doctor-"));
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({ reviewerModel: "openai/missing-reviewer" }), "utf8");
+    const harness = createHarness({ cwd });
+    harness.ctx.modelRegistry.find = () => undefined;
+    createReviewCycleExtension()(harness.pi as never);
+
+    await harness.commands.get("review-cycle")?.handler("config doctor", harness.ctx);
+
+    const doctorText = latestWidgetContent(harness, "review-cycle-config-doctor")?.join("\n") ?? "";
+    assert.match(doctorText, /reviewerModel unusable/);
+    assert.match(doctorText, /Reviewer model not found: openai\/missing-reviewer/);
+    assert.doesNotMatch(doctorText, /No config problems detected/);
+    assert.ok(harness.notifications.some((entry) => entry.message.includes("1 issue") && entry.level === "warning"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("review-cycle config doctor counts typo-only unknown keys as issues", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-config-unknown-key-"));
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({ statusCardVisibile: true }), "utf8");
+    const harness = createHarness({ cwd });
+    createReviewCycleExtension()(harness.pi as never);
+
+    await harness.commands.get("review-cycle")?.handler("config doctor", harness.ctx);
+
+    const doctorText = latestWidgetContent(harness, "review-cycle-config-doctor")?.join("\n") ?? "";
+    assert.match(doctorText, /✗ unknown keys: statusCardVisibile/);
+    assert.match(doctorText, /✗ 1 config issue detected/);
+    assert.doesNotMatch(doctorText, /No config problems detected/);
+    assert.ok(harness.notifications.some((entry) => entry.message.includes("1 issue") && entry.level === "warning"));
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

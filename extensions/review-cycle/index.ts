@@ -1354,9 +1354,23 @@ async function showReviewCycleConfigDoctor(
     const knownKeys = new Set(["reviewerModel", "tests", "manualApply", "autoRerunAfterApply", "maxReviewRounds", "allowDirty", "reviewerOutputVisible", "statusCardVisible"]);
     const unknownKeys = Object.keys(record).filter((key) => !knownKeys.has(key));
     const reviewerModel = record.reviewerModel;
-    if (reviewerModel === undefined) lines.push("✓ reviewerModel: unset (uses active model)");
-    else if (typeof reviewerModel === "string" && parseModelRef(reviewerModel)) lines.push(`✓ reviewerModel: ${reviewerModel}`);
-    else {
+    if (reviewerModel === undefined) {
+      lines.push("✓ reviewerModel: unset (uses active model)");
+    } else if (typeof reviewerModel === "string") {
+      const parsedReviewerModel = parseModelRef(reviewerModel);
+      if (!parsedReviewerModel) {
+        issues += 1;
+        lines.push(`✗ invalid reviewerModel: expected provider/model, got ${formatConfigValue(reviewerModel)}`);
+      } else {
+        const reviewerModelError = validateRequestedReviewerModel(ctx, parsedReviewerModel);
+        if (reviewerModelError) {
+          issues += 1;
+          lines.push(`✗ reviewerModel unusable: ${reviewerModelError}`);
+        } else {
+          lines.push(`✓ reviewerModel: ${reviewerModel}`);
+        }
+      }
+    } else {
       issues += 1;
       lines.push(`✗ invalid reviewerModel: expected provider/model, got ${formatConfigValue(reviewerModel)}`);
     }
@@ -1391,7 +1405,10 @@ async function showReviewCycleConfigDoctor(
         lines.push(`✗ invalid maxReviewRounds: expected positive integer, got ${formatConfigValue(record.maxReviewRounds)}`);
       }
     }
-    if (unknownKeys.length > 0) lines.push(`ℹ unknown keys: ${unknownKeys.join(", ")}`);
+    if (unknownKeys.length > 0) {
+      issues += unknownKeys.length;
+      lines.push(`✗ unknown keys: ${unknownKeys.join(", ")}`);
+    }
   }
 
   const prefsDiagnostic = await readJsonObjectFile(join(ctx.cwd, REVIEW_CYCLE_PREFERENCES_PATH));
