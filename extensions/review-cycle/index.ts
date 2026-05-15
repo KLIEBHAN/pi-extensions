@@ -413,8 +413,9 @@ function appendReviewerOutputChunkAndRender(
   updateReviewerOutputWidget(ctx, state);
 }
 
-function createCombinedAbortSignal(signals: readonly AbortSignal[]): { signal: AbortSignal; cleanup: () => void } {
+function createCombinedAbortSignal(signals: readonly (AbortSignal | undefined)[]): { signal: AbortSignal; cleanup: () => void } {
   const controller = new AbortController();
+  const activeSignals = signals.filter((signal): signal is AbortSignal => !!signal);
   const listeners: Array<{ signal: AbortSignal; abort: () => void }> = [];
   const cleanup = () => {
     for (const listener of listeners) {
@@ -427,12 +428,12 @@ function createCombinedAbortSignal(signals: readonly AbortSignal[]): { signal: A
     cleanup();
   };
 
-  if (signals.some((signal) => signal.aborted)) {
+  if (activeSignals.some((signal) => signal.aborted)) {
     controller.abort();
     return { signal: controller.signal, cleanup };
   }
 
-  for (const signal of signals) {
+  for (const signal of activeSignals) {
     signal.addEventListener("abort", abort, { once: true });
     listeners.push({ signal, abort });
   }
