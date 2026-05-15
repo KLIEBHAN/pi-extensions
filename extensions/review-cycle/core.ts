@@ -82,6 +82,18 @@ export const MAX_REVIEW_PROMPT_SECTION_CHARS = 20_000;
 export const MAX_APPLY_REVIEW_CHARS = 24_000;
 export const MAX_TASK_SUMMARY_CHARS = 48;
 
+export type ReviewVerdict = "APPROVE" | "APPROVE_WITH_NOTES" | "CHANGES_REQUESTED";
+
+export interface ReviewerGuardOptions {
+  allowedTestCommands?: readonly string[];
+}
+
+export interface ReviewSummary {
+  verdict?: ReviewVerdict;
+  findingCount: number;
+  severityCounts: Record<"critical" | "high" | "medium" | "low" | "other", number>;
+}
+
 export interface ModelRef {
   provider: string;
   id: string;
@@ -91,7 +103,9 @@ export type ReviewCycleCommand =
   | { kind: "start"; task: string; reviewerModel?: ModelRef }
   | { kind: "status" }
   | { kind: "stop" }
+  | { kind: "rerun"; reviewerModel?: ModelRef }
   | { kind: "output"; mode: "on" | "off" | "toggle" }
+  | { kind: "tests"; action: "show" | "clear" | "add" | "set"; command?: string }
   | { error: string };
 
 export interface GitBaseline {
@@ -224,9 +238,9 @@ export function parseModelRef(value: string | undefined): ModelRef | undefined {
   };
 }
 
-function parseStartArgs(tokens: string[]): ReviewCycleCommand {
+function parseReviewerModelFlag(tokens: string[]): { reviewerModel?: ModelRef; remaining: string[] } | { error: string } {
   let reviewerModel: ModelRef | undefined;
-  const taskTokens: string[] = [];
+  const remaining: string[] = [];
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
@@ -246,16 +260,41 @@ function parseStartArgs(tokens: string[]): ReviewCycleCommand {
       return { error: `Unknown flag: ${token}` };
     }
 
-    taskTokens.push(...tokens.slice(index));
-    break;
+    remaining.push(token);
   }
 
-  const task = taskTokens.join(" ").trim();
+  return { reviewerModel, remaining };
+}
+
+function parseStartArgs(tokens: string[]): ReviewCycleCommand {
+  const parsed = parseReviewerModelFlag(tokens);
+  if ("error" in parsed) return parsed;
+
+  const task = parsed.remaining.join(" ").trim();
   if (!task) {
     return { error: "Usage: /review-cycle [on] [--reviewer-model provider/model] <task>" };
   }
 
-  return { kind: "start", task, reviewerModel };
+  return { kind: "start", task, reviewerModel: parsed.reviewerModel };
+}
+
+function parseRerunArgs(tokens: string[]): ReviewCycleCommand {
+  const parsed = parseReviewerModelFlag(tokens);
+  if ("error" in parsed) return parsed;
+  if (parsed.remaining.length > 0) return { error: "Usage: /review-cycle rerun [--reviewer-model provider/model]" };
+  return { kind: "rerun", reviewerModel: parsed.reviewerModel };
+}
+
+function parseTestsArgs(tokens: string[]): ReviewCycleCommand {
+  const action = (tokens[0] ?? "status").toLowerCase();
+  if (action === "status" || action === "show" || action === "list") return { kind: "tests", action: "show" };
+  if (action === "clear" || action === "off") return { kind: "tests", action: "clear" };
+  if (action === "add" || action === "set") {
+    const command = tokens.slice(1).join(" ").trim();
+    if (!command) return { error: `Usage: /review-cycle tests ${action} <test command>` };
+    return { kind: "tests", action: action === "add" ? "add" : "set", command };
+  }
+  return { error: "Usage: /review-cycle tests [status|clear|add <cmd>|set <cmd>]" };
 }
 
 export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
@@ -270,6 +309,9 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
 
   if (command === "status") return { kind: "status" };
   if (command === "stop" || command === "off") return { kind: "stop" };
+  if (command === "rerun") return parseRerunArgs(rest);
+  if (command === "tests") return parseTestsArgs(rest);
+  if (command === "config" && rest[0]?.toLowerCase() === "tests") return parseTestsArgs(rest.slice(1));
   if (command === "output") {
     const mode = (rest[0] ?? "toggle").toLowerCase();
     if (mode === "on" || mode === "show") return { kind: "output", mode: "on" };
@@ -444,14 +486,32 @@ function hasBlockedTestArguments(tokens: string[]): boolean {
   return tokens.some(isBlockedTestArgument);
 }
 
-export function isReviewerTestCommandAllowed(command: string): boolean {
+function normalizeTestCommandTokens(command: string): string[] | undefined {
   const rawTokens = tokenizeReviewerShellCommand(command);
   const tokens = rawTokens ? stripEnvAssignments(rawTokens) : undefined;
-  if (!tokens || tokens.length === 0) return false;
+  if (!tokens || tokens.length === 0) return undefined;
+  if (hasBlockedTestArguments(tokens.slice(1))) return undefined;
+  return tokens;
+}
+
+function testCommandMatchesConfigured(tokens: string[], allowedTestCommands: readonly string[]): boolean {
+  return allowedTestCommands.some((allowedCommand) => {
+    const allowedTokens = normalizeTestCommandTokens(allowedCommand);
+    if (!allowedTokens || allowedTokens.length !== tokens.length) return false;
+    return allowedTokens.every((token, index) => token === tokens[index]);
+  });
+}
+
+export function isReviewerTestCommandAllowed(command: string, options: ReviewerGuardOptions = {}): boolean {
+  const tokens = normalizeTestCommandTokens(command);
+  if (!tokens) return false;
+
+  if (options.allowedTestCommands && options.allowedTestCommands.length > 0) {
+    return testCommandMatchesConfigured(tokens, options.allowedTestCommands);
+  }
 
   const executable = tokens[0]!.startsWith("./") ? tokens[0]!.slice(2) : tokens[0]!;
   if (!(REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS as readonly string[]).includes(executable)) return false;
-  if (hasBlockedTestArguments(tokens.slice(1))) return false;
 
   switch (executable) {
     case "npm":
@@ -515,25 +575,27 @@ export function isReviewerGitCommandAllowed(command: string): boolean {
   return tokens.slice(1).every((token) => !isBlockedGitArgument(token));
 }
 
-export function isReviewerBashCommandAllowed(command: string): boolean {
-  return isReviewerGitCommandAllowed(command) || isReviewerTestCommandAllowed(command);
+export function isReviewerBashCommandAllowed(command: string, options: ReviewerGuardOptions = {}): boolean {
+  return isReviewerGitCommandAllowed(command) || isReviewerTestCommandAllowed(command, options);
 }
 
-export function isReviewerToolCallAllowed(toolName: string, input: unknown): boolean {
+export function isReviewerToolCallAllowed(toolName: string, input: unknown, options: ReviewerGuardOptions = {}): boolean {
   if ((REVIEWER_ALLOWED_DIRECT_TOOL_NAMES as readonly string[]).includes(toolName)) return true;
   if (toolName !== REVIEWER_ALLOWED_BASH_TOOL_NAME) return false;
   if (typeof input !== "object" || input === null) return false;
   const command = (input as { command?: unknown }).command;
-  return typeof command === "string" && isReviewerBashCommandAllowed(command);
+  return typeof command === "string" && isReviewerBashCommandAllowed(command, options);
 }
 
-export function buildReviewerToolGuardExtensionSource(): string {
+export function buildReviewerToolGuardExtensionSource(options: ReviewerGuardOptions = {}): string {
+  const allowedConfiguredTestCommands = options.allowedTestCommands ?? [];
   return `const REVIEWER_ALLOWED_DIRECT_TOOL_NAMES = new Set(${JSON.stringify([...REVIEWER_ALLOWED_DIRECT_TOOL_NAMES])});
 const REVIEWER_ALLOWED_BASH_TOOL_NAME = ${JSON.stringify(REVIEWER_ALLOWED_BASH_TOOL_NAME)};
 const REVIEWER_ALLOWED_GIT_SUBCOMMANDS = new Set(${JSON.stringify([...REVIEWER_ALLOWED_GIT_SUBCOMMANDS])});
 const REVIEWER_BLOCKED_GIT_ARGUMENTS = ${JSON.stringify([...REVIEWER_BLOCKED_GIT_ARGUMENTS])};
 const REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS = new Set(${JSON.stringify([...REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS])});
 const REVIEWER_BLOCKED_TEST_ARGUMENTS = ${JSON.stringify([...REVIEWER_BLOCKED_TEST_ARGUMENTS])};
+const REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS = ${JSON.stringify([...allowedConfiguredTestCommands])};
 const REVIEWER_BLOCKED_SHELL_CHARS = ${JSON.stringify(";&|<>`$(){}[]*!?")};
 const REVIEWER_BLOCKED_DOUBLE_QUOTE_CHARS = ${JSON.stringify("$`\\!")};
 
@@ -612,13 +674,30 @@ function hasBlockedTestArguments(tokens) {
   return tokens.some(isBlockedTestArgument);
 }
 
-function isReviewerTestCommandAllowed(command) {
+function normalizeTestCommandTokens(command) {
   const rawTokens = tokenizeReviewerShellCommand(command);
   const tokens = rawTokens ? stripEnvAssignments(rawTokens) : undefined;
-  if (!tokens || tokens.length === 0) return false;
+  if (!tokens || tokens.length === 0) return undefined;
+  if (hasBlockedTestArguments(tokens.slice(1))) return undefined;
+  return tokens;
+}
+
+function testCommandMatchesConfigured(tokens, allowedTestCommands) {
+  return allowedTestCommands.some((allowedCommand) => {
+    const allowedTokens = normalizeTestCommandTokens(allowedCommand);
+    if (!allowedTokens || allowedTokens.length !== tokens.length) return false;
+    return allowedTokens.every((token, index) => token === tokens[index]);
+  });
+}
+
+function isReviewerTestCommandAllowed(command) {
+  const tokens = normalizeTestCommandTokens(command);
+  if (!tokens) return false;
+  if (REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS.length > 0) {
+    return testCommandMatchesConfigured(tokens, REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS);
+  }
   const executable = tokens[0].startsWith("./") ? tokens[0].slice(2) : tokens[0];
   if (!REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS.has(executable)) return false;
-  if (hasBlockedTestArguments(tokens.slice(1))) return false;
   switch (executable) {
     case "npm":
     case "pnpm":
@@ -734,6 +813,40 @@ export function buildReviewerUserPrompt(input: ReviewerPromptInput): string {
   ].filter((value): value is string => !!value);
 
   return sections.join("\n\n");
+}
+
+export function parseReviewSummary(review: string): ReviewSummary {
+  const verdictMatch = /\b(APPROVE_WITH_NOTES|CHANGES_REQUESTED|APPROVE)\b/.exec(review);
+  const verdict = verdictMatch?.[1] as ReviewVerdict | undefined;
+  const severityCounts: ReviewSummary["severityCounts"] = {
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    other: 0,
+  };
+
+  const findingsSection = /##\s+Findings\s*\n([\s\S]*?)(?:\n##\s+|$)/i.exec(review)?.[1] ?? "";
+  const findingLines = findingsSection
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^[-*]\s+/.test(line))
+    .filter((line) => !/no\s+(mandatory\s+)?findings|none/i.test(line));
+
+  for (const line of findingLines) {
+    const normalized = line.toLowerCase();
+    if (/\bcritical\b/.test(normalized)) severityCounts.critical += 1;
+    else if (/\bhigh\b/.test(normalized)) severityCounts.high += 1;
+    else if (/\bmedium\b/.test(normalized)) severityCounts.medium += 1;
+    else if (/\blow\b/.test(normalized)) severityCounts.low += 1;
+    else severityCounts.other += 1;
+  }
+
+  return {
+    verdict,
+    findingCount: findingLines.length,
+    severityCounts,
+  };
 }
 
 export function buildApplyReviewPrompt(input: ApplyReviewPromptInput): string {

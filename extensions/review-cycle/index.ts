@@ -13,6 +13,7 @@ import {
   DEFAULT_REVIEW_TOOLS,
   buildReviewerToolGuardExtensionSource,
   extractAssistantText,
+  parseReviewSummary,
   IMPLEMENTATION_SYSTEM_PROMPT,
   parseModelRef,
   parseReviewCycleArgs,
@@ -24,12 +25,14 @@ import {
   type ChangeSnapshot,
   type GitBaseline,
   type ModelRef,
+  type ReviewSummary,
 } from "./core.ts";
 
 const GIT_TIMEOUT_MS = 120_000;
 const MAX_REVIEWER_STDERR_CHARS = 4_000;
 const MAX_IMPLEMENTATION_SUMMARY_CHARS = 8_000;
 const REVIEWER_OUTPUT_WIDGET_KEY = "review-cycle-reviewer-output";
+const REVIEWER_SUMMARY_WIDGET_KEY = "review-cycle-review-summary";
 const MAX_REVIEWER_OUTPUT_LINES = 80;
 const MAX_REVIEWER_OUTPUT_LINE_CHARS = 240;
 
@@ -45,6 +48,7 @@ interface ReviewCycleState {
   review?: string;
   reviewerOutputVisible: boolean;
   reviewerOutputLines: string[];
+  allowedTestCommands: string[];
 }
 
 interface FreshReviewResult {
@@ -61,6 +65,14 @@ interface AssistantTurn {
 
 interface ReviewCyclePreferences {
   reviewerOutputVisible: boolean;
+  allowedTestCommands: string[];
+}
+
+interface LastReviewCycleRun {
+  task: string;
+  baseline: GitBaseline;
+  reviewerModel?: ModelRef;
+  implementationSummary?: string;
 }
 
 interface ReviewCycleDependencies {
@@ -109,10 +121,20 @@ function clearReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandConte
   ctx.ui.setWidget(REVIEWER_OUTPUT_WIDGET_KEY, undefined);
 }
 
+function clearReviewerSummaryWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
+  ctx.ui.setWidget(REVIEWER_SUMMARY_WIDGET_KEY, undefined);
+}
+
 function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
   stateRef.current = undefined;
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
   clearReviewerOutputWidget(ctx);
+  clearReviewerSummaryWidget(ctx);
+}
+
+function finishState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
+  if (stateRef.current) stateRef.current.active = false;
+  ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
 }
 
 function truncateLine(text: string): string {
@@ -143,6 +165,24 @@ function appendReviewerOutputChunk(state: ReviewCycleState, chunk: string): void
       pushReviewerOutputLine(state, "");
     }
   }
+}
+
+function formatReviewSummary(summary: ReviewSummary): string[] {
+  const severityParts = Object.entries(summary.severityCounts)
+    .filter(([, count]) => count > 0)
+    .map(([severity, count]) => `${count} ${severity}`);
+  return [
+    `Verdict: ${summary.verdict ?? "UNKNOWN"}`,
+    `Findings: ${summary.findingCount}${severityParts.length > 0 ? ` (${severityParts.join(", ")})` : ""}`,
+  ];
+}
+
+function updateReviewSummaryWidget(ctx: ExtensionContext | ExtensionCommandContext, summary: ReviewSummary, action: string): void {
+  ctx.ui.setWidget(
+    REVIEWER_SUMMARY_WIDGET_KEY,
+    ["Fresh reviewer summary", ...formatReviewSummary(summary), `Next: ${action}`],
+    { placement: "belowEditor" },
+  );
 }
 
 function updateReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
@@ -313,13 +353,13 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   return { command: "pi", args };
 }
 
-async function writeReviewerRuntimeFiles(): Promise<{ dir: string; systemPromptPath: string; toolGuardPath: string }> {
+async function writeReviewerRuntimeFiles(allowedTestCommands: readonly string[]): Promise<{ dir: string; systemPromptPath: string; toolGuardPath: string }> {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-cycle-"));
   const systemPromptPath = join(dir, "reviewer-system-prompt.md");
   const toolGuardPath = join(dir, "reviewer-tool-guard.ts");
   await Promise.all([
     writeFile(systemPromptPath, REVIEWER_SYSTEM_PROMPT, { encoding: "utf8", mode: 0o600 }),
-    writeFile(toolGuardPath, buildReviewerToolGuardExtensionSource(), { encoding: "utf8", mode: 0o600 }),
+    writeFile(toolGuardPath, buildReviewerToolGuardExtensionSource({ allowedTestCommands }), { encoding: "utf8", mode: 0o600 }),
   ]);
   return { dir, systemPromptPath, toolGuardPath };
 }
@@ -332,8 +372,9 @@ async function runFreshReviewAgent(options: {
   timeoutMs?: number;
   onOutput?: (chunk: string) => void;
   onLine?: (line: string) => void;
+  allowedTestCommands?: readonly string[];
 }): Promise<FreshReviewResult> {
-  const temp = await writeReviewerRuntimeFiles();
+  const temp = await writeReviewerRuntimeFiles(options.allowedTestCommands ?? []);
   const args = [
     "--mode",
     "json",
@@ -565,6 +606,7 @@ async function startReviewCycle(
     reviewerModel,
     reviewerOutputVisible: preferences.reviewerOutputVisible,
     reviewerOutputLines: [],
+    allowedTestCommands: [...preferences.allowedTestCommands],
   };
 
   stateRef.current = state;
@@ -594,6 +636,7 @@ async function runReviewAndQueueApply(
 ): Promise<void> {
   state.phase = "reviewing";
   state.reviewerOutputLines = [];
+  clearReviewerSummaryWidget(ctx);
   setStatus(ctx, state);
   appendReviewerOutputLineAndRender(ctx, state, "Starting fresh-context reviewer...");
   ctx.ui.notify("Review-cycle: starting fresh-context review", "info");
@@ -628,17 +671,73 @@ async function runReviewAndQueueApply(
     onLine: (line) => {
       if (stateRef.current === state) appendReviewerOutputLineAndRender(ctx, state, line);
     },
+    allowedTestCommands: state.allowedTestCommands,
   });
 
   if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
 
   state.review = result.text.trim() || "Reviewer returned no text.";
   appendReviewerOutputLineAndRender(ctx, state, "Fresh-context reviewer finished.");
+  const summary = parseReviewSummary(state.review);
+
+  if (summary.verdict === "APPROVE") {
+    updateReviewSummaryWidget(ctx, summary, "done; no apply pass needed");
+    finishState(ctx, stateRef);
+    ctx.ui.notify("Review-cycle: reviewer approved; no apply pass needed", "info");
+    return;
+  }
+
+  updateReviewSummaryWidget(ctx, summary, "applying feedback");
   state.phase = "applying";
   setStatus(ctx, state);
   ctx.ui.notify("Review-cycle: fresh review complete; applying feedback", "info");
 
   pi.sendUserMessage(buildApplyReviewPrompt({ task: state.task, review: state.review }));
+}
+
+function makeLastRunFromState(state: ReviewCycleState): LastReviewCycleRun {
+  return {
+    task: state.task,
+    baseline: state.baseline,
+    reviewerModel: state.reviewerModel,
+    implementationSummary: state.implementationSummary,
+  };
+}
+
+async function rerunReviewCycle(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  stateRef: { current?: ReviewCycleState },
+  preferences: ReviewCyclePreferences,
+  lastRun: LastReviewCycleRun | undefined,
+  reviewerModelOverride: ModelRef | undefined,
+  getChangeSnapshotImpl: typeof getChangeSnapshot,
+  runFreshReviewAgentImpl: typeof runFreshReviewAgent,
+): Promise<void> {
+  if (stateRef.current?.active) {
+    ctx.ui.notify("A review-cycle run is already active. Use /review-cycle stop first.", "warning");
+    return;
+  }
+  if (!lastRun) {
+    ctx.ui.notify("No previous review-cycle run to rerun", "warning");
+    return;
+  }
+
+  const state: ReviewCycleState = {
+    active: true,
+    phase: "reviewing",
+    runId: makeRunId(),
+    task: lastRun.task,
+    startedAt: Date.now(),
+    baseline: lastRun.baseline,
+    reviewerModel: reviewerModelOverride ?? lastRun.reviewerModel,
+    implementationSummary: lastRun.implementationSummary,
+    reviewerOutputVisible: preferences.reviewerOutputVisible,
+    reviewerOutputLines: [],
+    allowedTestCommands: [...preferences.allowedTestCommands],
+  };
+  stateRef.current = state;
+  await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
 }
 
 function showStatus(ctx: ExtensionCommandContext, state: ReviewCycleState | undefined): void {
@@ -657,7 +756,8 @@ function showStatus(ctx: ExtensionCommandContext, state: ReviewCycleState | unde
 export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
   return function (pi: ExtensionAPI) {
   const stateRef: { current?: ReviewCycleState } = {};
-  const preferences: ReviewCyclePreferences = { reviewerOutputVisible: true };
+  const preferences: ReviewCyclePreferences = { reviewerOutputVisible: true, allowedTestCommands: [] };
+  let lastRun: LastReviewCycleRun | undefined;
   const getGitBaselineImpl = deps.getGitBaseline ?? getGitBaseline;
   const getChangeSnapshotImpl = deps.getChangeSnapshot ?? getChangeSnapshot;
   const runFreshReviewAgentImpl = deps.runFreshReviewAgent ?? runFreshReviewAgent;
@@ -697,10 +797,46 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
         return;
       }
 
+      if (parsed.kind === "rerun") {
+        await rerunReviewCycle(
+          pi,
+          ctx,
+          stateRef,
+          preferences,
+          lastRun,
+          parsed.reviewerModel,
+          getChangeSnapshotImpl,
+          runFreshReviewAgentImpl,
+        );
+        return;
+      }
+
+      if (parsed.kind === "tests") {
+        if (parsed.action === "show") {
+          const configured = preferences.allowedTestCommands.length > 0
+            ? preferences.allowedTestCommands.join("; ")
+            : "default safe test allowlist";
+          ctx.ui.notify(`Review-cycle test commands: ${configured}`, "info");
+          return;
+        }
+        if (parsed.action === "clear") {
+          preferences.allowedTestCommands = [];
+          ctx.ui.notify("Review-cycle test commands reset to default safe allowlist", "info");
+          return;
+        }
+        if (parsed.command) {
+          preferences.allowedTestCommands = parsed.action === "set"
+            ? [parsed.command]
+            : [...preferences.allowedTestCommands, parsed.command];
+          ctx.ui.notify(`Review-cycle test command ${parsed.action === "set" ? "set" : "added"}: ${parsed.command}`, "info");
+          return;
+        }
+      }
+
       if (parsed.kind === "output") {
         const nextVisible = parsed.mode === "toggle" ? !preferences.reviewerOutputVisible : parsed.mode === "on";
         preferences.reviewerOutputVisible = nextVisible;
-        if (stateRef.current?.active) {
+        if (stateRef.current) {
           stateRef.current.reviewerOutputVisible = nextVisible;
           updateReviewerOutputWidget(ctx, stateRef.current);
         } else if (!nextVisible) {
@@ -711,6 +847,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       }
 
       await startReviewCycle(pi, ctx, stateRef, preferences, getGitBaselineImpl, parsed.task, parsed.reviewerModel);
+      if (stateRef.current) lastRun = makeLastRunFromState(stateRef.current);
     },
   });
 
@@ -731,6 +868,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     }
 
     await startReviewCycle(pi, ctx, stateRef, preferences, getGitBaselineImpl, taskFlag.trim(), reviewerModel);
+    if (stateRef.current) lastRun = makeLastRunFromState(stateRef.current);
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -763,6 +901,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
 
     if (state.phase === "implementing") {
       state.implementationSummary = truncateMiddle(assistantTurn.text, MAX_IMPLEMENTATION_SUMMARY_CHARS);
+      lastRun = makeLastRunFromState(state);
       try {
         await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
       } catch (error) {
@@ -776,7 +915,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     }
 
     if (state.phase === "applying") {
-      clearState(ctx, stateRef);
+      finishState(ctx, stateRef);
       ctx.ui.notify("Review-cycle completed: feedback application phase finished", "info");
     }
   });

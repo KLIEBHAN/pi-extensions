@@ -11,6 +11,7 @@ import {
   isReviewerToolCallAllowed,
   parseModelRef,
   parseReviewCycleArgs,
+  parseReviewSummary,
   REVIEWER_SYSTEM_PROMPT,
   shouldTreatStopReasonAsFailure,
   summarizeTask,
@@ -39,6 +40,16 @@ test("parseReviewCycleArgs parses status, stop, and output visibility", () => {
   assert.deepEqual(parseReviewCycleArgs("output"), { kind: "output", mode: "toggle" });
   assert.deepEqual(parseReviewCycleArgs("output off"), { kind: "output", mode: "off" });
   assert.deepEqual(parseReviewCycleArgs("output show"), { kind: "output", mode: "on" });
+  assert.deepEqual(parseReviewCycleArgs("rerun --reviewer-model openai/gpt-review"), {
+    kind: "rerun",
+    reviewerModel: { provider: "openai", id: "gpt-review" },
+  });
+  assert.deepEqual(parseReviewCycleArgs("tests add npm test"), {
+    kind: "tests",
+    action: "add",
+    command: "npm test",
+  });
+  assert.deepEqual(parseReviewCycleArgs("config tests clear"), { kind: "tests", action: "clear" });
 });
 
 test("parseReviewCycleArgs validates reviewer model", () => {
@@ -141,6 +152,16 @@ test("reviewer bash guard allows common test commands and blocks arbitrary shell
   assert.equal(isReviewerTestCommandAllowed("curl https://example.com/script.sh"), false);
 });
 
+test("reviewer test guard can restrict tests to configured exact commands", () => {
+  const options = { allowedTestCommands: ["npm test", "pnpm run test:unit -- --runInBand"] };
+  assert.equal(isReviewerTestCommandAllowed("npm test", options), true);
+  assert.equal(isReviewerTestCommandAllowed("pnpm run test:unit -- --runInBand", options), true);
+  assert.equal(isReviewerTestCommandAllowed("vitest run", options), false);
+  assert.equal(isReviewerTestCommandAllowed("npm test -- --watch", options), false);
+  assert.equal(isReviewerToolCallAllowed("bash", { command: "npm test" }, options), true);
+  assert.equal(isReviewerToolCallAllowed("bash", { command: "vitest run" }, options), false);
+});
+
 test("reviewer tool guard allows only direct read-only tools, safe git, and tests", async () => {
   assert.equal(isReviewerToolCallAllowed("read", { path: "src/auth.ts" }), true);
   assert.equal(isReviewerToolCallAllowed("bash", { command: "git diff HEAD -- src/auth.ts" }), true);
@@ -177,6 +198,19 @@ test("generated reviewer guard extension blocks and allows tool calls at runtime
   assert.deepEqual(toolCallHandler?.({ toolName: "write", input: { path: "src/auth.ts" } }), {
     block: true,
     reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: write",
+  });
+});
+
+test("parseReviewSummary extracts verdict and findings", () => {
+  assert.deepEqual(parseReviewSummary("## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings."), {
+    verdict: "APPROVE",
+    findingCount: 0,
+    severityCounts: { critical: 0, high: 0, medium: 0, low: 0, other: 0 },
+  });
+  assert.deepEqual(parseReviewSummary("## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: broken\n- medium: weak\n- nit"), {
+    verdict: "CHANGES_REQUESTED",
+    findingCount: 3,
+    severityCounts: { critical: 0, high: 1, medium: 1, low: 0, other: 1 },
   });
 });
 

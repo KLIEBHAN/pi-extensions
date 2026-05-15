@@ -283,7 +283,10 @@ pi -e ./extensions/prompt-autocomplete \
 - The reviewer subprocess is technically guarded: `read`, `grep`, `find`, `ls`, and `bash` are available, but `bash` only permits read-only git inspection commands such as `git status`, `git diff`, `git show`, `git log`, `git blame`, and `git ls-files`, plus common test commands such as `npm test`, `pnpm test`, `yarn test`, `bun test`, `pytest`, `cargo test`, and `go test`.
 - Mutating tools, arbitrary shell execution, unsafe shell/git arguments, and unknown/custom tools are blocked in the reviewer subprocess. Auto-discovered extensions are disabled for that subprocess; only the guard extension is loaded.
 - Reviewer text, tool calls, and tool results stream into a live widget while the review runs; use `/review-cycle output off|on|toggle` to hide or show it.
-- The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification.
+- A compact review summary widget shows the verdict, finding counts, and next action. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` still queue the apply pass.
+- The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification when needed.
+- `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
+- `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands; `/review-cycle tests clear` restores the default safe test allowlist.
 - `/review-cycle status` shows the current phase; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow.
 - Optional reviewer model selection via `--reviewer-model provider/model` or CLI flag `--review-cycle-reviewer-model provider/model`.
 
@@ -303,6 +306,8 @@ Then inside pi:
 /review-cycle status
 /review-cycle output off
 /review-cycle output on
+/review-cycle tests set npm test
+/review-cycle rerun
 /review-cycle stop
 ```
 

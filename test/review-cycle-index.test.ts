@@ -152,6 +152,89 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.ok(harness.widgets.at(-1)?.content?.some((line) => line.includes("APPROVE_WITH_NOTES")));
 });
 
+test("review-cycle ends without apply pass when reviewer approves", async () => {
+  const harness = createHarness();
+  let reviewCalls = 0;
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main",
+      diffStat: "",
+      diff: "",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async (options: any) => {
+      reviewCalls += 1;
+      options.onOutput?.("## Verdict\nAPPROVE\n");
+      return {
+        text: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.",
+        exitCode: 0,
+        stderr: "",
+        messages: [],
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("small approved task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(reviewCalls, 1);
+  assert.equal(harness.sentMessages.length, 1);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("no apply pass"))));
+});
+
+test("review-cycle rerun reuses the previous task and honors configured test commands", async () => {
+  const harness = createHarness();
+  const allowedTestCommandSnapshots: string[][] = [];
+  const prompts: string[] = [];
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/auth.ts",
+      diffStat: "src/auth.ts | 2 ++",
+      diff: "diff --git a/src/auth.ts b/src/auth.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async (options: any) => {
+      allowedTestCommandSnapshots.push([...(options.allowedTestCommands ?? [])]);
+      prompts.push(options.prompt);
+      return {
+        text: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.",
+        exitCode: 0,
+        stderr: "",
+        messages: [],
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("tests set npm test", harness.ctx);
+  await harness.commands.get("review-cycle")?.handler("implement rerun target", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  await harness.commands.get("review-cycle")?.handler("rerun", harness.ctx);
+
+  assert.equal(allowedTestCommandSnapshots.length, 2);
+  assert.deepEqual(allowedTestCommandSnapshots[0], ["npm test"]);
+  assert.deepEqual(allowedTestCommandSnapshots[1], ["npm test"]);
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts.every((prompt) => prompt.includes("implement rerun target")));
+});
+
 test("review-cycle output command toggles persisted visibility before a run starts", async () => {
   const harness = createHarness();
   let outputLineCalls = 0;
@@ -181,7 +264,10 @@ test("review-cycle output command toggles persisted visibility before a run star
   }, harness.ctx);
 
   assert.equal(outputLineCalls, 1);
-  assert.equal(harness.widgets.filter((entry) => entry.content).length, 0);
+  assert.equal(
+    harness.widgets.filter((entry) => entry.key === "review-cycle-reviewer-output" && entry.content).length,
+    0,
+  );
 
   await harness.commands.get("review-cycle")?.handler("output on", harness.ctx);
   assert.ok(harness.widgets.at(-1)?.content?.some((line) => line.includes("reviewer line while hidden")));
