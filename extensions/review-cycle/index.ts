@@ -34,8 +34,6 @@ const MAX_REVIEWER_STDERR_CHARS = 4_000;
 const MAX_IMPLEMENTATION_SUMMARY_CHARS = 8_000;
 const STATUS_CARD_WIDGET_KEY = "review-cycle-status-card";
 const REVIEWER_OUTPUT_WIDGET_KEY = "review-cycle-reviewer-output";
-const REVIEWER_SUMMARY_WIDGET_KEY = "review-cycle-review-summary";
-const PREFLIGHT_WIDGET_KEY = "review-cycle-preflight";
 const HELP_WIDGET_KEY = "review-cycle-help";
 const ARTIFACT_WIDGET_KEY = "review-cycle-artifact";
 const MAX_REVIEWER_OUTPUT_LINES = 80;
@@ -47,6 +45,8 @@ const REVIEWER_KILL_GRACE_MS = 5_000;
 const MAX_ARTIFACT_LIST_ITEMS = 10;
 const REVIEW_CYCLE_CONFIG_PATH = ".pi/review-cycle.json";
 const REVIEW_CYCLE_ARTIFACT_DIR = ".pi/review-cycle";
+const STATUS_CARD_LABEL_WIDTH = 9;
+const STATUS_CARD_DIVIDER = "─────";
 
 type ReviewCyclePhase = "confirming" | "implementing" | "reviewing" | "manual" | "applying" | "failed";
 
@@ -228,14 +228,6 @@ function clearReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandConte
   ctx.ui.setWidget(REVIEWER_OUTPUT_WIDGET_KEY, undefined);
 }
 
-function clearReviewerSummaryWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
-  ctx.ui.setWidget(REVIEWER_SUMMARY_WIDGET_KEY, undefined);
-}
-
-function clearPreflightWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
-  ctx.ui.setWidget(PREFLIGHT_WIDGET_KEY, undefined);
-}
-
 function abortActiveReviewer(state: ReviewCycleState | undefined): void {
   state?.reviewerAbortController?.abort();
 }
@@ -247,8 +239,6 @@ function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: {
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
   clearStatusCardWidget(ctx);
   clearReviewerOutputWidget(ctx);
-  clearReviewerSummaryWidget(ctx);
-  clearPreflightWidget(ctx);
 }
 
 function finishState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
@@ -293,14 +283,15 @@ function formatTestPolicy(allowedTestCommands: readonly string[]): string {
 }
 
 function formatReviewerLabel(state: Pick<ReviewCycleState, "reviewerModel" | "reviewerModelSource">): string {
-  const source = state.reviewerModelSource === "active" ? "active" : state.reviewerModelSource;
-  return state.reviewerModel ? `${modelRefToCli(state.reviewerModel)} (${source})` : "active model at review time";
+  if (!state.reviewerModel) return "active model at review time";
+  return `${modelRefToCli(state.reviewerModel)} (${state.reviewerModelSource})`;
 }
 
 function formatGitLine(state: ReviewCycleState): string {
-  return state.baseline.isGitRepo
-    ? `${state.baseline.dirty ? "dirty" : "clean"}${state.baseline.head ? ` · ${state.baseline.head.slice(0, 12)}` : ""}`
-    : "not a git repository";
+  if (!state.baseline.isGitRepo) return "not a git repository";
+  const status = state.baseline.dirty ? "dirty" : "clean";
+  const head = state.baseline.head ? ` · ${state.baseline.head.slice(0, 12)}` : "";
+  return `${status}${head}`;
 }
 
 function getDefaultStatusCardAction(state: ReviewCycleState): string {
@@ -310,7 +301,7 @@ function getDefaultStatusCardAction(state: ReviewCycleState): string {
     case "implementing":
       return "waiting for implementation agent to finish";
     case "reviewing":
-      return "/review-cycle output toggle, /review-cycle panel, or /review-cycle stop";
+      return "reviewer running — /review-cycle stop to cancel";
     case "manual":
       return "/review-cycle apply or /review-cycle skip";
     case "applying":
@@ -320,58 +311,58 @@ function getDefaultStatusCardAction(state: ReviewCycleState): string {
   }
 }
 
+function formatStatusCardLabel(label: string, value: string): string {
+  return `${`${label}:`.padEnd(STATUS_CARD_LABEL_WIDTH)} ${value}`;
+}
+
+function formatFlowLine(state: ReviewCycleState): string {
+  const apply = state.manualApply ? "wait for /review-cycle apply" : "auto-apply unless APPROVE";
+  const round = `${Math.max(0, state.reviewRound)}/${state.maxReviewRounds}`;
+  let rerun = "";
+  if (state.autoRerunAfterApply) {
+    rerun = ` · round ${round} (rerun until approved)`;
+  } else if (state.reviewRound > 0) {
+    rerun = ` · round ${round}`;
+  }
+  return `implement → review → ${apply}${rerun}`;
+}
+
 function updateStatusCardWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
-  const phase = getPhaseStatus(state);
-  const workerModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+  const workerLabel = ctx.model ? modelRefToCli(ctx.model) : "selected model";
   const summary = state.reviewSummary;
   const mandatoryFindings = summary?.findings.filter((finding) => finding.mandatory !== false).length ?? 0;
   const warnings = [
-    !state.baseline.isGitRepo ? "Warning: git change scoping is degraded." : undefined,
-    state.baseline.isGitRepo && state.baseline.dirty ? "Warning: workspace was already dirty before start." : undefined,
-    state.lastReviewError ? `Last error: ${truncateMiddle(state.lastReviewError, 700)}` : undefined,
+    !state.baseline.isGitRepo ? "⚠ git change scoping is degraded" : undefined,
+    state.baseline.isGitRepo && state.baseline.dirty ? "⚠ workspace was already dirty before start" : undefined,
+    state.lastReviewError ? `⚠ last error: ${truncateMiddle(state.lastReviewError, 700)}` : undefined,
   ].filter((line): line is string => !!line);
-  const checklistMode = state.statusCardChecklistMode ?? (state.phase === "applying" || !state.active ? "handled" : "pending");
+  const defaultChecklistMode: "pending" | "handled" = state.phase === "applying" || !state.active ? "handled" : "pending";
+  const checklistMode = state.statusCardChecklistMode ?? defaultChecklistMode;
+  const verdictLine = summary
+    ? `Verdict: ${summary.verdict ?? "UNKNOWN"} · ${summary.findingCount} finding${summary.findingCount === 1 ? "" : "s"} · ${mandatoryFindings} mandatory`
+    : undefined;
 
-  ctx.ui.setWidget(
-    STATUS_CARD_WIDGET_KEY,
-    [
-      "Review-cycle status",
-      `${formatStatusLine(state)} · round ${Math.max(0, state.reviewRound)}/${state.maxReviewRounds}`,
-      `Phase: ${phase.label}`,
-      `Task: ${summarizeTask(state.task, 140)}`,
-      `Worker: ${workerModel ? modelRefToCli(workerModel) : "selected model"}`,
-      `Reviewer: ${formatReviewerLabel(state)}`,
-      `Tests: ${formatTestPolicy(state.allowedTestCommands)} (${state.testPolicySource})`,
-      `Git: ${formatGitLine(state)}`,
-      `Mode: implement → fresh review → ${state.manualApply ? "wait for /review-cycle apply" : "auto-apply unless APPROVE"}${state.autoRerunAfterApply ? ` → rerun until approved (max ${state.maxReviewRounds} reviews)` : ""}`,
-      summary ? `Review: ${summary.verdict ?? "UNKNOWN"} · findings ${summary.findingCount} · mandatory ${mandatoryFindings}` : undefined,
-      summary?.reviewDataWarning,
-      ...(summary ? formatFindingsChecklist(summary, checklistMode) : []),
-      state.artifactRunPath ? `Artifact: ${state.artifactRunPath}` : undefined,
-      `Next: ${state.statusCardAction ?? getDefaultStatusCardAction(state)}`,
-      ...warnings,
-    ].flat().filter((line): line is string => !!line).map((line) => truncateLine(line)),
-    { placement: "belowEditor" },
-  );
-}
+  const lines = [
+    "Review-cycle status",
+    formatStatusLine(state),
+    formatStatusCardLabel("Task", summarizeTask(state.task, 140)),
+    STATUS_CARD_DIVIDER,
+    formatStatusCardLabel("Worker", workerLabel),
+    formatStatusCardLabel("Reviewer", formatReviewerLabel(state)),
+    formatStatusCardLabel("Tests", `${formatTestPolicy(state.allowedTestCommands)} (${state.testPolicySource})`),
+    formatStatusCardLabel("Git", formatGitLine(state)),
+    formatStatusCardLabel("Flow", formatFlowLine(state)),
+    summary ? STATUS_CARD_DIVIDER : undefined,
+    verdictLine,
+    summary?.reviewDataWarning ? `⚠ ${summary.reviewDataWarning}` : undefined,
+    ...(summary ? formatFindingsChecklist(summary, checklistMode) : []),
+    STATUS_CARD_DIVIDER,
+    state.artifactRunPath ? formatStatusCardLabel("Artifact", state.artifactRunPath) : undefined,
+    formatStatusCardLabel("Next", state.statusCardAction ?? getDefaultStatusCardAction(state)),
+    ...warnings,
+  ].filter((line): line is string => !!line).map((line) => truncateLine(line));
 
-function updatePreflightWidget(
-  ctx: ExtensionContext | ExtensionCommandContext,
-  state: ReviewCycleState,
-  _workerModel: ModelRef | undefined,
-): void {
-  state.statusCardAction = state.phase === "confirming"
-    ? "/review-cycle continue or /review-cycle abort"
-    : "implementation phase running";
-  updateStatusCardWidget(ctx, state);
-  clearPreflightWidget(ctx);
-}
-
-function updateFailureWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
-  state.statusCardAction = "/review-cycle retry, /review-cycle retry --reviewer-model provider/model, /review-cycle output on, or /review-cycle stop";
-  state.statusCardChecklistMode = "pending";
-  updateStatusCardWidget(ctx, state);
-  clearReviewerSummaryWidget(ctx);
+  ctx.ui.setWidget(STATUS_CARD_WIDGET_KEY, lines, { placement: "belowEditor" });
 }
 
 function showHelp(ctx: ExtensionCommandContext): void {
@@ -379,22 +370,35 @@ function showHelp(ctx: ExtensionCommandContext): void {
     HELP_WIDGET_KEY,
     [
       "Review-cycle commands",
-      "/review-cycle <task>  — start implement → review → apply",
-      "/rc <task>            — short alias for /review-cycle",
-      "/review-cycle --manual-apply <task>  — wait for /review-cycle apply or skip after review",
-      "/review-cycle --until-approved [--max-review-rounds n] <task>  — auto-rerun review after apply",
-      "/review-cycle --allow-dirty <task>  — start even when the workspace is already dirty",
-      "/review-cycle continue|abort  — decide after a dirty-workspace preflight pause",
-      "/review-cycle apply|skip  — continue or finish a manual-apply review",
-      "/review-cycle retry [--reviewer-model provider/model]  — retry a failed reviewer subprocess",
-      "/review-cycle panel  — open interactive status/action overlay",
-      "/review-cycle status  — show phase, elapsed time, reviewer, tests, task",
-      "/review-cycle rerun [--reviewer-model provider/model]  — rerun fresh review for the last task",
-      "/review-cycle output off|on|toggle  — hide/show live reviewer output",
-      "/review-cycle artifact [show|list|path] [n]  — inspect latest or recent review artifacts",
-      "/review-cycle tests status|set <cmd>|add <cmd>|clear  — configure exact reviewer test commands",
-      "Repo config: .pi/review-cycle.json with reviewerModel, tests, manualApply, autoRerunAfterApply, maxReviewRounds, allowDirty",
-      "/review-cycle stop  — cancel the managed workflow",
+      "",
+      "Start",
+      "  /review-cycle <task>                              start implement → review → apply",
+      "  /rc <task>                                        short alias",
+      "  /review-cycle --manual-apply <task>               wait for apply/skip after review",
+      "  /review-cycle --until-approved [--max-review-rounds n] <task>",
+      "                                                    auto-rerun review after apply",
+      "  /review-cycle --allow-dirty <task>                start with dirty workspace",
+      "",
+      "Control",
+      "  /review-cycle continue|abort                      after a dirty-workspace pause",
+      "  /review-cycle apply|skip                          finish a manual-apply review",
+      "  /review-cycle retry [--reviewer-model provider/model]",
+      "                                                    retry a failed reviewer subprocess",
+      "  /review-cycle rerun [--reviewer-model provider/model]",
+      "                                                    rerun fresh review for the last task",
+      "  /review-cycle stop                                cancel the managed workflow",
+      "",
+      "Inspect",
+      "  /review-cycle status                              status line",
+      "  /review-cycle panel                               interactive overlay",
+      "  /review-cycle output off|on|toggle                hide/show live reviewer log",
+      "  /review-cycle artifact [show|list|path] [n]       inspect review artifacts",
+      "",
+      "Config",
+      "  /review-cycle tests status|set <cmd>|add <cmd>|clear",
+      "                                                    configure reviewer test commands",
+      "  Repo file: .pi/review-cycle.json",
+      "    keys: reviewerModel, tests, manualApply, autoRerunAfterApply, maxReviewRounds, allowDirty",
     ],
     { placement: "belowEditor" },
   );
@@ -402,7 +406,7 @@ function showHelp(ctx: ExtensionCommandContext): void {
 }
 
 function formatFindingsChecklist(summary: ReviewSummary, mode: "pending" | "handled"): string[] {
-  if (summary.findings.length === 0) return ["Findings checklist: (none)"];
+  if (summary.findings.length === 0) return ["Findings: (none)"];
   const marker = mode === "handled" ? "[x]" : "[ ]";
   const shown = summary.findings.slice(0, MAX_CHECKLIST_ITEMS).map((finding, index) => {
     const severity = finding.severity === "other" ? "finding" : finding.severity.toUpperCase();
@@ -411,23 +415,21 @@ function formatFindingsChecklist(summary: ReviewSummary, mode: "pending" | "hand
   });
   const omitted = summary.findings.length - shown.length;
   return [
-    `Findings checklist (${mode === "handled" ? "apply pass completed" : "pending apply"}):`,
+    "Findings:",
     ...shown,
     ...(omitted > 0 ? [`… (${omitted} more)`] : []),
   ];
 }
 
-function updateReviewSummaryWidget(
+function applyReviewAction(
   ctx: ExtensionContext | ExtensionCommandContext,
   state: ReviewCycleState,
-  summary: ReviewSummary,
   action: string,
-  checklistMode: "pending" | "handled" = "pending",
+  checklistMode: "pending" | "handled",
 ): void {
   state.statusCardAction = action;
   state.statusCardChecklistMode = checklistMode;
   updateStatusCardWidget(ctx, state);
-  clearReviewerSummaryWidget(ctx);
 }
 
 function updateReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
@@ -440,8 +442,8 @@ function updateReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandCont
   ctx.ui.setWidget(
     REVIEWER_OUTPUT_WIDGET_KEY,
     [
-      `Fresh reviewer output — /review-cycle output off or /rc output off to hide (${lines.length} line${lines.length === 1 ? "" : "s"})`,
-      ...lines.slice(-MAX_REVIEWER_OUTPUT_LINES),
+      `Reviewer output · ${lines.length} line${lines.length === 1 ? "" : "s"} · /rc output off to hide`,
+      ...lines,
     ],
     { placement: "belowEditor" },
   );
@@ -487,10 +489,8 @@ function buildPanelStatusLines(state: ReviewCycleState | undefined, lastRun: Las
       lastRun ? `Last task: ${summarizeTask(lastRun.task, 100)}` : "Last task: (none)",
     ];
   }
-  const phase = getPhaseStatus(state);
   const lines = [
     formatStatusLine(state),
-    `Phase: ${phase.label}`,
     `Task: ${summarizeTask(state.task, 100)}`,
     `Reviewer: ${formatReviewerLabel(state)}`,
     `Tests: ${formatTestPolicy(state.allowedTestCommands)}`,
@@ -1105,17 +1105,33 @@ function resolveRunOptions(
     maxReviewRounds?: number;
   },
 ): ReviewCycleRunOptions {
-  const autoRerunAfterApply = command.untilApproved ?? config.autoRerunAfterApply ?? false;
   const reviewerModel = command.reviewerModel ?? config.reviewerModel;
-  const commandTestsConfigured = preferences.allowedTestCommands !== undefined;
+
+  let reviewerModelSource: ReviewCycleRunOptions["reviewerModelSource"];
+  if (command.reviewerModel) reviewerModelSource = "command";
+  else if (config.reviewerModel) reviewerModelSource = "config";
+  else reviewerModelSource = "active";
+
+  const commandTests = preferences.allowedTestCommands;
+  const configTests = config.tests ?? [];
+  let testPolicySource: ReviewCycleRunOptions["testPolicySource"];
+  let allowedTestCommands: string[];
+  if (commandTests !== undefined) {
+    testPolicySource = commandTests.length > 0 ? "command" : "default";
+    allowedTestCommands = [...commandTests];
+  } else {
+    testPolicySource = configTests.length > 0 ? "config" : "default";
+    allowedTestCommands = [...configTests];
+  }
+
   return {
     reviewerModel,
-    reviewerModelSource: command.reviewerModel ? "command" : config.reviewerModel ? "config" : "active",
-    testPolicySource: commandTestsConfigured ? preferences.allowedTestCommands!.length > 0 ? "command" : "default" : config.tests && config.tests.length > 0 ? "config" : "default",
+    reviewerModelSource,
+    testPolicySource,
     reviewerOutputVisible: preferences.reviewerOutputVisible,
-    allowedTestCommands: commandTestsConfigured ? [...preferences.allowedTestCommands!] : [...(config.tests ?? [])],
+    allowedTestCommands,
     manualApply: command.manualApply ?? config.manualApply ?? false,
-    autoRerunAfterApply,
+    autoRerunAfterApply: command.untilApproved ?? config.autoRerunAfterApply ?? false,
     maxReviewRounds: Math.max(1, command.maxReviewRounds ?? config.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS),
     allowDirty: command.allowDirty ?? config.allowDirty ?? false,
   };
@@ -1237,11 +1253,12 @@ function parseArtifactMetadata(content: string): Partial<ReviewArtifactEntry> | 
   const record = parsed as Record<string, unknown>;
   if (record.schemaVersion !== 1) return undefined;
 
-  const findings = typeof record.findings === "number" && Number.isFinite(record.findings)
-    ? String(record.findings)
-    : typeof record.findings === "string"
-      ? record.findings
-      : undefined;
+  let findings: string | undefined;
+  if (typeof record.findings === "number" && Number.isFinite(record.findings)) {
+    findings = String(record.findings);
+  } else if (typeof record.findings === "string") {
+    findings = record.findings;
+  }
   return {
     stage: typeof record.stage === "string" ? record.stage : undefined,
     task: typeof record.task === "string" ? record.task : undefined,
@@ -1425,7 +1442,6 @@ async function startReviewCycle(
 
   stateRef.current = state;
   setStatus(ctx, state);
-  updatePreflightWidget(ctx, state, ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined);
 
   if (!pi.getSessionName()) {
     pi.setSessionName(`Review: ${summarizeTask(task, 56)}`);
@@ -1452,7 +1468,6 @@ function continueDirtyReviewCycle(pi: ExtensionAPI, ctx: ExtensionCommandContext
   state.phase = "implementing";
   state.allowDirty = true;
   setStatus(ctx, state);
-  updatePreflightWidget(ctx, state, ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined);
   ctx.ui.notify("Review-cycle continued with pre-existing git changes", "warning");
   pi.sendUserMessage(state.task);
 }
@@ -1471,8 +1486,6 @@ async function runReviewAndQueueApply(
   state.statusCardChecklistMode = undefined;
   state.reviewRound += 1;
   state.reviewerOutputLines = [];
-  clearPreflightWidget(ctx);
-  clearReviewerSummaryWidget(ctx);
   setStatus(ctx, state);
   appendReviewerOutputLineAndRender(ctx, state, "Starting fresh-context reviewer...");
   ctx.ui.notify("Review-cycle: starting fresh-context review", "info");
@@ -1538,21 +1551,21 @@ async function runReviewAndQueueApply(
   if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
 
   if (summary.verdict === "APPROVE") {
-    updateReviewSummaryWidget(ctx, state, summary, "done; no apply pass needed", "handled");
+    applyReviewAction(ctx, state, "done; no apply pass needed", "handled");
     finishState(ctx, stateRef);
     ctx.ui.notify("Review-cycle: reviewer approved; no apply pass needed", "info");
     return;
   }
 
   if (state.manualApply) {
-    updateReviewSummaryWidget(ctx, state, summary, "waiting for /review-cycle apply or /review-cycle skip", "pending");
+    applyReviewAction(ctx, state, "waiting for /review-cycle apply or /review-cycle skip", "pending");
     state.phase = "manual";
     setStatus(ctx, state);
     ctx.ui.notify("Review-cycle: review complete; waiting for /review-cycle apply or /review-cycle skip", "info");
     return;
   }
 
-  updateReviewSummaryWidget(ctx, state, summary, "applying feedback", "pending");
+  applyReviewAction(ctx, state, "applying feedback", "pending");
   state.phase = "applying";
   setStatus(ctx, state);
   ctx.ui.notify("Review-cycle: fresh review complete; applying feedback", "info");
@@ -1567,7 +1580,7 @@ function queueManualApply(pi: ExtensionAPI, ctx: ExtensionCommandContext, state:
   }
   state.phase = "applying";
   setStatus(ctx, state);
-  if (state.reviewSummary) updateReviewSummaryWidget(ctx, state, state.reviewSummary, "applying feedback", "pending");
+  if (state.reviewSummary) applyReviewAction(ctx, state, "applying feedback", "pending");
   ctx.ui.notify("Review-cycle: applying manually approved review feedback", "info");
   pi.sendUserMessage(buildApplyReviewPrompt({ task: state.task, review: state.review }));
 }
@@ -1578,7 +1591,7 @@ async function skipManualApply(ctx: ExtensionCommandContext, stateRef: { current
     ctx.ui.notify("No manual review feedback is waiting to skip", "info");
     return;
   }
-  if (state.reviewSummary) updateReviewSummaryWidget(ctx, state, state.reviewSummary, "skipped by user", "handled");
+  if (state.reviewSummary) applyReviewAction(ctx, state, "skipped by user", "handled");
   await writeReviewArtifact(ctx.cwd, state, "manual-apply-skipped");
   if (stateRef.current !== state || !state.active || state.phase !== "manual") return;
   finishState(ctx, stateRef);
@@ -1589,8 +1602,7 @@ function markReviewFailure(ctx: ExtensionContext | ExtensionCommandContext, stat
   state.phase = "failed";
   state.lastReviewError = error instanceof Error ? error.message : String(error);
   state.reviewRound = Math.max(0, state.reviewRound - 1);
-  setStatus(ctx, state);
-  updateFailureWidget(ctx, state);
+  applyReviewAction(ctx, state, "/review-cycle retry or /review-cycle stop", "pending");
 }
 
 function makeLastRunFromState(state: ReviewCycleState): LastReviewCycleRun {
@@ -1630,7 +1642,7 @@ async function rerunReviewCycle(
     startedAt: Date.now(),
     baseline: lastRun.baseline,
     reviewerModel: reviewerModelOverride ?? lastRun.reviewerModel ?? options.reviewerModel,
-    reviewerModelSource: reviewerModelOverride ? "command" : lastRun.reviewerModel ? "command" : options.reviewerModelSource,
+    reviewerModelSource: reviewerModelOverride || lastRun.reviewerModel ? "command" : options.reviewerModelSource,
     testPolicySource: options.testPolicySource,
     implementationSummary: lastRun.implementationSummary,
     reviewerOutputVisible: options.reviewerOutputVisible,
@@ -1827,14 +1839,8 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
 
       if (parsed.kind === "tests") {
         if (parsed.action === "show") {
-          const configured = preferences.allowedTestCommands !== undefined
-            ? preferences.allowedTestCommands.length > 0
-              ? preferences.allowedTestCommands.join("; ")
-              : "default safe test allowlist"
-            : repoConfig.tests && repoConfig.tests.length > 0
-              ? repoConfig.tests.join("; ")
-              : "default safe test allowlist";
-          ctx.ui.notify(`Review-cycle test commands: ${configured}`, "info");
+          const activeCommands = preferences.allowedTestCommands ?? repoConfig.tests ?? [];
+          ctx.ui.notify(`Review-cycle test commands: ${formatTestPolicy(activeCommands)}`, "info");
           return;
         }
         if (parsed.action === "clear") {
@@ -1960,14 +1966,14 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     if (state.phase === "applying") {
       const beforeApplyFingerprint = changeSnapshotFingerprint(state.lastChanges);
       state.applySummary = truncateMiddle(assistantTurn.text, MAX_IMPLEMENTATION_SUMMARY_CHARS);
-      if (state.reviewSummary) updateReviewSummaryWidget(ctx, state, state.reviewSummary, "apply pass finished", "handled");
+      if (state.reviewSummary) applyReviewAction(ctx, state, "apply pass finished", "handled");
       const afterApplyChanges = await getChangeSnapshotImpl(pi, ctx.cwd, state.baseline).catch(() => undefined);
       if (stateRef.current !== state || !state.active || state.phase !== "applying") return;
       const applyMadeNoWorkspaceChanges = !!afterApplyChanges && !!beforeApplyFingerprint && changeSnapshotFingerprint(afterApplyChanges) === beforeApplyFingerprint;
       if (afterApplyChanges) state.lastChanges = afterApplyChanges;
 
       if (state.autoRerunAfterApply && state.reviewRound < state.maxReviewRounds && applyMadeNoWorkspaceChanges) {
-        if (state.reviewSummary) updateReviewSummaryWidget(ctx, state, state.reviewSummary, "stopped: apply pass made no workspace changes", "handled");
+        if (state.reviewSummary) applyReviewAction(ctx, state, "stopped: apply pass made no workspace changes", "handled");
         await writeReviewArtifact(ctx.cwd, state, "stopped-no-change-after-apply");
         if (stateRef.current !== state || !state.active || state.phase !== "applying") return;
         finishState(ctx, stateRef);
