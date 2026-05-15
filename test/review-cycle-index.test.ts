@@ -201,6 +201,20 @@ test("review-cycle panel renders an overlay and dispatches the selected action",
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer output hidden")));
 });
 
+test("review-cycle panel supports terminal arrow-key sequences", async () => {
+  const harness = createHarness({ panelInputs: ["\u001b[1;1B", "\r"] });
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("arrow navigation task", harness.ctx);
+  await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle panel action: Stop run")));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Stopped review-cycle")));
+  assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+});
+
 test("review-cycle inactive panel shows the rerun target", async () => {
   const harness = createHarness({ panelInputs: ["\r"] });
   let reviewCalls = 0;

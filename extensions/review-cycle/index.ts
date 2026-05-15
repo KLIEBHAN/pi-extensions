@@ -474,10 +474,18 @@ function truncatePanelLine(text: string, width: number): string {
   return text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`;
 }
 
+function matchesPanelArrowInput(data: string, direction: "up" | "down"): boolean {
+  const finalByte = direction === "up" ? "A" : "B";
+  const applicationSequence = direction === "up" ? "\u001bOA" : "\u001bOB";
+  return data === direction
+    || data === `\u001b[${finalByte}`
+    || data === applicationSequence
+    || new RegExp(`^\\u001b\\[1;\\d+(?::[123])?${finalByte}$`).test(data);
+}
+
 function matchesPanelInput(data: string, ...keys: string[]): boolean {
   return keys.some((key) => {
-    if (key === "up") return data === "up" || data === "\u001b[A";
-    if (key === "down") return data === "down" || data === "\u001b[B";
+    if (key === "up" || key === "down") return matchesPanelArrowInput(data, key);
     if (key === "enter") return data === "enter" || data === "return" || data === "\r" || data === "\n";
     if (key === "escape") return data === "escape" || data === "\u001b";
     return data === key;
