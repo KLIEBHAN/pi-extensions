@@ -617,25 +617,7 @@ function normalizeConfiguredTestCommandTokens(command: string): string[] | undef
   return tokens;
 }
 
-function testCommandMatchesConfigured(command: string, allowedTestCommands: readonly string[]): boolean {
-  const tokens = normalizeConfiguredTestCommandTokens(command);
-  if (!tokens) return false;
-
-  return allowedTestCommands.some((allowedCommand) => {
-    const allowedTokens = normalizeConfiguredTestCommandTokens(allowedCommand);
-    if (!allowedTokens || allowedTokens.length !== tokens.length) return false;
-    return allowedTokens.every((token, index) => token === tokens[index]);
-  });
-}
-
-export function isReviewerTestCommandAllowed(command: string, options: ReviewerGuardOptions = {}): boolean {
-  if (options.allowedTestCommands && options.allowedTestCommands.length > 0) {
-    return testCommandMatchesConfigured(command, options.allowedTestCommands);
-  }
-
-  const tokens = normalizeTestCommandTokens(command);
-  if (!tokens) return false;
-
+function isReviewerTestTokensAllowed(tokens: string[]): boolean {
   const executable = tokens[0]!.startsWith("./") ? tokens[0]!.slice(2) : tokens[0]!;
   if (!(REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS as readonly string[]).includes(executable)) return false;
 
@@ -675,6 +657,26 @@ export function isReviewerTestCommandAllowed(command: string, options: ReviewerG
     default:
       return false;
   }
+}
+
+function testCommandMatchesConfigured(command: string, allowedTestCommands: readonly string[]): boolean {
+  const tokens = normalizeConfiguredTestCommandTokens(command);
+  if (!tokens || !isReviewerTestTokensAllowed(tokens)) return false;
+
+  return allowedTestCommands.some((allowedCommand) => {
+    const allowedTokens = normalizeConfiguredTestCommandTokens(allowedCommand);
+    if (!allowedTokens || !isReviewerTestTokensAllowed(allowedTokens) || allowedTokens.length !== tokens.length) return false;
+    return allowedTokens.every((token, index) => token === tokens[index]);
+  });
+}
+
+export function isReviewerTestCommandAllowed(command: string, options: ReviewerGuardOptions = {}): boolean {
+  if (options.allowedTestCommands && options.allowedTestCommands.length > 0) {
+    return testCommandMatchesConfigured(command, options.allowedTestCommands);
+  }
+
+  const tokens = normalizeTestCommandTokens(command);
+  return !!tokens && isReviewerTestTokensAllowed(tokens);
 }
 
 export function isReviewerGitCommandAllowed(command: string): boolean {
@@ -815,22 +817,7 @@ function normalizeConfiguredTestCommandTokens(command) {
   return tokens;
 }
 
-function testCommandMatchesConfigured(command, allowedTestCommands) {
-  const tokens = normalizeConfiguredTestCommandTokens(command);
-  if (!tokens) return false;
-  return allowedTestCommands.some((allowedCommand) => {
-    const allowedTokens = normalizeConfiguredTestCommandTokens(allowedCommand);
-    if (!allowedTokens || allowedTokens.length !== tokens.length) return false;
-    return allowedTokens.every((token, index) => token === tokens[index]);
-  });
-}
-
-function isReviewerTestCommandAllowed(command) {
-  if (REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS.length > 0) {
-    return testCommandMatchesConfigured(command, REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS);
-  }
-  const tokens = normalizeTestCommandTokens(command);
-  if (!tokens) return false;
+function isReviewerTestTokensAllowed(tokens) {
   const executable = tokens[0].startsWith("./") ? tokens[0].slice(2) : tokens[0];
   if (!REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS.has(executable)) return false;
   switch (executable) {
@@ -869,6 +856,24 @@ function isReviewerTestCommandAllowed(command) {
     default:
       return false;
   }
+}
+
+function testCommandMatchesConfigured(command, allowedTestCommands) {
+  const tokens = normalizeConfiguredTestCommandTokens(command);
+  if (!tokens || !isReviewerTestTokensAllowed(tokens)) return false;
+  return allowedTestCommands.some((allowedCommand) => {
+    const allowedTokens = normalizeConfiguredTestCommandTokens(allowedCommand);
+    if (!allowedTokens || !isReviewerTestTokensAllowed(allowedTokens) || allowedTokens.length !== tokens.length) return false;
+    return allowedTokens.every((token, index) => token === tokens[index]);
+  });
+}
+
+function isReviewerTestCommandAllowed(command) {
+  if (REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS.length > 0) {
+    return testCommandMatchesConfigured(command, REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS);
+  }
+  const tokens = normalizeTestCommandTokens(command);
+  return !!tokens && isReviewerTestTokensAllowed(tokens);
 }
 
 function isReviewerGitCommandAllowed(command) {

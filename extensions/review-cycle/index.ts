@@ -163,7 +163,7 @@ function getPhaseStatus(state: ReviewCycleState): { step: number; label: string 
     case "implementing":
       return { step: 1, label: "implementing" };
     case "reviewing":
-      return { step: 2, label: `reviewing round ${state.reviewRound + 1}` };
+      return { step: 2, label: `reviewing round ${Math.max(1, state.reviewRound)}` };
     case "manual":
       return { step: 2, label: "awaiting manual apply" };
     case "applying":

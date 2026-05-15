@@ -179,6 +179,9 @@ test("reviewer test guard can restrict tests to configured exact commands", () =
   assert.equal(isReviewerTestCommandAllowed("npm test -- --watch", options), false);
   assert.equal(isReviewerTestCommandAllowed("FOO=bar npm test", options), false);
   assert.equal(isReviewerTestCommandAllowed("NODE_OPTIONS=--require=./some-file npm test", options), false);
+  assert.equal(isReviewerTestCommandAllowed("rm -rf .", { allowedTestCommands: ["rm -rf ."] }), false);
+  assert.equal(isReviewerTestCommandAllowed("npm install", { allowedTestCommands: ["npm install"] }), false);
+  assert.equal(isReviewerTestCommandAllowed("FOO=bar npm test", { allowedTestCommands: ["FOO=bar npm test"] }), false);
   assert.equal(isReviewerToolCallAllowed("bash", { command: "npm test" }, options), true);
   assert.equal(isReviewerToolCallAllowed("bash", { command: "FOO=bar npm test" }, options), false);
   assert.equal(isReviewerToolCallAllowed("bash", { command: "vitest run" }, options), false);
@@ -217,6 +220,22 @@ test("generated reviewer guard extension blocks and allows tool calls at runtime
     block: true,
     reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: bash",
   });
+
+  const unsafeConfiguredSource = buildReviewerToolGuardExtensionSource({ allowedTestCommands: ["rm -rf ."] });
+  const unsafeConfiguredModule = await import(`data:text/javascript,${encodeURIComponent(unsafeConfiguredSource)}`) as {
+    default: (pi: { on: (event: string, handler: Function) => void }) => void;
+  };
+  let unsafeConfiguredHandler: Function | undefined;
+  unsafeConfiguredModule.default({
+    on(event: string, handler: Function) {
+      if (event === "tool_call") unsafeConfiguredHandler = handler;
+    },
+  });
+  assert.deepEqual(unsafeConfiguredHandler?.({ toolName: "bash", input: { command: "rm -rf ." } }), {
+    block: true,
+    reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: bash",
+  });
+
   assert.deepEqual(toolCallHandler?.({ toolName: "bash", input: { command: "npm install" } }), {
     block: true,
     reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: bash",

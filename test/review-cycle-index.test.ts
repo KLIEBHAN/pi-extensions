@@ -148,6 +148,9 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
     ],
   }, harness.ctx);
 
+  assert.ok(harness.statuses.some((entry) => /Review 2\/3 reviewing round 1/.test(entry.value ?? "")));
+  assert.equal(harness.statuses.some((entry) => /Review 2\/3 reviewing round 2/.test(entry.value ?? "")), false);
+
   assert.equal(reviewCalls.length, 1);
   assert.equal(reviewCalls[0]?.cwd, "/repo");
   assert.match(reviewCalls[0]?.prompt ?? "", /implement auth hardening/);
