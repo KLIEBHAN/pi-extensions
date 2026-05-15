@@ -60,6 +60,23 @@ export const REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS = [
   "vitest",
   "yarn",
 ] as const;
+export const REVIEWER_BLOCKED_TEST_ARGUMENTS = [
+  "--init",
+  "--inspect",
+  "--inspect-brk",
+  "--interactive",
+  "--open",
+  "--pdb",
+  "--ui",
+  "--update",
+  "--update-snapshot",
+  "--updateSnapshot",
+  "--watch",
+  "--watchAll",
+  "-u",
+  "-w",
+  "init",
+] as const;
 export const DEFAULT_REVIEW_TOOLS = REVIEWER_ALLOWED_TOOL_NAMES;
 export const MAX_REVIEW_PROMPT_SECTION_CHARS = 20_000;
 export const MAX_APPLY_REVIEW_CHARS = 24_000;
@@ -419,6 +436,14 @@ function isPythonTestCommand(tokens: string[]): boolean {
   return tokens[1] === "-m" && (tokens[2] === "pytest" || tokens[2] === "unittest");
 }
 
+function isBlockedTestArgument(token: string): boolean {
+  return REVIEWER_BLOCKED_TEST_ARGUMENTS.some((blocked) => token === blocked || token.startsWith(`${blocked}=`));
+}
+
+function hasBlockedTestArguments(tokens: string[]): boolean {
+  return tokens.some(isBlockedTestArgument);
+}
+
 export function isReviewerTestCommandAllowed(command: string): boolean {
   const rawTokens = tokenizeReviewerShellCommand(command);
   const tokens = rawTokens ? stripEnvAssignments(rawTokens) : undefined;
@@ -426,6 +451,7 @@ export function isReviewerTestCommandAllowed(command: string): boolean {
 
   const executable = tokens[0]!.startsWith("./") ? tokens[0]!.slice(2) : tokens[0]!;
   if (!(REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS as readonly string[]).includes(executable)) return false;
+  if (hasBlockedTestArguments(tokens.slice(1))) return false;
 
   switch (executable) {
     case "npm":
@@ -507,6 +533,7 @@ const REVIEWER_ALLOWED_BASH_TOOL_NAME = ${JSON.stringify(REVIEWER_ALLOWED_BASH_T
 const REVIEWER_ALLOWED_GIT_SUBCOMMANDS = new Set(${JSON.stringify([...REVIEWER_ALLOWED_GIT_SUBCOMMANDS])});
 const REVIEWER_BLOCKED_GIT_ARGUMENTS = ${JSON.stringify([...REVIEWER_BLOCKED_GIT_ARGUMENTS])};
 const REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS = new Set(${JSON.stringify([...REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS])});
+const REVIEWER_BLOCKED_TEST_ARGUMENTS = ${JSON.stringify([...REVIEWER_BLOCKED_TEST_ARGUMENTS])};
 const REVIEWER_BLOCKED_SHELL_CHARS = ${JSON.stringify(";&|<>`$(){}[]*!?")};
 const REVIEWER_BLOCKED_DOUBLE_QUOTE_CHARS = ${JSON.stringify("$`\\!")};
 
@@ -577,12 +604,21 @@ function isPythonTestCommand(tokens) {
   return tokens[1] === "-m" && (tokens[2] === "pytest" || tokens[2] === "unittest");
 }
 
+function isBlockedTestArgument(token) {
+  return REVIEWER_BLOCKED_TEST_ARGUMENTS.some((blocked) => token === blocked || token.startsWith(blocked + "="));
+}
+
+function hasBlockedTestArguments(tokens) {
+  return tokens.some(isBlockedTestArgument);
+}
+
 function isReviewerTestCommandAllowed(command) {
   const rawTokens = tokenizeReviewerShellCommand(command);
   const tokens = rawTokens ? stripEnvAssignments(rawTokens) : undefined;
   if (!tokens || tokens.length === 0) return false;
   const executable = tokens[0].startsWith("./") ? tokens[0].slice(2) : tokens[0];
   if (!REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS.has(executable)) return false;
+  if (hasBlockedTestArguments(tokens.slice(1))) return false;
   switch (executable) {
     case "npm":
     case "pnpm":

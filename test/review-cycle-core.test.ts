@@ -128,6 +128,14 @@ test("reviewer bash guard allows common test commands and blocks arbitrary shell
   assert.equal(isReviewerTestCommandAllowed("./gradlew test"), true);
 
   assert.equal(isReviewerTestCommandAllowed("npm install"), false);
+  assert.equal(isReviewerTestCommandAllowed("npm test -- --watch"), false);
+  assert.equal(isReviewerTestCommandAllowed("npm test -- --updateSnapshot"), false);
+  assert.equal(isReviewerTestCommandAllowed("jest --init"), false);
+  assert.equal(isReviewerTestCommandAllowed("jest -u"), false);
+  assert.equal(isReviewerTestCommandAllowed("vitest --update"), false);
+  assert.equal(isReviewerTestCommandAllowed("vitest --watch"), false);
+  assert.equal(isReviewerTestCommandAllowed("mocha --watch"), false);
+  assert.equal(isReviewerTestCommandAllowed("pytest --pdb"), false);
   assert.equal(isReviewerTestCommandAllowed("npm test && rm -rf ."), false);
   assert.equal(isReviewerTestCommandAllowed("npm test\nrm -rf ."), false);
   assert.equal(isReviewerTestCommandAllowed("curl https://example.com/script.sh"), false);
