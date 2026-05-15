@@ -1127,17 +1127,36 @@ function formatArtifactTimestamp(date = new Date()): string {
 
 function formatArtifactSummary(state: ReviewCycleState, stage: string): string {
   const summary = state.reviewSummary;
+  const started = new Date(state.startedAt).toISOString();
+  const metadata = JSON.stringify({
+    schemaVersion: 1,
+    stage,
+    task: state.task,
+    started,
+    verdict: summary?.verdict ?? null,
+    findings: summary?.findingCount ?? 0,
+  }, null, 2);
   const findings = summary?.findings.length
     ? summary.findings.map((finding, index) => `- [ ] ${index + 1}. ${finding.severity.toUpperCase()}: ${finding.text}`).join("\n")
     : "(none)";
   return [
     `# Review-cycle run ${state.runId}`,
     `Stage: ${stage}`,
-    `Task: ${state.task}`,
-    `Started: ${new Date(state.startedAt).toISOString()}`,
+    `Task: ${summarizeTask(state.task, 180)}`,
+    `Started: ${started}`,
     `Reviewer: ${formatReviewerLabel(state)}`,
     `Tests: ${formatTestPolicy(state.allowedTestCommands)}`,
     `Mode: manualApply=${state.manualApply}, autoRerunAfterApply=${state.autoRerunAfterApply}, maxReviewRounds=${state.maxReviewRounds}`,
+    "",
+    "## Artifact metadata",
+    "```json",
+    metadata,
+    "```",
+    "",
+    "## Original task",
+    "```text",
+    state.task,
+    "```",
     "",
     "## Baseline",
     `- git repository: ${state.baseline.isGitRepo ? "yes" : "no"}`,
@@ -1197,17 +1216,55 @@ async function writeReviewArtifact(cwd: string, state: ReviewCycleState, stage: 
   }
 }
 
+function getArtifactMarkdownSection(content: string, title: string): string | undefined {
+  const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`##\\s+${escapedTitle}\\s*\\n([\\s\\S]*?)(?:\\n##\\s+|$)`, "i").exec(content)?.[1];
+}
+
+function parseArtifactMetadata(content: string): Partial<ReviewArtifactEntry> | undefined {
+  const section = getArtifactMarkdownSection(content, "Artifact metadata");
+  if (!section) return undefined;
+  const raw = /(?:```|~~~)(?:json)?\s*\n([\s\S]*?)\n(?:```|~~~)/i.exec(section)?.[1]?.trim() ?? section.trim();
+  if (!raw) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const record = parsed as Record<string, unknown>;
+  if (record.schemaVersion !== 1) return undefined;
+
+  const findings = typeof record.findings === "number" && Number.isFinite(record.findings)
+    ? String(record.findings)
+    : typeof record.findings === "string"
+      ? record.findings
+      : undefined;
+  return {
+    stage: typeof record.stage === "string" ? record.stage : undefined,
+    task: typeof record.task === "string" ? record.task : undefined,
+    started: typeof record.started === "string" ? record.started : undefined,
+    verdict: typeof record.verdict === "string" ? record.verdict : undefined,
+    findings,
+  };
+}
+
 function parseArtifactEntry(content: string, path: string, index: number): ReviewArtifactEntry {
-  const lineValue = (pattern: RegExp) => pattern.exec(content)?.[1]?.trim();
+  const header = content.split(/\n##\s+/)[0] ?? content;
+  const reviewSummary = getArtifactMarkdownSection(content, "Review summary") ?? "";
+  const lineValue = (body: string, pattern: RegExp) => pattern.exec(body)?.[1]?.trim();
+  const metadata = parseArtifactMetadata(content) ?? {};
   return {
     index,
     path,
     fileName: basename(path),
-    stage: lineValue(/^Stage:\s*(.+)$/m),
-    task: lineValue(/^Task:\s*(.+)$/m),
-    started: lineValue(/^Started:\s*(.+)$/m),
-    verdict: lineValue(/^- verdict:\s*(.+)$/m),
-    findings: lineValue(/^- findings:\s*(.+)$/m),
+    stage: metadata.stage ?? lineValue(header, /^Stage:\s*(.+)$/m),
+    task: metadata.task ?? lineValue(header, /^Task:\s*(.+)$/m),
+    started: metadata.started ?? lineValue(header, /^Started:\s*(.+)$/m),
+    verdict: metadata.verdict ?? lineValue(reviewSummary, /^- verdict:\s*(.+)$/m),
+    findings: metadata.findings ?? lineValue(reviewSummary, /^- findings:\s*(.+)$/m),
   };
 }
 
