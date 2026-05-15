@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
@@ -65,6 +65,7 @@ interface ReviewCycleState {
   lastReviewError?: string;
   reviewerOutputVisible: boolean;
   reviewerOutputLines: string[];
+  reviewerAbortController?: AbortController;
   allowedTestCommands: string[];
   manualApply: boolean;
   autoRerunAfterApply: boolean;
@@ -206,7 +207,12 @@ function clearPreflightWidget(ctx: ExtensionContext | ExtensionCommandContext): 
   ctx.ui.setWidget(PREFLIGHT_WIDGET_KEY, undefined);
 }
 
+function abortActiveReviewer(state: ReviewCycleState | undefined): void {
+  state?.reviewerAbortController?.abort();
+}
+
 function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
+  abortActiveReviewer(stateRef.current);
   stateRef.current = undefined;
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
   clearReviewerOutputWidget(ctx);
@@ -215,6 +221,7 @@ function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: {
 }
 
 function finishState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
+  abortActiveReviewer(stateRef.current);
   if (stateRef.current) stateRef.current.active = false;
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
 }
@@ -404,6 +411,32 @@ function appendReviewerOutputChunkAndRender(
 ): void {
   appendReviewerOutputChunk(state, chunk);
   updateReviewerOutputWidget(ctx, state);
+}
+
+function createCombinedAbortSignal(signals: readonly AbortSignal[]): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const listeners: Array<{ signal: AbortSignal; abort: () => void }> = [];
+  const cleanup = () => {
+    for (const listener of listeners) {
+      listener.signal.removeEventListener("abort", listener.abort);
+    }
+    listeners.length = 0;
+  };
+  const abort = () => {
+    controller.abort();
+    cleanup();
+  };
+
+  if (signals.some((signal) => signal.aborted)) {
+    controller.abort();
+    return { signal: controller.signal, cleanup };
+  }
+
+  for (const signal of signals) {
+    signal.addEventListener("abort", abort, { once: true });
+    listeners.push({ signal, abort });
+  }
+  return { signal: controller.signal, cleanup };
 }
 
 function getLastAssistantTurn(event: { messages?: unknown[] }): AssistantTurn | undefined {
@@ -876,14 +909,24 @@ async function writeReviewArtifact(cwd: string, state: ReviewCycleState, stage: 
   state.artifactRunPath ??= join(dir, "runs", `${formatArtifactTimestamp()}-${state.runId}.md`);
   const latestPath = join(dir, "latest.md");
   const content = formatArtifactSummary(state, stage);
+  const runTempPath = `${state.artifactRunPath}.${process.pid}.${Date.now()}.tmp`;
+  const latestTempPath = `${latestPath}.${process.pid}.${Date.now()}.tmp`;
   try {
     await mkdir(join(dir, "runs"), { recursive: true });
     await Promise.all([
-      writeFile(state.artifactRunPath, content, "utf8"),
-      writeFile(latestPath, content, "utf8"),
+      writeFile(runTempPath, content, "utf8"),
+      writeFile(latestTempPath, content, "utf8"),
+    ]);
+    await Promise.all([
+      rename(runTempPath, state.artifactRunPath),
+      rename(latestTempPath, latestPath),
     ]);
     return state.artifactRunPath;
   } catch {
+    await Promise.all([
+      rm(runTempPath, { force: true }).catch(() => undefined),
+      rm(latestTempPath, { force: true }).catch(() => undefined),
+    ]);
     return undefined;
   }
 }
@@ -1054,19 +1097,29 @@ async function runReviewAndQueueApply(
   });
 
   const reviewerModel = state.reviewerModel ?? resolveDefaultReviewerModel(ctx);
-  const result = await runFreshReviewAgentImpl({
-    cwd: ctx.cwd,
-    prompt: reviewerPrompt,
-    reviewerModel,
-    signal: ctx.signal,
-    onOutput: (chunk) => {
-      if (stateRef.current === state) appendReviewerOutputChunkAndRender(ctx, state, chunk);
-    },
-    onLine: (line) => {
-      if (stateRef.current === state) appendReviewerOutputLineAndRender(ctx, state, line);
-    },
-    allowedTestCommands: state.allowedTestCommands,
-  });
+  const reviewerAbortController = new AbortController();
+  const combinedSignal = createCombinedAbortSignal([ctx.signal, reviewerAbortController.signal]);
+  state.reviewerAbortController = reviewerAbortController;
+  const result = await (async () => {
+    try {
+      return await runFreshReviewAgentImpl({
+        cwd: ctx.cwd,
+        prompt: reviewerPrompt,
+        reviewerModel,
+        signal: combinedSignal.signal,
+        onOutput: (chunk) => {
+          if (stateRef.current === state) appendReviewerOutputChunkAndRender(ctx, state, chunk);
+        },
+        onLine: (line) => {
+          if (stateRef.current === state) appendReviewerOutputLineAndRender(ctx, state, line);
+        },
+        allowedTestCommands: state.allowedTestCommands,
+      });
+    } finally {
+      combinedSignal.cleanup();
+      if (state.reviewerAbortController === reviewerAbortController) state.reviewerAbortController = undefined;
+    }
+  })();
 
   if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
 
@@ -1186,6 +1239,7 @@ async function rerunReviewCycle(
   try {
     await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
   } catch (error) {
+    if (stateRef.current !== state) return;
     markReviewFailure(ctx, state, error);
     await writeReviewArtifact(ctx.cwd, state, "review-failed");
     ctx.ui.notify(`Review-cycle rerun failed: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -1321,6 +1375,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
         try {
           await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
         } catch (error) {
+          if (stateRef.current !== state) return;
           markReviewFailure(ctx, state, error);
           stopStatusTicker();
           await writeReviewArtifact(ctx.cwd, state, "review-failed");
@@ -1476,7 +1531,8 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       try {
         await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
       } catch (error) {
-        if (stateRef.current === state) markReviewFailure(ctx, state, error);
+        if (stateRef.current !== state) return;
+        markReviewFailure(ctx, state, error);
         stopStatusTicker();
         await writeReviewArtifact(ctx.cwd, state, "review-failed");
         ctx.ui.notify(
@@ -1511,6 +1567,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
         try {
           await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
         } catch (error) {
+          if (stateRef.current !== state) return;
           markReviewFailure(ctx, state, error);
           stopStatusTicker();
           await writeReviewArtifact(ctx.cwd, state, "review-failed");

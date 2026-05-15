@@ -288,11 +288,11 @@ pi -e ./extensions/prompt-autocomplete \
 - A compact review summary widget shows the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` either queue the apply pass or wait for `/review-cycle apply` in manual mode.
 - The reviewer also returns a structured `## Review Data` JSON block with `schemaVersion: 1`, which the extension uses for robust checklist rendering; invalid structured data is surfaced and falls back to Markdown parsing.
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification when needed.
-- Review artifacts are written to `.pi/review-cycle/latest.md` and `.pi/review-cycle/runs/<timestamp>-<run-id>.md`; use `/review-cycle artifact` or `/review-cycle artifact path` to inspect them.
+- Review artifacts are written atomically to `.pi/review-cycle/latest.md` and `.pi/review-cycle/runs/<timestamp>-<run-id>.md`; use `/review-cycle artifact` or `/review-cycle artifact path` to inspect them. Generated artifact files are ignored by git.
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
 - `/review-cycle retry` retries a failed reviewer subprocess without discarding the implementation state.
 - `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands and reject unsafe/non-test commands early; `/review-cycle tests clear` restores the default safe test allowlist.
-- `/review-cycle status` shows a richer status line with phase step, live-refreshed elapsed time, reviewer, tests, and task; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow.
+- `/review-cycle status` shows a richer status line with phase step, live-refreshed elapsed time, reviewer, tests, and task; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow and aborts an active reviewer subprocess.
 - If the workspace is already dirty, the cycle pauses for `/review-cycle continue` or `/review-cycle abort` unless `--allow-dirty` or config `allowDirty` is set.
 - `/review-cycle help` or `/rc help` shows all commands and examples in a help widget.
 - Repo defaults can be stored in `.pi/review-cycle.json` with `reviewerModel`, `tests`, `manualApply`, `autoRerunAfterApply`, `maxReviewRounds`, and `allowDirty`; unsafe configured test commands are ignored with a warning.
