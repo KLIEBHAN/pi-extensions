@@ -220,6 +220,32 @@ test("review-cycle panel supports terminal arrow-key sequences", async () => {
   assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
 });
 
+test("review-cycle panel wraps arrow navigation at the first and last actions", async () => {
+  const upHarness = createHarness({ panelInputs: ["\u001b[A", "\r"] });
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+  })(upHarness.pi as never);
+
+  await upHarness.commands.get("review-cycle")?.handler("wrap upward panel task", upHarness.ctx);
+  await upHarness.commands.get("review-cycle")?.handler("panel", upHarness.ctx);
+
+  assert.equal(upHarness.notifications.some((entry) => entry.message.includes("Review-cycle panel action:")), false);
+  assert.equal(upHarness.notifications.some((entry) => entry.message.includes("reviewer output hidden")), false);
+
+  const downHarness = createHarness({ panelInputs: ["end", "\u001b[B", "\r"] });
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+  })(downHarness.pi as never);
+
+  await downHarness.commands.get("review-cycle")?.handler("wrap downward panel task", downHarness.ctx);
+  await downHarness.commands.get("review-cycle")?.handler("panel", downHarness.ctx);
+
+  const overlayText = downHarness.overlays.at(-1)?.lines.join("\n") ?? "";
+  assert.match(overlayText, /navigate wraps/);
+  assert.ok(downHarness.notifications.some((entry) => entry.message.includes("Review-cycle panel action: Hide reviewer output")));
+  assert.ok(downHarness.notifications.some((entry) => entry.message.includes("reviewer output hidden")));
+});
+
 test("review-cycle panel supports vim keys, number shortcuts, and home/end", async () => {
   const harness = createHarness({ panelInputs: ["j", "k", "end", "home", "2"] });
   createReviewCycleExtension({

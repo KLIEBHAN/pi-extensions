@@ -692,7 +692,7 @@ class ReviewCyclePanelComponent {
     const lines = [
       border,
       row("Review-cycle panel"),
-      row("↑↓/j/k navigate • home/end jump • 1-9 run • enter run • esc/q close"),
+      row("↑↓/j/k navigate wraps • home/end jump • 1-9 run • enter run • esc/q close"),
       row(),
       ...buildPanelIntroLines(this.getState(), this.getLastRun()).map((line) => row(line)),
       row(),
@@ -715,12 +715,12 @@ class ReviewCyclePanelComponent {
       return;
     }
     if (matchesPanelInput(data, "up") || data === "k" || data === "K") {
-      this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+      this.selectedIndex = actions.length > 0 ? (this.selectedIndex - 1 + actions.length) % actions.length : 0;
       this.requestRender();
       return;
     }
     if (matchesPanelInput(data, "down") || data === "j" || data === "J") {
-      this.selectedIndex = Math.min(actions.length - 1, this.selectedIndex + 1);
+      this.selectedIndex = actions.length > 0 ? (this.selectedIndex + 1) % actions.length : 0;
       this.requestRender();
       return;
     }
