@@ -288,7 +288,7 @@ pi -e ./extensions/prompt-autocomplete \
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification when needed.
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
 - `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands; `/review-cycle tests clear` restores the default safe test allowlist.
-- `/review-cycle status` shows a richer status line with phase step, elapsed time, reviewer, tests, and task; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow.
+- `/review-cycle status` shows a richer status line with phase step, live-refreshed elapsed time, reviewer, tests, and task; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow.
 - `/review-cycle help` or `/rc help` shows all commands and examples in a help widget.
 - Optional reviewer model selection via `--reviewer-model provider/model` or CLI flag `--review-cycle-reviewer-model provider/model`.
 

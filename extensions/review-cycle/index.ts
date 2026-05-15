@@ -38,6 +38,7 @@ const HELP_WIDGET_KEY = "review-cycle-help";
 const MAX_REVIEWER_OUTPUT_LINES = 80;
 const MAX_REVIEWER_OUTPUT_LINE_CHARS = 240;
 const MAX_CHECKLIST_ITEMS = 12;
+const STATUS_REFRESH_INTERVAL_MS = 1_000;
 
 interface ReviewCycleState {
   active: boolean;
@@ -829,6 +830,7 @@ async function rerunReviewCycle(
   reviewerModelOverride: ModelRef | undefined,
   getChangeSnapshotImpl: typeof getChangeSnapshot,
   runFreshReviewAgentImpl: typeof runFreshReviewAgent,
+  onStateStarted?: () => void,
 ): Promise<void> {
   if (stateRef.current?.active) {
     ctx.ui.notify("A review-cycle run is already active. Use /review-cycle stop first.", "warning");
@@ -853,6 +855,7 @@ async function rerunReviewCycle(
     allowedTestCommands: [...preferences.allowedTestCommands],
   };
   stateRef.current = state;
+  onStateStarted?.();
   await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
 }
 
@@ -875,9 +878,29 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
   const stateRef: { current?: ReviewCycleState } = {};
   const preferences: ReviewCyclePreferences = { reviewerOutputVisible: true, allowedTestCommands: [] };
   let lastRun: LastReviewCycleRun | undefined;
+  let statusRefreshTimer: ReturnType<typeof setInterval> | undefined;
   const getGitBaselineImpl = deps.getGitBaseline ?? getGitBaseline;
   const getChangeSnapshotImpl = deps.getChangeSnapshot ?? getChangeSnapshot;
   const runFreshReviewAgentImpl = deps.runFreshReviewAgent ?? runFreshReviewAgent;
+
+  const stopStatusTicker = () => {
+    if (!statusRefreshTimer) return;
+    clearInterval(statusRefreshTimer);
+    statusRefreshTimer = undefined;
+  };
+
+  const startStatusTicker = (ctx: ExtensionContext | ExtensionCommandContext) => {
+    stopStatusTicker();
+    statusRefreshTimer = setInterval(() => {
+      const state = stateRef.current;
+      if (!state?.active) {
+        stopStatusTicker();
+        return;
+      }
+      setStatus(ctx, state);
+    }, STATUS_REFRESH_INTERVAL_MS);
+    statusRefreshTimer.unref?.();
+  };
 
   pi.registerFlag("review-cycle-task", {
     description: "Auto-start a review-cycle run with this task",
@@ -912,6 +935,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
           return;
         }
         clearState(ctx, stateRef);
+        stopStatusTicker();
         if (!ctx.isIdle()) ctx.abort();
         ctx.ui.notify("Stopped review-cycle", "info");
         return;
@@ -927,6 +951,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
           parsed.reviewerModel,
           getChangeSnapshotImpl,
           runFreshReviewAgentImpl,
+          () => startStatusTicker(ctx),
         );
         return;
       }
@@ -967,6 +992,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       }
 
       await startReviewCycle(pi, ctx, stateRef, preferences, getGitBaselineImpl, parsed.task, parsed.reviewerModel);
+      if (stateRef.current?.active) startStatusTicker(ctx);
       if (stateRef.current) lastRun = makeLastRunFromState(stateRef.current);
   };
 
@@ -982,6 +1008,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
 
   pi.on("session_start", async (event, ctx) => {
     clearState(ctx, stateRef);
+    stopStatusTicker();
 
     if (event.reason !== "startup") return;
     const taskFlag = pi.getFlag("review-cycle-task");
@@ -997,6 +1024,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     }
 
     await startReviewCycle(pi, ctx, stateRef, preferences, getGitBaselineImpl, taskFlag.trim(), reviewerModel);
+    if (stateRef.current?.active) startStatusTicker(ctx);
     if (stateRef.current) lastRun = makeLastRunFromState(stateRef.current);
   });
 
@@ -1024,6 +1052,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     if (shouldTreatStopReasonAsFailure(assistantTurn.stopReason)) {
       const phase = state.phase;
       clearState(ctx, stateRef);
+      stopStatusTicker();
       ctx.ui.notify(`Review-cycle stopped: ${phase} phase ended with ${assistantTurn.stopReason}`, "warning");
       return;
     }
@@ -1035,6 +1064,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
         await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
       } catch (error) {
         if (stateRef.current === state) clearState(ctx, stateRef);
+        stopStatusTicker();
         ctx.ui.notify(
           `Review-cycle failed during fresh review: ${error instanceof Error ? error.message : String(error)}`,
           "error",
@@ -1046,6 +1076,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     if (state.phase === "applying") {
       if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "apply pass finished", "handled");
       finishState(ctx, stateRef);
+      stopStatusTicker();
       ctx.ui.notify("Review-cycle completed: feedback application phase finished", "info");
     }
   });
