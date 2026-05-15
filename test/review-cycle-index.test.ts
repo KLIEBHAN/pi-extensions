@@ -851,6 +851,7 @@ test("review-cycle failed reviewer can be retried", async () => {
 
   assert.equal(reviewCalls, 1);
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("model unavailable"))));
+  assert.match(harness.statuses.at(-1)?.value ?? "", /Review 2\/3 review failed/);
 
   await harness.commands.get("review-cycle")?.handler("retry", harness.ctx);
 

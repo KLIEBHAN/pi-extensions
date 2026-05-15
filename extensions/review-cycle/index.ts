@@ -1603,6 +1603,7 @@ function markReviewFailure(ctx: ExtensionContext | ExtensionCommandContext, stat
   state.lastReviewError = error instanceof Error ? error.message : String(error);
   state.reviewRound = Math.max(0, state.reviewRound - 1);
   applyReviewAction(ctx, state, "/review-cycle retry or /review-cycle stop", "pending");
+  setStatus(ctx, state);
 }
 
 function makeLastRunFromState(state: ReviewCycleState): LastReviewCycleRun {
