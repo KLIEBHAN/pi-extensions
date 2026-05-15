@@ -1087,6 +1087,8 @@ async function runReviewAndQueueApply(
     notes: ["Change snapshot collection failed before review."],
   } satisfies ChangeSnapshot));
 
+  if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
+
   state.lastChanges = changes;
 
   const reviewerPrompt = buildReviewerUserPrompt({

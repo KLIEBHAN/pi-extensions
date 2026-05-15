@@ -579,6 +579,46 @@ test("review-cycle failed reviewer can be retried", async () => {
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
 });
 
+test("review-cycle stop during change snapshot does not launch reviewer", async () => {
+  const harness = createHarness();
+  let resolveSnapshot: ((value: any) => void) | undefined;
+  let reviewCalls = 0;
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => await new Promise((resolve) => {
+      resolveSnapshot = resolve;
+    }),
+    runFreshReviewAgent: async () => {
+      reviewCalls += 1;
+      return { text: "## Verdict\nAPPROVE", exitCode: 0, stderr: "", messages: [] };
+    },
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("snapshot stop task", harness.ctx);
+  const agentEndPromise = harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await harness.commands.get("review-cycle")?.handler("stop", harness.ctx);
+  resolveSnapshot?.({
+    isGitRepo: true,
+    baselineHead: "abc123",
+    status: "## main\n M src/a.ts",
+    diffStat: "src/a.ts | 1 +",
+    diff: "diff --git a/src/a.ts b/src/a.ts",
+    committedChanges: "",
+    untrackedFiles: [],
+    notes: [],
+  });
+  await agentEndPromise;
+
+  assert.equal(reviewCalls, 0);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Stopped review-cycle")));
+  assert.equal(harness.notifications.some((entry) => entry.message.includes("failed during fresh review")), false);
+});
+
 test("review-cycle stop aborts an active reviewer without reporting a failure", async () => {
   const harness = createHarness();
   let reviewerSignal: AbortSignal | undefined;
