@@ -220,6 +220,22 @@ test("review-cycle panel supports terminal arrow-key sequences", async () => {
   assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
 });
 
+test("review-cycle panel supports vim keys, number shortcuts, and home/end", async () => {
+  const harness = createHarness({ panelInputs: ["j", "k", "end", "home", "2"] });
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("shortcut navigation task", harness.ctx);
+  await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
+
+  const overlayText = harness.overlays.at(-1)?.lines.join("\n") ?? "";
+  assert.match(overlayText, /1\./);
+  assert.match(overlayText, /home\/end jump/);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle panel action: Stop run")));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Stopped review-cycle")));
+});
+
 test("review-cycle status card is hidden by default and can be toggled from the panel", async () => {
   const harness = createHarness({ panelInputs: ["\u001b[1;1B", "\u001b[1;1B", "\r"] });
   createReviewCycleExtension({
@@ -253,6 +269,39 @@ test("review-cycle inactive status-card toggle honors repo config default", asyn
     await harness.commands.get("review-cycle")?.handler("config default should now be hidden", harness.ctx);
 
     assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("review-cycle status reports inactive repo defaults", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-status-defaults-"));
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({
+      reviewerModel: "openai/gpt-review",
+      tests: ["CI=1 npm test"],
+      manualApply: true,
+      autoRerunAfterApply: true,
+      maxReviewRounds: 4,
+      allowDirty: true,
+      reviewerOutputVisible: false,
+      statusCardVisible: true,
+    }), "utf8");
+    const harness = createHarness({ cwd });
+    createReviewCycleExtension()(harness.pi as never);
+
+    await harness.commands.get("review-cycle")?.handler("status", harness.ctx);
+
+    const status = harness.notifications.find((entry) => entry.message.includes("No active review-cycle run"))?.message ?? "";
+    assert.match(status, /reviewer=openai\/gpt-review/);
+    assert.match(status, /tests=CI=1 npm test/);
+    assert.match(status, /status-card=shown/);
+    assert.match(status, /reviewer-output=hidden/);
+    assert.match(status, /manualApply=true/);
+    assert.match(status, /autoRerun=true/);
+    assert.match(status, /maxRounds=4/);
+    assert.match(status, /allowDirty=true/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -308,6 +357,9 @@ test("review-cycle inactive panel shows the rerun target", async () => {
   const overlayText = harness.overlays.at(-1)?.lines.join("\n") ?? "";
   assert.match(overlayText, /No active review-cycle run/);
   assert.match(overlayText, /Rerun target: rerunable inactive task/);
+  assert.match(overlayText, /Last review: APPROVE/);
+  assert.match(overlayText, /Last artifact:/);
+  assert.match(overlayText, /Open latest review artifact/);
   assert.match(overlayText, /Rerun last review/);
   assert.equal(reviewCalls, 2);
 });
@@ -454,6 +506,8 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("CHANGES_REQUESTED"))));
   assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("tests passed"))));
   assert.ok(visibleWidgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("[ ] 1. HIGH"))));
+  assert.ok(latestWidgetContent(harness, "review-cycle-reviewer-output")?.some((line) => line.includes("Reviewer output collapsed")));
+  assert.ok(latestWidgetContent(harness, "review-cycle-reviewer-output")?.some((line) => line.includes("Full reviewer log captured")));
 
   await harness.commands.get("review-cycle")?.handler("output off", harness.ctx);
   assert.equal(harness.widgets.at(-1)?.key, "review-cycle-reviewer-output");
@@ -1133,6 +1187,52 @@ test("review-cycle stop aborts an active reviewer without reporting a failure", 
   assert.equal(reviewerSignal?.aborted, true);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Stopped review-cycle")));
   assert.equal(harness.notifications.some((entry) => entry.message.includes("failed during fresh review")), false);
+});
+
+test("review-cycle persists UI preferences across extension instances", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-prefs-"));
+  try {
+    const first = createHarness({ cwd });
+    createReviewCycleExtension()(first.pi as never);
+    await first.commands.get("review-cycle")?.handler("output off", first.ctx);
+    await first.commands.get("review-cycle")?.handler("status-card on", first.ctx);
+
+    const preferencesJson = await readFile(join(cwd, ".pi", "review-cycle", "preferences.json"), "utf8");
+    assert.match(preferencesJson, /"reviewerOutputVisible": false/);
+    assert.match(preferencesJson, /"statusCardVisible": true/);
+
+    const second = createHarness({ cwd });
+    let sawReviewerOutputVisible: boolean | undefined;
+    createReviewCycleExtension({
+      getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+      getChangeSnapshot: async () => ({
+        isGitRepo: true,
+        baselineHead: "abc123",
+        status: "## main",
+        diffStat: "",
+        diff: "",
+        committedChanges: "",
+        untrackedFiles: [],
+        notes: [],
+      }),
+      runFreshReviewAgent: async (options: any) => {
+        sawReviewerOutputVisible = second.widgets.some((entry) => entry.key === "review-cycle-reviewer-output" && entry.content !== undefined);
+        options.onLine?.("hidden persisted line");
+        return { text: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.", exitCode: 0, stderr: "", messages: [] };
+      },
+    })(second.pi as never);
+
+    await second.commands.get("review-cycle")?.handler("persisted prefs task", second.ctx);
+    assert.ok(latestWidgetContent(second, "review-cycle-status-card")?.some((line) => line.includes("persisted prefs task")));
+    await second.handlers.get("agent_end")?.({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+    }, second.ctx);
+
+    assert.equal(sawReviewerOutputVisible, false);
+    assert.equal(second.widgets.some((entry) => entry.key === "review-cycle-reviewer-output" && entry.content?.some((line) => line.includes("hidden persisted line"))), false);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("review-cycle output command toggles persisted visibility before a run starts", async () => {
