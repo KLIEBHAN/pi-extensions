@@ -15,6 +15,7 @@ pi -e ./extensions/copy-prompt.ts
 pi -e ./extensions/permission-gate.ts
 pi -e ./extensions/auto-mode --auto-goal "improve onboarding robustness"
 pi -e ./extensions/prompt-autocomplete --prompt-autocomplete
+pi -e ./extensions/review-cycle
 pi -e ./extensions/ralphy-loop
 pi -e ./extensions/session-name.ts
 pi -e ./extensions/terminal-bench.ts --terminal-bench
@@ -90,6 +91,7 @@ Use `~/.pi/agent/extensions/` for all projects and `.pi/extensions/` for the cur
 | `permission-gate.ts` | Asks for confirmation before dangerous bash commands | `pi -e ./extensions/permission-gate.ts` |
 | `auto-mode/` | Controller-driven autonomous improvement loop that keeps iterating with transparent follow-up prompts | `/auto on --iterations 8 improve onboarding robustness` |
 | `prompt-autocomplete/` | Copilot/Cursor-style inline AI autocomplete for the prompt editor with Tab accept and Escape dismiss | `pi -e ./extensions/prompt-autocomplete --prompt-autocomplete` |
+| `review-cycle/` | Runs implement → fresh-context code review → apply-review feedback as a managed workflow | `/review-cycle add input validation` |
 | `ralphy-loop/` | Repeats the same task with autonomous prompts, AI completion verification, and per-iteration context pruning | `/ralphy-loop 5 harden edge cases` |
 | `session-name.ts` | Adds `/session-name <name>` to label the current session | `/session-name auth-refactor` |
 | `terminal-bench.ts` | Migrated from `feat/terminal-bench-optimizations`; adds Terminal-Bench prompt rules, tmux tools, environment bootstrapping, and completion verification | `pi -e ./extensions/terminal-bench.ts --terminal-bench` |
@@ -269,6 +271,49 @@ pi -e ./extensions/prompt-autocomplete \
 - For troubleshooting, start with `--prompt-autocomplete-debug` or run `/prompt-autocomplete debug-on` temporarily.
 - If you want to tune the internal autocomplete prompt, edit `extensions/prompt-autocomplete/system-prompt.template.md`; `{{PLACEHOLDER}}` variables are filled in by `extensions/prompt-autocomplete/core.ts`, `{{PLACEHOLDER|fallback}}` uses the fallback text when no variable is provided, and `\{{PLACEHOLDER}}` keeps the placeholder syntax literal.
 
+## Review-cycle extension
+
+`extensions/review-cycle/` adds a managed implement-review-apply workflow.
+
+### What it adds
+
+- `/review-cycle <task>` starts a normal implementation request in the current agent.
+- After the implementation turn finishes, the extension spawns a separate `pi --mode json -p --no-session` reviewer process, so the reviewer has a fresh context window.
+- The reviewer receives the original task, the implementation summary, the baseline git commit/status, and current diff/status data. It can also inspect the workspace with read-only tools.
+- The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification.
+- `/review-cycle status` shows the current phase; `/review-cycle stop` cancels the managed workflow.
+- Optional reviewer model selection via `--reviewer-model provider/model` or CLI flag `--review-cycle-reviewer-model provider/model`.
+
+### Usage
+
+Directly from this repository:
+
+```bash
+pi -e ./extensions/review-cycle
+```
+
+Then inside pi:
+
+```text
+/review-cycle add input validation to the login form
+/review-cycle on --reviewer-model anthropic/claude-sonnet-4-5 harden auth error handling
+/review-cycle status
+/review-cycle stop
+```
+
+Auto-start from CLI:
+
+```bash
+pi -e ./extensions/review-cycle \
+  --review-cycle-task "add input validation to the login form"
+```
+
+Notes:
+
+- For best change scoping, start from a clean git working tree. If the run starts dirty, the reviewer is warned that pre-existing changes may be included.
+- If the implementation creates commits, the review still uses the baseline commit captured at start and reviews changes since that baseline.
+- The reviewer is instructed not to modify files and only use read-only commands.
+
 ## Ralphy loop extension
 
 `extensions/ralphy-loop/` is inspired by the repeat loop in Ralphy, but implemented with pi extension APIs.
@@ -429,6 +474,9 @@ pi-extensions/
 │   │   ├── core.ts
 │   │   ├── index.ts
 │   │   └── system-prompt.template.md
+│   ├── review-cycle/
+│   │   ├── core.ts
+│   │   └── index.ts
 │   ├── ralphy-loop/
 │   │   ├── core.ts
 │   │   └── index.ts
