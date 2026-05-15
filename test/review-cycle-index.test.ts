@@ -92,6 +92,10 @@ function createHarness(options: { cwd?: string; panelInputs?: string[] } = {}) {
   };
 }
 
+function latestWidgetContent(harness: ReturnType<typeof createHarness>, key: string): string[] | undefined {
+  return [...harness.widgets].reverse().find((entry) => entry.key === key)?.content;
+}
+
 test("runFreshReviewAgent spawns a guarded reviewer process and parses JSON stream", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "review-cycle-spawn-"));
   try {
@@ -193,6 +197,63 @@ test("review-cycle panel renders an overlay and dispatches the selected action",
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer output hidden")));
 });
 
+test("review-cycle panel refreshes actions when phase changes while open", async () => {
+  const harness = createHarness();
+  let resolveReview: ((value: any) => void) | undefined;
+  let agentEndPromise: Promise<void> | undefined;
+  let refreshedLines: string[] = [];
+
+  (harness.ctx.ui as any).custom = async (factory: Function, customOptions?: unknown) => {
+    let finish: (value: unknown) => void = () => undefined;
+    const result = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const done = (value: unknown) => finish(value);
+    const component = factory({ requestRender() {} }, {}, {}, done);
+    harness.overlays.push({ lines: component.render(80), options: customOptions });
+    resolveReview?.({
+      text: "## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: needs manual apply",
+      exitCode: 0,
+      stderr: "",
+      messages: [],
+    });
+    await agentEndPromise;
+    refreshedLines = component.render(80);
+    component.handleInput?.("\r");
+    return await result;
+  };
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => await new Promise<any>((resolve) => {
+      resolveReview = resolve;
+    }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("--manual-apply dynamic panel task", harness.ctx);
+  agentEndPromise = harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx) as Promise<void> | undefined;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
+
+  assert.ok(harness.overlays.some((entry) => entry.lines.some((line) => line.includes("Hide reviewer output"))));
+  assert.ok(refreshedLines.some((line) => line.includes("Apply review feedback")));
+  assert.equal(harness.sentMessages.length, 2);
+  assert.match(harness.sentMessages[1]?.text ?? "", /Fresh-context review/);
+});
+
 test("review-cycle streams reviewer output into a toggleable widget and queues apply prompt", async () => {
   const harness = createHarness();
   const reviewCalls: Array<{ prompt: string; cwd: string }> = [];
@@ -290,6 +351,7 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   }, harness.ctx);
 
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("[x] 1. HIGH"))));
+  assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
 });
 
 test("review-cycle surfaces invalid structured review data and falls back to markdown", async () => {
@@ -429,6 +491,7 @@ test("review-cycle ends without apply pass when reviewer approves", async () => 
   assert.equal(harness.sentMessages.length, 1);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("no apply pass"))));
+  assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
 });
 
 test("review-cycle rerun reuses the previous task and honors configured test commands", async () => {
@@ -571,6 +634,8 @@ CHANGES_REQUESTED
       messages: [{ role: "assistant", content: [{ type: "text", text: "applied and verified" }], stopReason: "stop" }],
     }, harness.ctx);
 
+    assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+
     const latest = await readFile(join(cwd, ".pi", "review-cycle", "latest.md"), "utf8");
     assert.match(latest, /Stage: apply-complete/);
     assert.match(latest, /Needs fix/);
@@ -582,6 +647,41 @@ CHANGES_REQUESTED
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test("review-cycle manual skip clears the status card", async () => {
+  const harness = createHarness();
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => ({
+      text: "## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: optional manual skip scenario",
+      exitCode: 0,
+      stderr: "",
+      messages: [],
+    }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("--manual-apply skip status card", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+  assert.ok(latestWidgetContent(harness, "review-cycle-status-card")?.some((line) => line.includes("/review-cycle apply")));
+
+  await harness.commands.get("review-cycle")?.handler("skip", harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("manual apply skipped")));
+  assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
 });
 
 test("review-cycle until-approved reruns review after apply", async () => {

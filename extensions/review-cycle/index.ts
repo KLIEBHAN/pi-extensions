@@ -230,6 +230,7 @@ function abortActiveReviewer(state: ReviewCycleState | undefined): void {
 
 function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
   abortActiveReviewer(stateRef.current);
+  if (stateRef.current) stateRef.current.active = false;
   stateRef.current = undefined;
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
   clearStatusCardWidget(ctx);
@@ -242,6 +243,7 @@ function finishState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: 
   abortActiveReviewer(stateRef.current);
   if (stateRef.current) stateRef.current.active = false;
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
+  clearStatusCardWidget(ctx);
 }
 
 function truncateLine(text: string): string {
@@ -526,27 +528,41 @@ function buildPanelActions(state: ReviewCycleState | undefined, lastRun: LastRev
 
 class ReviewCyclePanelComponent {
   private selectedIndex = 0;
-  private readonly state: ReviewCycleState | undefined;
-  private readonly lastRun: LastReviewCycleRun | undefined;
-  private readonly actions: readonly ReviewCyclePanelAction[];
+  private lastRenderedActionIds: string[] = [];
+  private readonly getState: () => ReviewCycleState | undefined;
+  private readonly getLastRun: () => LastReviewCycleRun | undefined;
+  private readonly getActions: () => readonly ReviewCyclePanelAction[];
   private readonly requestRender: () => void;
   private readonly done: (actionId: string | undefined) => void;
 
   constructor(
-    state: ReviewCycleState | undefined,
-    lastRun: LastReviewCycleRun | undefined,
-    actions: readonly ReviewCyclePanelAction[],
+    getState: () => ReviewCycleState | undefined,
+    getLastRun: () => LastReviewCycleRun | undefined,
+    getActions: () => readonly ReviewCyclePanelAction[],
     requestRender: () => void,
     done: (actionId: string | undefined) => void,
   ) {
-    this.state = state;
-    this.lastRun = lastRun;
-    this.actions = actions;
+    this.getState = getState;
+    this.getLastRun = getLastRun;
+    this.getActions = getActions;
     this.requestRender = requestRender;
     this.done = done;
   }
 
+  private currentActions(): readonly ReviewCyclePanelAction[] {
+    const actions = this.getActions();
+    this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, actions.length - 1));
+    return actions;
+  }
+
+  private actionsChangedSinceRender(actions: readonly ReviewCyclePanelAction[]): boolean {
+    if (this.lastRenderedActionIds.length !== actions.length) return true;
+    return actions.some((action, index) => action.id !== this.lastRenderedActionIds[index]);
+  }
+
   render(width: number): string[] {
+    const actions = this.currentActions();
+    this.lastRenderedActionIds = actions.map((action) => action.id);
     const safeWidth = Math.max(24, width);
     const innerWidth = Math.max(1, safeWidth - 4);
     const border = `╭${"─".repeat(Math.max(0, safeWidth - 2))}╮`;
@@ -557,10 +573,10 @@ class ReviewCyclePanelComponent {
       row("Review-cycle panel"),
       row("↑↓ navigate • enter run action • esc/q close"),
       row(),
-      ...buildPanelStatusLines(this.state, this.lastRun).map((line) => row(line)),
+      ...buildPanelStatusLines(this.getState(), this.getLastRun()).map((line) => row(line)),
       row(),
       row("Actions"),
-      ...this.actions.map((action, index) => {
+      ...actions.map((action, index) => {
         const marker = index === this.selectedIndex ? "›" : " ";
         return row(`${marker} ${action.label} — ${action.description}`);
       }),
@@ -570,6 +586,7 @@ class ReviewCyclePanelComponent {
   }
 
   handleInput(data: string): void {
+    const actions = this.currentActions();
     if (matchesPanelInput(data, "escape") || data === "q" || data === "Q") {
       this.done(undefined);
       return;
@@ -580,12 +597,16 @@ class ReviewCyclePanelComponent {
       return;
     }
     if (matchesPanelInput(data, "down")) {
-      this.selectedIndex = Math.min(this.actions.length - 1, this.selectedIndex + 1);
+      this.selectedIndex = Math.min(actions.length - 1, this.selectedIndex + 1);
       this.requestRender();
       return;
     }
     if (matchesPanelInput(data, "enter")) {
-      this.done(this.actions[this.selectedIndex]?.id);
+      if (this.actionsChangedSinceRender(actions)) {
+        this.requestRender();
+        return;
+      }
+      this.done(actions[this.selectedIndex]?.id);
     }
   }
 
@@ -594,23 +615,24 @@ class ReviewCyclePanelComponent {
 
 async function showReviewCyclePanel(
   ctx: ExtensionCommandContext,
-  state: ReviewCycleState | undefined,
-  lastRun: LastReviewCycleRun | undefined,
+  getState: () => ReviewCycleState | undefined,
+  getLastRun: () => LastReviewCycleRun | undefined,
 ): Promise<string | undefined> {
-  if (state?.active) updateStatusCardWidget(ctx, state);
+  const activeState = getState();
+  if (activeState?.active) updateStatusCardWidget(ctx, activeState);
   const custom = (ctx.ui as { custom?: Function }).custom;
   if (typeof custom !== "function") {
     ctx.ui.notify("Review-cycle panel overlay is not available in this UI; showing the status card instead", "warning");
     return undefined;
   }
 
-  const actions = buildPanelActions(state, lastRun);
+  const getActions = () => buildPanelActions(getState(), getLastRun());
   const selectedActionId = await custom.call(
     ctx.ui,
     (tui: { requestRender?: () => void } | undefined, _theme: unknown, _keybindings: unknown, done: (actionId: string | undefined) => void) => new ReviewCyclePanelComponent(
-      state,
-      lastRun,
-      actions,
+      getState,
+      getLastRun,
+      getActions,
       () => tui?.requestRender?.(),
       done,
     ),
@@ -626,7 +648,7 @@ async function showReviewCyclePanel(
     },
   );
 
-  const action = actions.find((candidate) => candidate.id === selectedActionId);
+  const action = getActions().find((candidate) => candidate.id === selectedActionId);
   if (!action?.command) return undefined;
   ctx.ui.notify(`Review-cycle panel action: ${action.label}`, "info");
   return action.command;
@@ -1554,7 +1576,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       }
 
       if (parsed.kind === "panel") {
-        const panelCommand = await showReviewCyclePanel(ctx, stateRef.current, lastRun);
+        const panelCommand = await showReviewCyclePanel(ctx, () => stateRef.current, () => lastRun);
         if (panelCommand) await handleReviewCycleCommand(panelCommand, ctx);
         return;
       }
