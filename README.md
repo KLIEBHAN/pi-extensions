@@ -293,6 +293,8 @@ pi -e ./extensions/prompt-autocomplete \
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
 - `/review-cycle retry` retries a failed reviewer subprocess without discarding the implementation state.
 - `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands and reject unsafe/non-test commands early; `/review-cycle tests clear` restores the default safe test allowlist.
+- `/review-cycle prefs status` shows effective, session, persisted, and repo UI preference values; `/review-cycle prefs reset` deletes `.pi/review-cycle/preferences.json` and reverts UI preferences to repo/default values.
+- `/review-cycle config doctor` diagnoses `.pi/review-cycle.json`, persisted UI preferences, unsafe test commands, invalid value shapes, unknown keys, and effective defaults.
 - `/review-cycle status` shows a compact status notification with phase, elapsed time, reviewer, tests, task, status-card visibility, and reviewer-output state. Without an active run, it shows the effective repo/default configuration; `/review-cycle panel` opens the interactive action overlay; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow and aborts an active reviewer subprocess. Reviewer subprocess shutdown escalates from `SIGTERM` to `SIGKILL` when a timed-out/aborted child does not exit.
 - If the workspace is already dirty, the cycle pauses for `/review-cycle continue` or `/review-cycle abort` unless `--allow-dirty` or config `allowDirty` is set.
 - `/review-cycle help` or `/rc help` shows all commands and examples in a help widget.
@@ -322,6 +324,9 @@ Then inside pi:
 /review-cycle panel
 /review-cycle output off
 /review-cycle output on
+/review-cycle prefs status
+/review-cycle prefs reset
+/review-cycle config doctor
 /review-cycle tests set npm test
 /review-cycle continue
 /review-cycle apply

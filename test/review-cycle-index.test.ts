@@ -333,6 +333,82 @@ test("review-cycle status reports inactive repo defaults", async () => {
   }
 });
 
+test("review-cycle prefs status and reset inspect and clear persisted UI preferences", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-prefs-reset-"));
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({
+      reviewerOutputVisible: false,
+      statusCardVisible: true,
+    }), "utf8");
+    const harness = createHarness({ cwd });
+    createReviewCycleExtension({
+      getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    })(harness.pi as never);
+
+    await harness.commands.get("review-cycle")?.handler("status-card off", harness.ctx);
+    await harness.commands.get("review-cycle")?.handler("output on", harness.ctx);
+    await harness.commands.get("review-cycle")?.handler("prefs status", harness.ctx);
+
+    const prefsText = latestWidgetContent(harness, "review-cycle-prefs")?.join("\n") ?? "";
+    assert.match(prefsText, /Review-cycle preferences/);
+    assert.match(prefsText, /File: \.pi\/review-cycle\/preferences\.json \(present\)/);
+    assert.match(prefsText, /Status card: effective hidden/);
+    assert.match(prefsText, /Reviewer output: effective shown/);
+
+    await harness.commands.get("review-cycle")?.handler("prefs reset", harness.ctx);
+
+    assert.ok(harness.notifications.some((entry) => entry.message.includes("preferences reset")));
+    await assert.rejects(readFile(join(cwd, ".pi", "review-cycle", "preferences.json"), "utf8"));
+
+    await harness.commands.get("review-cycle")?.handler("after prefs reset uses repo defaults", harness.ctx);
+
+    assert.ok(latestWidgetContent(harness, "review-cycle-status-card")?.some((line) => line.includes("after prefs reset uses repo defaults")));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("review-cycle config doctor reports invalid config and preference entries", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-config-doctor-"));
+  try {
+    await mkdir(join(cwd, ".pi", "review-cycle"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({
+      reviewerModel: "bad-model",
+      tests: ["CI=1 npm test", "rm -rf .", 42],
+      manualApply: "yes",
+      autoRerunAfterApply: true,
+      maxReviewRounds: 0,
+      allowDirty: false,
+      reviewerOutputVisible: "sometimes",
+      statusCardVisible: true,
+      extraKey: "value",
+    }), "utf8");
+    await writeFile(join(cwd, ".pi", "review-cycle", "preferences.json"), JSON.stringify({
+      reviewerOutputVisible: "bad",
+      statusCardVisible: false,
+    }), "utf8");
+    const harness = createHarness({ cwd });
+    createReviewCycleExtension()(harness.pi as never);
+
+    await harness.commands.get("review-cycle")?.handler("config doctor", harness.ctx);
+
+    const doctorText = latestWidgetContent(harness, "review-cycle-config-doctor")?.join("\n") ?? "";
+    assert.match(doctorText, /Review-cycle config doctor/);
+    assert.match(doctorText, /invalid reviewerModel/);
+    assert.match(doctorText, /unsafe tests: rm -rf \./);
+    assert.match(doctorText, /invalid boolean manualApply/);
+    assert.match(doctorText, /invalid maxReviewRounds/);
+    assert.match(doctorText, /invalid boolean reviewerOutputVisible/);
+    assert.match(doctorText, /unknown keys: extraKey/);
+    assert.match(doctorText, /Preferences: \.pi\/review-cycle\/preferences\.json \(found\)/);
+    assert.match(doctorText, /Effective defaults/);
+    assert.ok(harness.notifications.some((entry) => entry.message.includes("config doctor shown") && entry.level === "warning"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("review-cycle panel fallback shows the status card when custom UI is unavailable", async () => {
   const harness = createHarness();
   createReviewCycleExtension({

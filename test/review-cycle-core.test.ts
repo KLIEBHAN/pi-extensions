@@ -46,6 +46,10 @@ test("parseReviewCycleArgs parses help, status, stop, and output visibility", ()
   assert.deepEqual(parseReviewCycleArgs("output"), { kind: "output", mode: "toggle" });
   assert.deepEqual(parseReviewCycleArgs("output off"), { kind: "output", mode: "off" });
   assert.deepEqual(parseReviewCycleArgs("output show"), { kind: "output", mode: "on" });
+  assert.deepEqual(parseReviewCycleArgs("prefs"), { kind: "prefs", action: "status" });
+  assert.deepEqual(parseReviewCycleArgs("prefs reset"), { kind: "prefs", action: "reset" });
+  assert.deepEqual(parseReviewCycleArgs("config doctor"), { kind: "config", action: "doctor" });
+  assert.deepEqual(parseReviewCycleArgs("doctor"), { kind: "config", action: "doctor" });
   assert.deepEqual(parseReviewCycleArgs("rerun --reviewer-model openai/gpt-review"), {
     kind: "rerun",
     reviewerModel: { provider: "openai", id: "gpt-review" },

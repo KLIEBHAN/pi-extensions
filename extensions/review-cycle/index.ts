@@ -36,6 +36,8 @@ const STATUS_CARD_WIDGET_KEY = "review-cycle-status-card";
 const REVIEWER_OUTPUT_WIDGET_KEY = "review-cycle-reviewer-output";
 const HELP_WIDGET_KEY = "review-cycle-help";
 const ARTIFACT_WIDGET_KEY = "review-cycle-artifact";
+const PREFS_WIDGET_KEY = "review-cycle-prefs";
+const CONFIG_DOCTOR_WIDGET_KEY = "review-cycle-config-doctor";
 const MAX_REVIEWER_OUTPUT_LINES = 80;
 const MAX_REVIEWER_OUTPUT_LINE_CHARS = 240;
 const MAX_CHECKLIST_ITEMS = 12;
@@ -412,6 +414,8 @@ function showHelp(ctx: ExtensionCommandContext): void {
       "  /review-cycle artifact [show|list|path] [n]       inspect review artifacts",
       "",
       "Config",
+      "  /review-cycle prefs status|reset                  inspect/reset persisted UI preferences",
+      "  /review-cycle config doctor                       diagnose repo config and preferences",
       "  /review-cycle tests status|set <cmd>|add <cmd>|clear",
       "                                                    configure reviewer test commands",
       "  Repo file: .pi/review-cycle.json",
@@ -1235,6 +1239,190 @@ async function persistReviewCyclePreferences(
   }
 }
 
+function formatOptionalVisibility(value: boolean | undefined): string {
+  return value === undefined ? "unset" : value ? "shown" : "hidden";
+}
+
+function formatOptionalBoolean(value: boolean | undefined): string {
+  return value === undefined ? "unset" : value ? "true" : "false";
+}
+
+async function showReviewCyclePreferencesStatus(
+  ctx: ExtensionCommandContext,
+  preferences: ReviewCyclePreferences,
+  config: ReviewCycleRepoConfig,
+  effective: ReviewCycleRunOptions,
+): Promise<void> {
+  const path = join(ctx.cwd, REVIEW_CYCLE_PREFERENCES_PATH);
+  const persisted = await loadReviewCyclePreferences(ctx.cwd);
+  const exists = existsSync(path);
+  ctx.ui.setWidget(PREFS_WIDGET_KEY, [
+    "Review-cycle preferences",
+    `File: ${REVIEW_CYCLE_PREFERENCES_PATH} (${exists ? "present" : "absent"})`,
+    "",
+    `Status card: effective ${formatOptionalVisibility(effective.statusCardVisible)} · session ${formatOptionalVisibility(preferences.statusCardVisible)} · persisted ${formatOptionalVisibility(persisted.statusCardVisible)} · repo ${formatOptionalVisibility(config.statusCardVisible)} · default hidden`,
+    `Reviewer output: effective ${formatOptionalVisibility(effective.reviewerOutputVisible)} · session ${formatOptionalVisibility(preferences.reviewerOutputVisible)} · persisted ${formatOptionalVisibility(persisted.reviewerOutputVisible)} · repo ${formatOptionalVisibility(config.reviewerOutputVisible)} · default shown`,
+    "",
+    "Reset UI preferences: /review-cycle prefs reset",
+  ], { placement: "belowEditor" });
+  ctx.ui.notify("Review-cycle preferences shown", "info");
+}
+
+async function resetReviewCyclePreferences(
+  ctx: ExtensionCommandContext,
+  preferences: ReviewCyclePreferences,
+  config: ReviewCycleRepoConfig,
+  state: ReviewCycleState | undefined,
+): Promise<void> {
+  delete preferences.statusCardVisible;
+  delete preferences.reviewerOutputVisible;
+  await rm(join(ctx.cwd, REVIEW_CYCLE_PREFERENCES_PATH), { force: true }).catch(() => undefined);
+
+  const effective = resolveRunOptions(preferences, config, {});
+  if (state?.active) {
+    state.statusCardVisible = effective.statusCardVisible;
+    state.reviewerOutputVisible = effective.reviewerOutputVisible;
+    updateStatusCardWidget(ctx, state);
+    updateReviewerOutputWidget(ctx, state);
+  } else {
+    clearStatusCardWidget(ctx);
+    if (!effective.reviewerOutputVisible) clearReviewerOutputWidget(ctx);
+  }
+
+  ctx.ui.notify("Review-cycle preferences reset to repo/default values", "info");
+}
+
+interface JsonObjectFileDiagnostic {
+  exists: boolean;
+  parseError?: string;
+  record?: Record<string, unknown>;
+}
+
+async function readJsonObjectFile(path: string): Promise<JsonObjectFileDiagnostic> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return { exists: false };
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { exists: true, parseError: "expected a JSON object" };
+    }
+    return { exists: true, record: parsed as Record<string, unknown> };
+  } catch (error) {
+    return { exists: true, parseError: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function formatConfigValue(value: unknown): string {
+  if (value === undefined) return "unset";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
+function inspectBooleanConfig(record: Record<string, unknown>, key: string, lines: string[]): number {
+  if (!(key in record)) return 0;
+  if (typeof record[key] === "boolean") {
+    lines.push(`✓ ${key}: ${record[key] ? "true" : "false"}`);
+    return 0;
+  }
+  lines.push(`✗ invalid boolean ${key}: expected true/false, got ${formatConfigValue(record[key])}`);
+  return 1;
+}
+
+async function showReviewCycleConfigDoctor(
+  ctx: ExtensionCommandContext,
+  preferences: ReviewCyclePreferences,
+  config: ReviewCycleRepoConfig,
+  effective: ReviewCycleRunOptions,
+): Promise<void> {
+  const lines: string[] = ["Review-cycle config doctor"];
+  let issues = 0;
+
+  const configDiagnostic = await readJsonObjectFile(join(ctx.cwd, REVIEW_CYCLE_CONFIG_PATH));
+  lines.push("", `Repo config: ${REVIEW_CYCLE_CONFIG_PATH} (${configDiagnostic.exists ? "found" : "missing"})`);
+  if (!configDiagnostic.exists) {
+    lines.push("ℹ no repo config; built-in defaults and persisted preferences apply");
+  } else if (configDiagnostic.parseError) {
+    issues += 1;
+    lines.push(`✗ JSON invalid: ${configDiagnostic.parseError}`);
+  } else if (configDiagnostic.record) {
+    const record = configDiagnostic.record;
+    const knownKeys = new Set(["reviewerModel", "tests", "manualApply", "autoRerunAfterApply", "maxReviewRounds", "allowDirty", "reviewerOutputVisible", "statusCardVisible"]);
+    const unknownKeys = Object.keys(record).filter((key) => !knownKeys.has(key));
+    const reviewerModel = record.reviewerModel;
+    if (reviewerModel === undefined) lines.push("✓ reviewerModel: unset (uses active model)");
+    else if (typeof reviewerModel === "string" && parseModelRef(reviewerModel)) lines.push(`✓ reviewerModel: ${reviewerModel}`);
+    else {
+      issues += 1;
+      lines.push(`✗ invalid reviewerModel: expected provider/model, got ${formatConfigValue(reviewerModel)}`);
+    }
+
+    const tests = record.tests;
+    if (tests === undefined) {
+      lines.push("✓ tests: unset (default safe allowlist)");
+    } else if (Array.isArray(tests)) {
+      const stringTests = tests.filter((value): value is string => typeof value === "string" && value.trim().length > 0).map((value) => value.trim());
+      const invalidTestCount = tests.length - stringTests.length;
+      const safeTests = stringTests.filter((command) => isReviewerTestCommandAllowed(command, { allowedTestCommands: [command] }));
+      const unsafeTests = stringTests.filter((command) => !isReviewerTestCommandAllowed(command, { allowedTestCommands: [command] }));
+      lines.push(`✓ tests: ${safeTests.length} safe${invalidTestCount ? `, ${invalidTestCount} invalid entr${invalidTestCount === 1 ? "y" : "ies"}` : ""}${unsafeTests.length ? `, ${unsafeTests.length} unsafe` : ""}`);
+      if (unsafeTests.length > 0) {
+        issues += unsafeTests.length;
+        lines.push(`✗ unsafe tests: ${unsafeTests.join("; ")}`);
+      }
+      if (invalidTestCount > 0) issues += invalidTestCount;
+    } else {
+      issues += 1;
+      lines.push(`✗ invalid tests: expected string array, got ${formatConfigValue(tests)}`);
+    }
+
+    for (const key of ["manualApply", "autoRerunAfterApply", "allowDirty", "reviewerOutputVisible", "statusCardVisible"]) {
+      issues += inspectBooleanConfig(record, key, lines);
+    }
+    if ("maxReviewRounds" in record) {
+      const maxReviewRounds = parseConfigPositiveInteger(record.maxReviewRounds);
+      if (maxReviewRounds) lines.push(`✓ maxReviewRounds: ${maxReviewRounds}`);
+      else {
+        issues += 1;
+        lines.push(`✗ invalid maxReviewRounds: expected positive integer, got ${formatConfigValue(record.maxReviewRounds)}`);
+      }
+    }
+    if (unknownKeys.length > 0) lines.push(`ℹ unknown keys: ${unknownKeys.join(", ")}`);
+  }
+
+  const prefsDiagnostic = await readJsonObjectFile(join(ctx.cwd, REVIEW_CYCLE_PREFERENCES_PATH));
+  lines.push("", `Preferences: ${REVIEW_CYCLE_PREFERENCES_PATH} (${prefsDiagnostic.exists ? "found" : "missing"})`);
+  if (!prefsDiagnostic.exists) {
+    lines.push("ℹ no persisted UI preferences");
+  } else if (prefsDiagnostic.parseError) {
+    issues += 1;
+    lines.push(`✗ JSON invalid: ${prefsDiagnostic.parseError}`);
+  } else if (prefsDiagnostic.record) {
+    issues += inspectBooleanConfig(prefsDiagnostic.record, "reviewerOutputVisible", lines);
+    issues += inspectBooleanConfig(prefsDiagnostic.record, "statusCardVisible", lines);
+  }
+
+  const reviewer = effective.reviewerModel ? `${modelRefToCli(effective.reviewerModel)} (${effective.reviewerModelSource})` : "active model at review time";
+  lines.push(
+    "",
+    "Effective defaults",
+    `Reviewer: ${reviewer}`,
+    `Tests: ${formatTestPolicy(effective.allowedTestCommands)} (${effective.testPolicySource})`,
+    `Status card: ${effective.statusCardVisible ? "shown" : "hidden"}`,
+    `Reviewer output: ${effective.reviewerOutputVisible ? "shown" : "hidden"}`,
+    `Mode: manualApply=${formatOptionalBoolean(effective.manualApply)}, autoRerunAfterApply=${formatOptionalBoolean(effective.autoRerunAfterApply)}, maxReviewRounds=${effective.maxReviewRounds}, allowDirty=${formatOptionalBoolean(effective.allowDirty)}`,
+    "",
+    issues === 0 ? "✓ No config problems detected" : `✗ ${issues} config issue${issues === 1 ? "" : "s"} detected`,
+  );
+
+  ctx.ui.setWidget(CONFIG_DOCTOR_WIDGET_KEY, lines.map((line) => truncateLine(line)), { placement: "belowEditor" });
+  ctx.ui.notify(`Review-cycle config doctor shown${issues === 0 ? "" : `: ${issues} issue${issues === 1 ? "" : "s"}`}`, issues === 0 ? "info" : "warning");
+}
+
 async function loadReviewCycleConfig(cwd: string): Promise<ReviewCycleRepoConfig> {
   const path = join(cwd, REVIEW_CYCLE_CONFIG_PATH);
   let raw: string;
@@ -1967,6 +2155,20 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
 
       if (parsed.kind === "status") {
         showStatus(ctx, stateRef.current, resolveRunOptions(preferences, repoConfig, {}));
+        return;
+      }
+
+      if (parsed.kind === "prefs") {
+        if (parsed.action === "status") {
+          await showReviewCyclePreferencesStatus(ctx, preferences, repoConfig, resolveRunOptions(preferences, repoConfig, {}));
+        } else {
+          await resetReviewCyclePreferences(ctx, preferences, repoConfig, stateRef.current);
+        }
+        return;
+      }
+
+      if (parsed.kind === "config") {
+        await showReviewCycleConfigDoctor(ctx, preferences, repoConfig, resolveRunOptions(preferences, repoConfig, {}));
         return;
       }
 

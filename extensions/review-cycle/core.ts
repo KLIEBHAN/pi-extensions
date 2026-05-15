@@ -136,6 +136,8 @@ export type ReviewCycleCommand =
   | { kind: "rerun"; reviewerModel?: ModelRef }
   | { kind: "artifact"; action: "show" | "path" | "list"; runIndex?: number }
   | { kind: "output"; mode: "on" | "off" | "toggle" }
+  | { kind: "prefs"; action: "status" | "reset" }
+  | { kind: "config"; action: "doctor" }
   | { kind: "tests"; action: "show" | "clear" | "add" | "set"; command?: string }
   | { error: string };
 
@@ -464,8 +466,20 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
     }
     return { error: "Usage: /review-cycle artifact [show|latest|list|path] [run-number]" };
   }
+  if (command === "prefs" || command === "preferences") {
+    const action = (rest[0] ?? "status").toLowerCase();
+    if (rest.length <= 1 && (action === "status" || action === "show")) return { kind: "prefs", action: "status" };
+    if (rest.length <= 1 && (action === "reset" || action === "clear")) return { kind: "prefs", action: "reset" };
+    return { error: "Usage: /review-cycle prefs [status|reset]" };
+  }
   if (command === "tests") return parseTestsArgs(rest);
-  if (command === "config" && rest[0]?.toLowerCase() === "tests") return parseTestsArgs(rest.slice(1));
+  if (command === "config") {
+    const subcommand = rest[0]?.toLowerCase();
+    if (subcommand === "tests") return parseTestsArgs(rest.slice(1));
+    if (rest.length === 1 && (subcommand === "doctor" || subcommand === "check" || subcommand === "diagnose")) return { kind: "config", action: "doctor" };
+    return parseStartArgs(tokenized);
+  }
+  if (command === "doctor") return rest.length === 0 ? { kind: "config", action: "doctor" } : { error: "Usage: /review-cycle doctor" };
   if (command === "output") {
     const mode = (rest[0] ?? "toggle").toLowerCase();
     if (mode === "on" || mode === "show") return { kind: "output", mode: "on" };
