@@ -42,6 +42,7 @@ const MAX_REVIEWER_OUTPUT_LINE_CHARS = 240;
 const MAX_CHECKLIST_ITEMS = 12;
 const STATUS_REFRESH_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_REVIEW_ROUNDS = 2;
+const REVIEWER_KILL_GRACE_MS = 5_000;
 const REVIEW_CYCLE_CONFIG_PATH = ".pi/review-cycle.json";
 const REVIEW_CYCLE_ARTIFACT_DIR = ".pi/review-cycle";
 
@@ -590,6 +591,7 @@ export async function runFreshReviewAgent(options: {
   reviewerModel?: ModelRef;
   signal?: AbortSignal;
   timeoutMs?: number;
+  killGraceMs?: number;
   onOutput?: (chunk: string) => void;
   onLine?: (line: string) => void;
   allowedTestCommands?: readonly string[];
@@ -631,6 +633,7 @@ export async function runFreshReviewAgent(options: {
       let timedOut = false;
       let aborted = false;
       let settled = false;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
 
       const finishReject = (error: Error) => {
         if (settled) return;
@@ -695,11 +698,18 @@ export async function runFreshReviewAgent(options: {
         }
       };
 
+      const clearKillTimer = () => {
+        if (!killTimer) return;
+        clearTimeout(killTimer);
+        killTimer = undefined;
+      };
+
       const killProcess = () => {
         proc.kill("SIGTERM");
-        setTimeout(() => {
-          if (!proc.killed) proc.kill("SIGKILL");
-        }, 5_000).unref?.();
+        killTimer ??= setTimeout(() => {
+          if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+        }, options.killGraceMs ?? REVIEWER_KILL_GRACE_MS);
+        killTimer.unref?.();
       };
 
       const timeout = setTimeout(() => {
@@ -734,12 +744,14 @@ export async function runFreshReviewAgent(options: {
 
       proc.on("error", (error) => {
         clearTimeout(timeout);
+        clearKillTimer();
         if (options.signal) options.signal.removeEventListener("abort", abortHandler);
         finishReject(error);
       });
 
       proc.on("close", (code) => {
         clearTimeout(timeout);
+        clearKillTimer();
         if (options.signal) options.signal.removeEventListener("abort", abortHandler);
         if (buffer.trim()) processLine(buffer);
 

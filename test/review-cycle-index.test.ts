@@ -121,6 +121,32 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   }
 });
 
+test("runFreshReviewAgent escalates timed-out reviewer subprocesses that ignore SIGTERM", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-timeout-"));
+  try {
+    const fakePiPath = join(cwd, "ignore-sigterm.mjs");
+    await writeFile(fakePiPath, `
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1_000);
+`, "utf8");
+
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => runFreshReviewAgent({
+        cwd,
+        prompt: "review this",
+        timeoutMs: 50,
+        killGraceMs: 50,
+        invocation: { command: process.execPath, args: [fakePiPath] },
+      }),
+      /Fresh review agent timed out after 50ms/,
+    );
+    assert.ok(Date.now() - startedAt < 2_000, "reviewer subprocess should be force-killed after the grace period");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("review-cycle registers /rc alias and shows command help", async () => {
   const harness = createHarness();
   createReviewCycleExtension()(harness.pi as never);
