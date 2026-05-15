@@ -181,9 +181,11 @@ test("reviewer test guard can restrict tests to configured exact commands", () =
   assert.equal(isReviewerTestCommandAllowed("npm test -- --watch", options), false);
   assert.equal(isReviewerTestCommandAllowed("FOO=bar npm test", options), false);
   assert.equal(isReviewerTestCommandAllowed("NODE_OPTIONS=--require=./some-file npm test", options), false);
+  assert.equal(isReviewerTestCommandAllowed("CI=1 npm test", { allowedTestCommands: ["CI=1 npm test"] }), true);
+  assert.equal(isReviewerTestCommandAllowed("CI=1 npm test", { allowedTestCommands: ["npm test"] }), false);
   assert.equal(isReviewerTestCommandAllowed("rm -rf .", { allowedTestCommands: ["rm -rf ."] }), false);
   assert.equal(isReviewerTestCommandAllowed("npm install", { allowedTestCommands: ["npm install"] }), false);
-  assert.equal(isReviewerTestCommandAllowed("FOO=bar npm test", { allowedTestCommands: ["FOO=bar npm test"] }), false);
+  assert.equal(isReviewerTestCommandAllowed("FOO=bar npm test", { allowedTestCommands: ["FOO=bar npm test"] }), true);
   assert.equal(isReviewerToolCallAllowed("bash", { command: "npm test" }, options), true);
   assert.equal(isReviewerToolCallAllowed("bash", { command: "FOO=bar npm test" }, options), false);
   assert.equal(isReviewerToolCallAllowed("bash", { command: "vitest run" }, options), false);
@@ -219,6 +221,22 @@ test("generated reviewer guard extension blocks and allows tool calls at runtime
   assert.equal(toolCallHandler?.({ toolName: "bash", input: { command: "npm test" } }), undefined);
 
   assert.deepEqual(toolCallHandler?.({ toolName: "bash", input: { command: "FOO=bar npm test" } }), {
+    block: true,
+    reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: bash",
+  });
+
+  const envConfiguredSource = buildReviewerToolGuardExtensionSource({ allowedTestCommands: ["CI=1 npm test"] });
+  const envConfiguredModule = await import(`data:text/javascript,${encodeURIComponent(envConfiguredSource)}`) as {
+    default: (pi: { on: (event: string, handler: Function) => void }) => void;
+  };
+  let envConfiguredHandler: Function | undefined;
+  envConfiguredModule.default({
+    on(event: string, handler: Function) {
+      if (event === "tool_call") envConfiguredHandler = handler;
+    },
+  });
+  assert.equal(envConfiguredHandler?.({ toolName: "bash", input: { command: "CI=1 npm test" } }), undefined);
+  assert.deepEqual(envConfiguredHandler?.({ toolName: "bash", input: { command: "npm test" } }), {
     block: true,
     reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: bash",
   });

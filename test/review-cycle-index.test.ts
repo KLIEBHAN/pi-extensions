@@ -353,9 +353,13 @@ test("review-cycle rejects unsafe test commands before storing preferences", asy
 
   await harness.commands.get("review-cycle")?.handler("tests set npm install", harness.ctx);
   await harness.commands.get("review-cycle")?.handler("tests status", harness.ctx);
+  await harness.commands.get("review-cycle")?.handler("tests set CI=1 npm test", harness.ctx);
+  await harness.commands.get("review-cycle")?.handler("tests status", harness.ctx);
 
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Unsafe reviewer test command rejected: npm install")));
   assert.ok(harness.notifications.some((entry) => entry.message.includes("default safe test allowlist")));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle test command set: CI=1 npm test")));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle test commands: CI=1 npm test")));
 });
 
 test("review-cycle pauses on dirty workspace until continue", async () => {
@@ -382,7 +386,7 @@ test("review-cycle uses repo config, waits for manual apply, and writes artifact
     await mkdir(join(cwd, ".pi"), { recursive: true });
     await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({
       reviewerModel: "openai/gpt-review",
-      tests: ["npm test", "rm -rf ."],
+      tests: ["CI=1 npm test", "rm -rf ."],
       manualApply: true,
     }), "utf8");
 
@@ -426,7 +430,7 @@ CHANGES_REQUESTED
       messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
     }, harness.ctx);
 
-    assert.deepEqual(allowedTestCommandSnapshots[0], ["npm test"]);
+    assert.deepEqual(allowedTestCommandSnapshots[0], ["CI=1 npm test"]);
     assert.ok(harness.notifications.some((entry) => entry.message.includes("Ignored unsafe configured reviewer test command: rm -rf .")));
     assert.equal(harness.sentMessages.length, 1);
     assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("waiting for /review-cycle apply"))));

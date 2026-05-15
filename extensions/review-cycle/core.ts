@@ -669,13 +669,18 @@ function isReviewerTestTokensAllowed(tokens: string[]): boolean {
   }
 }
 
+function isReviewerConfiguredTestTokensAllowed(tokens: string[]): boolean {
+  const testTokens = stripEnvAssignments(tokens);
+  return testTokens.length > 0 && isReviewerTestTokensAllowed(testTokens);
+}
+
 function testCommandMatchesConfigured(command: string, allowedTestCommands: readonly string[]): boolean {
   const tokens = normalizeConfiguredTestCommandTokens(command);
-  if (!tokens || !isReviewerTestTokensAllowed(tokens)) return false;
+  if (!tokens || !isReviewerConfiguredTestTokensAllowed(tokens)) return false;
 
   return allowedTestCommands.some((allowedCommand) => {
     const allowedTokens = normalizeConfiguredTestCommandTokens(allowedCommand);
-    if (!allowedTokens || !isReviewerTestTokensAllowed(allowedTokens) || allowedTokens.length !== tokens.length) return false;
+    if (!allowedTokens || !isReviewerConfiguredTestTokensAllowed(allowedTokens) || allowedTokens.length !== tokens.length) return false;
     return allowedTokens.every((token, index) => token === tokens[index]);
   });
 }
@@ -868,12 +873,17 @@ function isReviewerTestTokensAllowed(tokens) {
   }
 }
 
+function isReviewerConfiguredTestTokensAllowed(tokens) {
+  const testTokens = stripEnvAssignments(tokens);
+  return testTokens.length > 0 && isReviewerTestTokensAllowed(testTokens);
+}
+
 function testCommandMatchesConfigured(command, allowedTestCommands) {
   const tokens = normalizeConfiguredTestCommandTokens(command);
-  if (!tokens || !isReviewerTestTokensAllowed(tokens)) return false;
+  if (!tokens || !isReviewerConfiguredTestTokensAllowed(tokens)) return false;
   return allowedTestCommands.some((allowedCommand) => {
     const allowedTokens = normalizeConfiguredTestCommandTokens(allowedCommand);
-    if (!allowedTokens || !isReviewerTestTokensAllowed(allowedTokens) || allowedTokens.length !== tokens.length) return false;
+    if (!allowedTokens || !isReviewerConfiguredTestTokensAllowed(allowedTokens) || allowedTokens.length !== tokens.length) return false;
     return allowedTokens.every((token, index) => token === tokens[index]);
   });
 }
