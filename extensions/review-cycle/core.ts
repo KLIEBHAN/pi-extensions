@@ -315,6 +315,10 @@ export function tokenizeReviewerShellCommand(command: string): string[] | undefi
   let escape = false;
 
   for (const char of trimmed) {
+    if (char === "\n" || char === "\r") {
+      return undefined;
+    }
+
     if (escape) {
       current += char;
       escape = false;
@@ -413,6 +417,10 @@ function tokenizeReviewerShellCommand(command) {
   let quote;
   let escape = false;
   for (const char of trimmed) {
+    if (char === "\\n" || char === "\\r") {
+      return undefined;
+    }
+
     if (escape) {
       current += char;
       escape = false;

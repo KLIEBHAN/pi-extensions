@@ -95,6 +95,9 @@ test("reviewer bash guard allows read-only git inspection and blocks mutations",
   assert.equal(isReviewerBashCommandAllowed("git checkout main"), false);
   assert.equal(isReviewerBashCommandAllowed("git diff HEAD --output=/tmp/review.diff"), false);
   assert.equal(isReviewerBashCommandAllowed("git diff HEAD > /tmp/review.diff"), false);
+  assert.equal(isReviewerBashCommandAllowed("git status\nrm -rf ."), false);
+  assert.equal(isReviewerBashCommandAllowed("git status\r\nrm -rf ."), false);
+  assert.equal(isReviewerBashCommandAllowed("git status \\\nrm -rf ."), false);
   assert.equal(isReviewerBashCommandAllowed('git diff "$(touch /tmp/review-cycle-pwn)"'), false);
   assert.equal(isReviewerBashCommandAllowed("rm -rf ."), false);
 });
