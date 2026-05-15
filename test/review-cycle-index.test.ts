@@ -290,6 +290,39 @@ test("review-cycle surfaces invalid structured review data and falls back to mar
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("fallback finding"))));
 });
 
+test("review-cycle fails closed when reviewer omits a recognized verdict", async () => {
+  const harness = createHarness();
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => ({
+      text: "I inspected the diff but forgot the required verdict.",
+      exitCode: 0,
+      stderr: "",
+      messages: [],
+    }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("malformed review task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(harness.sentMessages.length, 1);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("failed during fresh review") && entry.message.includes("recognized verdict")));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("recognized verdict"))));
+});
+
 test("review-cycle fresh review works when context signal is missing", async () => {
   const harness = createHarness();
   (harness.ctx as any).signal = undefined;

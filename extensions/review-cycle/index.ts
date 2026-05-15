@@ -1142,6 +1142,9 @@ async function runReviewAndQueueApply(
   appendReviewerOutputLineAndRender(ctx, state, "Fresh-context reviewer finished.");
   const summary = parseReviewSummary(state.review);
   state.reviewSummary = summary;
+  if (!summary.verdict) {
+    throw new Error("Fresh review output did not include a recognized verdict (APPROVE, APPROVE_WITH_NOTES, or CHANGES_REQUESTED)");
+  }
 
   await writeReviewArtifact(ctx.cwd, state, "review-complete");
   if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;

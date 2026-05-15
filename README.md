@@ -286,7 +286,7 @@ pi -e ./extensions/prompt-autocomplete \
 - A preflight widget appears before the implementation starts, showing task, worker/reviewer model, test policy, git baseline, and auto-apply mode.
 - Reviewer text, tool calls, and tool results stream into a live widget while the review runs; use `/review-cycle output off|on|toggle` to hide or show it.
 - A compact review summary widget shows the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` either queue the apply pass or wait for `/review-cycle apply` in manual mode.
-- The reviewer also returns a structured `## Review Data` JSON block with `schemaVersion: 1`, which the extension uses for robust checklist rendering; invalid structured data is surfaced and falls back to Markdown parsing.
+- The reviewer also returns a structured `## Review Data` JSON block with `schemaVersion: 1`, which the extension uses for robust checklist rendering; invalid structured data is surfaced and falls back to Markdown parsing. Reviews without a recognized `APPROVE`, `APPROVE_WITH_NOTES`, or `CHANGES_REQUESTED` verdict fail closed and can be retried.
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification when needed.
 - Review artifacts are written atomically to `.pi/review-cycle/latest.md` and `.pi/review-cycle/runs/<timestamp>-<run-id>.md`; use `/review-cycle artifact` or `/review-cycle artifact path` to inspect them. Generated artifact files are ignored by git.
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
