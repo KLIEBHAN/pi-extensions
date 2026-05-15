@@ -494,21 +494,31 @@ function normalizeTestCommandTokens(command: string): string[] | undefined {
   return tokens;
 }
 
-function testCommandMatchesConfigured(tokens: string[], allowedTestCommands: readonly string[]): boolean {
+function normalizeConfiguredTestCommandTokens(command: string): string[] | undefined {
+  const tokens = tokenizeReviewerShellCommand(command);
+  if (!tokens || tokens.length === 0) return undefined;
+  if (hasBlockedTestArguments(tokens)) return undefined;
+  return tokens;
+}
+
+function testCommandMatchesConfigured(command: string, allowedTestCommands: readonly string[]): boolean {
+  const tokens = normalizeConfiguredTestCommandTokens(command);
+  if (!tokens) return false;
+
   return allowedTestCommands.some((allowedCommand) => {
-    const allowedTokens = normalizeTestCommandTokens(allowedCommand);
+    const allowedTokens = normalizeConfiguredTestCommandTokens(allowedCommand);
     if (!allowedTokens || allowedTokens.length !== tokens.length) return false;
     return allowedTokens.every((token, index) => token === tokens[index]);
   });
 }
 
 export function isReviewerTestCommandAllowed(command: string, options: ReviewerGuardOptions = {}): boolean {
+  if (options.allowedTestCommands && options.allowedTestCommands.length > 0) {
+    return testCommandMatchesConfigured(command, options.allowedTestCommands);
+  }
+
   const tokens = normalizeTestCommandTokens(command);
   if (!tokens) return false;
-
-  if (options.allowedTestCommands && options.allowedTestCommands.length > 0) {
-    return testCommandMatchesConfigured(tokens, options.allowedTestCommands);
-  }
 
   const executable = tokens[0]!.startsWith("./") ? tokens[0]!.slice(2) : tokens[0]!;
   if (!(REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS as readonly string[]).includes(executable)) return false;
@@ -682,20 +692,29 @@ function normalizeTestCommandTokens(command) {
   return tokens;
 }
 
-function testCommandMatchesConfigured(tokens, allowedTestCommands) {
+function normalizeConfiguredTestCommandTokens(command) {
+  const tokens = tokenizeReviewerShellCommand(command);
+  if (!tokens || tokens.length === 0) return undefined;
+  if (hasBlockedTestArguments(tokens)) return undefined;
+  return tokens;
+}
+
+function testCommandMatchesConfigured(command, allowedTestCommands) {
+  const tokens = normalizeConfiguredTestCommandTokens(command);
+  if (!tokens) return false;
   return allowedTestCommands.some((allowedCommand) => {
-    const allowedTokens = normalizeTestCommandTokens(allowedCommand);
+    const allowedTokens = normalizeConfiguredTestCommandTokens(allowedCommand);
     if (!allowedTokens || allowedTokens.length !== tokens.length) return false;
     return allowedTokens.every((token, index) => token === tokens[index]);
   });
 }
 
 function isReviewerTestCommandAllowed(command) {
+  if (REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS.length > 0) {
+    return testCommandMatchesConfigured(command, REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS);
+  }
   const tokens = normalizeTestCommandTokens(command);
   if (!tokens) return false;
-  if (REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS.length > 0) {
-    return testCommandMatchesConfigured(tokens, REVIEWER_ALLOWED_CONFIGURED_TEST_COMMANDS);
-  }
   const executable = tokens[0].startsWith("./") ? tokens[0].slice(2) : tokens[0];
   if (!REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS.has(executable)) return false;
   switch (executable) {
