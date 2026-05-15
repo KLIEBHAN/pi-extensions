@@ -210,13 +210,12 @@ function formatStatusLine(state: ReviewCycleState): string {
 }
 
 function setStatus(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState | undefined): void {
+  ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
   if (!state?.active) {
-    ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
     clearStatusCardWidget(ctx);
     return;
   }
 
-  ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, formatStatusLine(state));
   updateStatusCardWidget(ctx, state);
 }
 

@@ -356,8 +356,8 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
 
   assert.equal(harness.sentMessages.length, 1);
   assert.equal(harness.sentMessages[0]?.text, "implement auth hardening");
-  assert.equal(harness.statuses.at(-1)?.key, "review-cycle");
-  assert.match(harness.statuses.at(-1)?.value ?? "", /Review 1\/3 implementing/);
+  assert.ok(harness.statuses.some((entry) => entry.key === "review-cycle"));
+  assert.equal(harness.statuses.some((entry) => entry.key === "review-cycle" && entry.value !== undefined), false);
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("Review-cycle status"))));
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("default safe test allowlist"))));
   const statusCardText = latestWidgetContent(harness, "review-cycle-status-card")?.join("\n") ?? "";
@@ -375,8 +375,8 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
     ],
   }, harness.ctx);
 
-  assert.ok(harness.statuses.some((entry) => /Review 2\/3 reviewing round 1/.test(entry.value ?? "")));
-  assert.equal(harness.statuses.some((entry) => /Review 2\/3 reviewing round 2/.test(entry.value ?? "")), false);
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => /Review 2\/3 reviewing round 1/.test(line))));
+  assert.equal(harness.statuses.some((entry) => entry.key === "review-cycle" && entry.value !== undefined), false);
 
   assert.equal(reviewCalls.length, 1);
   assert.equal(reviewCalls[0]?.cwd, "/repo");
@@ -911,7 +911,8 @@ test("review-cycle failed reviewer can be retried", async () => {
 
   assert.equal(reviewCalls, 1);
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("model unavailable"))));
-  assert.match(harness.statuses.at(-1)?.value ?? "", /Review 2\/3 review failed/);
+  assert.equal(harness.statuses.some((entry) => entry.key === "review-cycle" && entry.value !== undefined), false);
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => /Review 2\/3 review failed/.test(line))));
 
   await harness.commands.get("review-cycle")?.handler("retry", harness.ctx);
 
