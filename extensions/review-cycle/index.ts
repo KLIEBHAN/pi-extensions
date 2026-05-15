@@ -342,9 +342,11 @@ function updateStatusCardWidget(ctx: ExtensionContext | ExtensionCommandContext,
     ? `Verdict: ${summary.verdict ?? "UNKNOWN"} · ${summary.findingCount} finding${summary.findingCount === 1 ? "" : "s"} · ${mandatoryFindings} mandatory`
     : undefined;
 
+  const phase = getPhaseStatus(state);
   const lines = [
     "Review-cycle status",
-    formatStatusLine(state),
+    formatStatusCardLabel("Phase", `Review ${phase.step}/3 ${phase.label}`),
+    formatStatusCardLabel("Elapsed", formatElapsed(Date.now() - state.startedAt)),
     formatStatusCardLabel("Task", summarizeTask(state.task, 140)),
     STATUS_CARD_DIVIDER,
     formatStatusCardLabel("Worker", workerLabel),
@@ -482,26 +484,17 @@ function matchesPanelInput(data: string, ...keys: string[]): boolean {
   });
 }
 
-function buildPanelStatusLines(state: ReviewCycleState | undefined, lastRun: LastReviewCycleRun | undefined): string[] {
-  if (!state?.active) {
+function buildPanelIntroLines(state: ReviewCycleState | undefined, lastRun: LastReviewCycleRun | undefined): string[] {
+  if (state?.active) {
     return [
-      "No active review-cycle run.",
-      lastRun ? `Last task: ${summarizeTask(lastRun.task, 100)}` : "Last task: (none)",
+      "Actions for the active review-cycle run.",
+      "Run details stay in the status card to avoid duplicated panels.",
     ];
   }
-  const lines = [
-    formatStatusLine(state),
-    `Task: ${summarizeTask(state.task, 100)}`,
-    `Reviewer: ${formatReviewerLabel(state)}`,
-    `Tests: ${formatTestPolicy(state.allowedTestCommands)}`,
-    `Git: ${formatGitLine(state)}`,
+  return [
+    "No active review-cycle run.",
+    lastRun ? "Previous run available for rerun." : "Start with /review-cycle <task>.",
   ];
-  if (state.reviewSummary) {
-    const mandatoryFindings = state.reviewSummary.findings.filter((finding) => finding.mandatory !== false).length;
-    lines.push(`Review: ${state.reviewSummary.verdict ?? "UNKNOWN"} · findings ${state.reviewSummary.findingCount} · mandatory ${mandatoryFindings}`);
-  }
-  if (state.lastReviewError) lines.push(`Last error: ${truncateMiddle(state.lastReviewError, 220)}`);
-  return lines;
 }
 
 function buildPanelActions(state: ReviewCycleState | undefined, lastRun: LastReviewCycleRun | undefined): ReviewCyclePanelAction[] {
@@ -586,7 +579,7 @@ class ReviewCyclePanelComponent {
       row("Review-cycle panel"),
       row("↑↓ navigate • enter run action • esc/q close"),
       row(),
-      ...buildPanelStatusLines(this.getState(), this.getLastRun()).map((line) => row(line)),
+      ...buildPanelIntroLines(this.getState(), this.getLastRun()).map((line) => row(line)),
       row(),
       row("Actions"),
       ...actions.map((action, index) => {

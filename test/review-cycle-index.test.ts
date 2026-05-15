@@ -191,8 +191,12 @@ test("review-cycle panel renders an overlay and dispatches the selected action",
   await harness.commands.get("review-cycle")?.handler("overlay task", harness.ctx);
   await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
 
-  assert.ok(harness.overlays.some((entry) => entry.lines.some((line) => line.includes("Review-cycle panel"))));
-  assert.ok(harness.overlays.some((entry) => entry.lines.some((line) => line.includes("Hide reviewer output"))));
+  const overlayText = harness.overlays.at(-1)?.lines.join("\n") ?? "";
+  assert.match(overlayText, /Review-cycle panel/);
+  assert.match(overlayText, /Run details stay in the status card/);
+  assert.match(overlayText, /Hide reviewer output/);
+  assert.equal(overlayText.includes("overlay task"), false);
+  assert.equal(overlayText.includes("Reviewer:"), false);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle panel action: Hide reviewer output")));
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer output hidden")));
 });
@@ -304,6 +308,10 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.match(harness.statuses.at(-1)?.value ?? "", /Review 1\/3 implementing/);
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("Review-cycle status"))));
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("default safe test allowlist"))));
+  const statusCardText = latestWidgetContent(harness, "review-cycle-status-card")?.join("\n") ?? "";
+  assert.match(statusCardText, /Phase:\s+Review 1\/3 implementing/);
+  assert.match(statusCardText, /Elapsed:/);
+  assert.equal(statusCardText.match(/implement auth hardening/g)?.length, 1);
 
   await harness.handlers.get("agent_end")?.({
     messages: [
