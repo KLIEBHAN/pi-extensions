@@ -126,6 +126,7 @@ export type ReviewCycleCommand =
   | { kind: "help" }
   | { kind: "panel" }
   | { kind: "status" }
+  | { kind: "status-card"; mode: "on" | "off" | "toggle" }
   | { kind: "stop" }
   | { kind: "continue" }
   | { kind: "abort" }
@@ -424,7 +425,21 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
 
   if (command === "help" || command === "--help" || command === "-h") return { kind: "help" };
   if (command === "panel") return rest.length === 0 ? { kind: "panel" } : { error: "Usage: /review-cycle panel" };
-  if (command === "status") return { kind: "status" };
+  if (command === "status") {
+    if (rest.length === 0) return { kind: "status" };
+    const mode = rest[0]?.toLowerCase();
+    if (rest.length === 1 && (mode === "on" || mode === "show" || mode === "visible")) return { kind: "status-card", mode: "on" };
+    if (rest.length === 1 && (mode === "off" || mode === "hide" || mode === "hidden")) return { kind: "status-card", mode: "off" };
+    if (rest.length === 1 && mode === "toggle") return { kind: "status-card", mode: "toggle" };
+    return { error: "Usage: /review-cycle status [on|off|toggle]" };
+  }
+  if (command === "status-card" || command === "statuscard" || command === "card" || command === "review-status") {
+    const mode = (rest[0] ?? "toggle").toLowerCase();
+    if (rest.length <= 1 && (mode === "on" || mode === "show" || mode === "visible")) return { kind: "status-card", mode: "on" };
+    if (rest.length <= 1 && (mode === "off" || mode === "hide" || mode === "hidden")) return { kind: "status-card", mode: "off" };
+    if (rest.length <= 1 && mode === "toggle") return { kind: "status-card", mode: "toggle" };
+    return { error: "Usage: /review-cycle status-card [on|off|toggle]" };
+  }
   if (command === "stop" || command === "off") return { kind: "stop" };
   if (command === "continue") return rest.length === 0 ? { kind: "continue" } : { error: "Usage: /review-cycle continue" };
   if (command === "abort") return rest.length === 0 ? { kind: "abort" } : { error: "Usage: /review-cycle abort" };

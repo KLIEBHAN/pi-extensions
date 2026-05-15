@@ -37,6 +37,9 @@ test("parseReviewCycleArgs parses help, status, stop, and output visibility", ()
   assert.deepEqual(parseReviewCycleArgs("help"), { kind: "help" });
   assert.deepEqual(parseReviewCycleArgs("--help"), { kind: "help" });
   assert.deepEqual(parseReviewCycleArgs("status"), { kind: "status" });
+  assert.deepEqual(parseReviewCycleArgs("status off"), { kind: "status-card", mode: "off" });
+  assert.deepEqual(parseReviewCycleArgs("status-card on"), { kind: "status-card", mode: "on" });
+  assert.deepEqual(parseReviewCycleArgs("card"), { kind: "status-card", mode: "toggle" });
   assert.deepEqual(parseReviewCycleArgs("panel"), { kind: "panel" });
   assert.deepEqual(parseReviewCycleArgs("stop"), { kind: "stop" });
   assert.deepEqual(parseReviewCycleArgs("off"), { kind: "stop" });

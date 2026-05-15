@@ -67,6 +67,7 @@ interface ReviewCycleState {
   lastChanges?: ChangeSnapshot;
   lastReviewError?: string;
   reviewerOutputVisible: boolean;
+  statusCardVisible: boolean;
   reviewerOutputLines: string[];
   reviewerAbortController?: AbortController;
   allowedTestCommands: string[];
@@ -94,6 +95,7 @@ interface AssistantTurn {
 
 interface ReviewCyclePreferences {
   reviewerOutputVisible: boolean;
+  statusCardVisible?: boolean;
   allowedTestCommands?: string[];
 }
 
@@ -104,6 +106,7 @@ interface ReviewCycleRepoConfig {
   autoRerunAfterApply?: boolean;
   maxReviewRounds?: number;
   allowDirty?: boolean;
+  statusCardVisible?: boolean;
   ignoredTests?: string[];
 }
 
@@ -112,6 +115,7 @@ interface ReviewCycleRunOptions {
   reviewerModelSource: "command" | "config" | "active";
   testPolicySource: "command" | "config" | "default";
   reviewerOutputVisible: boolean;
+  statusCardVisible: boolean;
   allowedTestCommands: string[];
   manualApply: boolean;
   autoRerunAfterApply: boolean;
@@ -327,6 +331,11 @@ function formatFlowLine(state: ReviewCycleState): string {
 }
 
 function updateStatusCardWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
+  if (!state.statusCardVisible) {
+    clearStatusCardWidget(ctx);
+    return;
+  }
+
   const workerLabel = ctx.model ? modelRefToCli(ctx.model) : "selected model";
   const summary = state.reviewSummary;
   const mandatoryFindings = summary?.findings.filter((finding) => finding.mandatory !== false).length ?? 0;
@@ -390,8 +399,9 @@ function showHelp(ctx: ExtensionCommandContext): void {
       "  /review-cycle stop                                cancel the managed workflow",
       "",
       "Inspect",
-      "  /review-cycle status                              status line",
-      "  /review-cycle panel                               interactive overlay",
+      "  /review-cycle status                              notify current run status",
+      "  /review-cycle status-card off|on|toggle           hide/show main status card (hidden by default)",
+      "  /review-cycle panel                               interactive overlay with status details",
       "  /review-cycle output off|on|toggle                hide/show live reviewer log",
       "  /review-cycle artifact [show|list|path] [n]       inspect review artifacts",
       "",
@@ -399,7 +409,7 @@ function showHelp(ctx: ExtensionCommandContext): void {
       "  /review-cycle tests status|set <cmd>|add <cmd>|clear",
       "                                                    configure reviewer test commands",
       "  Repo file: .pi/review-cycle.json",
-      "    keys: reviewerModel, tests, manualApply, autoRerunAfterApply, maxReviewRounds, allowDirty",
+      "    keys: reviewerModel, tests, manualApply, autoRerunAfterApply, maxReviewRounds, allowDirty, statusCardVisible",
     ],
     { placement: "belowEditor" },
   );
@@ -491,12 +501,33 @@ function matchesPanelInput(data: string, ...keys: string[]): boolean {
   });
 }
 
+function buildPanelRunDetails(state: ReviewCycleState): string[] {
+  const lines = [
+    formatStatusLine(state),
+    `Task: ${summarizeTask(state.task, 100)}`,
+    `Reviewer: ${formatReviewerLabel(state)}`,
+    `Tests: ${formatTestPolicy(state.allowedTestCommands)}`,
+    `Git: ${formatGitLine(state)}`,
+  ];
+  if (state.reviewSummary) {
+    const mandatoryFindings = state.reviewSummary.findings.filter((finding) => finding.mandatory !== false).length;
+    lines.push(`Review: ${state.reviewSummary.verdict ?? "UNKNOWN"} · findings ${state.reviewSummary.findingCount} · mandatory ${mandatoryFindings}`);
+  }
+  if (state.lastReviewError) lines.push(`Last error: ${truncateMiddle(state.lastReviewError, 220)}`);
+  return lines;
+}
+
 function buildPanelIntroLines(state: ReviewCycleState | undefined, lastRun: LastReviewCycleRun | undefined): string[] {
   if (state?.active) {
-    return [
-      "Actions for the active review-cycle run.",
-      "Run details stay in the status card to avoid duplicated panels.",
-    ];
+    return state.statusCardVisible
+      ? [
+          "Actions for the active review-cycle run.",
+          "Run details stay in the status card to avoid duplicated panels.",
+        ]
+      : [
+          "Review status is hidden from the main view. Details are shown here.",
+          ...buildPanelRunDetails(state),
+        ];
   }
   return [
     "No active review-cycle run.",
@@ -525,6 +556,7 @@ function buildPanelActions(state: ReviewCycleState | undefined, lastRun: LastRev
     actions.push(
       { id: "output-toggle", label: state.reviewerOutputVisible ? "Hide reviewer output" : "Show reviewer output", description: "Toggle the live reviewer log widget", command: "output toggle" },
       { id: "stop", label: "Stop run", description: "Cancel the active review-cycle run", command: "stop" },
+      { id: "status-toggle", label: state.statusCardVisible ? "Hide review status" : "Show review status", description: "Toggle the main status-card widget", command: "status-card toggle" },
     );
   } else if (lastRun) {
     actions.push({ id: "rerun", label: "Rerun last review", description: "Run a fresh review for the previous task", command: "rerun" });
@@ -635,6 +667,10 @@ async function showReviewCyclePanel(
   if (activeState?.active) updateStatusCardWidget(ctx, activeState);
   const custom = (ctx.ui as { custom?: Function }).custom;
   if (typeof custom !== "function") {
+    if (activeState?.active) {
+      activeState.statusCardVisible = true;
+      updateStatusCardWidget(ctx, activeState);
+    }
     ctx.ui.notify("Review-cycle panel overlay is not available in this UI; showing the status card instead", "warning");
     return undefined;
   }
@@ -1085,6 +1121,7 @@ async function loadReviewCycleConfig(cwd: string): Promise<ReviewCycleRepoConfig
     autoRerunAfterApply: parseConfigBoolean(record.autoRerunAfterApply),
     maxReviewRounds: parseConfigPositiveInteger(record.maxReviewRounds),
     allowDirty: parseConfigBoolean(record.allowDirty),
+    statusCardVisible: parseConfigBoolean(record.statusCardVisible),
   };
 }
 
@@ -1129,6 +1166,7 @@ function resolveRunOptions(
     reviewerModelSource,
     testPolicySource,
     reviewerOutputVisible: preferences.reviewerOutputVisible,
+    statusCardVisible: preferences.statusCardVisible ?? config.statusCardVisible ?? false,
     allowedTestCommands,
     manualApply: command.manualApply ?? config.manualApply ?? false,
     autoRerunAfterApply: command.untilApproved ?? config.autoRerunAfterApply ?? false,
@@ -1431,6 +1469,7 @@ async function startReviewCycle(
     reviewerModelSource: options.reviewerModelSource,
     testPolicySource: options.testPolicySource,
     reviewerOutputVisible: options.reviewerOutputVisible,
+    statusCardVisible: options.statusCardVisible,
     reviewerOutputLines: [],
     allowedTestCommands: [...options.allowedTestCommands],
     manualApply: options.manualApply,
@@ -1456,7 +1495,12 @@ async function startReviewCycle(
     ctx.ui.notify("Review-cycle started with pre-existing git changes because --allow-dirty/config allowDirty is set.", "warning");
   }
 
-  ctx.ui.notify("Review-cycle started: implementation phase", "info");
+  ctx.ui.notify(
+    state.statusCardVisible
+      ? "Review-cycle started: implementation phase"
+      : "Review-cycle started: implementation phase · details in /review-cycle panel",
+    "info",
+  );
   pi.sendUserMessage(task);
 }
 
@@ -1647,6 +1691,7 @@ async function rerunReviewCycle(
     testPolicySource: options.testPolicySource,
     implementationSummary: lastRun.implementationSummary,
     reviewerOutputVisible: options.reviewerOutputVisible,
+    statusCardVisible: options.statusCardVisible,
     reviewerOutputLines: [],
     allowedTestCommands: [...options.allowedTestCommands],
     manualApply: options.manualApply,
@@ -1669,14 +1714,15 @@ async function rerunReviewCycle(
 
 function showStatus(ctx: ExtensionCommandContext, state: ReviewCycleState | undefined): void {
   if (!state?.active) {
-    ctx.ui.notify("No active review-cycle run", "info");
+    ctx.ui.notify("No active review-cycle run. Use /review-cycle panel for the last-run actions.", "info");
     return;
   }
 
   const reviewer = `reviewer=${formatReviewerLabel(state)}`;
   const tests = `tests=${formatTestPolicy(state.allowedTestCommands)}`;
+  const card = `status-card=${state.statusCardVisible ? "shown" : "hidden"}`;
   ctx.ui.notify(
-    `${formatStatusLine(state)} · ${reviewer} · ${tests}`,
+    `${formatStatusLine(state)} · ${reviewer} · ${tests} · ${card} · panel=/review-cycle panel`,
     "info",
   );
 }
@@ -1742,6 +1788,19 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
 
       if (parsed.kind === "status") {
         showStatus(ctx, stateRef.current);
+        return;
+      }
+
+      if (parsed.kind === "status-card") {
+        const nextVisible = parsed.mode === "toggle" ? !(stateRef.current?.statusCardVisible ?? preferences.statusCardVisible ?? false) : parsed.mode === "on";
+        preferences.statusCardVisible = nextVisible;
+        if (stateRef.current) {
+          stateRef.current.statusCardVisible = nextVisible;
+          updateStatusCardWidget(ctx, stateRef.current);
+        } else if (!nextVisible) {
+          clearStatusCardWidget(ctx);
+        }
+        ctx.ui.notify(`Review-cycle status card ${nextVisible ? "shown" : "hidden"}`, "info");
         return;
       }
 

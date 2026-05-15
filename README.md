@@ -283,8 +283,8 @@ pi -e ./extensions/prompt-autocomplete \
 - The reviewer receives the original task, the implementation summary, the baseline git commit/status, and current diff/status data. It can also inspect the workspace with read-only tools.
 - The reviewer subprocess is technically guarded: `read`, `grep`, `find`, `ls`, and `bash` are available, but `bash` only permits read-only git inspection commands such as `git status`, `git diff`, `git show`, `git log`, `git blame`, and `git ls-files`, plus common test commands such as `npm test`, `pnpm test`, `yarn test`, `bun test`, `pytest`, `cargo test`, and `go test`.
 - Mutating tools, arbitrary shell execution, unsafe shell/git arguments, and unknown/custom tools are blocked in the reviewer subprocess. Auto-discovered extensions are disabled for that subprocess; only the guard extension is loaded.
-- A unified status-card widget appears throughout the workflow, showing phase, elapsed time, task, worker/reviewer model, test policy, git baseline, mode, latest review verdict/findings, artifact path, and the next suggested action. The extension deliberately keeps the footer free of duplicate review-cycle status.
-- `/review-cycle panel` opens an action-focused overlay for contextual actions such as continue, apply, skip, retry, output toggle, artifact, and stop; detailed run information stays in the unified status card to avoid duplicate panels.
+- The main status-card widget is hidden by default to keep the workspace quiet; use `/review-cycle status-card on|off|toggle` or repo config `statusCardVisible` to show/hide it. When shown, it contains phase, elapsed time, task, worker/reviewer model, test policy, git baseline, mode, verdict/findings, artifact path, and the next suggested action. The extension deliberately keeps the footer free of duplicate review-cycle status.
+- `/review-cycle panel` opens an action-focused overlay for contextual actions such as continue, apply, skip, retry, status-card toggle, output toggle, artifact, and stop. Because the status card is hidden by default, the panel also includes concise run details while hidden and avoids duplicating them when the card is visible.
 - Reviewer text, tool calls, and tool results stream into a live widget while the review runs; use `/review-cycle output off|on|toggle` to hide or show it.
 - The status card includes the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` either queue the apply pass or wait for `/review-cycle apply` in manual mode.
 - The reviewer also returns a structured `## Review Data` JSON block with `schemaVersion: 1`, which the extension uses for robust checklist rendering; invalid structured data is surfaced and falls back to Markdown parsing. Reviews without a recognized `APPROVE`, `APPROVE_WITH_NOTES`, or `CHANGES_REQUESTED` verdict fail closed and can be retried.
@@ -293,10 +293,10 @@ pi -e ./extensions/prompt-autocomplete \
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
 - `/review-cycle retry` retries a failed reviewer subprocess without discarding the implementation state.
 - `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands and reject unsafe/non-test commands early; `/review-cycle tests clear` restores the default safe test allowlist.
-- `/review-cycle status` shows a richer status line with phase step, live-refreshed elapsed time, reviewer, tests, and task; `/review-cycle panel` opens the interactive action overlay; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow and aborts an active reviewer subprocess. Reviewer subprocess shutdown escalates from `SIGTERM` to `SIGKILL` when a timed-out/aborted child does not exit.
+- `/review-cycle status` shows a compact status notification with phase, elapsed time, reviewer, tests, task, and status-card visibility; `/review-cycle panel` opens the interactive action overlay; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow and aborts an active reviewer subprocess. Reviewer subprocess shutdown escalates from `SIGTERM` to `SIGKILL` when a timed-out/aborted child does not exit.
 - If the workspace is already dirty, the cycle pauses for `/review-cycle continue` or `/review-cycle abort` unless `--allow-dirty` or config `allowDirty` is set.
 - `/review-cycle help` or `/rc help` shows all commands and examples in a help widget.
-- Repo defaults can be stored in `.pi/review-cycle.json` with `reviewerModel`, `tests`, `manualApply`, `autoRerunAfterApply`, `maxReviewRounds`, and `allowDirty`; unsafe configured test commands are ignored with a warning.
+- Repo defaults can be stored in `.pi/review-cycle.json` with `reviewerModel`, `tests`, `manualApply`, `autoRerunAfterApply`, `maxReviewRounds`, `allowDirty`, and `statusCardVisible`; unsafe configured test commands are ignored with a warning.
 - Optional reviewer model selection via `--reviewer-model provider/model` or CLI flag `--review-cycle-reviewer-model provider/model`.
 
 ### Usage
@@ -318,6 +318,7 @@ Then inside pi:
 /review-cycle --allow-dirty include current workspace changes
 /review-cycle help
 /review-cycle status
+/review-cycle status-card on
 /review-cycle panel
 /review-cycle output off
 /review-cycle output on
@@ -349,7 +350,8 @@ Repo config example:
   "manualApply": false,
   "autoRerunAfterApply": false,
   "maxReviewRounds": 2,
-  "allowDirty": false
+  "allowDirty": false,
+  "statusCardVisible": false
 }
 ```
 

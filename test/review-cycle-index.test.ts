@@ -96,6 +96,10 @@ function latestWidgetContent(harness: ReturnType<typeof createHarness>, key: str
   return [...harness.widgets].reverse().find((entry) => entry.key === key)?.content;
 }
 
+async function enableReviewStatusCard(harness: ReturnType<typeof createHarness>): Promise<void> {
+  await harness.commands.get("review-cycle")?.handler("status-card on", harness.ctx);
+}
+
 test("runFreshReviewAgent spawns a guarded reviewer process and parses JSON stream", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "review-cycle-spawn-"));
   try {
@@ -193,10 +197,11 @@ test("review-cycle panel renders an overlay and dispatches the selected action",
 
   const overlayText = harness.overlays.at(-1)?.lines.join("\n") ?? "";
   assert.match(overlayText, /Review-cycle panel/);
-  assert.match(overlayText, /Run details stay in the status card/);
+  assert.match(overlayText, /Review status is hidden from the main view/);
   assert.match(overlayText, /Hide reviewer output/);
-  assert.equal(overlayText.includes("overlay task"), false);
-  assert.equal(overlayText.includes("Reviewer:"), false);
+  assert.match(overlayText, /Show review status/);
+  assert.ok(overlayText.includes("overlay task"));
+  assert.ok(overlayText.includes("Reviewer:"));
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle panel action: Hide reviewer output")));
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer output hidden")));
 });
@@ -213,6 +218,22 @@ test("review-cycle panel supports terminal arrow-key sequences", async () => {
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle panel action: Stop run")));
   assert.ok(harness.notifications.some((entry) => entry.message.includes("Stopped review-cycle")));
   assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+});
+
+test("review-cycle status card is hidden by default and can be toggled from the panel", async () => {
+  const harness = createHarness({ panelInputs: ["\u001b[1;1B", "\u001b[1;1B", "\r"] });
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("toggle status card from panel", harness.ctx);
+  assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+
+  await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle panel action: Show review status")));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle status card shown")));
+  assert.ok(latestWidgetContent(harness, "review-cycle-status-card")?.some((line) => line.includes("toggle status card from panel")));
 });
 
 test("review-cycle inactive panel shows the rerun target", async () => {
@@ -358,6 +379,10 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.equal(harness.sentMessages[0]?.text, "implement auth hardening");
   assert.ok(harness.statuses.some((entry) => entry.key === "review-cycle"));
   assert.equal(harness.statuses.some((entry) => entry.key === "review-cycle" && entry.value !== undefined), false);
+  assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+
+  await harness.commands.get("review-cycle")?.handler("status-card on", harness.ctx);
+
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("Review-cycle status"))));
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("default safe test allowlist"))));
   const statusCardText = latestWidgetContent(harness, "review-cycle-status-card")?.join("\n") ?? "";
@@ -435,6 +460,7 @@ test("review-cycle surfaces invalid structured review data and falls back to mar
       messages: [],
     }),
   })(harness.pi as never);
+  await enableReviewStatusCard(harness);
 
   await harness.commands.get("review-cycle")?.handler("invalid data task", harness.ctx);
   await harness.handlers.get("agent_end")?.({
@@ -467,6 +493,7 @@ test("review-cycle fails closed when reviewer omits a recognized verdict", async
       messages: [],
     }),
   })(harness.pi as never);
+  await enableReviewStatusCard(harness);
 
   await harness.commands.get("review-cycle")?.handler("malformed review task", harness.ctx);
   await harness.handlers.get("agent_end")?.({
@@ -541,6 +568,7 @@ test("review-cycle ends without apply pass when reviewer approves", async () => 
       };
     },
   })(harness.pi as never);
+  await enableReviewStatusCard(harness);
 
   await harness.commands.get("review-cycle")?.handler("small approved task", harness.ctx);
   await harness.handlers.get("agent_end")?.({
@@ -618,6 +646,7 @@ test("review-cycle pauses on dirty workspace until continue", async () => {
   createReviewCycleExtension({
     getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main\n M existing.ts", dirty: true }),
   })(harness.pi as never);
+  await enableReviewStatusCard(harness);
 
   await harness.commands.get("review-cycle")?.handler("dirty task", harness.ctx);
 
@@ -675,6 +704,7 @@ CHANGES_REQUESTED
         };
       },
     })(harness.pi as never);
+    await enableReviewStatusCard(harness);
 
     await harness.commands.get("review-cycle")?.handler("config driven task", harness.ctx);
     await harness.handlers.get("agent_end")?.({
@@ -782,6 +812,7 @@ test("review-cycle manual skip clears the status card", async () => {
       messages: [],
     }),
   })(harness.pi as never);
+  await enableReviewStatusCard(harness);
 
   await harness.commands.get("review-cycle")?.handler("--manual-apply skip status card", harness.ctx);
   await harness.handlers.get("agent_end")?.({
@@ -903,6 +934,7 @@ test("review-cycle failed reviewer can be retried", async () => {
       return { text: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.", exitCode: 0, stderr: "", messages: [] };
     },
   })(harness.pi as never);
+  await enableReviewStatusCard(harness);
 
   await harness.commands.get("review-cycle")?.handler("retryable task", harness.ctx);
   await harness.handlers.get("agent_end")?.({
