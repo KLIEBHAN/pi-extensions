@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createReviewCycleExtension } from "../extensions/review-cycle/index.ts";
 
-function createHarness() {
+function createHarness(options: { cwd?: string } = {}) {
   const handlers = new Map<string, Function>();
   const commands = new Map<string, { handler: Function }>();
   const sentMessages: Array<{ text: string; options?: unknown }> = [];
@@ -36,7 +39,7 @@ function createHarness() {
   };
 
   const ctx = {
-    cwd: "/repo",
+    cwd: options.cwd ?? "/repo",
     signal: new AbortController().signal,
     model: { provider: "openai", id: "gpt-review" },
     modelRegistry: {
@@ -261,6 +264,176 @@ test("review-cycle rerun reuses the previous task and honors configured test com
   assert.deepEqual(allowedTestCommandSnapshots[1], ["npm test"]);
   assert.equal(prompts.length, 2);
   assert.ok(prompts.every((prompt) => prompt.includes("implement rerun target")));
+});
+
+test("review-cycle pauses on dirty workspace until continue", async () => {
+  const harness = createHarness();
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main\n M existing.ts", dirty: true }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("dirty task", harness.ctx);
+
+  assert.equal(harness.sentMessages.length, 0);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("workspace already dirty")));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-preflight" && entry.content?.some((line) => line.includes("continue or /review-cycle abort"))));
+
+  await harness.commands.get("review-cycle")?.handler("continue", harness.ctx);
+
+  assert.equal(harness.sentMessages.length, 1);
+  assert.equal(harness.sentMessages[0]?.text, "dirty task");
+});
+
+test("review-cycle uses repo config, waits for manual apply, and writes artifacts", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-test-"));
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({
+      reviewerModel: "openai/gpt-review",
+      tests: ["npm test"],
+      manualApply: true,
+    }), "utf8");
+
+    const harness = createHarness({ cwd });
+    const allowedTestCommandSnapshots: string[][] = [];
+
+    createReviewCycleExtension({
+      getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+      getChangeSnapshot: async () => ({
+        isGitRepo: true,
+        baselineHead: "abc123",
+        status: "## main\n M src/a.ts",
+        diffStat: "src/a.ts | 1 +",
+        diff: "diff --git a/src/a.ts b/src/a.ts",
+        committedChanges: "",
+        untrackedFiles: [],
+        notes: [],
+      }),
+      runFreshReviewAgent: async (options: any) => {
+        allowedTestCommandSnapshots.push([...(options.allowedTestCommands ?? [])]);
+        return {
+          text: `## Verdict
+CHANGES_REQUESTED
+
+## Findings
+- HIGH: src/a.ts needs fix
+
+## Review Data
+~~~json
+{"verdict":"CHANGES_REQUESTED","findings":[{"severity":"high","title":"Needs fix","file":"src/a.ts","line":3,"mandatory":true,"suggestion":"Fix it"}]}
+~~~`,
+          exitCode: 0,
+          stderr: "",
+          messages: [],
+        };
+      },
+    })(harness.pi as never);
+
+    await harness.commands.get("review-cycle")?.handler("config driven task", harness.ctx);
+    await harness.handlers.get("agent_end")?.({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+    }, harness.ctx);
+
+    assert.deepEqual(allowedTestCommandSnapshots[0], ["npm test"]);
+    assert.equal(harness.sentMessages.length, 1);
+    assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("waiting for /review-cycle apply"))));
+
+    await harness.commands.get("review-cycle")?.handler("apply", harness.ctx);
+    assert.equal(harness.sentMessages.length, 2);
+    assert.match(harness.sentMessages[1]?.text ?? "", /Fresh-context review/);
+
+    await harness.handlers.get("agent_end")?.({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "applied and verified" }], stopReason: "stop" }],
+    }, harness.ctx);
+
+    const latest = await readFile(join(cwd, ".pi", "review-cycle", "latest.md"), "utf8");
+    assert.match(latest, /Stage: apply-complete/);
+    assert.match(latest, /Needs fix/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("review-cycle until-approved reruns review after apply", async () => {
+  const harness = createHarness();
+  let reviewCalls = 0;
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => {
+      reviewCalls += 1;
+      return {
+        text: reviewCalls === 1
+          ? "## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: fix once"
+          : "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.",
+        exitCode: 0,
+        stderr: "",
+        messages: [],
+      };
+    },
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("--until-approved fix until clean", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+  assert.equal(reviewCalls, 1);
+  assert.equal(harness.sentMessages.length, 2);
+
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "applied" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(reviewCalls, 2);
+  assert.equal(harness.sentMessages.length, 2);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
+});
+
+test("review-cycle failed reviewer can be retried", async () => {
+  const harness = createHarness();
+  let reviewCalls = 0;
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => {
+      reviewCalls += 1;
+      if (reviewCalls === 1) throw new Error("model unavailable");
+      return { text: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.", exitCode: 0, stderr: "", messages: [] };
+    },
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("retryable task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(reviewCalls, 1);
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("reviewer failed"))));
+
+  await harness.commands.get("review-cycle")?.handler("retry", harness.ctx);
+
+  assert.equal(reviewCalls, 2);
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
 });
 
 test("review-cycle output command toggles persisted visibility before a run starts", async () => {

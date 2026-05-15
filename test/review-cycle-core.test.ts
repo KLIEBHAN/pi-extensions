@@ -52,6 +52,23 @@ test("parseReviewCycleArgs parses help, status, stop, and output visibility", ()
     command: "npm test",
   });
   assert.deepEqual(parseReviewCycleArgs("config tests clear"), { kind: "tests", action: "clear" });
+  assert.deepEqual(parseReviewCycleArgs("apply"), { kind: "apply" });
+  assert.deepEqual(parseReviewCycleArgs("skip"), { kind: "skip" });
+  assert.deepEqual(parseReviewCycleArgs("continue"), { kind: "continue" });
+  assert.deepEqual(parseReviewCycleArgs("abort"), { kind: "abort" });
+  assert.deepEqual(parseReviewCycleArgs("retry --reviewer-model openai/gpt-review"), {
+    kind: "retry",
+    reviewerModel: { provider: "openai", id: "gpt-review" },
+  });
+  assert.deepEqual(parseReviewCycleArgs("--manual-apply --until-approved --allow-dirty --max-review-rounds 3 fix auth"), {
+    kind: "start",
+    task: "fix auth",
+    reviewerModel: undefined,
+    manualApply: true,
+    untilApproved: true,
+    allowDirty: true,
+    maxReviewRounds: 3,
+  });
 });
 
 test("parseReviewCycleArgs validates reviewer model", () => {
@@ -225,6 +242,31 @@ test("parseReviewSummary extracts verdict and findings", () => {
       { severity: "high", text: "HIGH: broken" },
       { severity: "medium", text: "medium: weak" },
       { severity: "other", text: "nit" },
+    ],
+  });
+  assert.deepEqual(parseReviewSummary(`## Verdict
+CHANGES_REQUESTED
+
+## Findings
+- HIGH: fallback text
+
+## Review Data
+~~~json
+{"verdict":"APPROVE_WITH_NOTES","findings":[{"severity":"low","title":"Tiny issue","file":"src/a.ts","line":7,"mandatory":false,"suggestion":"Polish it"}]}
+~~~`), {
+    verdict: "APPROVE_WITH_NOTES",
+    findingCount: 1,
+    severityCounts: { critical: 0, high: 0, medium: 0, low: 1, other: 0 },
+    findings: [
+      {
+        severity: "low",
+        text: "Tiny issue — src/a.ts:7 — Polish it",
+        title: "Tiny issue",
+        file: "src/a.ts",
+        line: 7,
+        suggestion: "Polish it",
+        mandatory: false,
+      },
     ],
   });
 });

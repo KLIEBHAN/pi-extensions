@@ -92,6 +92,11 @@ export interface ReviewerGuardOptions {
 export interface ReviewFinding {
   severity: ReviewFindingSeverity;
   text: string;
+  title?: string;
+  file?: string;
+  line?: number;
+  suggestion?: string;
+  mandatory?: boolean;
 }
 
 export interface ReviewSummary {
@@ -107,10 +112,23 @@ export interface ModelRef {
 }
 
 export type ReviewCycleCommand =
-  | { kind: "start"; task: string; reviewerModel?: ModelRef }
+  | {
+      kind: "start";
+      task: string;
+      reviewerModel?: ModelRef;
+      manualApply?: boolean;
+      untilApproved?: boolean;
+      allowDirty?: boolean;
+      maxReviewRounds?: number;
+    }
   | { kind: "help" }
   | { kind: "status" }
   | { kind: "stop" }
+  | { kind: "continue" }
+  | { kind: "abort" }
+  | { kind: "apply" }
+  | { kind: "skip" }
+  | { kind: "retry"; reviewerModel?: ModelRef }
   | { kind: "rerun"; reviewerModel?: ModelRef }
   | { kind: "output"; mode: "on" | "off" | "toggle" }
   | { kind: "tests"; action: "show" | "clear" | "add" | "set"; command?: string }
@@ -181,7 +199,26 @@ Bullet list. Each finding should include severity, file/line when possible, the 
 List missing or weak verification, or say none.
 
 ## Notes
-Optional short positive notes or non-blocking improvements.`;
+Optional short positive notes or non-blocking improvements.
+
+## Review Data
+A fenced JSON object for machine parsing. Use this shape exactly:
+~~~json
+{
+  "verdict": "APPROVE_WITH_NOTES",
+  "findings": [
+    {
+      "severity": "high",
+      "title": "Short finding title",
+      "file": "src/example.ts",
+      "line": 42,
+      "mandatory": true,
+      "suggestion": "Specific fix"
+    }
+  ]
+}
+~~~
+Use an empty findings array when there are no findings.`;
 
 function tokenizeArgs(input: string): string[] | { error: string } {
   const trimmed = input.trim();
@@ -247,8 +284,25 @@ export function parseModelRef(value: string | undefined): ModelRef | undefined {
   };
 }
 
-function parseReviewerModelFlag(tokens: string[]): { reviewerModel?: ModelRef; remaining: string[] } | { error: string } {
+function parsePositiveIntegerToken(value: string | undefined): number | undefined {
+  if (!value || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function parseRunFlags(tokens: string[]): {
+  reviewerModel?: ModelRef;
+  manualApply?: boolean;
+  untilApproved?: boolean;
+  allowDirty?: boolean;
+  maxReviewRounds?: number;
+  remaining: string[];
+} | { error: string } {
   let reviewerModel: ModelRef | undefined;
+  let manualApply: boolean | undefined;
+  let untilApproved: boolean | undefined;
+  let allowDirty: boolean | undefined;
+  let maxReviewRounds: number | undefined;
   const remaining: string[] = [];
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -265,6 +319,34 @@ function parseReviewerModelFlag(tokens: string[]): { reviewerModel?: ModelRef; r
       continue;
     }
 
+    if (token === "--manual-apply") {
+      manualApply = true;
+      continue;
+    }
+
+    if (token === "--auto-apply") {
+      manualApply = false;
+      continue;
+    }
+
+    if (token === "--until-approved") {
+      untilApproved = true;
+      continue;
+    }
+
+    if (token === "--allow-dirty") {
+      allowDirty = true;
+      continue;
+    }
+
+    if (token === "--max-review-rounds") {
+      const parsed = parsePositiveIntegerToken(tokens[index + 1]);
+      if (!parsed) return { error: "--max-review-rounds must be a positive integer" };
+      maxReviewRounds = parsed;
+      index += 1;
+      continue;
+    }
+
     if (token.startsWith("--")) {
       return { error: `Unknown flag: ${token}` };
     }
@@ -272,26 +354,45 @@ function parseReviewerModelFlag(tokens: string[]): { reviewerModel?: ModelRef; r
     remaining.push(token);
   }
 
-  return { reviewerModel, remaining };
+  return { reviewerModel, manualApply, untilApproved, allowDirty, maxReviewRounds, remaining };
 }
 
 function parseStartArgs(tokens: string[]): ReviewCycleCommand {
-  const parsed = parseReviewerModelFlag(tokens);
+  const parsed = parseRunFlags(tokens);
   if ("error" in parsed) return parsed;
 
   const task = parsed.remaining.join(" ").trim();
   if (!task) {
-    return { error: "Usage: /review-cycle [on] [--reviewer-model provider/model] <task>" };
+    return { error: "Usage: /review-cycle [on] [--reviewer-model provider/model] [--manual-apply] [--until-approved] [--allow-dirty] [--max-review-rounds n] <task>" };
   }
 
-  return { kind: "start", task, reviewerModel: parsed.reviewerModel };
+  return {
+    kind: "start",
+    task,
+    reviewerModel: parsed.reviewerModel,
+    ...(parsed.manualApply !== undefined ? { manualApply: parsed.manualApply } : {}),
+    ...(parsed.untilApproved !== undefined ? { untilApproved: parsed.untilApproved } : {}),
+    ...(parsed.allowDirty !== undefined ? { allowDirty: parsed.allowDirty } : {}),
+    ...(parsed.maxReviewRounds !== undefined ? { maxReviewRounds: parsed.maxReviewRounds } : {}),
+  };
 }
 
 function parseRerunArgs(tokens: string[]): ReviewCycleCommand {
-  const parsed = parseReviewerModelFlag(tokens);
+  const parsed = parseRunFlags(tokens);
   if ("error" in parsed) return parsed;
-  if (parsed.remaining.length > 0) return { error: "Usage: /review-cycle rerun [--reviewer-model provider/model]" };
+  if (parsed.remaining.length > 0 || parsed.manualApply !== undefined || parsed.untilApproved !== undefined || parsed.allowDirty !== undefined || parsed.maxReviewRounds !== undefined) {
+    return { error: "Usage: /review-cycle rerun [--reviewer-model provider/model]" };
+  }
   return { kind: "rerun", reviewerModel: parsed.reviewerModel };
+}
+
+function parseRetryArgs(tokens: string[]): ReviewCycleCommand {
+  const parsed = parseRunFlags(tokens);
+  if ("error" in parsed) return parsed;
+  if (parsed.remaining.length > 0 || parsed.manualApply !== undefined || parsed.untilApproved !== undefined || parsed.allowDirty !== undefined || parsed.maxReviewRounds !== undefined) {
+    return { error: "Usage: /review-cycle retry [--reviewer-model provider/model]" };
+  }
+  return { kind: "retry", reviewerModel: parsed.reviewerModel };
 }
 
 function parseTestsArgs(tokens: string[]): ReviewCycleCommand {
@@ -319,6 +420,11 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
   if (command === "help" || command === "--help" || command === "-h") return { kind: "help" };
   if (command === "status") return { kind: "status" };
   if (command === "stop" || command === "off") return { kind: "stop" };
+  if (command === "continue") return rest.length === 0 ? { kind: "continue" } : { error: "Usage: /review-cycle continue" };
+  if (command === "abort") return rest.length === 0 ? { kind: "abort" } : { error: "Usage: /review-cycle abort" };
+  if (command === "apply") return rest.length === 0 ? { kind: "apply" } : { error: "Usage: /review-cycle apply" };
+  if (command === "skip") return rest.length === 0 ? { kind: "skip" } : { error: "Usage: /review-cycle skip" };
+  if (command === "retry") return parseRetryArgs(rest);
   if (command === "rerun") return parseRerunArgs(rest);
   if (command === "tests") return parseTestsArgs(rest);
   if (command === "config" && rest[0]?.toLowerCase() === "tests") return parseTestsArgs(rest.slice(1));
@@ -853,17 +959,96 @@ function parseFindingSeverity(text: string): ReviewFindingSeverity {
   return "other";
 }
 
-export function parseReviewSummary(review: string): ReviewSummary {
-  const verdictMatch = /\b(APPROVE_WITH_NOTES|CHANGES_REQUESTED|APPROVE)\b/.exec(review);
-  const verdict = verdictMatch?.[1] as ReviewVerdict | undefined;
-  const severityCounts: ReviewSummary["severityCounts"] = {
+function normalizeFindingSeverity(value: unknown, fallbackText = ""): ReviewFindingSeverity {
+  if (typeof value === "string") {
+    const normalized = value.toLowerCase();
+    if (normalized === "critical" || normalized === "high" || normalized === "medium" || normalized === "low" || normalized === "other") {
+      return normalized;
+    }
+  }
+  return parseFindingSeverity(fallbackText);
+}
+
+function isReviewVerdict(value: unknown): value is ReviewVerdict {
+  return value === "APPROVE" || value === "APPROVE_WITH_NOTES" || value === "CHANGES_REQUESTED";
+}
+
+function emptySeverityCounts(): ReviewSummary["severityCounts"] {
+  return {
     critical: 0,
     high: 0,
     medium: 0,
     low: 0,
     other: 0,
   };
+}
 
+function buildReviewSummary(verdict: ReviewVerdict | undefined, findings: ReviewFinding[]): ReviewSummary {
+  const severityCounts = emptySeverityCounts();
+  for (const finding of findings) {
+    severityCounts[finding.severity] += 1;
+  }
+  return {
+    verdict,
+    findingCount: findings.length,
+    severityCounts,
+    findings,
+  };
+}
+
+function extractReviewDataJson(review: string): unknown | undefined {
+  const section = /##\s+Review Data\s*\n([\s\S]*?)(?:\n##\s+|$)/i.exec(review)?.[1];
+  if (!section) return undefined;
+  const fenced = /(?:```|~~~)(?:json)?\s*\n([\s\S]*?)\n(?:```|~~~)/i.exec(section)?.[1];
+  const raw = (fenced ?? section).trim();
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseStructuredReviewSummary(review: string): ReviewSummary | undefined {
+  const data = extractReviewDataJson(review);
+  if (typeof data !== "object" || data === null) return undefined;
+  const record = data as { verdict?: unknown; findings?: unknown };
+  const verdict = isReviewVerdict(record.verdict) ? record.verdict : undefined;
+  if (!Array.isArray(record.findings)) return verdict ? buildReviewSummary(verdict, []) : undefined;
+
+  const findings = record.findings
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+    .map((item) => {
+      const title = typeof item.title === "string" ? item.title.trim() : undefined;
+      const suggestion = typeof item.suggestion === "string" ? item.suggestion.trim() : undefined;
+      const file = typeof item.file === "string" ? item.file.trim() : undefined;
+      const line = typeof item.line === "number" && Number.isFinite(item.line) && item.line > 0 ? Math.floor(item.line) : undefined;
+      const textParts = [
+        title,
+        file ? `${file}${line ? `:${line}` : ""}` : undefined,
+        suggestion,
+      ].filter((value): value is string => !!value);
+      const text = textParts.join(" — ") || JSON.stringify(item);
+      return {
+        severity: normalizeFindingSeverity(item.severity, text),
+        text,
+        title,
+        file,
+        line,
+        suggestion,
+        mandatory: typeof item.mandatory === "boolean" ? item.mandatory : true,
+      } satisfies ReviewFinding;
+    });
+
+  return buildReviewSummary(verdict, findings);
+}
+
+export function parseReviewSummary(review: string): ReviewSummary {
+  const structured = parseStructuredReviewSummary(review);
+  if (structured) return structured;
+
+  const verdictMatch = /\b(APPROVE_WITH_NOTES|CHANGES_REQUESTED|APPROVE)\b/.exec(review);
+  const verdict = verdictMatch?.[1] as ReviewVerdict | undefined;
   const findingsSection = /##\s+Findings\s*\n([\s\S]*?)(?:\n##\s+|$)/i.exec(review)?.[1] ?? "";
   const findings = findingsSection
     .split(/\r?\n/)
@@ -874,16 +1059,7 @@ export function parseReviewSummary(review: string): ReviewSummary {
     .filter(Boolean)
     .map((text) => ({ severity: parseFindingSeverity(text), text }));
 
-  for (const finding of findings) {
-    severityCounts[finding.severity] += 1;
-  }
-
-  return {
-    verdict,
-    findingCount: findings.length,
-    severityCounts,
-    findings,
-  };
+  return buildReviewSummary(verdict, findings);
 }
 
 export function buildApplyReviewPrompt(input: ApplyReviewPromptInput): string {

@@ -278,18 +278,24 @@ pi -e ./extensions/prompt-autocomplete \
 ### What it adds
 
 - `/review-cycle <task>` or short alias `/rc <task>` starts a normal implementation request in the current agent.
+- Optional start flags: `--manual-apply`, `--until-approved`, `--max-review-rounds <n>`, and `--allow-dirty`.
 - After the implementation turn finishes, the extension spawns a separate `pi --mode json -p --no-session` reviewer process, so the reviewer has a fresh context window.
 - The reviewer receives the original task, the implementation summary, the baseline git commit/status, and current diff/status data. It can also inspect the workspace with read-only tools.
 - The reviewer subprocess is technically guarded: `read`, `grep`, `find`, `ls`, and `bash` are available, but `bash` only permits read-only git inspection commands such as `git status`, `git diff`, `git show`, `git log`, `git blame`, and `git ls-files`, plus common test commands such as `npm test`, `pnpm test`, `yarn test`, `bun test`, `pytest`, `cargo test`, and `go test`.
 - Mutating tools, arbitrary shell execution, unsafe shell/git arguments, and unknown/custom tools are blocked in the reviewer subprocess. Auto-discovered extensions are disabled for that subprocess; only the guard extension is loaded.
 - A preflight widget appears before the implementation starts, showing task, worker/reviewer model, test policy, git baseline, and auto-apply mode.
 - Reviewer text, tool calls, and tool results stream into a live widget while the review runs; use `/review-cycle output off|on|toggle` to hide or show it.
-- A compact review summary widget shows the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` still queue the apply pass.
+- A compact review summary widget shows the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` either queue the apply pass or wait for `/review-cycle apply` in manual mode.
+- The reviewer also returns a structured `## Review Data` JSON block, which the extension uses for robust checklist rendering.
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification when needed.
+- Review artifacts are written to `.pi/review-cycle/latest.md` and `.pi/review-cycle/runs/<timestamp>-<run-id>.md`.
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
+- `/review-cycle retry` retries a failed reviewer subprocess without discarding the implementation state.
 - `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands; `/review-cycle tests clear` restores the default safe test allowlist.
 - `/review-cycle status` shows a richer status line with phase step, live-refreshed elapsed time, reviewer, tests, and task; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow.
+- If the workspace is already dirty, the cycle pauses for `/review-cycle continue` or `/review-cycle abort` unless `--allow-dirty` or config `allowDirty` is set.
 - `/review-cycle help` or `/rc help` shows all commands and examples in a help widget.
+- Repo defaults can be stored in `.pi/review-cycle.json` with `reviewerModel`, `tests`, `manualApply`, `autoRerunAfterApply`, `maxReviewRounds`, and `allowDirty`.
 - Optional reviewer model selection via `--reviewer-model provider/model` or CLI flag `--review-cycle-reviewer-model provider/model`.
 
 ### Usage
@@ -306,11 +312,17 @@ Then inside pi:
 /review-cycle add input validation to the login form
 /rc add input validation to the login form
 /review-cycle on --reviewer-model anthropic/claude-sonnet-4-5 harden auth error handling
+/review-cycle --manual-apply review sensitive payment changes
+/review-cycle --until-approved --max-review-rounds 3 harden auth edge cases
+/review-cycle --allow-dirty include current workspace changes
 /review-cycle help
 /review-cycle status
 /review-cycle output off
 /review-cycle output on
 /review-cycle tests set npm test
+/review-cycle continue
+/review-cycle apply
+/review-cycle retry
 /review-cycle rerun
 /review-cycle stop
 ```
@@ -322,9 +334,22 @@ pi -e ./extensions/review-cycle \
   --review-cycle-task "add input validation to the login form"
 ```
 
+Repo config example:
+
+```json
+{
+  "reviewerModel": "anthropic/claude-sonnet-4-5",
+  "tests": ["npm test", "npm run lint"],
+  "manualApply": false,
+  "autoRerunAfterApply": false,
+  "maxReviewRounds": 2,
+  "allowDirty": false
+}
+```
+
 Notes:
 
-- For best change scoping, start from a clean git working tree. If the run starts dirty, the reviewer is warned that pre-existing changes may be included.
+- For best change scoping, start from a clean git working tree. If the run starts dirty, the extension pauses for an explicit continue/abort decision unless dirty runs are allowed.
 - If the implementation creates commits, the review still uses the baseline commit captured at start and reviews changes since that baseline.
 - The reviewer is instructed not to modify files and the runtime also enforces this by disabling auto-discovered extensions and loading a guard extension into the reviewer subprocess.
 
