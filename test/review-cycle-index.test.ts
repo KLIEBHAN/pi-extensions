@@ -5,13 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReviewCycleExtension, runFreshReviewAgent } from "../extensions/review-cycle/index.ts";
 
-function createHarness(options: { cwd?: string } = {}) {
+function createHarness(options: { cwd?: string; panelInputs?: string[] } = {}) {
   const handlers = new Map<string, Function>();
   const commands = new Map<string, { handler: Function }>();
   const sentMessages: Array<{ text: string; options?: unknown }> = [];
   const notifications: Array<{ message: string; level?: string }> = [];
   const statuses: Array<{ key: string; value: string | undefined }> = [];
   const widgets: Array<{ key: string; content: string[] | undefined; options?: unknown }> = [];
+  const overlays: Array<{ lines: string[]; options?: unknown }> = [];
   let sessionName: string | undefined;
   let aborted = false;
 
@@ -52,6 +53,22 @@ function createHarness(options: { cwd?: string } = {}) {
       setWidget: (key: string, content: string[] | undefined, options?: unknown) => {
         widgets.push({ key, content, options });
       },
+      custom: async (factory: Function, customOptions?: unknown) => {
+        let settled = false;
+        let finish: (value: unknown) => void = () => undefined;
+        const done = (value: unknown) => {
+          settled = true;
+          finish(value);
+        };
+        const result = new Promise((resolve) => {
+          finish = resolve;
+        });
+        const component = factory({ requestRender() {} }, {}, {}, done);
+        overlays.push({ lines: component.render(80), options: customOptions });
+        for (const input of options.panelInputs ?? []) component.handleInput?.(input);
+        if (!settled) done(undefined);
+        return await result;
+      },
     },
     isIdle: () => true,
     abort: () => {
@@ -68,6 +85,7 @@ function createHarness(options: { cwd?: string } = {}) {
     notifications,
     statuses,
     widgets,
+    overlays,
     get aborted() {
       return aborted;
     },
@@ -160,6 +178,21 @@ test("review-cycle registers /rc alias and shows command help", async () => {
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-help" && entry.content?.some((line) => line.includes("/rc <task>"))));
 });
 
+test("review-cycle panel renders an overlay and dispatches the selected action", async () => {
+  const harness = createHarness({ panelInputs: ["\r"] });
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("overlay task", harness.ctx);
+  await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
+
+  assert.ok(harness.overlays.some((entry) => entry.lines.some((line) => line.includes("Review-cycle panel"))));
+  assert.ok(harness.overlays.some((entry) => entry.lines.some((line) => line.includes("Hide reviewer output"))));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle panel action: Hide reviewer output")));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer output hidden")));
+});
+
 test("review-cycle streams reviewer output into a toggleable widget and queues apply prompt", async () => {
   const harness = createHarness();
   const reviewCalls: Array<{ prompt: string; cwd: string }> = [];
@@ -208,8 +241,8 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.equal(harness.sentMessages[0]?.text, "implement auth hardening");
   assert.equal(harness.statuses.at(-1)?.key, "review-cycle");
   assert.match(harness.statuses.at(-1)?.value ?? "", /Review 1\/3 implementing/);
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-preflight" && entry.content?.some((line) => line.includes("Review-cycle preflight"))));
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-preflight" && entry.content?.some((line) => line.includes("default safe test allowlist"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("Review-cycle status"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("default safe test allowlist"))));
 
   await harness.handlers.get("agent_end")?.({
     messages: [
@@ -236,7 +269,7 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("Starting fresh-context reviewer"))));
   assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("CHANGES_REQUESTED"))));
   assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("tests passed"))));
-  assert.ok(visibleWidgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("[ ] 1. HIGH"))));
+  assert.ok(visibleWidgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("[ ] 1. HIGH"))));
 
   await harness.commands.get("review-cycle")?.handler("output off", harness.ctx);
   assert.equal(harness.widgets.at(-1)?.key, "review-cycle-reviewer-output");
@@ -256,7 +289,7 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
     ],
   }, harness.ctx);
 
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("[x] 1. HIGH"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("[x] 1. HIGH"))));
 });
 
 test("review-cycle surfaces invalid structured review data and falls back to markdown", async () => {
@@ -286,8 +319,8 @@ test("review-cycle surfaces invalid structured review data and falls back to mar
     messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
   }, harness.ctx);
 
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("Review Data invalid"))));
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("fallback finding"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("Review Data invalid"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("fallback finding"))));
 });
 
 test("review-cycle fails closed when reviewer omits a recognized verdict", async () => {
@@ -320,7 +353,7 @@ test("review-cycle fails closed when reviewer omits a recognized verdict", async
 
   assert.equal(harness.sentMessages.length, 1);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("failed during fresh review") && entry.message.includes("recognized verdict")));
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("recognized verdict"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("recognized verdict"))));
 });
 
 test("review-cycle fresh review works when context signal is missing", async () => {
@@ -395,7 +428,7 @@ test("review-cycle ends without apply pass when reviewer approves", async () => 
   assert.equal(reviewCalls, 1);
   assert.equal(harness.sentMessages.length, 1);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("no apply pass"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("no apply pass"))));
 });
 
 test("review-cycle rerun reuses the previous task and honors configured test commands", async () => {
@@ -467,7 +500,7 @@ test("review-cycle pauses on dirty workspace until continue", async () => {
 
   assert.equal(harness.sentMessages.length, 0);
   assert.ok(harness.notifications.some((entry) => entry.message.includes("workspace already dirty")));
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-preflight" && entry.content?.some((line) => line.includes("continue or /review-cycle abort"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("continue or /review-cycle abort"))));
 
   await harness.commands.get("review-cycle")?.handler("continue", harness.ctx);
 
@@ -528,7 +561,7 @@ CHANGES_REQUESTED
     assert.deepEqual(allowedTestCommandSnapshots[0], ["CI=1 npm test"]);
     assert.ok(harness.notifications.some((entry) => entry.message.includes("Ignored unsafe configured reviewer test command: rm -rf .")));
     assert.equal(harness.sentMessages.length, 1);
-    assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("waiting for /review-cycle apply"))));
+    assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("waiting for /review-cycle apply"))));
 
     await harness.commands.get("review-cycle")?.handler("apply", harness.ctx);
     assert.equal(harness.sentMessages.length, 2);
@@ -666,7 +699,7 @@ test("review-cycle failed reviewer can be retried", async () => {
   }, harness.ctx);
 
   assert.equal(reviewCalls, 1);
-  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-review-summary" && entry.content?.some((line) => line.includes("reviewer failed"))));
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("model unavailable"))));
 
   await harness.commands.get("review-cycle")?.handler("retry", harness.ctx);
 

@@ -283,16 +283,17 @@ pi -e ./extensions/prompt-autocomplete \
 - The reviewer receives the original task, the implementation summary, the baseline git commit/status, and current diff/status data. It can also inspect the workspace with read-only tools.
 - The reviewer subprocess is technically guarded: `read`, `grep`, `find`, `ls`, and `bash` are available, but `bash` only permits read-only git inspection commands such as `git status`, `git diff`, `git show`, `git log`, `git blame`, and `git ls-files`, plus common test commands such as `npm test`, `pnpm test`, `yarn test`, `bun test`, `pytest`, `cargo test`, and `go test`.
 - Mutating tools, arbitrary shell execution, unsafe shell/git arguments, and unknown/custom tools are blocked in the reviewer subprocess. Auto-discovered extensions are disabled for that subprocess; only the guard extension is loaded.
-- A preflight widget appears before the implementation starts, showing task, worker/reviewer model, test policy, git baseline, and auto-apply mode.
+- A unified status-card widget appears throughout the workflow, showing phase, elapsed time, task, worker/reviewer model, test policy, git baseline, mode, latest review verdict/findings, artifact path, and the next suggested action.
+- `/review-cycle panel` opens an interactive overlay with the same run status plus contextual actions such as continue, apply, skip, retry, output toggle, artifact, and stop.
 - Reviewer text, tool calls, and tool results stream into a live widget while the review runs; use `/review-cycle output off|on|toggle` to hide or show it.
-- A compact review summary widget shows the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` either queue the apply pass or wait for `/review-cycle apply` in manual mode.
+- The status card includes the verdict, finding counts, next action, and a findings checklist. `APPROVE` ends the cycle without an apply pass; `APPROVE_WITH_NOTES` and `CHANGES_REQUESTED` either queue the apply pass or wait for `/review-cycle apply` in manual mode.
 - The reviewer also returns a structured `## Review Data` JSON block with `schemaVersion: 1`, which the extension uses for robust checklist rendering; invalid structured data is surfaced and falls back to Markdown parsing. Reviews without a recognized `APPROVE`, `APPROVE_WITH_NOTES`, or `CHANGES_REQUESTED` verdict fail closed and can be retried.
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification when needed.
 - Review artifacts are written atomically to `.pi/review-cycle/latest.md` and `.pi/review-cycle/runs/<timestamp>-<run-id>.md`; use `/review-cycle artifact` or `/review-cycle artifact path` to inspect them. Generated artifact files are ignored by git.
 - `/review-cycle rerun` reruns the fresh-context reviewer against the previous task and current workspace state.
 - `/review-cycle retry` retries a failed reviewer subprocess without discarding the implementation state.
 - `/review-cycle tests add <cmd>` and `/review-cycle tests set <cmd>` restrict reviewer test execution to configured exact commands and reject unsafe/non-test commands early; `/review-cycle tests clear` restores the default safe test allowlist.
-- `/review-cycle status` shows a richer status line with phase step, live-refreshed elapsed time, reviewer, tests, and task; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow and aborts an active reviewer subprocess. Reviewer subprocess shutdown escalates from `SIGTERM` to `SIGKILL` when a timed-out/aborted child does not exit.
+- `/review-cycle status` shows a richer status line with phase step, live-refreshed elapsed time, reviewer, tests, and task; `/review-cycle panel` opens the interactive status/action overlay; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow and aborts an active reviewer subprocess. Reviewer subprocess shutdown escalates from `SIGTERM` to `SIGKILL` when a timed-out/aborted child does not exit.
 - If the workspace is already dirty, the cycle pauses for `/review-cycle continue` or `/review-cycle abort` unless `--allow-dirty` or config `allowDirty` is set.
 - `/review-cycle help` or `/rc help` shows all commands and examples in a help widget.
 - Repo defaults can be stored in `.pi/review-cycle.json` with `reviewerModel`, `tests`, `manualApply`, `autoRerunAfterApply`, `maxReviewRounds`, and `allowDirty`; unsafe configured test commands are ignored with a warning.
@@ -317,6 +318,7 @@ Then inside pi:
 /review-cycle --allow-dirty include current workspace changes
 /review-cycle help
 /review-cycle status
+/review-cycle panel
 /review-cycle output off
 /review-cycle output on
 /review-cycle tests set npm test

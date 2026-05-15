@@ -124,6 +124,7 @@ export type ReviewCycleCommand =
       maxReviewRounds?: number;
     }
   | { kind: "help" }
+  | { kind: "panel" }
   | { kind: "status" }
   | { kind: "stop" }
   | { kind: "continue" }
@@ -422,6 +423,7 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
   const command = first.toLowerCase();
 
   if (command === "help" || command === "--help" || command === "-h") return { kind: "help" };
+  if (command === "panel") return rest.length === 0 ? { kind: "panel" } : { error: "Usage: /review-cycle panel" };
   if (command === "status") return { kind: "status" };
   if (command === "stop" || command === "off") return { kind: "stop" };
   if (command === "continue") return rest.length === 0 ? { kind: "continue" } : { error: "Usage: /review-cycle continue" };

@@ -32,6 +32,7 @@ import {
 const GIT_TIMEOUT_MS = 120_000;
 const MAX_REVIEWER_STDERR_CHARS = 4_000;
 const MAX_IMPLEMENTATION_SUMMARY_CHARS = 8_000;
+const STATUS_CARD_WIDGET_KEY = "review-cycle-status-card";
 const REVIEWER_OUTPUT_WIDGET_KEY = "review-cycle-reviewer-output";
 const REVIEWER_SUMMARY_WIDGET_KEY = "review-cycle-review-summary";
 const PREFLIGHT_WIDGET_KEY = "review-cycle-preflight";
@@ -74,6 +75,8 @@ interface ReviewCycleState {
   reviewRound: number;
   allowDirty: boolean;
   artifactRunPath?: string;
+  statusCardAction?: string;
+  statusCardChecklistMode?: "pending" | "handled";
 }
 
 interface FreshReviewResult {
@@ -126,6 +129,13 @@ interface ReviewCycleDependencies {
   getGitBaseline?: typeof getGitBaseline;
   getChangeSnapshot?: typeof getChangeSnapshot;
   runFreshReviewAgent?: typeof runFreshReviewAgent;
+}
+
+interface ReviewCyclePanelAction {
+  id: string;
+  label: string;
+  description: string;
+  command?: string;
 }
 
 function makeRunId(): string {
@@ -190,10 +200,16 @@ function formatStatusLine(state: ReviewCycleState): string {
 function setStatus(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState | undefined): void {
   if (!state?.active) {
     ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
+    clearStatusCardWidget(ctx);
     return;
   }
 
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, formatStatusLine(state));
+  updateStatusCardWidget(ctx, state);
+}
+
+function clearStatusCardWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
+  ctx.ui.setWidget(STATUS_CARD_WIDGET_KEY, undefined);
 }
 
 function clearReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
@@ -216,6 +232,7 @@ function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: {
   abortActiveReviewer(stateRef.current);
   stateRef.current = undefined;
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
+  clearStatusCardWidget(ctx);
   clearReviewerOutputWidget(ctx);
   clearReviewerSummaryWidget(ctx);
   clearPreflightWidget(ctx);
@@ -266,46 +283,81 @@ function formatReviewerLabel(state: Pick<ReviewCycleState, "reviewerModel" | "re
   return state.reviewerModel ? `${modelRefToCli(state.reviewerModel)} (${source})` : "active model at review time";
 }
 
-function updatePreflightWidget(
-  ctx: ExtensionContext | ExtensionCommandContext,
-  state: ReviewCycleState,
-  workerModel: ModelRef | undefined,
-): void {
-  const gitLine = state.baseline.isGitRepo
+function formatGitLine(state: ReviewCycleState): string {
+  return state.baseline.isGitRepo
     ? `${state.baseline.dirty ? "dirty" : "clean"}${state.baseline.head ? ` · ${state.baseline.head.slice(0, 12)}` : ""}`
     : "not a git repository";
+}
+
+function getDefaultStatusCardAction(state: ReviewCycleState): string {
+  switch (state.phase) {
+    case "confirming":
+      return "/review-cycle continue or /review-cycle abort";
+    case "implementing":
+      return "waiting for implementation agent to finish";
+    case "reviewing":
+      return "/review-cycle output toggle, /review-cycle panel, or /review-cycle stop";
+    case "manual":
+      return "/review-cycle apply or /review-cycle skip";
+    case "applying":
+      return "waiting for apply pass to finish";
+    case "failed":
+      return "/review-cycle retry or /review-cycle stop";
+  }
+}
+
+function updateStatusCardWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
+  const phase = getPhaseStatus(state);
+  const workerModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+  const summary = state.reviewSummary;
+  const mandatoryFindings = summary?.findings.filter((finding) => finding.mandatory !== false).length ?? 0;
   const warnings = [
     !state.baseline.isGitRepo ? "Warning: git change scoping is degraded." : undefined,
     state.baseline.isGitRepo && state.baseline.dirty ? "Warning: workspace was already dirty before start." : undefined,
+    state.lastReviewError ? `Last error: ${truncateMiddle(state.lastReviewError, 700)}` : undefined,
   ].filter((line): line is string => !!line);
+  const checklistMode = state.statusCardChecklistMode ?? (state.phase === "applying" || !state.active ? "handled" : "pending");
 
   ctx.ui.setWidget(
-    PREFLIGHT_WIDGET_KEY,
+    STATUS_CARD_WIDGET_KEY,
     [
-      "Review-cycle preflight",
+      "Review-cycle status",
+      `${formatStatusLine(state)} · round ${Math.max(0, state.reviewRound)}/${state.maxReviewRounds}`,
+      `Phase: ${phase.label}`,
       `Task: ${summarizeTask(state.task, 140)}`,
       `Worker: ${workerModel ? modelRefToCli(workerModel) : "selected model"}`,
       `Reviewer: ${formatReviewerLabel(state)}`,
       `Tests: ${formatTestPolicy(state.allowedTestCommands)} (${state.testPolicySource})`,
-      `Git: ${gitLine}`,
+      `Git: ${formatGitLine(state)}`,
       `Mode: implement → fresh review → ${state.manualApply ? "wait for /review-cycle apply" : "auto-apply unless APPROVE"}${state.autoRerunAfterApply ? ` → rerun until approved (max ${state.maxReviewRounds} reviews)` : ""}`,
-      state.phase === "confirming" ? "Action: workspace is dirty; use /review-cycle continue or /review-cycle abort." : undefined,
+      summary ? `Review: ${summary.verdict ?? "UNKNOWN"} · findings ${summary.findingCount} · mandatory ${mandatoryFindings}` : undefined,
+      summary?.reviewDataWarning,
+      ...(summary ? formatFindingsChecklist(summary, checklistMode) : []),
+      state.artifactRunPath ? `Artifact: ${state.artifactRunPath}` : undefined,
+      `Next: ${state.statusCardAction ?? getDefaultStatusCardAction(state)}`,
       ...warnings,
-    ].filter((line): line is string => !!line),
+    ].flat().filter((line): line is string => !!line).map((line) => truncateLine(line)),
     { placement: "belowEditor" },
   );
 }
 
+function updatePreflightWidget(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  state: ReviewCycleState,
+  _workerModel: ModelRef | undefined,
+): void {
+  state.statusCardAction = state.phase === "confirming"
+    ? "/review-cycle continue or /review-cycle abort"
+    : "implementation phase running";
+  updateStatusCardWidget(ctx, state);
+  clearPreflightWidget(ctx);
+}
+
 function updateFailureWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
-  ctx.ui.setWidget(
-    REVIEWER_SUMMARY_WIDGET_KEY,
-    [
-      "Review-cycle reviewer failed",
-      `Error: ${truncateMiddle(state.lastReviewError ?? "unknown error", 800)}`,
-      "Next: /review-cycle retry, /review-cycle retry --reviewer-model provider/model, /review-cycle output on, or /review-cycle stop",
-    ],
-    { placement: "belowEditor" },
-  );
+  state.statusCardAction = "/review-cycle retry, /review-cycle retry --reviewer-model provider/model, /review-cycle output on, or /review-cycle stop";
+  state.statusCardChecklistMode = "pending";
+  updateStatusCardWidget(ctx, state);
+  clearReviewerSummaryWidget(ctx);
 }
 
 function showHelp(ctx: ExtensionCommandContext): void {
@@ -321,6 +373,7 @@ function showHelp(ctx: ExtensionCommandContext): void {
       "/review-cycle continue|abort  — decide after a dirty-workspace preflight pause",
       "/review-cycle apply|skip  — continue or finish a manual-apply review",
       "/review-cycle retry [--reviewer-model provider/model]  — retry a failed reviewer subprocess",
+      "/review-cycle panel  — open interactive status/action overlay",
       "/review-cycle status  — show phase, elapsed time, reviewer, tests, task",
       "/review-cycle rerun [--reviewer-model provider/model]  — rerun fresh review for the last task",
       "/review-cycle output off|on|toggle  — hide/show live reviewer output",
@@ -332,16 +385,6 @@ function showHelp(ctx: ExtensionCommandContext): void {
     { placement: "belowEditor" },
   );
   ctx.ui.notify("Review-cycle help shown", "info");
-}
-
-function formatReviewSummary(summary: ReviewSummary): string[] {
-  const severityParts = Object.entries(summary.severityCounts)
-    .filter(([, count]) => count > 0)
-    .map(([severity, count]) => `${count} ${severity}`);
-  return [
-    `Verdict: ${summary.verdict ?? "UNKNOWN"}`,
-    `Findings: ${summary.findingCount}${severityParts.length > 0 ? ` (${severityParts.join(", ")})` : ""}`,
-  ];
 }
 
 function formatFindingsChecklist(summary: ReviewSummary, mode: "pending" | "handled"): string[] {
@@ -362,21 +405,15 @@ function formatFindingsChecklist(summary: ReviewSummary, mode: "pending" | "hand
 
 function updateReviewSummaryWidget(
   ctx: ExtensionContext | ExtensionCommandContext,
+  state: ReviewCycleState,
   summary: ReviewSummary,
   action: string,
   checklistMode: "pending" | "handled" = "pending",
 ): void {
-  ctx.ui.setWidget(
-    REVIEWER_SUMMARY_WIDGET_KEY,
-    [
-      "Fresh reviewer summary",
-      ...formatReviewSummary(summary),
-      ...(summary.reviewDataWarning ? [summary.reviewDataWarning] : []),
-      ...formatFindingsChecklist(summary, checklistMode),
-      `Next: ${action}`,
-    ],
-    { placement: "belowEditor" },
-  );
+  state.statusCardAction = action;
+  state.statusCardChecklistMode = checklistMode;
+  updateStatusCardWidget(ctx, state);
+  clearReviewerSummaryWidget(ctx);
 }
 
 function updateReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
@@ -412,6 +449,187 @@ function appendReviewerOutputChunkAndRender(
 ): void {
   appendReviewerOutputChunk(state, chunk);
   updateReviewerOutputWidget(ctx, state);
+}
+
+function truncatePanelLine(text: string, width: number): string {
+  if (width <= 0) return "";
+  return text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`;
+}
+
+function matchesPanelInput(data: string, ...keys: string[]): boolean {
+  return keys.some((key) => {
+    if (key === "up") return data === "up" || data === "\u001b[A";
+    if (key === "down") return data === "down" || data === "\u001b[B";
+    if (key === "enter") return data === "enter" || data === "return" || data === "\r" || data === "\n";
+    if (key === "escape") return data === "escape" || data === "\u001b";
+    return data === key;
+  });
+}
+
+function buildPanelStatusLines(state: ReviewCycleState | undefined, lastRun: LastReviewCycleRun | undefined): string[] {
+  if (!state?.active) {
+    return [
+      "No active review-cycle run.",
+      lastRun ? `Last task: ${summarizeTask(lastRun.task, 100)}` : "Last task: (none)",
+    ];
+  }
+  const phase = getPhaseStatus(state);
+  const lines = [
+    formatStatusLine(state),
+    `Phase: ${phase.label}`,
+    `Task: ${summarizeTask(state.task, 100)}`,
+    `Reviewer: ${formatReviewerLabel(state)}`,
+    `Tests: ${formatTestPolicy(state.allowedTestCommands)}`,
+    `Git: ${formatGitLine(state)}`,
+  ];
+  if (state.reviewSummary) {
+    const mandatoryFindings = state.reviewSummary.findings.filter((finding) => finding.mandatory !== false).length;
+    lines.push(`Review: ${state.reviewSummary.verdict ?? "UNKNOWN"} · findings ${state.reviewSummary.findingCount} · mandatory ${mandatoryFindings}`);
+  }
+  if (state.lastReviewError) lines.push(`Last error: ${truncateMiddle(state.lastReviewError, 220)}`);
+  return lines;
+}
+
+function buildPanelActions(state: ReviewCycleState | undefined, lastRun: LastReviewCycleRun | undefined): ReviewCyclePanelAction[] {
+  const actions: ReviewCyclePanelAction[] = [];
+  if (state?.active) {
+    if (state.phase === "confirming") {
+      actions.push(
+        { id: "continue", label: "Continue with dirty workspace", description: "Start implementation despite pre-existing changes", command: "continue" },
+        { id: "abort", label: "Abort run", description: "Cancel this paused run", command: "abort" },
+      );
+    }
+    if (state.phase === "manual") {
+      actions.push(
+        { id: "apply", label: "Apply review feedback", description: "Queue the apply pass", command: "apply" },
+        { id: "skip", label: "Skip apply pass", description: "Finish this run without applying feedback", command: "skip" },
+      );
+    }
+    if (state.phase === "failed") {
+      actions.push({ id: "retry", label: "Retry reviewer", description: "Retry the failed fresh-context reviewer", command: "retry" });
+    }
+    actions.push(
+      { id: "output-toggle", label: state.reviewerOutputVisible ? "Hide reviewer output" : "Show reviewer output", description: "Toggle the live reviewer log widget", command: "output toggle" },
+      { id: "stop", label: "Stop run", description: "Cancel the active review-cycle run", command: "stop" },
+    );
+  } else if (lastRun) {
+    actions.push({ id: "rerun", label: "Rerun last review", description: "Run a fresh review for the previous task", command: "rerun" });
+  }
+
+  actions.push(
+    { id: "artifact", label: "Show latest artifact", description: "Open the latest review-cycle artifact widget", command: "artifact" },
+    { id: "artifact-path", label: "Copy/show artifact path", description: "Notify the latest artifact path", command: "artifact path" },
+    { id: "close", label: "Close panel", description: "Dismiss this overlay" },
+  );
+  return actions;
+}
+
+class ReviewCyclePanelComponent {
+  private selectedIndex = 0;
+  private readonly state: ReviewCycleState | undefined;
+  private readonly lastRun: LastReviewCycleRun | undefined;
+  private readonly actions: readonly ReviewCyclePanelAction[];
+  private readonly requestRender: () => void;
+  private readonly done: (actionId: string | undefined) => void;
+
+  constructor(
+    state: ReviewCycleState | undefined,
+    lastRun: LastReviewCycleRun | undefined,
+    actions: readonly ReviewCyclePanelAction[],
+    requestRender: () => void,
+    done: (actionId: string | undefined) => void,
+  ) {
+    this.state = state;
+    this.lastRun = lastRun;
+    this.actions = actions;
+    this.requestRender = requestRender;
+    this.done = done;
+  }
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(24, width);
+    const innerWidth = Math.max(1, safeWidth - 4);
+    const border = `╭${"─".repeat(Math.max(0, safeWidth - 2))}╮`;
+    const bottom = `╰${"─".repeat(Math.max(0, safeWidth - 2))}╯`;
+    const row = (text = "") => `│ ${truncatePanelLine(text, innerWidth).padEnd(innerWidth, " ")} │`;
+    const lines = [
+      border,
+      row("Review-cycle panel"),
+      row("↑↓ navigate • enter run action • esc/q close"),
+      row(),
+      ...buildPanelStatusLines(this.state, this.lastRun).map((line) => row(line)),
+      row(),
+      row("Actions"),
+      ...this.actions.map((action, index) => {
+        const marker = index === this.selectedIndex ? "›" : " ";
+        return row(`${marker} ${action.label} — ${action.description}`);
+      }),
+      bottom,
+    ];
+    return lines.map((line) => truncatePanelLine(line, safeWidth));
+  }
+
+  handleInput(data: string): void {
+    if (matchesPanelInput(data, "escape") || data === "q" || data === "Q") {
+      this.done(undefined);
+      return;
+    }
+    if (matchesPanelInput(data, "up")) {
+      this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+      this.requestRender();
+      return;
+    }
+    if (matchesPanelInput(data, "down")) {
+      this.selectedIndex = Math.min(this.actions.length - 1, this.selectedIndex + 1);
+      this.requestRender();
+      return;
+    }
+    if (matchesPanelInput(data, "enter")) {
+      this.done(this.actions[this.selectedIndex]?.id);
+    }
+  }
+
+  invalidate(): void {}
+}
+
+async function showReviewCyclePanel(
+  ctx: ExtensionCommandContext,
+  state: ReviewCycleState | undefined,
+  lastRun: LastReviewCycleRun | undefined,
+): Promise<string | undefined> {
+  if (state?.active) updateStatusCardWidget(ctx, state);
+  const custom = (ctx.ui as { custom?: Function }).custom;
+  if (typeof custom !== "function") {
+    ctx.ui.notify("Review-cycle panel overlay is not available in this UI; showing the status card instead", "warning");
+    return undefined;
+  }
+
+  const actions = buildPanelActions(state, lastRun);
+  const selectedActionId = await custom.call(
+    ctx.ui,
+    (tui: { requestRender?: () => void } | undefined, _theme: unknown, _keybindings: unknown, done: (actionId: string | undefined) => void) => new ReviewCyclePanelComponent(
+      state,
+      lastRun,
+      actions,
+      () => tui?.requestRender?.(),
+      done,
+    ),
+    {
+      overlay: true,
+      overlayOptions: {
+        width: "72%",
+        minWidth: 56,
+        maxHeight: "85%",
+        anchor: "right-center",
+        margin: 1,
+      },
+    },
+  );
+
+  const action = actions.find((candidate) => candidate.id === selectedActionId);
+  if (!action?.command) return undefined;
+  ctx.ui.notify(`Review-cycle panel action: ${action.label}`, "info");
+  return action.command;
 }
 
 function createCombinedAbortSignal(signals: readonly (AbortSignal | undefined)[]): { signal: AbortSignal; cleanup: () => void } {
@@ -1081,6 +1299,8 @@ async function runReviewAndQueueApply(
 ): Promise<void> {
   state.phase = "reviewing";
   state.lastReviewError = undefined;
+  state.statusCardAction = undefined;
+  state.statusCardChecklistMode = undefined;
   state.reviewRound += 1;
   state.reviewerOutputLines = [];
   clearPreflightWidget(ctx);
@@ -1150,21 +1370,21 @@ async function runReviewAndQueueApply(
   if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
 
   if (summary.verdict === "APPROVE") {
-    updateReviewSummaryWidget(ctx, summary, "done; no apply pass needed", "handled");
+    updateReviewSummaryWidget(ctx, state, summary, "done; no apply pass needed", "handled");
     finishState(ctx, stateRef);
     ctx.ui.notify("Review-cycle: reviewer approved; no apply pass needed", "info");
     return;
   }
 
   if (state.manualApply) {
-    updateReviewSummaryWidget(ctx, summary, "waiting for /review-cycle apply or /review-cycle skip", "pending");
+    updateReviewSummaryWidget(ctx, state, summary, "waiting for /review-cycle apply or /review-cycle skip", "pending");
     state.phase = "manual";
     setStatus(ctx, state);
     ctx.ui.notify("Review-cycle: review complete; waiting for /review-cycle apply or /review-cycle skip", "info");
     return;
   }
 
-  updateReviewSummaryWidget(ctx, summary, "applying feedback", "pending");
+  updateReviewSummaryWidget(ctx, state, summary, "applying feedback", "pending");
   state.phase = "applying";
   setStatus(ctx, state);
   ctx.ui.notify("Review-cycle: fresh review complete; applying feedback", "info");
@@ -1179,7 +1399,7 @@ function queueManualApply(pi: ExtensionAPI, ctx: ExtensionCommandContext, state:
   }
   state.phase = "applying";
   setStatus(ctx, state);
-  if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "applying feedback", "pending");
+  if (state.reviewSummary) updateReviewSummaryWidget(ctx, state, state.reviewSummary, "applying feedback", "pending");
   ctx.ui.notify("Review-cycle: applying manually approved review feedback", "info");
   pi.sendUserMessage(buildApplyReviewPrompt({ task: state.task, review: state.review }));
 }
@@ -1190,7 +1410,7 @@ async function skipManualApply(ctx: ExtensionCommandContext, stateRef: { current
     ctx.ui.notify("No manual review feedback is waiting to skip", "info");
     return;
   }
-  if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "skipped by user", "handled");
+  if (state.reviewSummary) updateReviewSummaryWidget(ctx, state, state.reviewSummary, "skipped by user", "handled");
   await writeReviewArtifact(ctx.cwd, state, "manual-apply-skipped");
   if (stateRef.current !== state || !state.active || state.phase !== "manual") return;
   finishState(ctx, stateRef);
@@ -1330,6 +1550,12 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
 
       if (parsed.kind === "help") {
         showHelp(ctx);
+        return;
+      }
+
+      if (parsed.kind === "panel") {
+        const panelCommand = await showReviewCyclePanel(ctx, stateRef.current, lastRun);
+        if (panelCommand) await handleReviewCycleCommand(panelCommand, ctx);
         return;
       }
 
@@ -1566,14 +1792,14 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
     if (state.phase === "applying") {
       const beforeApplyFingerprint = changeSnapshotFingerprint(state.lastChanges);
       state.applySummary = truncateMiddle(assistantTurn.text, MAX_IMPLEMENTATION_SUMMARY_CHARS);
-      if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "apply pass finished", "handled");
+      if (state.reviewSummary) updateReviewSummaryWidget(ctx, state, state.reviewSummary, "apply pass finished", "handled");
       const afterApplyChanges = await getChangeSnapshotImpl(pi, ctx.cwd, state.baseline).catch(() => undefined);
       if (stateRef.current !== state || !state.active || state.phase !== "applying") return;
       const applyMadeNoWorkspaceChanges = !!afterApplyChanges && !!beforeApplyFingerprint && changeSnapshotFingerprint(afterApplyChanges) === beforeApplyFingerprint;
       if (afterApplyChanges) state.lastChanges = afterApplyChanges;
 
       if (state.autoRerunAfterApply && state.reviewRound < state.maxReviewRounds && applyMadeNoWorkspaceChanges) {
-        if (state.reviewSummary) updateReviewSummaryWidget(ctx, state.reviewSummary, "stopped: apply pass made no workspace changes", "handled");
+        if (state.reviewSummary) updateReviewSummaryWidget(ctx, state, state.reviewSummary, "stopped: apply pass made no workspace changes", "handled");
         await writeReviewArtifact(ctx.cwd, state, "stopped-no-change-after-apply");
         if (stateRef.current !== state || !state.active || state.phase !== "applying") return;
         finishState(ctx, stateRef);
