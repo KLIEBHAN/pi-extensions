@@ -236,6 +236,44 @@ test("review-cycle status card is hidden by default and can be toggled from the 
   assert.ok(latestWidgetContent(harness, "review-cycle-status-card")?.some((line) => line.includes("toggle status card from panel")));
 });
 
+test("review-cycle inactive status-card toggle honors repo config default", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-config-toggle-"));
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "review-cycle.json"), JSON.stringify({ statusCardVisible: true }), "utf8");
+    const harness = createHarness({ cwd });
+    createReviewCycleExtension({
+      getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    })(harness.pi as never);
+
+    await harness.commands.get("review-cycle")?.handler("status-card toggle", harness.ctx);
+
+    assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle status card hidden")));
+
+    await harness.commands.get("review-cycle")?.handler("config default should now be hidden", harness.ctx);
+
+    assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("review-cycle panel fallback shows the status card when custom UI is unavailable", async () => {
+  const harness = createHarness();
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("fallback panel task", harness.ctx);
+  assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+
+  (harness.ctx.ui as { custom?: unknown }).custom = undefined;
+  await harness.commands.get("review-cycle")?.handler("panel", harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("panel overlay is not available")));
+  assert.ok(latestWidgetContent(harness, "review-cycle-status-card")?.some((line) => line.includes("fallback panel task")));
+});
+
 test("review-cycle inactive panel shows the rerun target", async () => {
   const harness = createHarness({ panelInputs: ["\r"] });
   let reviewCalls = 0;

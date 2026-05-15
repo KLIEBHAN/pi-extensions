@@ -1792,7 +1792,8 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       }
 
       if (parsed.kind === "status-card") {
-        const nextVisible = parsed.mode === "toggle" ? !(stateRef.current?.statusCardVisible ?? preferences.statusCardVisible ?? false) : parsed.mode === "on";
+        const currentVisible = stateRef.current?.statusCardVisible ?? preferences.statusCardVisible ?? repoConfig.statusCardVisible ?? false;
+        const nextVisible = parsed.mode === "toggle" ? !currentVisible : parsed.mode === "on";
         preferences.statusCardVisible = nextVisible;
         if (stateRef.current) {
           stateRef.current.statusCardVisible = nextVisible;
