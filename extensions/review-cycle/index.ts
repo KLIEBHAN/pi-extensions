@@ -29,6 +29,9 @@ import {
 const GIT_TIMEOUT_MS = 120_000;
 const MAX_REVIEWER_STDERR_CHARS = 4_000;
 const MAX_IMPLEMENTATION_SUMMARY_CHARS = 8_000;
+const REVIEWER_OUTPUT_WIDGET_KEY = "review-cycle-reviewer-output";
+const MAX_REVIEWER_OUTPUT_LINES = 80;
+const MAX_REVIEWER_OUTPUT_LINE_CHARS = 240;
 
 interface ReviewCycleState {
   active: boolean;
@@ -40,6 +43,8 @@ interface ReviewCycleState {
   reviewerModel?: ModelRef;
   implementationSummary?: string;
   review?: string;
+  reviewerOutputVisible: boolean;
+  reviewerOutputLines: string[];
 }
 
 interface FreshReviewResult {
@@ -52,6 +57,10 @@ interface FreshReviewResult {
 interface AssistantTurn {
   text: string;
   stopReason: string | undefined;
+}
+
+interface ReviewCyclePreferences {
+  reviewerOutputVisible: boolean;
 }
 
 function makeRunId(): string {
@@ -90,9 +99,79 @@ function setStatus(ctx: ExtensionContext | ExtensionCommandContext, state: Revie
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, `Review ${phase}: ${summarizeTask(state.task, 36)}`);
 }
 
+function clearReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
+  ctx.ui.setWidget(REVIEWER_OUTPUT_WIDGET_KEY, undefined);
+}
+
 function clearState(ctx: ExtensionContext | ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): void {
   stateRef.current = undefined;
   ctx.ui.setStatus(REVIEW_CYCLE_STATUS_KEY, undefined);
+  clearReviewerOutputWidget(ctx);
+}
+
+function truncateLine(text: string): string {
+  return text.length <= MAX_REVIEWER_OUTPUT_LINE_CHARS ? text : `${text.slice(0, MAX_REVIEWER_OUTPUT_LINE_CHARS - 1)}…`;
+}
+
+function pushReviewerOutputLine(state: ReviewCycleState, line: string): void {
+  state.reviewerOutputLines.push(truncateLine(line));
+  if (state.reviewerOutputLines.length > MAX_REVIEWER_OUTPUT_LINES) {
+    state.reviewerOutputLines.splice(0, state.reviewerOutputLines.length - MAX_REVIEWER_OUTPUT_LINES);
+  }
+}
+
+function appendReviewerOutputChunk(state: ReviewCycleState, chunk: string): void {
+  const normalized = chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const parts = normalized.split("\n");
+
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index]!;
+    if (index === 0 && state.reviewerOutputLines.length > 0) {
+      const lastIndex = state.reviewerOutputLines.length - 1;
+      state.reviewerOutputLines[lastIndex] = truncateLine(`${state.reviewerOutputLines[lastIndex]}${part}`);
+    } else {
+      pushReviewerOutputLine(state, part);
+    }
+
+    if (index < parts.length - 1) {
+      pushReviewerOutputLine(state, "");
+    }
+  }
+}
+
+function updateReviewerOutputWidget(ctx: ExtensionContext | ExtensionCommandContext, state: ReviewCycleState): void {
+  if (!state.reviewerOutputVisible) {
+    clearReviewerOutputWidget(ctx);
+    return;
+  }
+
+  const lines = state.reviewerOutputLines.length > 0 ? state.reviewerOutputLines : ["(waiting for reviewer output...)"];
+  ctx.ui.setWidget(
+    REVIEWER_OUTPUT_WIDGET_KEY,
+    [
+      `Fresh reviewer output — /review-cycle output off to hide (${lines.length} line${lines.length === 1 ? "" : "s"})`,
+      ...lines.slice(-MAX_REVIEWER_OUTPUT_LINES),
+    ],
+    { placement: "belowEditor" },
+  );
+}
+
+function appendReviewerOutputLineAndRender(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  state: ReviewCycleState,
+  line: string,
+): void {
+  pushReviewerOutputLine(state, line);
+  updateReviewerOutputWidget(ctx, state);
+}
+
+function appendReviewerOutputChunkAndRender(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  state: ReviewCycleState,
+  chunk: string,
+): void {
+  appendReviewerOutputChunk(state, chunk);
+  updateReviewerOutputWidget(ctx, state);
 }
 
 function getLastAssistantTurn(event: { messages?: unknown[] }): AssistantTurn | undefined {
@@ -245,6 +324,8 @@ async function runFreshReviewAgent(options: {
   reviewerModel?: ModelRef;
   signal?: AbortSignal;
   timeoutMs?: number;
+  onOutput?: (chunk: string) => void;
+  onLine?: (line: string) => void;
 }): Promise<FreshReviewResult> {
   const temp = await writeReviewerRuntimeFiles();
   const args = [
@@ -287,12 +368,55 @@ async function runFreshReviewAgent(options: {
         reject(error);
       };
 
+      const getEventTextDelta = (event: any): string | undefined => {
+        const messageEvent = event?.assistantMessageEvent;
+        if (!messageEvent || messageEvent.type !== "text_delta") return undefined;
+        if (typeof messageEvent.delta === "string") return messageEvent.delta;
+        if (typeof messageEvent.delta?.text === "string") return messageEvent.delta.text;
+        if (typeof messageEvent.text === "string") return messageEvent.text;
+        return undefined;
+      };
+
+      const getToolResultText = (result: any): string => {
+        const content = result?.content;
+        if (typeof content === "string") return content;
+        if (!Array.isArray(content)) return "";
+        return content
+          .map((part) => typeof part?.text === "string" ? part.text : "")
+          .filter(Boolean)
+          .join("\n");
+      };
+
       const processLine = (line: string) => {
         if (!line.trim()) return;
         let event: any;
         try {
           event = JSON.parse(line);
         } catch {
+          return;
+        }
+
+        if (event.type === "message_update") {
+          const delta = getEventTextDelta(event);
+          if (delta) options.onOutput?.(delta);
+          return;
+        }
+
+        if (event.type === "tool_execution_start") {
+          const argsText = event.args ? JSON.stringify(event.args) : "";
+          options.onLine?.(`→ ${event.toolName}${argsText ? ` ${truncateMiddle(argsText, 220)}` : ""}`);
+          return;
+        }
+
+        if (event.type === "tool_execution_end") {
+          const icon = event.isError ? "✗" : "✓";
+          options.onLine?.(`${icon} ${event.toolName}`);
+          const resultText = truncateMiddle(getToolResultText(event.result), 1_200).trim();
+          if (resultText) {
+            for (const resultLine of resultText.split(/\r?\n/).slice(0, 12)) {
+              options.onLine?.(`  ${resultLine}`);
+            }
+          }
           return;
         }
 
@@ -331,7 +455,11 @@ async function runFreshReviewAgent(options: {
       });
 
       proc.stderr.on("data", (data) => {
-        stderr += data.toString();
+        const text = data.toString();
+        stderr += text;
+        for (const line of text.split(/\r?\n/).filter(Boolean)) {
+          options.onLine?.(`stderr: ${line}`);
+        }
       });
 
       proc.on("error", (error) => {
@@ -385,6 +513,7 @@ async function startReviewCycle(
   pi: ExtensionAPI,
   ctx: ExtensionContext | ExtensionCommandContext,
   stateRef: { current?: ReviewCycleState },
+  preferences: ReviewCyclePreferences,
   task: string,
   reviewerModel: ModelRef | undefined,
 ): Promise<void> {
@@ -427,6 +556,8 @@ async function startReviewCycle(
     startedAt: Date.now(),
     baseline,
     reviewerModel,
+    reviewerOutputVisible: preferences.reviewerOutputVisible,
+    reviewerOutputLines: [],
   };
 
   stateRef.current = state;
@@ -453,7 +584,9 @@ async function runReviewAndQueueApply(
   state: ReviewCycleState,
 ): Promise<void> {
   state.phase = "reviewing";
+  state.reviewerOutputLines = [];
   setStatus(ctx, state);
+  appendReviewerOutputLineAndRender(ctx, state, "Starting fresh-context reviewer...");
   ctx.ui.notify("Review-cycle: starting fresh-context review", "info");
 
   const changes = await getChangeSnapshot(pi, ctx.cwd, state.baseline).catch((error) => ({
@@ -480,11 +613,18 @@ async function runReviewAndQueueApply(
     prompt: reviewerPrompt,
     reviewerModel,
     signal: ctx.signal,
+    onOutput: (chunk) => {
+      if (stateRef.current === state) appendReviewerOutputChunkAndRender(ctx, state, chunk);
+    },
+    onLine: (line) => {
+      if (stateRef.current === state) appendReviewerOutputLineAndRender(ctx, state, line);
+    },
   });
 
   if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
 
   state.review = result.text.trim() || "Reviewer returned no text.";
+  appendReviewerOutputLineAndRender(ctx, state, "Fresh-context reviewer finished.");
   state.phase = "applying";
   setStatus(ctx, state);
   ctx.ui.notify("Review-cycle: fresh review complete; applying feedback", "info");
@@ -507,6 +647,7 @@ function showStatus(ctx: ExtensionCommandContext, state: ReviewCycleState | unde
 
 export default function (pi: ExtensionAPI) {
   const stateRef: { current?: ReviewCycleState } = {};
+  const preferences: ReviewCyclePreferences = { reviewerOutputVisible: true };
 
   pi.registerFlag("review-cycle-task", {
     description: "Auto-start a review-cycle run with this task",
@@ -543,7 +684,20 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      await startReviewCycle(pi, ctx, stateRef, parsed.task, parsed.reviewerModel);
+      if (parsed.kind === "output") {
+        const nextVisible = parsed.mode === "toggle" ? !preferences.reviewerOutputVisible : parsed.mode === "on";
+        preferences.reviewerOutputVisible = nextVisible;
+        if (stateRef.current?.active) {
+          stateRef.current.reviewerOutputVisible = nextVisible;
+          updateReviewerOutputWidget(ctx, stateRef.current);
+        } else if (!nextVisible) {
+          clearReviewerOutputWidget(ctx);
+        }
+        ctx.ui.notify(`Review-cycle reviewer output ${nextVisible ? "shown" : "hidden"}`, "info");
+        return;
+      }
+
+      await startReviewCycle(pi, ctx, stateRef, preferences, parsed.task, parsed.reviewerModel);
     },
   });
 
@@ -563,7 +717,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    await startReviewCycle(pi, ctx, stateRef, taskFlag.trim(), reviewerModel);
+    await startReviewCycle(pi, ctx, stateRef, preferences, taskFlag.trim(), reviewerModel);
   });
 
   pi.on("before_agent_start", async (event) => {

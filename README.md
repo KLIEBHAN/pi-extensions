@@ -280,10 +280,11 @@ pi -e ./extensions/prompt-autocomplete \
 - `/review-cycle <task>` starts a normal implementation request in the current agent.
 - After the implementation turn finishes, the extension spawns a separate `pi --mode json -p --no-session` reviewer process, so the reviewer has a fresh context window.
 - The reviewer receives the original task, the implementation summary, the baseline git commit/status, and current diff/status data. It can also inspect the workspace with read-only tools.
-- The reviewer subprocess is technically guarded: `read`, `grep`, `find`, `ls`, and `bash` are available, but `bash` only permits read-only git inspection commands such as `git status`, `git diff`, `git show`, `git log`, `git blame`, and `git ls-files`.
-- Mutating tools, non-git shell execution, unsafe git arguments, and unknown/custom tools are blocked in the reviewer subprocess. Auto-discovered extensions are disabled for that subprocess; only the guard extension is loaded.
+- The reviewer subprocess is technically guarded: `read`, `grep`, `find`, `ls`, and `bash` are available, but `bash` only permits read-only git inspection commands such as `git status`, `git diff`, `git show`, `git log`, `git blame`, and `git ls-files`, plus common test commands such as `npm test`, `pnpm test`, `yarn test`, `bun test`, `pytest`, `cargo test`, and `go test`.
+- Mutating tools, arbitrary shell execution, unsafe shell/git arguments, and unknown/custom tools are blocked in the reviewer subprocess. Auto-discovered extensions are disabled for that subprocess; only the guard extension is loaded.
+- Reviewer text, tool calls, and tool results stream into a live widget while the review runs; use `/review-cycle output off|on|toggle` to hide or show it.
 - The review output is sent back to the original agent as a follow-up prompt so it can apply the feedback and run verification.
-- `/review-cycle status` shows the current phase; `/review-cycle stop` cancels the managed workflow.
+- `/review-cycle status` shows the current phase; `/review-cycle output off|on|toggle` controls the live reviewer log; `/review-cycle stop` cancels the managed workflow.
 - Optional reviewer model selection via `--reviewer-model provider/model` or CLI flag `--review-cycle-reviewer-model provider/model`.
 
 ### Usage
@@ -300,6 +301,8 @@ Then inside pi:
 /review-cycle add input validation to the login form
 /review-cycle on --reviewer-model anthropic/claude-sonnet-4-5 harden auth error handling
 /review-cycle status
+/review-cycle output off
+/review-cycle output on
 /review-cycle stop
 ```
 

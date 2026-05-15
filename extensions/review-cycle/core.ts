@@ -35,6 +35,31 @@ export const REVIEWER_BLOCKED_GIT_ARGUMENTS = [
   "--upload-pack",
   "--work-tree",
 ] as const;
+export const REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS = [
+  "ava",
+  "bun",
+  "cargo",
+  "ctest",
+  "deno",
+  "dotnet",
+  "go",
+  "gradle",
+  "gradlew",
+  "jest",
+  "mocha",
+  "mvn",
+  "mvnw",
+  "node",
+  "npm",
+  "pnpm",
+  "pytest",
+  "python",
+  "python3",
+  "tap",
+  "uv",
+  "vitest",
+  "yarn",
+] as const;
 export const DEFAULT_REVIEW_TOOLS = REVIEWER_ALLOWED_TOOL_NAMES;
 export const MAX_REVIEW_PROMPT_SECTION_CHARS = 20_000;
 export const MAX_APPLY_REVIEW_CHARS = 24_000;
@@ -49,6 +74,7 @@ export type ReviewCycleCommand =
   | { kind: "start"; task: string; reviewerModel?: ModelRef }
   | { kind: "status" }
   | { kind: "stop" }
+  | { kind: "output"; mode: "on" | "off" | "toggle" }
   | { error: string };
 
 export interface GitBaseline {
@@ -98,8 +124,8 @@ export const REVIEWER_SYSTEM_PROMPT = `You are a strict code-review agent runnin
 
 Rules:
 - Review only; do not modify files.
-- Use tools only for read-only inspection. The review-cycle runtime technically allows only: read, grep, find, ls, and guarded bash for read-only git inspection.
-- Mutating tools, non-git shell execution, unsafe git arguments, and unknown/custom tools are blocked by a runtime guard in the reviewer process.
+- Use tools only for read-only inspection and verification. The review-cycle runtime technically allows only: read, grep, find, ls, guarded bash for read-only git inspection, and guarded bash for common test commands.
+- Mutating tools, arbitrary shell execution, unsafe shell/git arguments, and unknown/custom tools are blocked by a runtime guard in the reviewer process.
 - Review all current changes in scope, including committed changes since the baseline commit, staged changes, unstaged changes, and untracked files.
 - Prioritize concrete defects over style preferences.
 - Do not ask the user questions. If something is ambiguous, state the assumption and review conservatively.
@@ -227,6 +253,13 @@ export function parseReviewCycleArgs(args: string): ReviewCycleCommand {
 
   if (command === "status") return { kind: "status" };
   if (command === "stop" || command === "off") return { kind: "stop" };
+  if (command === "output") {
+    const mode = (rest[0] ?? "toggle").toLowerCase();
+    if (mode === "on" || mode === "show") return { kind: "output", mode: "on" };
+    if (mode === "off" || mode === "hide") return { kind: "output", mode: "off" };
+    if (mode === "toggle") return { kind: "output", mode: "toggle" };
+    return { error: "Usage: /review-cycle output [on|off|toggle]" };
+  }
   if (command === "on" || command === "start") return parseStartArgs(rest);
 
   return parseStartArgs(tokenized);
@@ -369,7 +402,70 @@ function isBlockedGitArgument(token: string): boolean {
   return REVIEWER_BLOCKED_GIT_ARGUMENTS.some((blocked) => token === blocked || token.startsWith(`${blocked}=`));
 }
 
-export function isReviewerBashCommandAllowed(command: string): boolean {
+function stripEnvAssignments(tokens: string[]): string[] {
+  let index = 0;
+  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index]!)) {
+    index += 1;
+  }
+  return tokens.slice(index);
+}
+
+function isTestScriptName(token: string | undefined): boolean {
+  return !!token && (token === "test" || token.startsWith("test:") || token.endsWith(":test"));
+}
+
+function isPythonTestCommand(tokens: string[]): boolean {
+  if (tokens[0] !== "python" && tokens[0] !== "python3") return false;
+  return tokens[1] === "-m" && (tokens[2] === "pytest" || tokens[2] === "unittest");
+}
+
+export function isReviewerTestCommandAllowed(command: string): boolean {
+  const rawTokens = tokenizeReviewerShellCommand(command);
+  const tokens = rawTokens ? stripEnvAssignments(rawTokens) : undefined;
+  if (!tokens || tokens.length === 0) return false;
+
+  const executable = tokens[0]!.startsWith("./") ? tokens[0]!.slice(2) : tokens[0]!;
+  if (!(REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS as readonly string[]).includes(executable)) return false;
+
+  switch (executable) {
+    case "npm":
+    case "pnpm":
+    case "yarn":
+      return tokens[1] === "test" || (tokens[1] === "run" && isTestScriptName(tokens[2]));
+    case "bun":
+    case "deno":
+    case "cargo":
+    case "dotnet":
+      return tokens[1] === "test";
+    case "go":
+      return tokens[1] === "test";
+    case "node":
+      return tokens.includes("--test");
+    case "ava":
+    case "ctest":
+    case "jest":
+    case "mocha":
+    case "pytest":
+    case "tap":
+    case "vitest":
+      return true;
+    case "python":
+    case "python3":
+      return isPythonTestCommand(tokens);
+    case "uv":
+      return tokens[1] === "run" && (tokens[2] === "pytest" || isPythonTestCommand(tokens.slice(2)));
+    case "mvn":
+    case "mvnw":
+      return tokens.includes("test") || tokens.includes("verify");
+    case "gradle":
+    case "gradlew":
+      return tokens.includes("test") || tokens.some((token) => token.endsWith("Test"));
+    default:
+      return false;
+  }
+}
+
+export function isReviewerGitCommandAllowed(command: string): boolean {
   const tokens = tokenizeReviewerShellCommand(command);
   if (!tokens || tokens[0] !== "git") return false;
 
@@ -393,6 +489,10 @@ export function isReviewerBashCommandAllowed(command: string): boolean {
   return tokens.slice(1).every((token) => !isBlockedGitArgument(token));
 }
 
+export function isReviewerBashCommandAllowed(command: string): boolean {
+  return isReviewerGitCommandAllowed(command) || isReviewerTestCommandAllowed(command);
+}
+
 export function isReviewerToolCallAllowed(toolName: string, input: unknown): boolean {
   if ((REVIEWER_ALLOWED_DIRECT_TOOL_NAMES as readonly string[]).includes(toolName)) return true;
   if (toolName !== REVIEWER_ALLOWED_BASH_TOOL_NAME) return false;
@@ -406,6 +506,7 @@ export function buildReviewerToolGuardExtensionSource(): string {
 const REVIEWER_ALLOWED_BASH_TOOL_NAME = ${JSON.stringify(REVIEWER_ALLOWED_BASH_TOOL_NAME)};
 const REVIEWER_ALLOWED_GIT_SUBCOMMANDS = new Set(${JSON.stringify([...REVIEWER_ALLOWED_GIT_SUBCOMMANDS])});
 const REVIEWER_BLOCKED_GIT_ARGUMENTS = ${JSON.stringify([...REVIEWER_BLOCKED_GIT_ARGUMENTS])};
+const REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS = new Set(${JSON.stringify([...REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS])});
 const REVIEWER_BLOCKED_SHELL_CHARS = ${JSON.stringify(";&|<>`$(){}[]*!?")};
 const REVIEWER_BLOCKED_DOUBLE_QUOTE_CHARS = ${JSON.stringify("$`\\!")};
 
@@ -461,7 +562,66 @@ function isBlockedGitArgument(token) {
   return REVIEWER_BLOCKED_GIT_ARGUMENTS.some((blocked) => token === blocked || token.startsWith(blocked + "="));
 }
 
-function isReviewerBashCommandAllowed(command) {
+function stripEnvAssignments(tokens) {
+  let index = 0;
+  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
+  return tokens.slice(index);
+}
+
+function isTestScriptName(token) {
+  return !!token && (token === "test" || token.startsWith("test:") || token.endsWith(":test"));
+}
+
+function isPythonTestCommand(tokens) {
+  if (tokens[0] !== "python" && tokens[0] !== "python3") return false;
+  return tokens[1] === "-m" && (tokens[2] === "pytest" || tokens[2] === "unittest");
+}
+
+function isReviewerTestCommandAllowed(command) {
+  const rawTokens = tokenizeReviewerShellCommand(command);
+  const tokens = rawTokens ? stripEnvAssignments(rawTokens) : undefined;
+  if (!tokens || tokens.length === 0) return false;
+  const executable = tokens[0].startsWith("./") ? tokens[0].slice(2) : tokens[0];
+  if (!REVIEWER_ALLOWED_DIRECT_TEST_COMMANDS.has(executable)) return false;
+  switch (executable) {
+    case "npm":
+    case "pnpm":
+    case "yarn":
+      return tokens[1] === "test" || (tokens[1] === "run" && isTestScriptName(tokens[2]));
+    case "bun":
+    case "deno":
+    case "cargo":
+    case "dotnet":
+      return tokens[1] === "test";
+    case "go":
+      return tokens[1] === "test";
+    case "node":
+      return tokens.includes("--test");
+    case "ava":
+    case "ctest":
+    case "jest":
+    case "mocha":
+    case "pytest":
+    case "tap":
+    case "vitest":
+      return true;
+    case "python":
+    case "python3":
+      return isPythonTestCommand(tokens);
+    case "uv":
+      return tokens[1] === "run" && (tokens[2] === "pytest" || isPythonTestCommand(tokens.slice(2)));
+    case "mvn":
+    case "mvnw":
+      return tokens.includes("test") || tokens.includes("verify");
+    case "gradle":
+    case "gradlew":
+      return tokens.includes("test") || tokens.some((token) => token.endsWith("Test"));
+    default:
+      return false;
+  }
+}
+
+function isReviewerGitCommandAllowed(command) {
   const tokens = tokenizeReviewerShellCommand(command);
   if (!tokens || tokens[0] !== "git") return false;
   let subcommandIndex = 1;
@@ -478,6 +638,10 @@ function isReviewerBashCommandAllowed(command) {
   if (subcommand.startsWith("-")) return false;
   if (!REVIEWER_ALLOWED_GIT_SUBCOMMANDS.has(subcommand)) return false;
   return tokens.slice(1).every((token) => !isBlockedGitArgument(token));
+}
+
+function isReviewerBashCommandAllowed(command) {
+  return isReviewerGitCommandAllowed(command) || isReviewerTestCommandAllowed(command);
 }
 
 function isReviewerToolCallAllowed(toolName, input) {

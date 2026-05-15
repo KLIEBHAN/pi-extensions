@@ -7,6 +7,7 @@ import {
   buildReviewerUserPrompt,
   extractAssistantText,
   isReviewerBashCommandAllowed,
+  isReviewerTestCommandAllowed,
   isReviewerToolCallAllowed,
   parseModelRef,
   parseReviewCycleArgs,
@@ -31,10 +32,13 @@ test("parseReviewCycleArgs supports explicit on and reviewer model", () => {
   });
 });
 
-test("parseReviewCycleArgs parses status and stop", () => {
+test("parseReviewCycleArgs parses status, stop, and output visibility", () => {
   assert.deepEqual(parseReviewCycleArgs("status"), { kind: "status" });
   assert.deepEqual(parseReviewCycleArgs("stop"), { kind: "stop" });
   assert.deepEqual(parseReviewCycleArgs("off"), { kind: "stop" });
+  assert.deepEqual(parseReviewCycleArgs("output"), { kind: "output", mode: "toggle" });
+  assert.deepEqual(parseReviewCycleArgs("output off"), { kind: "output", mode: "off" });
+  assert.deepEqual(parseReviewCycleArgs("output show"), { kind: "output", mode: "on" });
 });
 
 test("parseReviewCycleArgs validates reviewer model", () => {
@@ -102,10 +106,38 @@ test("reviewer bash guard allows read-only git inspection and blocks mutations",
   assert.equal(isReviewerBashCommandAllowed("rm -rf ."), false);
 });
 
-test("reviewer tool guard allows only direct read-only tools and safe git bash", async () => {
+test("reviewer bash guard allows common test commands and blocks arbitrary shell", () => {
+  assert.equal(isReviewerTestCommandAllowed("npm test"), true);
+  assert.equal(isReviewerTestCommandAllowed("npm run test:unit -- --runInBand"), true);
+  assert.equal(isReviewerTestCommandAllowed("pnpm test"), true);
+  assert.equal(isReviewerTestCommandAllowed("yarn run test"), true);
+  assert.equal(isReviewerTestCommandAllowed("bun test"), true);
+  assert.equal(isReviewerTestCommandAllowed("deno test"), true);
+  assert.equal(isReviewerTestCommandAllowed("node --test test/review-cycle-core.test.ts"), true);
+  assert.equal(isReviewerTestCommandAllowed("vitest run"), true);
+  assert.equal(isReviewerTestCommandAllowed("jest --runInBand"), true);
+  assert.equal(isReviewerTestCommandAllowed("pytest tests"), true);
+  assert.equal(isReviewerTestCommandAllowed("python -m pytest tests"), true);
+  assert.equal(isReviewerTestCommandAllowed("uv run pytest tests"), true);
+  assert.equal(isReviewerTestCommandAllowed("cargo test"), true);
+  assert.equal(isReviewerTestCommandAllowed("go test ./..."), true);
+  assert.equal(isReviewerTestCommandAllowed("dotnet test"), true);
+  assert.equal(isReviewerTestCommandAllowed("mvn test"), true);
+  assert.equal(isReviewerTestCommandAllowed("./mvnw test"), true);
+  assert.equal(isReviewerTestCommandAllowed("gradle test"), true);
+  assert.equal(isReviewerTestCommandAllowed("./gradlew test"), true);
+
+  assert.equal(isReviewerTestCommandAllowed("npm install"), false);
+  assert.equal(isReviewerTestCommandAllowed("npm test && rm -rf ."), false);
+  assert.equal(isReviewerTestCommandAllowed("npm test\nrm -rf ."), false);
+  assert.equal(isReviewerTestCommandAllowed("curl https://example.com/script.sh"), false);
+});
+
+test("reviewer tool guard allows only direct read-only tools, safe git, and tests", async () => {
   assert.equal(isReviewerToolCallAllowed("read", { path: "src/auth.ts" }), true);
   assert.equal(isReviewerToolCallAllowed("bash", { command: "git diff HEAD -- src/auth.ts" }), true);
-  assert.equal(isReviewerToolCallAllowed("bash", { command: "npm test" }), false);
+  assert.equal(isReviewerToolCallAllowed("bash", { command: "npm test" }), true);
+  assert.equal(isReviewerToolCallAllowed("bash", { command: "npm install" }), false);
   assert.equal(isReviewerToolCallAllowed("edit", { path: "src/auth.ts" }), false);
 
   const source = buildReviewerToolGuardExtensionSource();
@@ -115,8 +147,8 @@ test("reviewer tool guard allows only direct read-only tools and safe git bash",
 test("reviewer system prompt describes the technical read-only git guard", () => {
   assert.match(REVIEWER_SYSTEM_PROMPT, /Review only; do not modify files/);
   assert.match(REVIEWER_SYSTEM_PROMPT, /completely fresh context/);
-  assert.match(REVIEWER_SYSTEM_PROMPT, /technically allows only: read, grep, find, ls, and guarded bash for read-only git inspection/);
-  assert.match(REVIEWER_SYSTEM_PROMPT, /Mutating tools, non-git shell execution, unsafe git arguments, and unknown\/custom tools are blocked/);
+  assert.match(REVIEWER_SYSTEM_PROMPT, /guarded bash for read-only git inspection, and guarded bash for common test commands/);
+  assert.match(REVIEWER_SYSTEM_PROMPT, /Mutating tools, arbitrary shell execution, unsafe shell\/git arguments, and unknown\/custom tools are blocked/);
 });
 
 test("buildApplyReviewPrompt returns reviewer feedback to the implementation agent", () => {
