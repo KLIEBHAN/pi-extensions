@@ -152,6 +152,34 @@ test("reviewer tool guard allows only direct read-only tools, safe git, and test
   await import(`data:text/javascript,${encodeURIComponent(source)}`);
 });
 
+test("generated reviewer guard extension blocks and allows tool calls at runtime", async () => {
+  const source = buildReviewerToolGuardExtensionSource();
+  const module = await import(`data:text/javascript,${encodeURIComponent(source)}`) as {
+    default: (pi: { on: (event: string, handler: Function) => void }) => void;
+  };
+  let toolCallHandler: Function | undefined;
+
+  module.default({
+    on(event: string, handler: Function) {
+      if (event === "tool_call") toolCallHandler = handler;
+    },
+  });
+
+  assert.equal(typeof toolCallHandler, "function");
+  assert.equal(toolCallHandler?.({ toolName: "read", input: { path: "src/auth.ts" } }), undefined);
+  assert.equal(toolCallHandler?.({ toolName: "bash", input: { command: "git status --short" } }), undefined);
+  assert.equal(toolCallHandler?.({ toolName: "bash", input: { command: "npm test" } }), undefined);
+
+  assert.deepEqual(toolCallHandler?.({ toolName: "bash", input: { command: "npm install" } }), {
+    block: true,
+    reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: bash",
+  });
+  assert.deepEqual(toolCallHandler?.({ toolName: "write", input: { path: "src/auth.ts" } }), {
+    block: true,
+    reason: "Review-cycle reviewer is read-only. Tool or command is not allowed: write",
+  });
+});
+
 test("reviewer system prompt describes the technical read-only git guard", () => {
   assert.match(REVIEWER_SYSTEM_PROMPT, /Review only; do not modify files/);
   assert.match(REVIEWER_SYSTEM_PROMPT, /completely fresh context/);

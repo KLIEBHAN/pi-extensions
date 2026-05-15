@@ -63,6 +63,12 @@ interface ReviewCyclePreferences {
   reviewerOutputVisible: boolean;
 }
 
+interface ReviewCycleDependencies {
+  getGitBaseline?: typeof getGitBaseline;
+  getChangeSnapshot?: typeof getChangeSnapshot;
+  runFreshReviewAgent?: typeof runFreshReviewAgent;
+}
+
 function makeRunId(): string {
   return `review-cycle-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -514,6 +520,7 @@ async function startReviewCycle(
   ctx: ExtensionContext | ExtensionCommandContext,
   stateRef: { current?: ReviewCycleState },
   preferences: ReviewCyclePreferences,
+  getGitBaselineImpl: typeof getGitBaseline,
   task: string,
   reviewerModel: ModelRef | undefined,
 ): Promise<void> {
@@ -542,7 +549,7 @@ async function startReviewCycle(
     return;
   }
 
-  const baseline = await getGitBaseline(pi, ctx.cwd).catch((error) => ({
+  const baseline = await getGitBaselineImpl(pi, ctx.cwd).catch((error) => ({
     isGitRepo: false,
     status: `git baseline unavailable: ${error instanceof Error ? error.message : String(error)}`,
     dirty: false,
@@ -582,6 +589,8 @@ async function runReviewAndQueueApply(
   ctx: ExtensionContext,
   stateRef: { current?: ReviewCycleState },
   state: ReviewCycleState,
+  getChangeSnapshotImpl: typeof getChangeSnapshot,
+  runFreshReviewAgentImpl: typeof runFreshReviewAgent,
 ): Promise<void> {
   state.phase = "reviewing";
   state.reviewerOutputLines = [];
@@ -589,7 +598,7 @@ async function runReviewAndQueueApply(
   appendReviewerOutputLineAndRender(ctx, state, "Starting fresh-context reviewer...");
   ctx.ui.notify("Review-cycle: starting fresh-context review", "info");
 
-  const changes = await getChangeSnapshot(pi, ctx.cwd, state.baseline).catch((error) => ({
+  const changes = await getChangeSnapshotImpl(pi, ctx.cwd, state.baseline).catch((error) => ({
     isGitRepo: state.baseline.isGitRepo,
     baselineHead: state.baseline.head,
     status: `change snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`,
@@ -608,7 +617,7 @@ async function runReviewAndQueueApply(
   });
 
   const reviewerModel = state.reviewerModel ?? resolveDefaultReviewerModel(ctx);
-  const result = await runFreshReviewAgent({
+  const result = await runFreshReviewAgentImpl({
     cwd: ctx.cwd,
     prompt: reviewerPrompt,
     reviewerModel,
@@ -645,9 +654,13 @@ function showStatus(ctx: ExtensionCommandContext, state: ReviewCycleState | unde
   );
 }
 
-export default function (pi: ExtensionAPI) {
+export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
+  return function (pi: ExtensionAPI) {
   const stateRef: { current?: ReviewCycleState } = {};
   const preferences: ReviewCyclePreferences = { reviewerOutputVisible: true };
+  const getGitBaselineImpl = deps.getGitBaseline ?? getGitBaseline;
+  const getChangeSnapshotImpl = deps.getChangeSnapshot ?? getChangeSnapshot;
+  const runFreshReviewAgentImpl = deps.runFreshReviewAgent ?? runFreshReviewAgent;
 
   pi.registerFlag("review-cycle-task", {
     description: "Auto-start a review-cycle run with this task",
@@ -697,7 +710,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      await startReviewCycle(pi, ctx, stateRef, preferences, parsed.task, parsed.reviewerModel);
+      await startReviewCycle(pi, ctx, stateRef, preferences, getGitBaselineImpl, parsed.task, parsed.reviewerModel);
     },
   });
 
@@ -717,7 +730,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    await startReviewCycle(pi, ctx, stateRef, preferences, taskFlag.trim(), reviewerModel);
+    await startReviewCycle(pi, ctx, stateRef, preferences, getGitBaselineImpl, taskFlag.trim(), reviewerModel);
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -751,7 +764,7 @@ export default function (pi: ExtensionAPI) {
     if (state.phase === "implementing") {
       state.implementationSummary = truncateMiddle(assistantTurn.text, MAX_IMPLEMENTATION_SUMMARY_CHARS);
       try {
-        await runReviewAndQueueApply(pi, ctx, stateRef, state);
+        await runReviewAndQueueApply(pi, ctx, stateRef, state, getChangeSnapshotImpl, runFreshReviewAgentImpl);
       } catch (error) {
         if (stateRef.current === state) clearState(ctx, stateRef);
         ctx.ui.notify(
@@ -767,4 +780,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Review-cycle completed: feedback application phase finished", "info");
     }
   });
+  };
 }
+
+export default createReviewCycleExtension();
