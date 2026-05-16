@@ -35,6 +35,8 @@
  *   pi -e ./terminal-bench.ts --terminal-bench --thinking high
  */
 
+import { readFileSync } from "node:fs";
+
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
@@ -50,32 +52,65 @@ const TMUX_MARKER_PREFIX = "__PI_TBENCH_END__";
 const MAX_CONTRACT_ITEMS = 10;
 const MAX_RECENT_TOOL_ACTIONS = 8;
 
-const TERMINAL_BENCH_GUIDELINES = `
-## Terminal-Bench Rules
+type TerminalBenchPromptTemplateSectionName = "TERMINAL_BENCH_GUIDELINES" | "COMPLETION_CHECKLIST";
 
-- You must complete the entire task WITHOUT any human intervention. Do not ask
-  clarifying questions or wait for human input. Make reasonable assumptions and
-  proceed.
-- You do NOT have eyes or ears. For multimedia files (images, audio, video),
-  use programmatic or CLI tools to inspect them (e.g. file, identify, ffprobe,
-  exiftool, python scripts). Never guess content from filenames alone.
-- Keep state changes minimal, but preserve required final artifacts, services,
-  processes, sockets, ports, and files exactly as requested.
-- Prefer short, targeted commands. Avoid long blocking commands; if something
-  may take a while, inspect intermediate output instead of waiting blindly.
-- First identify the exact observable contract: required paths, filenames,
-  sockets, ports, hashes/checksums, command outputs, versions, modes,
-  thresholds, counts, artifacts, and final running state. Implement those exact
-  facts; do not substitute approximate equivalents.
-- Before finishing, verify from the user/verifier perspective with targeted
-  checks. If tests/specs are present, inspect them to understand the observable
-  contract; compare actual final values against that contract.
-- If verification or cleanup may be destructive, perform it only on temporary
-  copies.
-- For interactive programs or commands that need special key sequences
-  (Ctrl+C, Ctrl+D, arrow keys, etc.), use the tmux_send tool instead of bash.
-  Use tmux_read to inspect the current terminal state at any time.
-`.trim();
+const TERMINAL_BENCH_PROMPT_TEMPLATE_SECTION_NAMES: TerminalBenchPromptTemplateSectionName[] = [
+  "TERMINAL_BENCH_GUIDELINES",
+  "COMPLETION_CHECKLIST",
+];
+const SECTIONED_PROMPT_TEMPLATE_PATTERN = /<!--\s*BEGIN\s+([A-Z_]+)\s*-->([\s\S]*?)<!--\s*END\s+\1\s*-->/g;
+const PROMPT_TEMPLATE_VARIABLE_PATTERN = /{{([A-Z_]+)}}/g;
+
+function normalizePromptTemplateText(text: string): string {
+  return text.replace(/\r\n/g, "\n").trim();
+}
+
+function parseSectionedPromptTemplate(template: string): Record<string, string> {
+  const sections: Record<string, string> = {};
+
+  for (const match of normalizePromptTemplateText(template).matchAll(SECTIONED_PROMPT_TEMPLATE_PATTERN)) {
+    const sectionName = match[1];
+    const sectionBody = match[2];
+    if (!sectionName || !sectionBody) continue;
+    if (sections[sectionName]) {
+      throw new Error(`Duplicate terminal-bench prompt template section: ${sectionName}`);
+    }
+    sections[sectionName] = normalizePromptTemplateText(sectionBody);
+  }
+
+  return sections;
+}
+
+function loadTerminalBenchPromptTemplateSections(template: string): Record<TerminalBenchPromptTemplateSectionName, string> {
+  const parsedSections = parseSectionedPromptTemplate(template);
+  const missingSections = TERMINAL_BENCH_PROMPT_TEMPLATE_SECTION_NAMES.filter((sectionName) => !parsedSections[sectionName]);
+  if (missingSections.length > 0) {
+    throw new Error(`Missing terminal-bench prompt template section(s): ${missingSections.join(", ")}`);
+  }
+
+  return Object.fromEntries(
+    TERMINAL_BENCH_PROMPT_TEMPLATE_SECTION_NAMES.map((sectionName) => [sectionName, parsedSections[sectionName]!]),
+  ) as Record<TerminalBenchPromptTemplateSectionName, string>;
+}
+
+function renderPromptTemplate(template: string, variables: Record<string, string>): string {
+  return normalizePromptTemplateText(
+    template.replace(PROMPT_TEMPLATE_VARIABLE_PATTERN, (_match, variableName: string) => {
+      const value = variables[variableName];
+      if (value === undefined) {
+        throw new Error(`Missing terminal-bench prompt template variable: ${variableName}`);
+      }
+      return value;
+    }),
+  );
+}
+
+const TERMINAL_BENCH_PROMPT_TEMPLATE = readFileSync(
+  new URL("./terminal-bench.system-prompt.template.md", import.meta.url),
+  "utf8",
+);
+const TERMINAL_BENCH_PROMPT_TEMPLATE_SECTIONS = loadTerminalBenchPromptTemplateSections(TERMINAL_BENCH_PROMPT_TEMPLATE);
+const TERMINAL_BENCH_GUIDELINES = TERMINAL_BENCH_PROMPT_TEMPLATE_SECTIONS.TERMINAL_BENCH_GUIDELINES;
 
 const COMPLETION_CHECKLIST = (
   taskHint: string,
@@ -93,26 +128,12 @@ const COMPLETION_CHECKLIST = (
       ? `\n\nRecent tool activity:\n${recentToolActions.map((item) => `- ${item}`).join("\n")}`
       : "";
 
-  return `
-VERIFICATION REQUIRED: You signaled that you are finished. Before moving on,
-review this checklist carefully.
-
-Original task:
-${taskHint}${contractSection}${recentActionsSection}
-
-Last terminal output:
-${terminalState}
-
-Checklist — mark each as DONE or TODO:
-- Exact observable contract satisfied, including required paths/files/ports/
-  sockets/artifacts/outputs/final state? [TODO/DONE]
-- Targeted verification run from the user/verifier perspective, with actual
-  values compared against the contract? [TODO/DONE]
-- Required final state preserved, and any destructive checks/cleanup limited to
-  temporary copies? [TODO/DONE]
-
-If everything is DONE, proceed. If any item is TODO, fix it first.
-`.trim();
+  return renderPromptTemplate(TERMINAL_BENCH_PROMPT_TEMPLATE_SECTIONS.COMPLETION_CHECKLIST, {
+    TASK_HINT: taskHint,
+    CONTRACT_SECTION: contractSection,
+    RECENT_ACTIONS_SECTION: recentActionsSection,
+    TERMINAL_STATE: terminalState,
+  });
 };
 
 const BOOTSTRAP_COMMAND = [

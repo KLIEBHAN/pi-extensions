@@ -460,6 +460,7 @@ That makes the loop safer and simpler than forcing session switches from extensi
 ## Terminal-Bench extension
 
 `extensions/terminal-bench.ts` is the most specialized extension in this repository.
+Its system prompt lives next to it in `extensions/terminal-bench.system-prompt.template.md`.
 
 It is intended for benchmark-style tasks where the agent should work autonomously, verify completion carefully, and handle interactive terminal programs through `tmux`.
 
@@ -495,6 +496,7 @@ pi --terminal-bench
 ### Notes
 
 - The extension does nothing unless `--terminal-bench` is provided.
+- If you copy `terminal-bench.ts` manually, copy `terminal-bench.system-prompt.template.md` next to it.
 - It creates and uses a dedicated `tmux` session for interactive terminal control.
 - `tmux` should be installed and available on `PATH` if you want to use `tmux_send` and `tmux_read`.
 
@@ -502,8 +504,8 @@ pi --terminal-bench
 
 For Harbor-based Terminal-Bench runs, see `examples/harbor-wrapper/README.md`.
 
-The wrapper uploads the bundled `extensions/terminal-bench.ts` file into the
-sandbox automatically. By default it installs the published npm `pi` package,
+The wrapper uploads the bundled `extensions/terminal-bench.ts` file and its
+prompt template into the sandbox automatically. By default it installs the published npm `pi` package,
 and it can optionally run a local `pi-mono` checkout for unreleased testing.
 
 ## Repository structure
@@ -534,7 +536,8 @@ pi-extensions/
 │   │   ├── core.ts
 │   │   └── index.ts
 │   ├── session-name.ts
-│   └── terminal-bench.ts
+│   ├── terminal-bench.ts
+│   └── terminal-bench.system-prompt.template.md
 ├── themes/
 │   └── hermes-dark.json
 ├── .gitignore

@@ -5,8 +5,9 @@ Runs pi as a [Terminal-Bench 2.0](https://tbench.ai) agent via [Harbor](https://
 ## How It Works
 
 The wrapper installs Node.js and pi inside the Harbor sandbox container,
-uploads the bundled terminal-bench extension from this repository plus auth
-credentials, injects an `ANTHROPIC_OAUTH_TOKEN` from `auth.json` when
+uploads the bundled terminal-bench extension and prompt template from this
+repository plus auth credentials, injects an `ANTHROPIC_OAUTH_TOKEN` from
+`auth.json` when
 available, then runs pi in print mode (`-p`) for each task from `/app` when
 that directory exists.
 Pi uses its `terminal-bench` extension for:
@@ -34,7 +35,8 @@ export ANTHROPIC_API_KEY=sk-ant-...    # Option 1: API key
 
 Note: Pi is installed automatically *inside* the sandbox container during
 setup. This wrapper also uploads the bundled `../../extensions/terminal-bench.ts`
-file automatically, so no separate global extension install is required.
+file and `../../extensions/terminal-bench.system-prompt.template.md`
+automatically, so no separate global extension install is required.
 
 ## Pi Source Mode
 
@@ -265,7 +267,7 @@ Harbor Orchestrator
   │     ├── Installs Node.js + pi in container
   │     │   ├── from npm (default)
   │     │   └── or from uploaded local checkout (opt-in)
-  │     ├── Uploads bundled terminal-bench.ts from pi-extensions
+  │     ├── Uploads bundled terminal-bench.ts and prompt template from pi-extensions
   │     ├── Uploads auth.json (if available)
   │     ├── Sets PI_CODING_AGENT_DIR in-container
   │     └── Installs tmux

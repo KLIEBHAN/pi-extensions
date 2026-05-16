@@ -17,6 +17,7 @@ Usage:
 Requires:
     - harbor: pip install harbor
     - bundled terminal-bench extension at ../../extensions/terminal-bench.ts
+      plus ../../extensions/terminal-bench.system-prompt.template.md
     - auth.json at ~/.pi/agent/auth.json (for subscription auth)
       OR ANTHROPIC_API_KEY set in environment
 """
@@ -47,6 +48,7 @@ NODE_VERSION = "22.16.0"
 _HOST_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 _HOST_AUTH = Path.home() / ".pi" / "agent" / "auth.json"
 _HOST_EXTENSION = _HOST_PACKAGE_ROOT / "extensions" / "terminal-bench.ts"
+_HOST_EXTENSION_TEMPLATE = _HOST_PACKAGE_ROOT / "extensions" / "terminal-bench.system-prompt.template.md"
 _DEFAULT_LOCAL_REPO_ROOT = _HOST_PACKAGE_ROOT.parent / "pi-mono"
 
 # Paths inside the container
@@ -54,6 +56,7 @@ _REMOTE_PI_DIR = "/root/.pi/agent"
 _REMOTE_AUTH = f"{_REMOTE_PI_DIR}/auth.json"
 _REMOTE_EXT_DIR = f"{_REMOTE_PI_DIR}/extensions"
 _REMOTE_EXT = f"{_REMOTE_EXT_DIR}/terminal-bench.ts"
+_REMOTE_EXT_TEMPLATE = f"{_REMOTE_EXT_DIR}/terminal-bench.system-prompt.template.md"
 _REMOTE_REPO_DIR = "/tmp/pi-mono"
 _REMOTE_REPO_ARCHIVE = "/tmp/pi-mono.tar.gz"
 _REMOTE_TASK = "/tmp/pi-task.txt"
@@ -78,6 +81,17 @@ def _find_extension() -> Path:
 
     raise FileNotFoundError(
         f"Bundled terminal-bench extension not found at {_HOST_EXTENSION}. "
+        "Expected this wrapper to live inside the pi-extensions repository."
+    )
+
+
+def _find_extension_template() -> Path:
+    """Locate the terminal-bench prompt template used by the extension."""
+    if _HOST_EXTENSION_TEMPLATE.exists():
+        return _HOST_EXTENSION_TEMPLATE
+
+    raise FileNotFoundError(
+        f"Bundled terminal-bench prompt template not found at {_HOST_EXTENSION_TEMPLATE}. "
         "Expected this wrapper to live inside the pi-extensions repository."
     )
 
@@ -451,11 +465,14 @@ class PiAgent(BaseAgent):
                     "--trace-jsonl yet; continuing without structured trace capture"
                 )
 
-        # 4. Upload bundled terminal-bench extension
+        # 4. Upload bundled terminal-bench extension and prompt template
         ext_path = _find_extension()
+        ext_template_path = _find_extension_template()
         _LOGGER.info("Uploading bundled terminal-bench extension from %s", ext_path)
+        _LOGGER.info("Uploading bundled terminal-bench prompt template from %s", ext_template_path)
         await environment.exec(f"mkdir -p {_REMOTE_EXT_DIR}", timeout_sec=5)
         await environment.upload_file(str(ext_path), _REMOTE_EXT)
+        await environment.upload_file(str(ext_template_path), _REMOTE_EXT_TEMPLATE)
 
         # 5. Upload auth.json for subscription auth (if available)
         if _HOST_AUTH.exists():
