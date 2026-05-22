@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReviewCycleExtension, runFreshReviewAgent } from "../extensions/review-cycle/index.ts";
 
-function createHarness(options: { cwd?: string; panelInputs?: string[]; flags?: Record<string, unknown> } = {}) {
+function createHarness(options: { cwd?: string; panelInputs?: string[]; flags?: Record<string, unknown>; isIdle?: () => boolean } = {}) {
   const handlers = new Map<string, Function>();
   const commands = new Map<string, { handler: Function }>();
   const sentMessages: Array<{ text: string; options?: unknown }> = [];
@@ -70,7 +70,7 @@ function createHarness(options: { cwd?: string; panelInputs?: string[]; flags?: 
         return await result;
       },
     },
-    isIdle: () => true,
+    isIdle: () => options.isIdle?.() ?? true,
     abort: () => {
       aborted = true;
     },
@@ -643,6 +643,7 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.equal(harness.sentMessages.length, 2);
   assert.match(harness.sentMessages[1]?.text ?? "", /Fresh-context review/);
   assert.match(harness.sentMessages[1]?.text ?? "", /CHANGES_REQUESTED/);
+  assert.deepEqual(harness.sentMessages[1]?.options, { deliverAs: "followUp" });
 
   const visibleWidgets = harness.widgets.filter((entry) => entry.content);
   assert.ok(visibleWidgets.some((entry) => entry.content?.some((line) => line.includes("Starting fresh-context reviewer"))));
@@ -672,6 +673,57 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
 
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("[x] 1. HIGH"))));
   assert.equal(latestWidgetContent(harness, "review-cycle-status-card"), undefined);
+});
+
+test("review-cycle defers auto apply follow-up until agent_end settles", async () => {
+  let idle = true;
+  const harness = createHarness({ isIdle: () => idle });
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => ({
+      text: "## Verdict\nCHANGES_REQUESTED\n\n## Findings\n- HIGH: src/a.ts: missing guard",
+      exitCode: 0,
+      stderr: "",
+      messages: [],
+    }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("deferred apply task", harness.ctx);
+  assert.equal(harness.sentMessages.length, 1);
+
+  idle = false;
+  await harness.handlers.get("agent_end")?.({
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "implemented" }],
+        stopReason: "stop",
+      },
+    ],
+  }, harness.ctx);
+
+  assert.equal(harness.sentMessages.length, 1);
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(harness.sentMessages.length, 1);
+
+  idle = true;
+  await new Promise((resolve) => setTimeout(resolve, 70));
+
+  assert.equal(harness.sentMessages.length, 2);
+  assert.match(harness.sentMessages[1]?.text ?? "", /Fresh-context review/);
+  assert.deepEqual(harness.sentMessages[1]?.options, { deliverAs: "followUp" });
 });
 
 test("review-cycle surfaces invalid structured review data and falls back to markdown", async () => {
@@ -954,6 +1006,7 @@ CHANGES_REQUESTED
     await harness.commands.get("review-cycle")?.handler("apply", harness.ctx);
     assert.equal(harness.sentMessages.length, 2);
     assert.match(harness.sentMessages[1]?.text ?? "", /Fresh-context review/);
+    assert.deepEqual(harness.sentMessages[1]?.options, { deliverAs: "followUp" });
 
     await harness.handlers.get("agent_end")?.({
       messages: [{ role: "assistant", content: [{ type: "text", text: "applied and verified" }], stopReason: "stop" }],

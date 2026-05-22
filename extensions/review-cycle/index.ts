@@ -44,6 +44,7 @@ const MAX_CHECKLIST_ITEMS = 12;
 const STATUS_REFRESH_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_REVIEW_ROUNDS = 2;
 const REVIEWER_KILL_GRACE_MS = 5_000;
+const FOLLOW_UP_IDLE_RETRY_MS = 50;
 const MAX_ARTIFACT_LIST_ITEMS = 10;
 const REVIEW_CYCLE_CONFIG_PATH = ".pi/review-cycle.json";
 const REVIEW_CYCLE_ARTIFACT_DIR = ".pi/review-cycle";
@@ -1772,6 +1773,34 @@ function changeSnapshotFingerprint(snapshot: ChangeSnapshot | undefined): string
   });
 }
 
+function sendFollowUpUserMessage(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext | ExtensionCommandContext,
+  content: string,
+  shouldSend?: () => boolean,
+): void {
+  const sendWhenIdle = () => {
+    if (shouldSend && !shouldSend()) return;
+
+    if (!ctx.isIdle()) {
+      setTimeout(sendWhenIdle, FOLLOW_UP_IDLE_RETRY_MS);
+      return;
+    }
+
+    pi.sendUserMessage(content, { deliverAs: "followUp" });
+  };
+
+  // agent_end handlers run before the underlying AgentSession is fully idle.
+  // Wait until idle so the apply prompt starts a real next turn instead of
+  // being queued after the final follow-up poll and left stranded.
+  if (!ctx.isIdle()) {
+    setTimeout(sendWhenIdle, 0);
+    return;
+  }
+
+  sendWhenIdle();
+}
+
 async function startReviewCycle(
   pi: ExtensionAPI,
   ctx: ExtensionContext | ExtensionCommandContext,
@@ -1972,7 +2001,12 @@ async function runReviewAndQueueApply(
   setStatus(ctx, state);
   ctx.ui.notify("Review-cycle: fresh review complete; applying feedback", "info");
 
-  pi.sendUserMessage(buildApplyReviewPrompt({ task: state.task, review: state.review }));
+  sendFollowUpUserMessage(
+    pi,
+    ctx,
+    buildApplyReviewPrompt({ task: state.task, review: state.review }),
+    () => stateRef.current === state && state.active && state.phase === "applying",
+  );
 }
 
 function queueManualApply(pi: ExtensionAPI, ctx: ExtensionCommandContext, state: ReviewCycleState): void {
@@ -1984,7 +2018,7 @@ function queueManualApply(pi: ExtensionAPI, ctx: ExtensionCommandContext, state:
   setStatus(ctx, state);
   if (state.reviewSummary) applyReviewAction(ctx, state, "applying feedback", "pending");
   ctx.ui.notify("Review-cycle: applying manually approved review feedback", "info");
-  pi.sendUserMessage(buildApplyReviewPrompt({ task: state.task, review: state.review }));
+  pi.sendUserMessage(buildApplyReviewPrompt({ task: state.task, review: state.review }), { deliverAs: "followUp" });
 }
 
 async function skipManualApply(ctx: ExtensionCommandContext, stateRef: { current?: ReviewCycleState }): Promise<void> {
