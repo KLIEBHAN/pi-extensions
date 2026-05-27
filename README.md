@@ -277,7 +277,7 @@ pi -e ./extensions/prompt-autocomplete \
 
 ### What it adds
 
-- `/review-cycle <task>` or short alias `/rc <task>` starts a normal implementation request in the current agent.
+- `/review-cycle <task>` or short alias `/rc <task>` starts a normal implementation request in the current agent. If another review-cycle run is active, the extension stops that run automatically and starts the new one; replacement runs allow the current dirty workspace at start so no manual stop/continue step is needed.
 - Optional start flags: `--manual-apply`, `--until-approved`, `--max-review-rounds <n>`, and `--allow-dirty`.
 - After the implementation turn finishes, the extension spawns a separate `pi --mode json -p --no-session` reviewer process, so the reviewer has a fresh context window.
 - The reviewer receives the original task, the implementation summary, the baseline git commit/status, and current diff/status data. It can also inspect the workspace with read-only tools.

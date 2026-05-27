@@ -391,7 +391,7 @@ function showHelp(ctx: ExtensionCommandContext): void {
       "Review-cycle commands",
       "",
       "Start",
-      "  /review-cycle <task>                              start implement → review → apply",
+      "  /review-cycle <task>                              start implement → review → apply (replaces active run)",
       "  /rc <task>                                        short alias",
       "  /review-cycle --manual-apply <task>               wait for apply/skip after review",
       "  /review-cycle --until-approved [--max-review-rounds n] <task>",
@@ -1801,6 +1801,59 @@ function sendFollowUpUserMessage(
   sendWhenIdle();
 }
 
+function validateReviewCycleStartOptions(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  reviewerModel: ModelRef | undefined,
+): string | undefined {
+  if (!ctx.model) return "No model selected";
+  if (!ctx.modelRegistry.hasConfiguredAuth(ctx.model)) {
+    return `No configured auth for ${ctx.model.provider}/${ctx.model.id}`;
+  }
+  return validateRequestedReviewerModel(ctx, reviewerModel);
+}
+
+async function stopActiveReviewCycleForReplacement(
+  ctx: ExtensionCommandContext,
+  stateRef: { current?: ReviewCycleState },
+  stopStatusTicker: () => void,
+  nextTask: string,
+): Promise<boolean> {
+  const activeState = stateRef.current;
+  if (!activeState?.active) return true;
+
+  const previousPhase = activeState.phase;
+  const previousTask = summarizeTask(activeState.task, 48);
+  const shouldAbortMainAgent = previousPhase === "implementing" || previousPhase === "applying";
+
+  clearState(ctx, stateRef);
+  stopStatusTicker();
+
+  if (!ctx.isIdle()) {
+    if (shouldAbortMainAgent) ctx.abort();
+
+    const waitForIdle = (ctx as ExtensionCommandContext & { waitForIdle?: () => Promise<void> | void }).waitForIdle;
+    if (typeof waitForIdle !== "function") {
+      ctx.ui.notify("Review-cycle: stopped the active run, but the agent is still busy. Wait until idle before starting the new run.", "warning");
+      return false;
+    }
+
+    try {
+      await waitForIdle.call(ctx);
+    } catch (error) {
+      ctx.ui.notify(`Review-cycle: stopped the active run, but waiting for idle failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      return false;
+    }
+  }
+
+  if (!ctx.isIdle()) {
+    ctx.ui.notify("Review-cycle: stopped the active run, but the agent is still busy. Wait until idle before starting the new run.", "warning");
+    return false;
+  }
+
+  ctx.ui.notify(`Review-cycle: stopped active ${previousPhase} run (${previousTask}) to start ${summarizeTask(nextTask, 48)}`, "info");
+  return true;
+}
+
 async function startReviewCycle(
   pi: ExtensionAPI,
   ctx: ExtensionContext | ExtensionCommandContext,
@@ -1819,18 +1872,9 @@ async function startReviewCycle(
     return;
   }
 
-  if (!ctx.model) {
-    ctx.ui.notify("No model selected", "error");
-    return;
-  }
-  if (!ctx.modelRegistry.hasConfiguredAuth(ctx.model)) {
-    ctx.ui.notify(`No configured auth for ${ctx.model.provider}/${ctx.model.id}`, "error");
-    return;
-  }
-
-  const reviewerModelError = validateRequestedReviewerModel(ctx, options.reviewerModel);
-  if (reviewerModelError) {
-    ctx.ui.notify(reviewerModelError, "error");
+  const startOptionsError = validateReviewCycleStartOptions(ctx, options.reviewerModel);
+  if (startOptionsError) {
+    ctx.ui.notify(startOptionsError, "error");
     return;
   }
 
@@ -1875,7 +1919,7 @@ async function startReviewCycle(
     ctx.ui.notify("Review-cycle paused: workspace already dirty. Use /review-cycle continue or /review-cycle abort.", "warning");
     return;
   } else if (baseline.dirty) {
-    ctx.ui.notify("Review-cycle started with pre-existing git changes because --allow-dirty/config allowDirty is set.", "warning");
+    ctx.ui.notify("Review-cycle started with pre-existing git changes because dirty runs are allowed for this run.", "warning");
   }
 
   ctx.ui.notify(
@@ -2379,7 +2423,25 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       }
 
       const runOptions = resolveRunOptions(preferences, repoConfig, parsed);
-      await startReviewCycle(pi, ctx, stateRef, getGitBaselineImpl, parsed.task, runOptions);
+      const replacingActiveRun = !!stateRef.current?.active;
+      if (replacingActiveRun) {
+        const startOptionsError = validateReviewCycleStartOptions(ctx, runOptions.reviewerModel);
+        if (startOptionsError) {
+          ctx.ui.notify(startOptionsError, "error");
+          return;
+        }
+        const stopped = await stopActiveReviewCycleForReplacement(ctx, stateRef, stopStatusTicker, parsed.task);
+        if (!stopped) return;
+      }
+
+      await startReviewCycle(
+        pi,
+        ctx,
+        stateRef,
+        getGitBaselineImpl,
+        parsed.task,
+        replacingActiveRun ? { ...runOptions, allowDirty: true } : runOptions,
+      );
       if (stateRef.current?.active) startStatusTicker(ctx);
       if (stateRef.current) lastRun = makeLastRunFromState(stateRef.current);
   };

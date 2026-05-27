@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReviewCycleExtension, runFreshReviewAgent } from "../extensions/review-cycle/index.ts";
 
-function createHarness(options: { cwd?: string; panelInputs?: string[]; flags?: Record<string, unknown>; isIdle?: () => boolean } = {}) {
+function createHarness(options: { cwd?: string; panelInputs?: string[]; flags?: Record<string, unknown>; isIdle?: () => boolean; waitForIdle?: () => Promise<void> | void } = {}) {
   const handlers = new Map<string, Function>();
   const commands = new Map<string, { handler: Function }>();
   const sentMessages: Array<{ text: string; options?: unknown }> = [];
@@ -71,6 +71,9 @@ function createHarness(options: { cwd?: string; panelInputs?: string[]; flags?: 
       },
     },
     isIdle: () => options.isIdle?.() ?? true,
+    waitForIdle: async () => {
+      await options.waitForIdle?.();
+    },
     abort: () => {
       aborted = true;
     },
@@ -184,6 +187,53 @@ test("review-cycle registers /rc alias and shows command help", async () => {
 
   assert.ok(harness.notifications.some((entry) => entry.message.includes("help shown")));
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-help" && entry.content?.some((line) => line.includes("/rc <task>"))));
+});
+
+test("review-cycle start replaces an active run without requiring manual stop", async () => {
+  let baselineCalls = 0;
+  const harness = createHarness();
+  createReviewCycleExtension({
+    getGitBaseline: async () => {
+      baselineCalls += 1;
+      return baselineCalls === 1
+        ? { isGitRepo: true, head: "abc123", status: "## main", dirty: false }
+        : { isGitRepo: true, head: "abc123", status: "## main\n M previous.ts", dirty: true };
+    },
+  })(harness.pi as never);
+
+  await harness.commands.get("rc")?.handler("first active task", harness.ctx);
+  await harness.commands.get("rc")?.handler("on replacement task", harness.ctx);
+
+  assert.equal(harness.sentMessages.length, 2);
+  assert.equal(harness.sentMessages[0]?.text, "first active task");
+  assert.equal(harness.sentMessages[1]?.text, "replacement task");
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("stopped active implementing run")));
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("pre-existing git changes")));
+  assert.equal(harness.notifications.some((entry) => entry.message.includes("already active")), false);
+});
+
+test("review-cycle start aborts a busy active implementation before replacing it", async () => {
+  let idle = true;
+  const harness = createHarness({
+    isIdle: () => idle,
+    waitForIdle: async () => {
+      idle = true;
+    },
+  });
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+  })(harness.pi as never);
+
+  await harness.commands.get("rc")?.handler("busy first task", harness.ctx);
+  idle = false;
+  await harness.commands.get("rc")?.handler("on replacement after abort", harness.ctx);
+
+  assert.equal(harness.aborted, true);
+  assert.equal(harness.sentMessages.length, 2);
+  assert.equal(harness.sentMessages[0]?.text, "busy first task");
+  assert.equal(harness.sentMessages[1]?.text, "replacement after abort");
+  assert.equal(harness.notifications.some((entry) => entry.message.includes("Agent is busy")), false);
+  assert.equal(harness.notifications.some((entry) => entry.message.includes("already active")), false);
 });
 
 test("review-cycle panel renders an overlay and dispatches the selected action", async () => {
