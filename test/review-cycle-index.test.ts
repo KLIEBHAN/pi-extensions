@@ -236,6 +236,28 @@ test("review-cycle start aborts a busy active implementation before replacing it
   assert.equal(harness.notifications.some((entry) => entry.message.includes("already active")), false);
 });
 
+test("review-cycle start gives up replacing when the agent never becomes idle", async () => {
+  let idle = true;
+  const harness = createHarness({
+    isIdle: () => idle,
+    waitForIdle: () => new Promise<void>(() => {}),
+  });
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    replacementIdleTimeoutMs: 20,
+  })(harness.pi as never);
+
+  await harness.commands.get("rc")?.handler("stuck first task", harness.ctx);
+  idle = false;
+  await harness.commands.get("rc")?.handler("on replacement that hangs", harness.ctx);
+
+  assert.equal(harness.aborted, true);
+  assert.equal(harness.sentMessages.length, 1);
+  assert.equal(harness.sentMessages[0]?.text, "stuck first task");
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("still busy. Wait until idle")));
+  assert.equal(harness.notifications.some((entry) => entry.message.includes("waiting for idle failed")), false);
+});
+
 test("review-cycle panel renders an overlay and dispatches the selected action", async () => {
   const harness = createHarness({ panelInputs: ["\r"] });
   createReviewCycleExtension({

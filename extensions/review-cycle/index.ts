@@ -45,6 +45,7 @@ const STATUS_REFRESH_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_REVIEW_ROUNDS = 2;
 const REVIEWER_KILL_GRACE_MS = 5_000;
 const FOLLOW_UP_IDLE_RETRY_MS = 50;
+const REPLACEMENT_IDLE_TIMEOUT_MS = 10_000;
 const MAX_ARTIFACT_LIST_ITEMS = 10;
 const REVIEW_CYCLE_CONFIG_PATH = ".pi/review-cycle.json";
 const REVIEW_CYCLE_ARTIFACT_DIR = ".pi/review-cycle";
@@ -142,6 +143,7 @@ interface ReviewCycleDependencies {
   getGitBaseline?: typeof getGitBaseline;
   getChangeSnapshot?: typeof getChangeSnapshot;
   runFreshReviewAgent?: typeof runFreshReviewAgent;
+  replacementIdleTimeoutMs?: number;
 }
 
 interface ReviewCyclePanelAction {
@@ -1817,6 +1819,7 @@ async function stopActiveReviewCycleForReplacement(
   stateRef: { current?: ReviewCycleState },
   stopStatusTicker: () => void,
   nextTask: string,
+  idleTimeoutMs: number,
 ): Promise<boolean> {
   const activeState = stateRef.current;
   if (!activeState?.active) return true;
@@ -1824,6 +1827,7 @@ async function stopActiveReviewCycleForReplacement(
   const previousPhase = activeState.phase;
   const previousTask = summarizeTask(activeState.task, 48);
   const shouldAbortMainAgent = previousPhase === "implementing" || previousPhase === "applying";
+  const stillBusyMessage = "Review-cycle: stopped the active run, but the agent is still busy. Wait until idle before starting the new run.";
 
   clearState(ctx, stateRef);
   stopStatusTicker();
@@ -1833,25 +1837,52 @@ async function stopActiveReviewCycleForReplacement(
 
     const waitForIdle = (ctx as ExtensionCommandContext & { waitForIdle?: () => Promise<void> | void }).waitForIdle;
     if (typeof waitForIdle !== "function") {
-      ctx.ui.notify("Review-cycle: stopped the active run, but the agent is still busy. Wait until idle before starting the new run.", "warning");
+      ctx.ui.notify(stillBusyMessage, "warning");
       return false;
     }
 
     try {
-      await waitForIdle.call(ctx);
+      await waitForIdleWithTimeout(waitForIdle.call(ctx), idleTimeoutMs);
     } catch (error) {
+      if (error instanceof ReplacementIdleTimeoutError) {
+        ctx.ui.notify(stillBusyMessage, "warning");
+        return false;
+      }
       ctx.ui.notify(`Review-cycle: stopped the active run, but waiting for idle failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       return false;
     }
   }
 
   if (!ctx.isIdle()) {
-    ctx.ui.notify("Review-cycle: stopped the active run, but the agent is still busy. Wait until idle before starting the new run.", "warning");
+    ctx.ui.notify(stillBusyMessage, "warning");
     return false;
   }
 
   ctx.ui.notify(`Review-cycle: stopped active ${previousPhase} run (${previousTask}) to start ${summarizeTask(nextTask, 48)}`, "info");
   return true;
+}
+
+class ReplacementIdleTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Timed out after ${timeoutMs}ms waiting for the agent to become idle`);
+    this.name = "ReplacementIdleTimeoutError";
+  }
+}
+
+async function waitForIdleWithTimeout(idle: Promise<void> | void, timeoutMs: number): Promise<void> {
+  if (!(idle instanceof Promise)) return;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new ReplacementIdleTimeoutError(timeoutMs)), timeoutMs);
+    timer.unref?.();
+  });
+
+  try {
+    await Promise.race([idle, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function startReviewCycle(
@@ -2189,6 +2220,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
   const getGitBaselineImpl = deps.getGitBaseline ?? getGitBaseline;
   const getChangeSnapshotImpl = deps.getChangeSnapshot ?? getChangeSnapshot;
   const runFreshReviewAgentImpl = deps.runFreshReviewAgent ?? runFreshReviewAgent;
+  const replacementIdleTimeoutMs = deps.replacementIdleTimeoutMs ?? REPLACEMENT_IDLE_TIMEOUT_MS;
 
   const stopStatusTicker = () => {
     if (!statusRefreshTimer) return;
@@ -2430,7 +2462,7 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
           ctx.ui.notify(startOptionsError, "error");
           return;
         }
-        const stopped = await stopActiveReviewCycleForReplacement(ctx, stateRef, stopStatusTicker, parsed.task);
+        const stopped = await stopActiveReviewCycleForReplacement(ctx, stateRef, stopStatusTicker, parsed.task, replacementIdleTimeoutMs);
         if (!stopped) return;
       }
 
