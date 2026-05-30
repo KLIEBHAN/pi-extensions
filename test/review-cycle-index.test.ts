@@ -932,6 +932,79 @@ test("review-cycle reports diagnostics when the reviewer returns no text", async
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("produced no assistant text"))));
 });
 
+test("review-cycle uses streamed reviewer text when the final message has none", async () => {
+  const harness = createHarness();
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => ({
+      text: "",
+      streamedText: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.",
+      exitCode: 0,
+      stderr: "",
+      messages: [],
+      stopReason: "stop",
+    }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("streamed verdict task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.message.includes("reviewer approved")));
+  assert.equal(harness.notifications.some((entry) => entry.message.includes("failed during fresh review")), false);
+});
+
+test("review-cycle writes the captured reviewer log into the failure artifact", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-captured-log-"));
+  try {
+    const harness = createHarness({ cwd });
+
+    createReviewCycleExtension({
+      getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+      getChangeSnapshot: async () => ({
+        isGitRepo: true,
+        baselineHead: "abc123",
+        status: "## main\n M src/a.ts",
+        diffStat: "src/a.ts | 1 +",
+        diff: "diff --git a/src/a.ts b/src/a.ts",
+        committedChanges: "",
+        untrackedFiles: [],
+        notes: [],
+      }),
+      runFreshReviewAgent: async (options: any) => {
+        options.onLine?.("→ read app/foo.ts");
+        options.onLine?.("stderr: provider error: rate limited");
+        return { text: "", streamedText: "", exitCode: 0, stderr: "provider error: rate limited", messages: [], stopReason: "length" };
+      },
+    })(harness.pi as never);
+
+    await harness.commands.get("review-cycle")?.handler("captured log task", harness.ctx);
+    await harness.handlers.get("agent_end")?.({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+    }, harness.ctx);
+
+    const latest = await readFile(join(cwd, ".pi", "review-cycle", "latest.md"), "utf8");
+    assert.match(latest, /## Reviewer log \(captured\)/);
+    assert.match(latest, /read app\/foo\.ts/);
+    assert.match(latest, /provider error: rate limited/);
+    assert.match(latest, /Fresh review produced no assistant text/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("review-cycle fresh review works when context signal is missing", async () => {
   const harness = createHarness();
   (harness.ctx as any).signal = undefined;

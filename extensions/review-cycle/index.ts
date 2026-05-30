@@ -53,6 +53,7 @@ const REVIEW_CYCLE_ARTIFACT_DIR = ".pi/review-cycle";
 const REVIEW_CYCLE_PREFERENCES_PATH = ".pi/review-cycle/preferences.json";
 const STATUS_CARD_LABEL_WIDTH = 9;
 const STATUS_CARD_DIVIDER = "─────";
+const NO_REVIEWER_TEXT = "Reviewer returned no text.";
 
 type ReviewCyclePhase = "confirming" | "implementing" | "reviewing" | "manual" | "applying" | "failed";
 
@@ -94,6 +95,7 @@ interface FreshReviewResult {
   stderr: string;
   messages: Message[];
   stopReason?: string;
+  streamedText: string;
 }
 
 interface AssistantTurn {
@@ -1021,6 +1023,7 @@ export async function runFreshReviewAgent(options: {
       const messages: Message[] = [];
       let stderr = "";
       let buffer = "";
+      let streamedAssistantText = "";
       let timedOut = false;
       let aborted = false;
       let settled = false;
@@ -1062,7 +1065,10 @@ export async function runFreshReviewAgent(options: {
 
         if (event.type === "message_update") {
           const delta = getEventTextDelta(event);
-          if (delta) options.onOutput?.(delta);
+          if (delta) {
+            streamedAssistantText += delta;
+            options.onOutput?.(delta);
+          }
           return;
         }
 
@@ -1163,7 +1169,7 @@ export async function runFreshReviewAgent(options: {
         }
         if (!settled) {
           settled = true;
-          resolve({ text: finalText, exitCode, stderr, messages, stopReason: getFinalAssistantStopReason(messages) });
+          resolve({ text: finalText, exitCode, stderr, messages, stopReason: getFinalAssistantStopReason(messages), streamedText: streamedAssistantText });
         }
       });
     });
@@ -1628,6 +1634,9 @@ function formatArtifactSummary(state: ReviewCycleState, stage: string): string {
     "",
     "## Apply output",
     state.applySummary ? truncateMiddle(state.applySummary, 8_000) : "(not available)",
+    state.lastReviewError && state.reviewerOutputLines.length > 0
+      ? `\n## Reviewer log (captured)\n\`\`\`text\n${truncateMiddle(state.reviewerOutputLines.join("\n"), 8_000)}\n\`\`\``
+      : undefined,
     state.lastReviewError ? `\n## Last reviewer error\n${state.lastReviewError}` : undefined,
   ].filter((value): value is string => value !== undefined).join("\n");
 }
@@ -2077,8 +2086,8 @@ async function runReviewAndQueueApply(
 
   if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
 
-  const reviewText = result.text.trim();
-  state.review = reviewText || "Reviewer returned no text.";
+  const reviewText = result.text.trim() || (result.streamedText ?? "").trim();
+  state.review = reviewText || NO_REVIEWER_TEXT;
   appendReviewerOutputLineAndRender(ctx, state, "Fresh-context reviewer finished.");
   const summary = parseReviewSummary(state.review);
   state.reviewSummary = summary;
