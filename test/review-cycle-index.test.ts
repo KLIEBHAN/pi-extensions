@@ -150,6 +150,35 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   }
 });
 
+test("runFreshReviewAgent forwards the reviewer model and stop reason", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "review-cycle-model-"));
+  try {
+    const fakePiPath = join(cwd, "fake-pi.mjs");
+    await writeFile(fakePiPath, `
+const args = process.argv.slice(2);
+const fail = (message) => { console.error(message); process.exit(2); };
+const modelIndex = args.indexOf("--model");
+if (modelIndex < 0) fail("missing --model");
+if (args[modelIndex + 1] !== "anthropic/claude-sonnet-4-5") fail("wrong model: " + args[modelIndex + 1]);
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "## Verdict\\nAPPROVE\\n\\n## Findings\\nNo mandatory findings." }] } }));
+`, "utf8");
+
+    const result = await runFreshReviewAgent({
+      cwd,
+      prompt: "review this",
+      reviewerModel: { provider: "anthropic", id: "claude-sonnet-4-5" },
+      timeoutMs: 10_000,
+      invocation: { command: process.execPath, args: [fakePiPath] },
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.match(result.text, /APPROVE/);
+    assert.equal(result.stopReason, "stop");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runFreshReviewAgent escalates timed-out reviewer subprocesses that ignore SIGTERM", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "review-cycle-timeout-"));
   try {
