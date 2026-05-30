@@ -22,6 +22,7 @@ import {
   REVIEWER_SYSTEM_PROMPT,
   shouldTreatStopReasonAsFailure,
   summarizeTask,
+  truncateEnd,
   truncateMiddle,
   type ChangeSnapshot,
   type GitBaseline,
@@ -92,6 +93,7 @@ interface FreshReviewResult {
   exitCode: number;
   stderr: string;
   messages: Message[];
+  stopReason?: string;
 }
 
 interface AssistantTurn {
@@ -1161,7 +1163,7 @@ export async function runFreshReviewAgent(options: {
         }
         if (!settled) {
           settled = true;
-          resolve({ text: finalText, exitCode, stderr, messages });
+          resolve({ text: finalText, exitCode, stderr, messages, stopReason: getFinalAssistantStopReason(messages) });
         }
       });
     });
@@ -1178,6 +1180,37 @@ function getFinalAssistantOutput(messages: Message[]): string {
     if (text) return text;
   }
   return "";
+}
+
+function getFinalAssistantStopReason(messages: Message[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant") continue;
+    const stopReason = (message as { stopReason?: unknown }).stopReason;
+    return typeof stopReason === "string" && stopReason ? stopReason : undefined;
+  }
+  return undefined;
+}
+
+function summarizeReviewerStderr(stderr: string): string | undefined {
+  const trimmed = stderr.trim();
+  if (!trimmed) return undefined;
+  const tail = trimmed.split(/\r?\n/).filter((line) => line.trim()).slice(-5).join(" | ");
+  return truncateEnd(tail, 400) || undefined;
+}
+
+function buildReviewVerdictError(reviewText: string, result: FreshReviewResult): string {
+  const diagnostics: string[] = [];
+  if (result.stopReason) diagnostics.push(`stopReason=${result.stopReason}`);
+  const stderrSummary = summarizeReviewerStderr(result.stderr);
+  if (stderrSummary) diagnostics.push(`stderr=${stderrSummary}`);
+  const suffix = diagnostics.length > 0 ? ` (${diagnostics.join("; ")})` : "";
+
+  if (!reviewText) {
+    return `Fresh review produced no assistant text${suffix}. The reviewer model may be reasoning-only, may have hit its output limit, or returned an empty response. Try /review-cycle retry, optionally with a dedicated --reviewer-model.`;
+  }
+
+  return `Fresh review output did not include a recognized verdict (APPROVE, APPROVE_WITH_NOTES, or CHANGES_REQUESTED)${suffix}.`;
 }
 
 function parseConfigBoolean(value: unknown): boolean | undefined {
@@ -2044,13 +2077,14 @@ async function runReviewAndQueueApply(
 
   if (stateRef.current !== state || !state.active || state.phase !== "reviewing") return;
 
-  state.review = result.text.trim() || "Reviewer returned no text.";
+  const reviewText = result.text.trim();
+  state.review = reviewText || "Reviewer returned no text.";
   appendReviewerOutputLineAndRender(ctx, state, "Fresh-context reviewer finished.");
   const summary = parseReviewSummary(state.review);
   state.reviewSummary = summary;
   collapseReviewerOutputWidget(ctx, state);
   if (!summary.verdict) {
-    throw new Error("Fresh review output did not include a recognized verdict (APPROVE, APPROVE_WITH_NOTES, or CHANGES_REQUESTED)");
+    throw new Error(buildReviewVerdictError(reviewText, result));
   }
 
   await writeReviewArtifact(ctx.cwd, state, "review-complete");

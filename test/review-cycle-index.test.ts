@@ -864,6 +864,45 @@ test("review-cycle fails closed when reviewer omits a recognized verdict", async
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("recognized verdict"))));
 });
 
+test("review-cycle reports diagnostics when the reviewer returns no text", async () => {
+  const harness = createHarness();
+
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## main", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## main\n M src/a.ts",
+      diffStat: "src/a.ts | 1 +",
+      diff: "diff --git a/src/a.ts b/src/a.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => ({
+      text: "",
+      exitCode: 0,
+      stderr: "provider error: rate limited\ngiving up",
+      messages: [],
+      stopReason: "length",
+    }),
+  })(harness.pi as never);
+  await enableReviewStatusCard(harness);
+
+  await harness.commands.get("review-cycle")?.handler("empty reviewer task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.equal(harness.sentMessages.length, 1);
+  const failure = harness.notifications.find((entry) => entry.message.includes("failed during fresh review"))?.message ?? "";
+  assert.match(failure, /produced no assistant text/);
+  assert.match(failure, /stopReason=length/);
+  assert.match(failure, /stderr=/);
+  assert.equal(failure.includes("recognized verdict"), false);
+  assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("produced no assistant text"))));
+});
+
 test("review-cycle fresh review works when context signal is missing", async () => {
   const harness = createHarness();
   (harness.ctx as any).signal = undefined;
