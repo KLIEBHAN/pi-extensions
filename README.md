@@ -257,7 +257,7 @@ Optional dedicated fast model:
 pi -e ./extensions/prompt-autocomplete \
   --prompt-autocomplete \
   --prompt-autocomplete-model openai/gpt-5.4-mini \
-  --prompt-autocomplete-max-alternatives 2
+  --prompt-autocomplete-max-alternatives 3
 ```
 
 ### Notes
@@ -266,7 +266,7 @@ pi -e ./extensions/prompt-autocomplete \
 - Built-in slash-command and file/path autocomplete keep working.
 - By default it pauses while the main agent is streaming so it can use the finished conversation context. Override with `--prompt-autocomplete-while-streaming` if you really want live suggestions while the agent is still working.
 - Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling.
-- The default suggestion count is 2. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
+- The default suggestion count is 3. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
 - Legacy `Ctrl+Tab` and `Alt+[` / `Alt+]` remain supported as fallbacks when your terminal forwards them.
 - For troubleshooting, start with `--prompt-autocomplete-debug` or run `/prompt-autocomplete debug-on` temporarily.
 - If you want to tune the internal autocomplete prompt, edit `extensions/prompt-autocomplete/system-prompt.template.md`; `{{PLACEHOLDER}}` variables are filled in by `extensions/prompt-autocomplete/core.ts`, `{{PLACEHOLDER|fallback}}` uses the fallback text when no variable is provided, and `\{{PLACEHOLDER}}` keeps the placeholder syntax literal.
