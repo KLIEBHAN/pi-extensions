@@ -43,13 +43,12 @@ const REQUEST_MAX_RETRY_DELAY_MS = 2_000;
 const FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_CACHE_TTL_MS = 60_000;
 const REQUEST_CACHE_MAX_ENTRIES = 128;
-// Keymap audit vs. pi defaults (packages/coding-agent/src/core/keybindings.ts +
-// packages/tui/src/keybindings.ts): of the keys below only `ctrl+,` is bound by
-// default (app.openSettings). `ctrl+.`, `alt+]`, `alt+[`, `ctrl+space` and
-// `ctrl+tab` are unbound, so the editor can safely own them — including the
-// broadened `ctrl+.`/`alt+]` one-shot trigger, which shadows no base action.
-// `ctrl+,` (cycle previous) only overrides app.openSettings while ≥2 suggestions
-// are visible; `alt+[` stays as a conflict-free fallback.
+// Keymap audit vs. pi defaults (packages/tui/src/keybindings.ts +
+// packages/coding-agent/src/core/keybindings.ts): none of the keys below are bound
+// by pi's default keymap, so the editor can safely own them — including the
+// broadened `ctrl+.`/`alt+]` one-shot trigger, which shadows no base action. The
+// only nearby defaults are `ctrl+]` (jumpForward) and `ctrl+alt+]` (jumpBackward),
+// both distinct from our `alt+]`.
 const WORD_ACCEPT_KEYS: readonly KeyId[] = ["ctrl+space", "ctrl+tab"];
 const CYCLE_NEXT_KEYS: readonly KeyId[] = ["ctrl+.", "alt+]"];
 const CYCLE_PREV_KEYS: readonly KeyId[] = ["ctrl+,", "alt+["];
