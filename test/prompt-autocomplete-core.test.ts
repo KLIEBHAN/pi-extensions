@@ -6,8 +6,13 @@ import {
   buildLatestAssistantMessageContext,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
+  computeRequestMaxTokens,
   createOwnerRefCounter,
+  DEFAULT_MAX_ALTERNATIVES,
+  DEFAULT_MAX_SUGGESTION_CHARS,
   DEFAULT_PREFERRED_MODEL,
+  MAX_REQUEST_MAX_TOKENS,
+  MIN_REQUEST_MAX_TOKENS,
   extractMessageText,
   extractNextSuggestionChunk,
   normalizePromptSuggestion,
@@ -37,6 +42,17 @@ test("parseBoundedIntFlag clamps invalid and out-of-range values", () => {
   assert.equal(parseBoundedIntFlag("-1", 100, 0, 1000), 0);
   assert.equal(parseBoundedIntFlag("5000", 100, 0, 1000), 1000);
   assert.equal(parseBoundedIntFlag("abc", 100, 0, 1000), 100);
+});
+
+test("computeRequestMaxTokens scales with alternatives and clamps to the budget", () => {
+  // Default config (3 alternatives, 160 chars) lands above the old fixed 192 budget.
+  assert.equal(computeRequestMaxTokens(DEFAULT_MAX_ALTERNATIVES, DEFAULT_MAX_SUGGESTION_CHARS), 210);
+  // Small requests are floored to the minimum budget.
+  assert.equal(computeRequestMaxTokens(1, 16), MIN_REQUEST_MAX_TOKENS);
+  // Extreme requests are capped at the maximum budget.
+  assert.equal(computeRequestMaxTokens(5, 1000), MAX_REQUEST_MAX_TOKENS);
+  // More alternatives never decrease the budget.
+  assert.ok(computeRequestMaxTokens(4, 160) > computeRequestMaxTokens(3, 160));
 });
 
 test("default prompt autocomplete model now follows the active model", () => {

@@ -7,6 +7,7 @@ import {
   buildLatestUserMessageContext,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
+  computeRequestMaxTokens,
   createOwnerRefCounter,
   DEFAULT_DEBOUNCE_MS,
   DEFAULT_MAX_ALTERNATIVES,
@@ -34,10 +35,6 @@ const CURSOR_TOKEN = "\x1b[7m \x1b[0m";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 const SPINNER_INTERVAL_MS = 80;
 const SPINNER_LABEL = "Generating suggestion";
-// Scale the completion budget with the requested alternatives so a JSON array of
-// several short suggestions cannot be truncated mid-string (which would break parsing).
-const MIN_REQUEST_MAX_TOKENS = 192;
-const MAX_REQUEST_MAX_TOKENS = 1_024;
 // Inline autocomplete should fail fast instead of inheriting long provider retry/timeout defaults.
 const REQUEST_TIMEOUT_MS = 8_000;
 const REQUEST_MAX_RETRIES = 0;
@@ -146,14 +143,6 @@ function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
 
 function formatPrimaryKey(keys: readonly KeyId[]): string {
   return keys[0] ?? "";
-}
-
-function computeRequestMaxTokens(maxAlternatives: number, maxSuggestionChars: number): number {
-  // Rough chars→tokens estimate per suggestion plus JSON quoting/comma overhead,
-  // and a fixed wrapper budget for the surrounding {"completions":[...]} envelope.
-  const tokensPerSuggestion = Math.ceil(maxSuggestionChars / 3) + 8;
-  const estimated = 24 + maxAlternatives * tokensPerSuggestion;
-  return Math.max(MIN_REQUEST_MAX_TOKENS, Math.min(MAX_REQUEST_MAX_TOKENS, estimated));
 }
 
 function hashText(text: string): string {

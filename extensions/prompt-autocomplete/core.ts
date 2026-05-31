@@ -63,6 +63,10 @@ export const MAX_CONTEXT_MESSAGES = 6;
 export const MAX_CONTEXT_MESSAGE_CHARS = 600;
 export const MAX_LATEST_ASSISTANT_MESSAGE_CHARS = 3_000;
 export const MAX_LATEST_USER_MESSAGE_CHARS = 1_200;
+// Scale the completion budget with the requested alternatives so a JSON array of
+// several short suggestions cannot be truncated mid-string (which would break parsing).
+export const MIN_REQUEST_MAX_TOKENS = 192;
+export const MAX_REQUEST_MAX_TOKENS = 1_024;
 
 export interface ModelRef {
   provider: string;
@@ -463,6 +467,14 @@ export function parseBoundedIntFlag(
   const parsed = Number.parseInt(value.trim(), 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, parsed));
+}
+
+export function computeRequestMaxTokens(maxAlternatives: number, maxSuggestionChars: number): number {
+  // Rough chars→tokens estimate per suggestion plus JSON quoting/comma overhead,
+  // and a fixed wrapper budget for the surrounding {"completions":[...]} envelope.
+  const tokensPerSuggestion = Math.ceil(maxSuggestionChars / 3) + 8;
+  const estimated = 24 + maxAlternatives * tokensPerSuggestion;
+  return Math.max(MIN_REQUEST_MAX_TOKENS, Math.min(MAX_REQUEST_MAX_TOKENS, estimated));
 }
 
 export function extractMessageText(content: unknown, maxChars = Number.POSITIVE_INFINITY): string {
