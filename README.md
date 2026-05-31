@@ -213,10 +213,10 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 ### What it adds
 
 - ghost-text style prompt suggestions directly in the editor, including when the draft is still empty by default
-- shows 2 alternatives by default, with configurable limit via flag
+- shows 3 alternatives by default, with configurable limit via flag
 - `Tab` accepts the whole current suggestion
 - `Ctrl+Space` accepts the next word/chunk from the current suggestion
-- `Ctrl+,` and `Ctrl+.` cycle through alternative suggestions
+- `Ctrl+,` and `Ctrl+.` cycle through alternative suggestions; when there is nothing to cycle, `Ctrl+.` forces a one-shot suggestion (even while the agent is working and while-streaming is off)
 - legacy fallbacks remain supported when your terminal forwards them: `Ctrl+Tab`, `Alt+[`, `Alt+]`
 - `Escape` dismisses the current suggestion for the current draft
 - repeated acceptance can keep extending the prompt step by step
@@ -225,7 +225,7 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 - configurable alternative count via `--prompt-autocomplete-max-alternatives <1-5>`
 - clean default UI: debug/status lines stay hidden unless you opt into debug mode
 - the internal autocomplete system prompt lives in `extensions/prompt-autocomplete/system-prompt.template.md` and is rendered through a tiny mini-template helper with `{{PLACEHOLDER}}`, `{{PLACEHOLDER|fallback}}`, and escaped literals via `\{{PLACEHOLDER}}`, so prompt tuning stays decoupled from TypeScript while still allowing reusable prompt fragments
-- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle`
+- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle` and `/prompt-autocomplete while-streaming on|off|toggle`
 
 ### Usage
 
@@ -246,6 +246,8 @@ Or enable it for the current session from inside pi:
 ```text
 /prompt-autocomplete on
 /prompt-autocomplete status
+/prompt-autocomplete while-streaming on
+/prompt-autocomplete while-streaming toggle
 /prompt-autocomplete debug-on
 /prompt-autocomplete debug-off
 /prompt-autocomplete off
@@ -264,8 +266,9 @@ pi -e ./extensions/prompt-autocomplete \
 
 - The extension suggests as soon as the cursor is at the end of the current draft, even if the draft is still empty by default (`--prompt-autocomplete-min-chars 0`). Raise `--prompt-autocomplete-min-chars` if you want to avoid empty-draft next-prompt suggestions.
 - Built-in slash-command and file/path autocomplete keep working.
-- By default it pauses while the main agent is streaming so it can use the finished conversation context. Override with `--prompt-autocomplete-while-streaming` if you really want live suggestions while the agent is still working.
-- Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling.
+- By default it pauses while the main agent is streaming so it can use the finished conversation context. Override at startup with `--prompt-autocomplete-while-streaming`, or toggle it per session with `/prompt-autocomplete while-streaming on|off|toggle`.
+- Even while-streaming is off, press `Ctrl+.` with no active suggestion to force a single one-shot completion during an agent turn; it ignores the streaming gate and the post-error cooldown for that one request.
+- Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling (and `Ctrl+.` doubles as the one-shot trigger).
 - The default suggestion count is 3. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
 - Legacy `Ctrl+Tab` and `Alt+[` / `Alt+]` remain supported as fallbacks when your terminal forwards them.
 - For troubleshooting, start with `--prompt-autocomplete-debug` or run `/prompt-autocomplete debug-on` temporarily.

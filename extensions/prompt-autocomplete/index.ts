@@ -98,6 +98,9 @@ interface PromptAutocompleteCacheEntry {
 interface SuggestionRefreshOptions {
   clearExisting?: boolean;
   immediate?: boolean;
+  // Manual one-shot trigger: bypasses the streaming gate and error cooldown so the
+  // user can force a single suggestion while the main agent is still working.
+  manual?: boolean;
 }
 
 interface PromptAutocompleteSharedState {
@@ -358,6 +361,11 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
+    if (this.canTriggerManualSuggestion(data)) {
+      this.triggerManualSuggestion();
+      return;
+    }
+
     if (this.canAcceptInlineSuggestionByWord(data)) {
       this.acceptInlineSuggestionByWord();
       return;
@@ -520,6 +528,21 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.tui.requestRender();
   }
 
+  // Fires only when CYCLE_NEXT (ctrl+.) is pressed and there is nothing to cycle
+  // through, so the same key both advances alternatives and forces a one-shot
+  // suggestion (e.g. while the agent is streaming and while-streaming is off).
+  private canTriggerManualSuggestion(data: string): boolean {
+    if (!this.shared.enabled || this.activationId !== this.shared.activationId) return false;
+    if (this.isShowingAutocomplete()) return false;
+    return matchesAnyKey(data, CYCLE_NEXT_KEYS);
+  }
+
+  private triggerManualSuggestion(): void {
+    this.dismissedKey = undefined;
+    updateDebugState(this.shared, "manual", "Manual one-shot suggestion trigger");
+    this.refreshSuggestion({ clearExisting: true, immediate: true, manual: true });
+  }
+
   private canDismissInlineSuggestion(data: string): boolean {
     return this.shouldRenderInlineSuggestion() && !!this.getActiveSuggestion() && matchesKey(data, "escape");
   }
@@ -612,10 +635,17 @@ class PromptAutocompleteEditor extends CustomEditor {
     return cursor.col === (lines[cursor.line]?.length ?? 0);
   }
 
-  private getSuppressionReason(): string | undefined {
+  private getSuppressionReason(options: { manual?: boolean } = {}): string | undefined {
     if (!this.isCursorAtEndOfDraft()) return "Cursor is not at the end of the draft";
-    if (!this.shared.config.allowWhileStreaming && this.shared.streaming) return "Waiting for the current agent turn to finish";
-    if (Date.now() < this.suspendedUntil) return "In temporary cooldown after the last error";
+    // A manual one-shot trigger deliberately ignores the streaming gate and the
+    // post-error cooldown; everything below still applies (model/auth, min-chars,
+    // slash/path contexts) because those would never produce a useful suggestion.
+    if (!options.manual) {
+      if (!this.shared.config.allowWhileStreaming && this.shared.streaming) {
+        return "Waiting for the current agent turn to finish";
+      }
+      if (Date.now() < this.suspendedUntil) return "In temporary cooldown after the last error";
+    }
 
     const model = resolveSuggestionModel(this.shared);
     if (!model) return "No usable autocomplete model with configured auth was found";
@@ -651,7 +681,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
-    const suppressionReason = this.getSuppressionReason();
+    const suppressionReason = this.getSuppressionReason({ manual: options.manual });
     if (suppressionReason) {
       this.cancelPendingRequest();
       updateDebugState(this.shared, "waiting", suppressionReason);
@@ -1081,6 +1111,37 @@ function setDebugDisplay(shared: PromptAutocompleteSharedState, enabled: boolean
   }
 }
 
+function setWhileStreaming(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  arg: string | undefined,
+): void {
+  let next: boolean;
+  if (arg === "on") {
+    next = true;
+  } else if (arg === "off") {
+    next = false;
+  } else if (arg === undefined || arg === "toggle") {
+    next = !shared.config.allowWhileStreaming;
+  } else {
+    ctx.ui.notify("Usage: /prompt-autocomplete while-streaming [on|off|toggle]", "warning");
+    return;
+  }
+
+  shared.config.allowWhileStreaming = next;
+  ctx.ui.notify(`Prompt autocomplete while-streaming ${next ? "enabled" : "disabled"}`, "info");
+
+  if (shared.enabled) {
+    refreshEditorImmediately(
+      shared,
+      next ? "ready" : "waiting",
+      next
+        ? "While-streaming enabled; suggestions can run during agent turns"
+        : "While-streaming disabled; suggestions wait for the agent to finish",
+    );
+  }
+}
+
 function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
   shared.enabled = true;
   mountEditor(ctx, shared);
@@ -1098,7 +1159,8 @@ function notifyPromptAutocompleteEnabled(
 ): void {
   const keyHint =
     `Tab accepts all, ${formatPrimaryKey(WORD_ACCEPT_KEYS)} accepts one word, ` +
-    `${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives.`;
+    `${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives, ` +
+    `${formatPrimaryKey(CYCLE_NEXT_KEYS)} forces a one-shot suggestion (even while the agent works).`;
   const resolvedModel = resolveSuggestionModel(shared);
 
   if (options.includeModel) {
@@ -1270,7 +1332,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const command = args.trim().toLowerCase() || "status";
+      const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const command = parts[0] || "status";
+
+      if (command === "while-streaming") {
+        setWhileStreaming(ctx, shared, parts[1]);
+        return;
+      }
+
       const handlers = createPromptAutocompleteCommandHandlers(ctx, shared);
       const handler = handlers[command];
 
@@ -1280,7 +1349,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        "Usage: /prompt-autocomplete [on|off|toggle|status|debug-on|debug-off|debug-toggle]",
+        "Usage: /prompt-autocomplete [on|off|toggle|status|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
         "warning",
       );
     },
