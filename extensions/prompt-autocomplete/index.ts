@@ -34,8 +34,10 @@ const CURSOR_TOKEN = "\x1b[7m \x1b[0m";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 const SPINNER_INTERVAL_MS = 80;
 const SPINNER_LABEL = "Generating suggestion";
-// Keep the completion budget just large enough for a small JSON array of short alternatives.
-const REQUEST_MAX_TOKENS = 192;
+// Scale the completion budget with the requested alternatives so a JSON array of
+// several short suggestions cannot be truncated mid-string (which would break parsing).
+const MIN_REQUEST_MAX_TOKENS = 192;
+const MAX_REQUEST_MAX_TOKENS = 1_024;
 // Inline autocomplete should fail fast instead of inheriting long provider retry/timeout defaults.
 const REQUEST_TIMEOUT_MS = 8_000;
 const REQUEST_MAX_RETRIES = 0;
@@ -141,6 +143,14 @@ function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
 
 function formatPrimaryKey(keys: readonly KeyId[]): string {
   return keys[0] ?? "";
+}
+
+function computeRequestMaxTokens(maxAlternatives: number, maxSuggestionChars: number): number {
+  // Rough chars→tokens estimate per suggestion plus JSON quoting/comma overhead,
+  // and a fixed wrapper budget for the surrounding {"completions":[...]} envelope.
+  const tokensPerSuggestion = Math.ceil(maxSuggestionChars / 3) + 8;
+  const estimated = 24 + maxAlternatives * tokensPerSuggestion;
+  return Math.max(MIN_REQUEST_MAX_TOKENS, Math.min(MAX_REQUEST_MAX_TOKENS, estimated));
 }
 
 function hashText(text: string): string {
@@ -838,25 +848,32 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
 
     if (request.draft.length === 0) {
+      sections.push("Current draft is empty.");
       sections.push(
-        "Current draft is empty. Suggest the best full next prompts the user could send now.",
-      );
-    } else if (request.draftTail.length < request.draft.length) {
-      sections.push(
-        `Current draft tail (the real draft is longer; the cursor is at the end of the full draft):\n${request.draftTail}`,
+        [
+          `Task: propose up to ${request.maxAlternatives} ranked, meaningfully distinct full next prompts the user could send now.`,
+          "Each item must be a complete next prompt, not a continuation fragment.",
+          "Suggest the prompt most likely to move the overall project forward.",
+          "Prefer 3-10 words when possible.",
+        ].join("\n"),
       );
     } else {
-      sections.push(`Current draft (cursor at end):\n${request.draft}`);
-    }
+      if (request.draftTail.length < request.draft.length) {
+        sections.push(
+          `Current draft tail (the real draft is longer; the cursor is at the end of the full draft):\n${request.draftTail}`,
+        );
+      } else {
+        sections.push(`Current draft (cursor at end):\n${request.draft}`);
+      }
 
-    sections.push(
-      `Return up to ${request.maxAlternatives} ranked alternatives as JSON with shape {\"completions\":[...]}.`,
-    );
-    sections.push(
-      request.draft.length === 0
-        ? "Each item should be a complete next prompt, not a continuation fragment."
-        : "Each item should be only the continuation to insert at the cursor.",
-    );
+      sections.push(
+        [
+          `Task: propose up to ${request.maxAlternatives} ranked, meaningfully distinct continuations to insert at the cursor.`,
+          "Each item must be only the text after the cursor; never restate text the user already typed.",
+          "If the draft ends inside a partially typed word, complete that word directly without a leading space.",
+        ].join("\n"),
+      );
+    }
 
     const userMessage: UserMessage = {
       role: "user",
@@ -874,7 +891,7 @@ class PromptAutocompleteEditor extends CustomEditor {
         apiKey: auth.apiKey,
         headers: auth.headers,
         signal,
-        maxTokens: REQUEST_MAX_TOKENS,
+        maxTokens: computeRequestMaxTokens(request.maxAlternatives, this.shared.config.maxSuggestionChars),
         timeoutMs: REQUEST_TIMEOUT_MS,
         maxRetries: REQUEST_MAX_RETRIES,
         maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
