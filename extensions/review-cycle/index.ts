@@ -1211,12 +1211,15 @@ function buildReviewVerdictError(reviewText: string, result: FreshReviewResult):
   const stderrSummary = summarizeReviewerStderr(result.stderr);
   if (stderrSummary) diagnostics.push(`stderr=${stderrSummary}`);
   const suffix = diagnostics.length > 0 ? ` (${diagnostics.join("; ")})` : "";
+  const lengthHint = result.stopReason === "length"
+    ? " The reviewer hit its output token limit; use a dedicated --reviewer-model with more headroom or reduce the review scope."
+    : "";
 
   if (!reviewText) {
-    return `Fresh review produced no assistant text${suffix}. The reviewer model may be reasoning-only, may have hit its output limit, or returned an empty response. Try /review-cycle retry, optionally with a dedicated --reviewer-model.`;
+    return `Fresh review produced no assistant text${suffix}. The reviewer model may be reasoning-only, may have hit its output limit, or returned an empty response.${lengthHint} Try /review-cycle retry, optionally with a dedicated --reviewer-model.`;
   }
 
-  return `Fresh review output did not include a recognized verdict (APPROVE, APPROVE_WITH_NOTES, or CHANGES_REQUESTED)${suffix}.`;
+  return `Fresh review output did not include a recognized verdict (APPROVE, APPROVE_WITH_NOTES, or CHANGES_REQUESTED)${suffix}.${lengthHint}`;
 }
 
 function parseConfigBoolean(value: unknown): boolean | undefined {
