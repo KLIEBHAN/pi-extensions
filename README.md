@@ -267,7 +267,7 @@ pi -e ./extensions/prompt-autocomplete \
 - The extension suggests as soon as the cursor is at the end of the current draft, even if the draft is still empty by default (`--prompt-autocomplete-min-chars 0`). Raise `--prompt-autocomplete-min-chars` if you want to avoid empty-draft next-prompt suggestions.
 - Built-in slash-command and file/path autocomplete keep working.
 - By default it pauses while the main agent is streaming so it can use the finished conversation context. Override at startup with `--prompt-autocomplete-while-streaming`, or toggle it per session with `/prompt-autocomplete while-streaming on|off|toggle`.
-- Even while-streaming is off, press `Ctrl+.` with no active suggestion to force a single one-shot completion during an agent turn; it ignores the streaming gate and the post-error cooldown for that one request.
+- Even while-streaming is off, press `Ctrl+.` with no active suggestion to force a single one-shot completion during an agent turn; it ignores the streaming gate, the post-error cooldown, and the min-chars threshold for that one request (model/auth and slash/path checks still apply).
 - Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling (and `Ctrl+.` doubles as the one-shot trigger).
 - The default suggestion count is 3. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
 - Legacy `Ctrl+Tab` and `Alt+[` / `Alt+]` remain supported as fallbacks when your terminal forwards them.

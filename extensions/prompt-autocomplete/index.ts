@@ -538,8 +538,9 @@ class PromptAutocompleteEditor extends CustomEditor {
   }
 
   private triggerManualSuggestion(): void {
+    // refreshSuggestion immediately sets its own debug state, so we only clear any
+    // standing dismissal here and let the refresh report the real outcome.
     this.dismissedKey = undefined;
-    updateDebugState(this.shared, "manual", "Manual one-shot suggestion trigger");
     this.refreshSuggestion({ clearExisting: true, immediate: true, manual: true });
   }
 
@@ -637,9 +638,9 @@ class PromptAutocompleteEditor extends CustomEditor {
 
   private getSuppressionReason(options: { manual?: boolean } = {}): string | undefined {
     if (!this.isCursorAtEndOfDraft()) return "Cursor is not at the end of the draft";
-    // A manual one-shot trigger deliberately ignores the streaming gate and the
-    // post-error cooldown; everything below still applies (model/auth, min-chars,
-    // slash/path contexts) because those would never produce a useful suggestion.
+    // A manual one-shot trigger deliberately ignores the noise-reduction gates
+    // (streaming gate, post-error cooldown, min-chars). Model/auth and slash/path
+    // checks still apply because those can never produce a useful suggestion.
     if (!options.manual) {
       if (!this.shared.config.allowWhileStreaming && this.shared.streaming) {
         return "Waiting for the current agent turn to finish";
@@ -651,7 +652,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (!model) return "No usable autocomplete model with configured auth was found";
 
     const draft = this.getText();
-    if (draft.trim().length < this.shared.config.minPromptChars) {
+    if (!options.manual && draft.trim().length < this.shared.config.minPromptChars) {
       return `Draft is shorter than min chars (${this.shared.config.minPromptChars})`;
     }
     if (shouldSkipPromptAutocomplete(draft)) {
@@ -881,7 +882,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       sections.push("Current draft is empty.");
       sections.push(
         [
-          `Task: propose up to ${request.maxAlternatives} ranked, meaningfully distinct full next prompts the user could send now.`,
+          `Task: propose up to ${request.maxAlternatives} ranked full next prompts the user could send now.`,
           "Each item must be a complete next prompt, not a continuation fragment.",
           "Suggest the prompt most likely to move the overall project forward.",
           "Prefer 3-10 words when possible.",
@@ -898,7 +899,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
       sections.push(
         [
-          `Task: propose up to ${request.maxAlternatives} ranked, meaningfully distinct continuations to insert at the cursor.`,
+          `Task: propose up to ${request.maxAlternatives} ranked continuations to insert at the cursor.`,
           "Each item must be only the text after the cursor; never restate text the user already typed.",
           "If the draft ends inside a partially typed word, complete that word directly without a leading space.",
         ].join("\n"),
@@ -1132,13 +1133,10 @@ function setWhileStreaming(
   ctx.ui.notify(`Prompt autocomplete while-streaming ${next ? "enabled" : "disabled"}`, "info");
 
   if (shared.enabled) {
-    refreshEditorImmediately(
-      shared,
-      next ? "ready" : "waiting",
-      next
-        ? "While-streaming enabled; suggestions can run during agent turns"
-        : "While-streaming disabled; suggestions wait for the agent to finish",
-    );
+    // Only label it "waiting" when disabling actually suppresses right now (agent
+    // streaming); otherwise the refresh below requests suggestions immediately.
+    const willSuppress = !next && shared.streaming;
+    refreshEditorImmediately(shared, willSuppress ? "waiting" : "ready", `While-streaming ${next ? "enabled" : "disabled"}`);
   }
 }
 
@@ -1160,7 +1158,7 @@ function notifyPromptAutocompleteEnabled(
   const keyHint =
     `Tab accepts all, ${formatPrimaryKey(WORD_ACCEPT_KEYS)} accepts one word, ` +
     `${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives, ` +
-    `${formatPrimaryKey(CYCLE_NEXT_KEYS)} forces a one-shot suggestion (even while the agent works).`;
+    `${formatPrimaryKey(CYCLE_NEXT_KEYS)} also forces a one-shot suggestion when none is shown (even while the agent works).`;
   const resolvedModel = resolveSuggestionModel(shared);
 
   if (options.includeModel) {
