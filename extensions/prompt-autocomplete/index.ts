@@ -235,7 +235,7 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     `state=${shared.debugState || "idle"}`,
     shared.lastError ? `error=${truncateDebug(shared.lastError, 90)}` : undefined,
     shared.lastRawResponse ? `raw=${truncateDebug(shared.lastRawResponse, 90)}` : undefined,
-    `keys=tab accept | ${formatPrimaryKey(WORD_ACCEPT_KEYS)} word | ${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle`,
+    `keys=tab accept | ${formatPrimaryKey(WORD_ACCEPT_KEYS)} word | ${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle | ${formatPrimaryKey(CYCLE_NEXT_KEYS)} force one-shot`,
   ]
     .filter((value): value is string => !!value)
     .join(" | ");
