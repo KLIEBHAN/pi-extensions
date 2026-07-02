@@ -928,6 +928,7 @@ test("review-cycle reports diagnostics when the reviewer returns no text", async
   assert.match(failure, /produced no assistant text/);
   assert.match(failure, /stopReason=length/);
   assert.match(failure, /stderr=/);
+  assert.match(failure, /output token limit/);
   assert.equal(failure.includes("recognized verdict"), false);
   assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-status-card" && entry.content?.some((line) => line.includes("produced no assistant text"))));
 });
@@ -1000,9 +1001,43 @@ test("review-cycle writes the captured reviewer log into the failure artifact", 
     assert.match(latest, /read app\/foo\.ts/);
     assert.match(latest, /provider error: rate limited/);
     assert.match(latest, /Fresh review produced no assistant text/);
+    assert.match(latest, /"stopReason": "length"/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test("review-cycle warns when the review scope is large", async () => {
+  const manyFiles = ["## master...origin/master", ...Array.from({ length: 30 }, (_, i) => ` M src/file${i}.ts`)].join("\n");
+  const harness = createHarness();
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## master", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: manyFiles,
+      diffStat: "src/file0.ts | 1 +",
+      diff: "diff --git a/src/file0.ts b/src/file0.ts",
+      committedChanges: "",
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => ({
+      text: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.",
+      streamedText: "",
+      exitCode: 0,
+      stderr: "",
+      messages: [],
+      stopReason: "stop",
+    }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("large scope task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.level === "warning" && entry.message.includes("large review scope") && entry.message.includes("30 files")));
 });
 
 test("review-cycle fresh review works when context signal is missing", async () => {

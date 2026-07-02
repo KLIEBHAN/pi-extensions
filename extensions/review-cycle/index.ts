@@ -54,6 +54,8 @@ const REVIEW_CYCLE_PREFERENCES_PATH = ".pi/review-cycle/preferences.json";
 const STATUS_CARD_LABEL_WIDTH = 9;
 const STATUS_CARD_DIVIDER = "─────";
 const NO_REVIEWER_TEXT = "Reviewer returned no text.";
+const LARGE_REVIEW_FILE_COUNT = 25;
+const LARGE_REVIEW_PROMPT_CHARS = 45_000;
 
 type ReviewCyclePhase = "confirming" | "implementing" | "reviewing" | "manual" | "applying" | "failed";
 
@@ -73,6 +75,7 @@ interface ReviewCycleState {
   reviewSummary?: ReviewSummary;
   lastChanges?: ChangeSnapshot;
   lastReviewError?: string;
+  reviewStopReason?: string;
   reviewerOutputVisible: boolean;
   statusCardVisible: boolean;
   reviewerOutputCollapsed: boolean;
@@ -1222,6 +1225,17 @@ function buildReviewVerdictError(reviewText: string, result: FreshReviewResult):
   return `Fresh review output did not include a recognized verdict (APPROVE, APPROVE_WITH_NOTES, or CHANGES_REQUESTED)${suffix}.${lengthHint}`;
 }
 
+function countChangedFiles(changes: ChangeSnapshot): number {
+  const status = changes.status?.trim();
+  if (!status || status === "working tree clean" || status === "not a git repository" || status === "(unknown)") {
+    return 0;
+  }
+  return status.split(/\r?\n/).filter((line) => {
+    const trimmed = line.trim();
+    return trimmed.length > 0 && !trimmed.startsWith("##");
+  }).length;
+}
+
 function parseConfigBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
@@ -1587,6 +1601,7 @@ function formatArtifactSummary(state: ReviewCycleState, stage: string): string {
     started,
     verdict: summary?.verdict ?? null,
     findings: summary?.findingCount ?? 0,
+    stopReason: state.reviewStopReason ?? null,
   }, null, 2);
   const findings = summary?.findings.length
     ? summary.findings.map((finding, index) => `- [ ] ${index + 1}. ${finding.severity.toUpperCase()}: ${finding.text}`).join("\n")
@@ -2029,6 +2044,7 @@ async function runReviewAndQueueApply(
 ): Promise<void> {
   state.phase = "reviewing";
   state.lastReviewError = undefined;
+  state.reviewStopReason = undefined;
   state.review = undefined;
   state.reviewSummary = undefined;
   state.statusCardAction = undefined;
@@ -2062,6 +2078,14 @@ async function runReviewAndQueueApply(
     changes,
   });
 
+  const changedFileCount = countChangedFiles(changes);
+  if (changedFileCount >= LARGE_REVIEW_FILE_COUNT || reviewerPrompt.length >= LARGE_REVIEW_PROMPT_CHARS) {
+    ctx.ui.notify(
+      `Review-cycle: large review scope (${changedFileCount} file${changedFileCount === 1 ? "" : "s"}, ~${Math.round(reviewerPrompt.length / 1000)} KB prompt). If the reviewer returns no text, use a dedicated --reviewer-model or reduce the scope.`,
+      "warning",
+    );
+  }
+
   const reviewerModel = state.reviewerModel ?? resolveDefaultReviewerModel(ctx);
   const reviewerAbortController = new AbortController();
   const combinedSignal = createCombinedAbortSignal([ctx.signal, reviewerAbortController.signal]);
@@ -2091,6 +2115,7 @@ async function runReviewAndQueueApply(
 
   const reviewText = result.text.trim() || (result.streamedText ?? "").trim();
   state.review = reviewText || NO_REVIEWER_TEXT;
+  state.reviewStopReason = result.stopReason;
   appendReviewerOutputLineAndRender(ctx, state, "Fresh-context reviewer finished.");
   const summary = parseReviewSummary(state.review);
   state.reviewSummary = summary;
