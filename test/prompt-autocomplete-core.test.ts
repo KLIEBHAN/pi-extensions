@@ -203,6 +203,38 @@ test("normalizePromptSuggestions parses JSON alternatives and deduplicates them"
   );
 });
 
+test("normalizePromptSuggestions salvages complete entries from truncated JSON responses", () => {
+  const truncated =
+    '{"completions":["Prüfe, ob die Suiten mit eigenen Factory-Mocks auch auf den manuellen Mock umstellbar sind","Konvertiere den manuellen Mock von module.exports';
+  assert.deepEqual(normalizePromptSuggestions("", truncated), [
+    "Prüfe, ob die Suiten mit eigenen Factory-Mocks auch auf den manuellen Mock umstellbar sind",
+  ]);
+});
+
+test("normalizePromptSuggestions salvages entries with escaped quotes and brackets from truncated JSON", () => {
+  const truncated = '{"completions":["Nutze arr[0] und \\"quoted\\" Text","Zweiter vollständiger Eintrag","abgeschn';
+  assert.deepEqual(normalizePromptSuggestions("", truncated), [
+    'Nutze arr[0] und "quoted" Text',
+    "Zweiter vollständiger Eintrag",
+  ]);
+});
+
+test("normalizePromptSuggestions never leaks unparseable JSON payloads as ghost text", () => {
+  assert.deepEqual(normalizePromptSuggestions("", '{"completions":["abgeschnittener Eintr'), []);
+  assert.deepEqual(normalizePromptSuggestions("", '{"unknown":"shape"}'), []);
+  assert.deepEqual(normalizePromptSuggestions("", '```json\n{"completions":["abgeschn'), []);
+});
+
+test("normalizePromptSuggestions salvages truncated bare JSON arrays", () => {
+  assert.deepEqual(normalizePromptSuggestions("", '["Vollständiger Eintrag","abgeschn'), ["Vollständiger Eintrag"]);
+});
+
+test("normalizePromptSuggestions keeps plain-text responses as fallback suggestion", () => {
+  assert.deepEqual(normalizePromptSuggestions("", "Fasse die letzten Änderungen zusammen"), [
+    "Fasse die letzten Änderungen zusammen",
+  ]);
+});
+
 test("extractNextSuggestionChunk returns the next word-like chunk", () => {
   assert.equal(extractNextSuggestionChunk(" und Tests für Edge Cases ergänzen"), " und ");
   assert.equal(extractNextSuggestionChunk("\n  eine Liste mit Schritten"), "\n  eine ");

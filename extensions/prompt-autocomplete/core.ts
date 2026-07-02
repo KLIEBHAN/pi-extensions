@@ -386,6 +386,70 @@ function getJsonCandidates(text: string): string[] {
   return [...candidates];
 }
 
+function looksLikeJsonPayload(text: string): boolean {
+  const stripped = stripCodeFences(text).trim();
+  return stripped.startsWith("{") || stripped.startsWith("[");
+}
+
+const SUGGESTION_ARRAY_KEY_PATTERN = /"(?:completions|suggestions|alternatives|items)"\s*:\s*\[/;
+
+function scanCompleteJsonStringLiterals(text: string, startIndex: number): string[] {
+  const results: string[] = [];
+  let i = startIndex;
+
+  while (i < text.length) {
+    const char = text[i];
+    if (char === "]") break;
+    if (char !== '"') {
+      i += 1;
+      continue;
+    }
+
+    let j = i + 1;
+    let closed = false;
+    while (j < text.length) {
+      const c = text[j];
+      if (c === "\\") {
+        j += 2;
+        continue;
+      }
+      if (c === '"') {
+        closed = true;
+        break;
+      }
+      j += 1;
+    }
+
+    // Truncated mid-string: discard the incomplete literal instead of leaking it.
+    if (!closed) break;
+
+    try {
+      const parsed = JSON.parse(text.slice(i, j + 1)) as unknown;
+      if (typeof parsed === "string") results.push(parsed);
+    } catch {
+      // Skip literals with invalid escapes.
+    }
+    i = j + 1;
+  }
+
+  return results;
+}
+
+function salvageTruncatedJsonSuggestions(text: string): string[] {
+  const stripped = stripCodeFences(text).trim();
+
+  const keyMatch = SUGGESTION_ARRAY_KEY_PATTERN.exec(stripped);
+  if (keyMatch) {
+    return scanCompleteJsonStringLiterals(stripped, keyMatch.index + keyMatch[0].length);
+  }
+
+  if (stripped.startsWith("[")) {
+    return scanCompleteJsonStringLiterals(stripped, 1);
+  }
+
+  return [];
+}
+
 function toStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string");
@@ -436,6 +500,14 @@ function parseSuggestionResponse(rawResponse: string): string[] {
     } catch {
       continue;
     }
+  }
+
+  // The response looks like a structured JSON payload but could not be parsed,
+  // typically because the completion was truncated mid-string (stopReason
+  // "length"). Salvage the complete entries instead of leaking raw JSON into
+  // the editor as ghost text.
+  if (looksLikeJsonPayload(rawResponse)) {
+    return salvageTruncatedJsonSuggestions(rawResponse);
   }
 
   return rawResponse.trim() ? [rawResponse] : [];
