@@ -887,6 +887,21 @@ async function getGitBaseline(pi: ExtensionAPI, cwd: string): Promise<GitBaselin
   };
 }
 
+function splitGitPathLines(text: string): string[] {
+  return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function uniqueGitPathLines(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const path of paths) {
+    if (seen.has(path)) continue;
+    seen.add(path);
+    unique.push(path);
+  }
+  return unique;
+}
+
 async function getChangeSnapshot(pi: ExtensionAPI, cwd: string, baseline: GitBaseline): Promise<ChangeSnapshot> {
   if (!baseline.isGitRepo) {
     return {
@@ -895,6 +910,7 @@ async function getChangeSnapshot(pi: ExtensionAPI, cwd: string, baseline: GitBas
       diffStat: "",
       diff: "",
       committedChanges: "",
+      changedFiles: [],
       untrackedFiles: [],
       notes: ["No git repository was detected."],
     };
@@ -902,7 +918,7 @@ async function getChangeSnapshot(pi: ExtensionAPI, cwd: string, baseline: GitBas
 
   const status = await execText(pi, cwd, "git", ["status", "--short", "--branch", "--untracked-files=all"]);
   const untracked = await execText(pi, cwd, "git", ["ls-files", "--others", "--exclude-standard"]);
-  const untrackedFiles = untracked.ok ? untracked.text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
+  const untrackedFiles = untracked.ok ? splitGitPathLines(untracked.text) : [];
   const notes: string[] = [];
 
   if (!baseline.head) {
@@ -910,6 +926,13 @@ async function getChangeSnapshot(pi: ExtensionAPI, cwd: string, baseline: GitBas
     const unstagedStat = await execText(pi, cwd, "git", ["diff", "--stat"]);
     const stagedDiff = await execText(pi, cwd, "git", ["diff", "--cached"]);
     const unstagedDiff = await execText(pi, cwd, "git", ["diff"]);
+    const stagedNames = await execText(pi, cwd, "git", ["diff", "--cached", "--name-only"]);
+    const unstagedNames = await execText(pi, cwd, "git", ["diff", "--name-only"]);
+    const changedFiles = uniqueGitPathLines([
+      ...(stagedNames.ok ? splitGitPathLines(stagedNames.text) : []),
+      ...(unstagedNames.ok ? splitGitPathLines(unstagedNames.text) : []),
+      ...untrackedFiles,
+    ]);
 
     return {
       isGitRepo: true,
@@ -917,6 +940,7 @@ async function getChangeSnapshot(pi: ExtensionAPI, cwd: string, baseline: GitBas
       diffStat: [stagedStat.text, unstagedStat.text].filter(Boolean).join("\n\n"),
       diff: [stagedDiff.text, unstagedDiff.text].filter(Boolean).join("\n\n"),
       committedChanges: "",
+      changedFiles,
       untrackedFiles,
       notes: [
         "No baseline commit was available, so the snapshot uses staged and unstaged diffs only.",
@@ -930,11 +954,20 @@ async function getChangeSnapshot(pi: ExtensionAPI, cwd: string, baseline: GitBas
   const indexDiffStat = await execText(pi, cwd, "git", ["diff", "--cached", "--stat", baseline.head, "--"]);
   const worktreeDiff = await execText(pi, cwd, "git", ["diff", baseline.head, "--"]);
   const indexDiff = await execText(pi, cwd, "git", ["diff", "--cached", baseline.head, "--"]);
+  const worktreeChangedNames = await execText(pi, cwd, "git", ["diff", "--name-only", baseline.head, "--"]);
+  const indexChangedNames = await execText(pi, cwd, "git", ["diff", "--cached", "--name-only", baseline.head, "--"]);
+  const changedFiles = uniqueGitPathLines([
+    ...(worktreeChangedNames.ok ? splitGitPathLines(worktreeChangedNames.text) : []),
+    ...(indexChangedNames.ok ? splitGitPathLines(indexChangedNames.text) : []),
+    ...untrackedFiles,
+  ]);
 
   if (!worktreeDiff.ok) notes.push(`git diff against baseline failed: ${truncateMiddle(worktreeDiff.text, 800)}`);
   if (!indexDiff.ok) notes.push(`git diff --cached against baseline failed: ${truncateMiddle(indexDiff.text, 800)}`);
   if (!worktreeDiffStat.ok) notes.push(`git diff --stat against baseline failed: ${truncateMiddle(worktreeDiffStat.text, 800)}`);
   if (!indexDiffStat.ok) notes.push(`git diff --cached --stat against baseline failed: ${truncateMiddle(indexDiffStat.text, 800)}`);
+  if (!worktreeChangedNames.ok) notes.push(`git diff --name-only against baseline failed: ${truncateMiddle(worktreeChangedNames.text, 800)}`);
+  if (!indexChangedNames.ok) notes.push(`git diff --cached --name-only against baseline failed: ${truncateMiddle(indexChangedNames.text, 800)}`);
 
   return {
     isGitRepo: true,
@@ -949,6 +982,7 @@ async function getChangeSnapshot(pi: ExtensionAPI, cwd: string, baseline: GitBas
       indexDiff.text ? `# Index vs baseline\n${indexDiff.text}` : undefined,
     ].filter((value): value is string => !!value).join("\n\n"),
     committedChanges: committedChanges.text,
+    changedFiles,
     untrackedFiles,
     notes,
   };
@@ -1225,15 +1259,41 @@ function buildReviewVerdictError(reviewText: string, result: FreshReviewResult):
   return `Fresh review output did not include a recognized verdict (APPROVE, APPROVE_WITH_NOTES, or CHANGES_REQUESTED)${suffix}.${lengthHint}`;
 }
 
-function countChangedFiles(changes: ChangeSnapshot): number {
-  const status = changes.status?.trim();
-  if (!status || status === "working tree clean" || status === "not a git repository" || status === "(unknown)") {
+function countStatusChangedFiles(status: string | undefined): number {
+  const trimmedStatus = status?.trim();
+  if (
+    !trimmedStatus
+    || trimmedStatus === "working tree clean"
+    || trimmedStatus === "not a git repository"
+    || trimmedStatus === "(unknown)"
+  ) {
     return 0;
   }
-  return status.split(/\r?\n/).filter((line) => {
+
+  return trimmedStatus.split(/\r?\n/).filter((line) => {
     const trimmed = line.trim();
     return trimmed.length > 0 && !trimmed.startsWith("##");
   }).length;
+}
+
+function parseDiffStatChangedFileCount(stat: string | undefined): number {
+  const matches = [...(stat ?? "").matchAll(/(\d+)\s+files?\s+changed/g)];
+  if (matches.length === 0) return 0;
+  return Math.max(...matches.map((match) => Number.parseInt(match[1] ?? "0", 10)).filter(Number.isFinite));
+}
+
+function countChangedFiles(changes: ChangeSnapshot): number {
+  const explicitChangedFiles = Array.isArray(changes.changedFiles)
+    ? uniqueGitPathLines(changes.changedFiles.map((file) => file.trim()).filter(Boolean)).length
+    : 0;
+
+  return Math.max(
+    explicitChangedFiles,
+    changes.untrackedFiles.length,
+    countStatusChangedFiles(changes.status),
+    parseDiffStatChangedFileCount(changes.diffStat),
+    parseDiffStatChangedFileCount(changes.committedChanges),
+  );
 }
 
 function parseConfigBoolean(value: unknown): boolean | undefined {

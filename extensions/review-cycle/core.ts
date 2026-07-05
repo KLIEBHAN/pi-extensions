@@ -155,6 +155,7 @@ export interface ChangeSnapshot {
   diffStat: string;
   diff: string;
   committedChanges: string;
+  changedFiles?: string[];
   untrackedFiles: string[];
   notes: string[];
 }

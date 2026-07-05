@@ -1040,6 +1040,39 @@ test("review-cycle warns when the review scope is large", async () => {
   assert.ok(harness.notifications.some((entry) => entry.level === "warning" && entry.message.includes("large review scope") && entry.message.includes("30 files")));
 });
 
+test("review-cycle warns when committed-only baseline changes make the review scope large", async () => {
+  const harness = createHarness();
+  createReviewCycleExtension({
+    getGitBaseline: async () => ({ isGitRepo: true, head: "abc123", status: "## master", dirty: false }),
+    getChangeSnapshot: async () => ({
+      isGitRepo: true,
+      baselineHead: "abc123",
+      status: "## master",
+      diffStat: "30 files changed, 30 insertions(+)",
+      diff: "diff --git a/src/file0.ts b/src/file0.ts",
+      committedChanges: "def456 committed changes\n 30 files changed, 30 insertions(+)",
+      changedFiles: Array.from({ length: 30 }, (_, i) => `src/file${i}.ts`),
+      untrackedFiles: [],
+      notes: [],
+    }),
+    runFreshReviewAgent: async () => ({
+      text: "## Verdict\nAPPROVE\n\n## Findings\nNo mandatory findings.",
+      streamedText: "",
+      exitCode: 0,
+      stderr: "",
+      messages: [],
+      stopReason: "stop",
+    }),
+  })(harness.pi as never);
+
+  await harness.commands.get("review-cycle")?.handler("committed-only large scope task", harness.ctx);
+  await harness.handlers.get("agent_end")?.({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "implemented and committed" }], stopReason: "stop" }],
+  }, harness.ctx);
+
+  assert.ok(harness.notifications.some((entry) => entry.level === "warning" && entry.message.includes("large review scope") && entry.message.includes("30 files")));
+});
+
 test("review-cycle fresh review works when context signal is missing", async () => {
   const harness = createHarness();
   (harness.ctx as any).signal = undefined;

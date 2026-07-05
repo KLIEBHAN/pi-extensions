@@ -379,72 +379,260 @@ function getJsonCandidates(text: string): string[] {
 
   const arrayStart = stripped.indexOf("[");
   const arrayEnd = stripped.lastIndexOf("]");
-  if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
+  // Only salvage a bracketed substring as a standalone JSON array when it is not
+  // nested inside an object-shaped payload. Otherwise an incomplete object such
+  // as {"items":["metadata"],"completions":["good","trunc can parse the
+  // completed inner items array before the structured truncation salvage runs.
+  if (
+    arrayStart !== -1
+    && arrayEnd !== -1
+    && arrayEnd > arrayStart
+    && (objectStart === -1 || arrayStart < objectStart)
+  ) {
     candidates.add(stripped.slice(arrayStart, arrayEnd + 1));
   }
 
   return [...candidates];
 }
 
-function looksLikeJsonPayload(text: string): boolean {
-  const stripped = stripCodeFences(text).trim();
-  return stripped.startsWith("{") || stripped.startsWith("[");
+const SUGGESTION_ARRAY_KEYS = ["completions", "suggestions", "alternatives", "items"] as const;
+const SUGGESTION_ARRAY_KEY_PATTERN = /"(?:completions|suggestions|alternatives|items)"\s*:\s*\[/;
+const JSON_CODE_FENCE_PATTERN = /```\s*(?:json)?[\s\S]*?(?:\{|\[)/i;
+
+type SuggestionArrayKey = typeof SUGGESTION_ARRAY_KEYS[number];
+
+interface JsonStringLiteral {
+  value: string;
+  end: number;
 }
 
-const SUGGESTION_ARRAY_KEY_PATTERN = /"(?:completions|suggestions|alternatives|items)"\s*:\s*\[/;
+interface JsonSkipResult {
+  end: number;
+  complete: boolean;
+}
 
-function scanCompleteJsonStringLiterals(text: string, startIndex: number): string[] {
+function hasJsonPayloadIndicator(text: string): boolean {
+  const stripped = stripCodeFences(text).trim();
+  return (
+    stripped.startsWith("{")
+    || stripped.startsWith("[")
+    || SUGGESTION_ARRAY_KEY_PATTERN.test(text)
+    || JSON_CODE_FENCE_PATTERN.test(text)
+  );
+}
+
+function skipJsonWhitespace(text: string, index: number): number {
+  let i = index;
+  while (i < text.length && /\s/.test(text[i])) i += 1;
+  return i;
+}
+
+function readJsonStringLiteral(text: string, startIndex: number): JsonStringLiteral | undefined {
+  if (text[startIndex] !== '"') return undefined;
+
+  let i = startIndex + 1;
+  while (i < text.length) {
+    const char = text[i];
+    if (char === "\\") {
+      i += 2;
+      continue;
+    }
+    if (char === '"') {
+      try {
+        const parsed = JSON.parse(text.slice(startIndex, i + 1)) as unknown;
+        return typeof parsed === "string" ? { value: parsed, end: i + 1 } : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    i += 1;
+  }
+
+  return undefined;
+}
+
+function skipJsonStringLiteral(text: string, startIndex: number): JsonSkipResult {
+  if (text[startIndex] !== '"') return { end: startIndex, complete: false };
+
+  let i = startIndex + 1;
+  while (i < text.length) {
+    const char = text[i];
+    if (char === "\\") {
+      i += 2;
+      continue;
+    }
+    if (char === '"') {
+      return { end: i + 1, complete: true };
+    }
+    i += 1;
+  }
+
+  return { end: text.length, complete: false };
+}
+
+function skipJsonValue(text: string, startIndex: number): JsonSkipResult {
+  let i = skipJsonWhitespace(text, startIndex);
+  if (i >= text.length) return { end: i, complete: false };
+
+  if (text[i] === '"') {
+    return skipJsonStringLiteral(text, i);
+  }
+
+  if (text[i] === "{" || text[i] === "[") {
+    const stack = [text[i] === "{" ? "}" : "]"];
+    i += 1;
+
+    while (i < text.length) {
+      const char = text[i];
+      if (char === '"') {
+        const skipped = skipJsonStringLiteral(text, i);
+        if (!skipped.complete) return skipped;
+        i = skipped.end;
+        continue;
+      }
+      if (char === "{") {
+        stack.push("}");
+        i += 1;
+        continue;
+      }
+      if (char === "[") {
+        stack.push("]");
+        i += 1;
+        continue;
+      }
+      if (char === stack[stack.length - 1]) {
+        stack.pop();
+        i += 1;
+        if (stack.length === 0) return { end: i, complete: true };
+        continue;
+      }
+      i += 1;
+    }
+
+    return { end: text.length, complete: false };
+  }
+
+  while (i < text.length && !/[,}\]]/.test(text[i])) i += 1;
+  return { end: i, complete: i > startIndex };
+}
+
+function scanTopLevelJsonStringArrayElements(text: string, startIndex: number): string[] {
   const results: string[] = [];
   let i = startIndex;
 
   while (i < text.length) {
+    i = skipJsonWhitespace(text, i);
     const char = text[i];
     if (char === "]") break;
-    if (char !== '"') {
+    if (char === ",") {
       i += 1;
       continue;
     }
 
-    let j = i + 1;
-    let closed = false;
-    while (j < text.length) {
-      const c = text[j];
-      if (c === "\\") {
-        j += 2;
-        continue;
-      }
-      if (c === '"') {
-        closed = true;
-        break;
-      }
-      j += 1;
+    if (char === '"') {
+      const literal = readJsonStringLiteral(text, i);
+      // Truncated or invalid top-level string: discard it instead of leaking it.
+      if (!literal) break;
+      results.push(literal.value);
+      i = literal.end;
+    } else {
+      const skipped = skipJsonValue(text, i);
+      if (!skipped.complete || skipped.end <= i) break;
+      i = skipped.end;
     }
 
-    // Truncated mid-string: discard the incomplete literal instead of leaking it.
-    if (!closed) break;
-
-    try {
-      const parsed = JSON.parse(text.slice(i, j + 1)) as unknown;
-      if (typeof parsed === "string") results.push(parsed);
-    } catch {
-      // Skip literals with invalid escapes.
-    }
-    i = j + 1;
+    i = skipJsonWhitespace(text, i);
+    if (text[i] === ",") i += 1;
   }
 
   return results;
 }
 
+function extractPrioritizedSalvagedSuggestions(
+  text: string,
+  starts: Partial<Record<SuggestionArrayKey, number>>,
+): string[] | undefined {
+  let sawSuggestionArray = false;
+
+  for (const key of SUGGESTION_ARRAY_KEYS) {
+    const start = starts[key];
+    if (typeof start !== "number") continue;
+    sawSuggestionArray = true;
+
+    const suggestions = scanTopLevelJsonStringArrayElements(text, start);
+    if (suggestions.length > 0) return suggestions;
+  }
+
+  return sawSuggestionArray ? [] : undefined;
+}
+
+function findTopLevelSuggestionArrayStartsInObject(
+  text: string,
+  objectStartIndex: number,
+): Partial<Record<SuggestionArrayKey, number>> {
+  const starts: Partial<Record<SuggestionArrayKey, number>> = {};
+  let i = objectStartIndex + 1;
+
+  while (i < text.length) {
+    i = skipJsonWhitespace(text, i);
+    if (text[i] === ",") {
+      i += 1;
+      continue;
+    }
+    if (text[i] === "}") break;
+    if (text[i] !== '"') {
+      const skipped = skipJsonValue(text, i);
+      if (!skipped.complete || skipped.end <= i) break;
+      i = skipped.end;
+      continue;
+    }
+
+    const keyLiteral = readJsonStringLiteral(text, i);
+    if (!keyLiteral) break;
+    i = skipJsonWhitespace(text, keyLiteral.end);
+    if (text[i] !== ":") {
+      i = keyLiteral.end;
+      continue;
+    }
+
+    i = skipJsonWhitespace(text, i + 1);
+    const key = keyLiteral.value as SuggestionArrayKey;
+    if (
+      text[i] === "["
+      && (SUGGESTION_ARRAY_KEYS as readonly string[]).includes(keyLiteral.value)
+      && starts[key] === undefined
+    ) {
+      starts[key] = i + 1;
+    }
+
+    const skipped = skipJsonValue(text, i);
+    if (!skipped.complete || skipped.end <= i) break;
+    i = skipped.end;
+  }
+
+  return starts;
+}
+
 function salvageTruncatedJsonSuggestions(text: string): string[] {
   const stripped = stripCodeFences(text).trim();
 
-  const keyMatch = SUGGESTION_ARRAY_KEY_PATTERN.exec(stripped);
-  if (keyMatch) {
-    return scanCompleteJsonStringLiterals(stripped, keyMatch.index + keyMatch[0].length);
+  if (stripped.startsWith("[")) {
+    return scanTopLevelJsonStringArrayElements(stripped, 1);
   }
 
-  if (stripped.startsWith("[")) {
-    return scanCompleteJsonStringLiterals(stripped, 1);
+  let i = 0;
+  while (i < stripped.length) {
+    if (stripped[i] !== "{") {
+      i += 1;
+      continue;
+    }
+
+    const starts = findTopLevelSuggestionArrayStartsInObject(stripped, i);
+    const suggestions = extractPrioritizedSalvagedSuggestions(stripped, starts);
+    if (suggestions !== undefined) return suggestions;
+
+    const skipped = skipJsonValue(stripped, i);
+    i = skipped.complete && skipped.end > i ? skipped.end : i + 1;
   }
 
   return [];
@@ -506,7 +694,7 @@ function parseSuggestionResponse(rawResponse: string): string[] {
   // typically because the completion was truncated mid-string (stopReason
   // "length"). Salvage the complete entries instead of leaking raw JSON into
   // the editor as ghost text.
-  if (looksLikeJsonPayload(rawResponse)) {
+  if (hasJsonPayloadIndicator(rawResponse)) {
     return salvageTruncatedJsonSuggestions(rawResponse);
   }
 

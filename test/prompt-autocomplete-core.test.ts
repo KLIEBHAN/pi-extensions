@@ -219,6 +219,48 @@ test("normalizePromptSuggestions salvages entries with escaped quotes and bracke
   ]);
 });
 
+test("normalizePromptSuggestions ignores nested strings while salvaging truncated JSON arrays", () => {
+  assert.deepEqual(
+    normalizePromptSuggestions("", '{"completions":[{"text":"bad"},"good","trunc'),
+    ["good"],
+  );
+  assert.deepEqual(
+    normalizePromptSuggestions("", '{"completions":[["nested"],"good","trunc'),
+    ["good"],
+  );
+});
+
+test("normalizePromptSuggestions uses top-level suggestion key priority while salvaging", () => {
+  assert.deepEqual(
+    normalizePromptSuggestions("", '{"items":["metadata"],"completions":["good","trunc'),
+    ["good"],
+  );
+  assert.deepEqual(
+    normalizePromptSuggestions("", '{"metadata":{"items":["metadata"]},"completions":["good","trunc'),
+    ["good"],
+  );
+  assert.deepEqual(
+    normalizePromptSuggestions("", '{"completions":[],"suggestions":["fallback","trunc'),
+    ["fallback"],
+  );
+  assert.deepEqual(
+    normalizePromptSuggestions("", '{"completions":[{"text":"bad"}],"suggestions":["fallback","trunc'),
+    ["fallback"],
+  );
+});
+
+test("normalizePromptSuggestions salvages JSON payloads after leading prose", () => {
+  assert.deepEqual(
+    normalizePromptSuggestions("", 'Here is JSON:\n```json\n{"completions":["good","trunc'),
+    ["good"],
+  );
+});
+
+test("normalizePromptSuggestions discards trailing broken escapes in truncated JSON", () => {
+  assert.deepEqual(normalizePromptSuggestions("", '{"completions":["complete","broken\\'), ["complete"]);
+  assert.deepEqual(normalizePromptSuggestions("", '{"completions":["complete","broken\\u12"'), ["complete"]);
+});
+
 test("normalizePromptSuggestions never leaks unparseable JSON payloads as ghost text", () => {
   assert.deepEqual(normalizePromptSuggestions("", '{"completions":["abgeschnittener Eintr'), []);
   assert.deepEqual(normalizePromptSuggestions("", '{"unknown":"shape"}'), []);
