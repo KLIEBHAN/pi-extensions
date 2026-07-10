@@ -1,5 +1,5 @@
-import { Type } from "@mariozechner/pi-ai";
-import { defineTool, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "typebox";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const MAX_NAME_CHARS = 200;
 

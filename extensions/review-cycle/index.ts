@@ -3,8 +3,8 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import type { Message } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { Message } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   APPLY_REVIEW_SYSTEM_PROMPT,
   buildApplyReviewPrompt,
@@ -2544,27 +2544,30 @@ export function createReviewCycleExtension(deps: ReviewCycleDependencies = {}) {
       }
 
       if (parsed.kind === "tests") {
-        if (parsed.action === "show") {
-          const activeCommands = preferences.allowedTestCommands ?? repoConfig.tests ?? [];
-          ctx.ui.notify(`Review-cycle test commands: ${formatTestPolicy(activeCommands)}`, "info");
-          return;
-        }
-        if (parsed.action === "clear") {
-          preferences.allowedTestCommands = [];
-          ctx.ui.notify("Review-cycle test commands reset to default safe allowlist", "info");
-          return;
-        }
-        if (parsed.command) {
-          if (!isReviewerTestCommandAllowed(parsed.command, { allowedTestCommands: [parsed.command] })) {
-            ctx.ui.notify(`Unsafe reviewer test command rejected: ${parsed.command}`, "warning");
+        switch (parsed.action) {
+          case "show": {
+            const activeCommands = preferences.allowedTestCommands ?? repoConfig.tests ?? [];
+            ctx.ui.notify(`Review-cycle test commands: ${formatTestPolicy(activeCommands)}`, "info");
             return;
           }
-          const currentConfigured = preferences.allowedTestCommands ?? repoConfig.tests ?? [];
-          preferences.allowedTestCommands = parsed.action === "set"
-            ? [parsed.command]
-            : [...currentConfigured, parsed.command];
-          ctx.ui.notify(`Review-cycle test command ${parsed.action === "set" ? "set" : "added"}: ${parsed.command}`, "info");
-          return;
+          case "clear":
+            preferences.allowedTestCommands = [];
+            ctx.ui.notify("Review-cycle test commands reset to default safe allowlist", "info");
+            return;
+          case "add":
+          case "set": {
+            const command = parsed.command;
+            if (!isReviewerTestCommandAllowed(command, { allowedTestCommands: [command] })) {
+              ctx.ui.notify(`Unsafe reviewer test command rejected: ${command}`, "warning");
+              return;
+            }
+            const currentConfigured = preferences.allowedTestCommands ?? repoConfig.tests ?? [];
+            preferences.allowedTestCommands = parsed.action === "set"
+              ? [command]
+              : [...currentConfigured, command];
+            ctx.ui.notify(`Review-cycle test command ${parsed.action === "set" ? "set" : "added"}: ${command}`, "info");
+            return;
+          }
         }
       }
 

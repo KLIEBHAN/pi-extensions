@@ -28,7 +28,7 @@ pi install ../pi-extensions
 pi install git:github.com/KLIEBHAN/pi-extensions
 ```
 
-After package installation, enabled extensions are auto-discovered by pi. The `copy-prompt` extension stays passive until `Alt+C` or `Ctrl+Alt+C` is pressed. On macOS it also handles the common default-terminal `Option+C` composed-character fallback when Option is not configured as Meta. The `terminal-bench` extension only activates when its flag is passed. The `prompt-autocomplete` extension is enabled by default and can be toggled per session with `/prompt-autocomplete on|off|toggle`.
+After package installation, extensions are auto-discovered by pi. The `copy-prompt` extension stays passive until `Alt+C` or `Ctrl+Alt+C` is pressed. On macOS it also handles the common default-terminal `Option+C` composed-character fallback when Option is not configured as Meta. The `terminal-bench` extension only activates when its flag is passed. The `prompt-autocomplete` extension is disabled by default and can be enabled explicitly with `--prompt-autocomplete` or `/prompt-autocomplete on`.
 
 The bundled themes are also available after installation. Select `hermes-dark` in `/settings` or set it in `~/.pi/agent/settings.json`:
 
@@ -208,11 +208,17 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 
 ## Prompt autocomplete extension
 
-`extensions/prompt-autocomplete/` adds inline AI autocomplete while you type your next prompt.
+`extensions/prompt-autocomplete/` adds inline AI autocomplete while you type your next prompt. It is also packaged independently as [`@kliebhan/pi-prompt-autocomplete`](extensions/prompt-autocomplete/README.md), so users can install it without loading the rest of this collection.
+
+[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.1.0/prompt-autocomplete-demo.mp4)
+
+```bash
+pi install npm:@kliebhan/pi-prompt-autocomplete
+```
 
 ### What it adds
 
-- ghost-text style prompt suggestions directly in the editor, including when the draft is still empty by default
+- ghost-text style prompt suggestions directly in the editor after explicit enablement and at least one non-whitespace draft character by default
 - shows 3 alternatives by default, with configurable limit via flag
 - `Tab` accepts the whole current suggestion
 - `Ctrl+Space` accepts the next word/chunk from the current suggestion
@@ -262,15 +268,22 @@ pi -e ./extensions/prompt-autocomplete \
   --prompt-autocomplete-max-alternatives 3
 ```
 
+### Privacy and provider usage
+
+Prompt autocomplete makes additional model requests. Each request can include the current draft, the latest user and assistant messages, and a bounded recent-conversation summary. By default it uses the active model; `--prompt-autocomplete-model provider/model` may send that context to a different provider. Requests may incur token costs and consume provider rate limits. Successful results are cached in memory for up to 60 seconds and are cleared when the session resets or the extension is disabled.
+
+The extension is disabled by default. Enabling it with the CLI flag or slash command is explicit consent to these autocomplete requests. Automatic empty-draft requests remain disabled by the default `--prompt-autocomplete-min-chars 1`; set the value to `0` to opt into them. A manual `Ctrl+.` one-shot is treated as explicit intent and can bypass the minimum-character gate.
+
 ### Notes
 
-- The extension suggests as soon as the cursor is at the end of the current draft, even if the draft is still empty by default (`--prompt-autocomplete-min-chars 0`). Raise `--prompt-autocomplete-min-chars` if you want to avoid empty-draft next-prompt suggestions.
+- The extension suggests when the cursor is at the end of a draft that meets `--prompt-autocomplete-min-chars` (default: `1`). Set it to `0` to opt into automatic empty-draft next-prompt suggestions.
 - Built-in slash-command and file/path autocomplete keep working.
 - By default it pauses while the main agent is streaming so it can use the finished conversation context. Override at startup with `--prompt-autocomplete-while-streaming`, or toggle it per session with `/prompt-autocomplete while-streaming on|off|toggle`.
 - Even while-streaming is off, press `Ctrl+.` with no active suggestion to force a single one-shot completion during an agent turn; it ignores the streaming gate, the post-error cooldown, and the min-chars threshold for that one request (model/auth and slash/path checks still apply).
 - Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling (and `Ctrl+.` doubles as the one-shot trigger).
 - The default suggestion count is 3. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
 - Legacy `Ctrl+Tab` and `Alt+[` / `Alt+]` remain supported as fallbacks when your terminal forwards them.
+- Prompt autocomplete requires exclusive ownership of Pi's custom editor slot. If another custom editor is already active, it refuses to replace it and reports a warning; disabling autocomplete never removes a later replacement editor.
 - For troubleshooting, start with `--prompt-autocomplete-debug` or run `/prompt-autocomplete debug-on` temporarily.
 - If you want to tune the internal autocomplete prompt, edit `extensions/prompt-autocomplete/system-prompt.template.md`; `{{PLACEHOLDER}}` variables are filled in by `extensions/prompt-autocomplete/core.ts`, `{{PLACEHOLDER|fallback}}` uses the fallback text when no variable is provided, and `\{{PLACEHOLDER}}` keeps the placeholder syntax literal.
 
@@ -554,10 +567,21 @@ pi-extensions/
 
 Place additional extensions in `extensions/` and additional themes in `themes/`.
 
+Run the full release gate, the focused autocomplete suite, or the package/install smoke test with:
+
+```bash
+npm run check
+npm run test:prompt-autocomplete
+npm run test:package
+npm run release:check:prompt-autocomplete
+```
+
+The package smoke tests build both the private collection tarball and the standalone `@kliebhan/pi-prompt-autocomplete` tarball, install them into temporary clean consumers, and verify exact Pi resource discovery against the pinned development Pi version. The standalone release process is documented in [`docs/releasing-prompt-autocomplete.md`](docs/releasing-prompt-autocomplete.md).
+
 Each extension should export a default function:
 
 ```ts
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
   // register tools, commands, events, UI

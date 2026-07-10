@@ -37,8 +37,8 @@
 
 import { readFileSync } from "node:fs";
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 const TBENCH_MAX_BYTES = 30 * 1024;
 const TBENCH_MAX_LINES = 1500;

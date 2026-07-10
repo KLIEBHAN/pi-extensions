@@ -138,7 +138,8 @@ export type ReviewCycleCommand =
   | { kind: "output"; mode: "on" | "off" | "toggle" }
   | { kind: "prefs"; action: "status" | "reset" }
   | { kind: "config"; action: "doctor" }
-  | { kind: "tests"; action: "show" | "clear" | "add" | "set"; command?: string }
+  | { kind: "tests"; action: "show" | "clear" }
+  | { kind: "tests"; action: "add" | "set"; command: string }
   | { error: string };
 
 export interface GitBaseline {

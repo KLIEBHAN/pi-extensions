@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 benchmark-runs/
 docs/architecture.html
+.pi/remote-pi/
+.pi-subagents/
 .pi/review-cycle/latest.md
 .pi/review-cycle/preferences.json
 .pi/review-cycle/runs/

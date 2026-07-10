@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "extensions/prompt-autocomplete/**/*.ts",
+    "test/package-smoke.test.ts",
+    "test/prompt-autocomplete-*.test.ts"
+  ]
+}

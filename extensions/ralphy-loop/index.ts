@@ -1,5 +1,5 @@
-import { complete, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { complete, type Api, type Model, type UserMessage } from "@earendil-works/pi-ai/compat";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_REPEAT,
   type CompletionVerificationResult,

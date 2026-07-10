@@ -59,6 +59,9 @@ test("parseReviewCycleArgs parses help, status, stop, and output visibility", ()
     action: "add",
     command: "npm test",
   });
+  assert.deepEqual(parseReviewCycleArgs("tests add"), {
+    error: "Usage: /review-cycle tests add <test command>",
+  });
   assert.deepEqual(parseReviewCycleArgs("config tests clear"), { kind: "tests", action: "clear" });
   assert.deepEqual(parseReviewCycleArgs("artifact"), { kind: "artifact", action: "show" });
   assert.deepEqual(parseReviewCycleArgs("artifact list"), { kind: "artifact", action: "list" });

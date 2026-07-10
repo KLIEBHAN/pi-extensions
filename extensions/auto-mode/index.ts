@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { join } from "node:path";
-import { complete, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { complete, type Api, type Model, type UserMessage } from "@earendil-works/pi-ai/compat";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   appendDecisionHistory,
   AUTO_MODE_STATE_TYPE,
@@ -849,7 +849,8 @@ function resolveControllerModel(snapshot: AutoModeStateV2, ctx: ExtensionContext
 }
 
 async function withControllerTimeout<T>(ctx: ExtensionContext, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
-  if (ctx.signal.aborted) {
+  const parentSignal = ctx.signal;
+  if (parentSignal?.aborted) {
     throw new Error("controller decision aborted before start");
   }
 
@@ -867,17 +868,17 @@ async function withControllerTimeout<T>(ctx: ExtensionContext, run: (signal: Abo
   }, CONTROLLER_DECISION_TIMEOUT_MS);
   const abortFromParent = () => {
     abortWith(
-      ctx.signal.reason instanceof Error ? ctx.signal.reason : new Error("controller decision aborted"),
-      ctx.signal.reason,
+      parentSignal?.reason instanceof Error ? parentSignal.reason : new Error("controller decision aborted"),
+      parentSignal?.reason,
     );
   };
-  ctx.signal.addEventListener("abort", abortFromParent, { once: true });
+  parentSignal?.addEventListener("abort", abortFromParent, { once: true });
 
   try {
     return await Promise.race([run(controller.signal), waitForAbort]);
   } finally {
     clearTimeout(timeout);
-    ctx.signal.removeEventListener("abort", abortFromParent);
+    parentSignal?.removeEventListener("abort", abortFromParent);
   }
 }
 

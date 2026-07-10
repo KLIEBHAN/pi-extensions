@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import type { Api, Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 
 const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
 const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
@@ -54,8 +55,9 @@ export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT = renderMiniTemplate(
 );
 
 export const DEFAULT_PREFERRED_MODEL = "current active model";
+export const DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED = false;
 export const DEFAULT_DEBOUNCE_MS = 350;
-export const DEFAULT_MIN_PROMPT_CHARS = 0;
+export const DEFAULT_MIN_PROMPT_CHARS = 1;
 export const DEFAULT_MAX_SUGGESTION_CHARS = 160;
 export const DEFAULT_MAX_ALTERNATIVES = 3;
 export const MAX_DRAFT_CONTEXT_CHARS = 2_000;
@@ -71,6 +73,104 @@ export const MAX_REQUEST_MAX_TOKENS = 1_024;
 export interface ModelRef {
   provider: string;
   id: string;
+}
+
+export interface PromptAutocompleteCacheIdentity {
+  leafId: string;
+  modelLabel: string;
+  maxAlternatives: number;
+  maxSuggestionChars: number;
+  draft: string;
+  latestAssistantContext: string;
+  latestUserContext: string;
+  recentContext: string;
+}
+
+export function buildPromptAutocompleteCacheKey(identity: PromptAutocompleteCacheIdentity): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify(identity))
+    .digest("hex");
+  return `${identity.modelLabel}|${digest}`;
+}
+
+export class ExpiringLruCache<T> {
+  private readonly entries = new Map<string, { value: T; expiresAt: number }>();
+  private readonly ttlMs: number;
+  private readonly maxEntries: number;
+  private readonly now: () => number;
+
+  constructor(ttlMs: number, maxEntries: number, now: () => number = Date.now) {
+    this.ttlMs = ttlMs;
+    this.maxEntries = maxEntries;
+    this.now = now;
+  }
+
+  get size(): number {
+    this.prune();
+    return this.entries.size;
+  }
+
+  get(key: string, options: { bypass?: boolean } = {}): T | undefined {
+    if (options.bypass) return undefined;
+
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= this.now()) {
+      this.entries.delete(key);
+      return undefined;
+    }
+
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: string, value: T): void {
+    this.entries.delete(key);
+    this.entries.set(key, { value, expiresAt: this.now() + this.ttlMs });
+    this.prune();
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  private prune(): void {
+    const now = this.now();
+    for (const [key, entry] of this.entries) {
+      if (entry.expiresAt <= now) this.entries.delete(key);
+    }
+
+    while (this.entries.size > this.maxEntries) {
+      const oldestKey = this.entries.keys().next().value as string | undefined;
+      if (oldestKey === undefined) break;
+      this.entries.delete(oldestKey);
+    }
+  }
+}
+
+export class SequenceOwnedSlot<T extends { seq: number }> {
+  private value?: T;
+
+  get current(): T | undefined {
+    return this.value;
+  }
+
+  set(value: T): void {
+    this.value = value;
+  }
+
+  clearIfOwned(seq: number): boolean {
+    if (this.value?.seq !== seq) return false;
+    this.value = undefined;
+    return true;
+  }
+
+  take(): T | undefined {
+    const value = this.value;
+    this.value = undefined;
+    return value;
+  }
 }
 
 export interface CoalescedRequestEntry<T> {

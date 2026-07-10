@@ -1,0 +1,240 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import promptAutocompleteExtension from "../extensions/prompt-autocomplete/index.ts";
+
+type Handler = (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown;
+type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown> | unknown;
+type EditorFactory = Exclude<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0], undefined>;
+
+interface HarnessOptions {
+  enabled?: boolean;
+  existingEditorFactory?: EditorFactory;
+  mode?: ExtensionContext["mode"];
+}
+
+function createHarness(options: HarnessOptions = {}) {
+  const mode = options.mode ?? "tui";
+  const flags = new Map<string, boolean | string>();
+  if (options.enabled !== undefined) flags.set("prompt-autocomplete", options.enabled);
+
+  const registeredFlags = new Map<string, { default?: boolean | string }>();
+  const handlers = new Map<string, Handler>();
+  const commands = new Map<string, CommandHandler>();
+  const notifications: Array<{ message: string; type?: string }> = [];
+  const editorSetCalls: Array<EditorFactory | undefined> = [];
+  let editorFactory = options.existingEditorFactory;
+
+  const ui = {
+    getEditorComponent: () => editorFactory,
+    setEditorComponent: (factory: EditorFactory | undefined) => {
+      editorFactory = factory;
+      editorSetCalls.push(factory);
+    },
+    setWidget: () => undefined,
+    notify: (message: string, type?: string) => notifications.push({ message, type }),
+  };
+
+  const model = { provider: "test-provider", id: "test-model" };
+  const modelRegistry = {
+    find: () => undefined,
+    hasConfiguredAuth: () => true,
+    getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "test-key", headers: {} }),
+  };
+  const sessionManager = {
+    getBranch: () => [],
+    getLeafId: () => "leaf-1",
+  };
+
+  const ctx = {
+    mode,
+    hasUI: mode === "tui" || mode === "rpc",
+    model,
+    modelRegistry,
+    sessionManager,
+    ui,
+  } as unknown as ExtensionContext;
+
+  const pi = {
+    registerFlag(name: string, definition: { default?: boolean | string }) {
+      registeredFlags.set(name, definition);
+      if (!flags.has(name) && definition.default !== undefined) {
+        flags.set(name, definition.default);
+      }
+    },
+    getFlag(name: string) {
+      return flags.get(name);
+    },
+    on(name: string, handler: Handler) {
+      handlers.set(name, handler);
+    },
+    registerCommand(name: string, definition: { handler: CommandHandler }) {
+      commands.set(name, definition.handler);
+    },
+  } as unknown as ExtensionAPI;
+
+  promptAutocompleteExtension(pi);
+
+  return {
+    commands,
+    ctx,
+    editorSetCalls,
+    flags,
+    handlers,
+    notifications,
+    registeredFlags,
+    getEditorFactory: () => editorFactory,
+    replaceEditorExternally: (factory: EditorFactory | undefined) => {
+      editorFactory = factory;
+    },
+  };
+}
+
+async function emit(harness: ReturnType<typeof createHarness>, name: string): Promise<void> {
+  await harness.handlers.get(name)?.({}, harness.ctx);
+}
+
+async function command(
+  harness: ReturnType<typeof createHarness>,
+  args: string,
+): Promise<void> {
+  await harness.commands.get("prompt-autocomplete")?.(args, harness.ctx);
+}
+
+const dummyEditorFactory = (() => ({ })) as unknown as EditorFactory;
+const replacementEditorFactory = (() => ({ })) as unknown as EditorFactory;
+
+test("prompt autocomplete is disabled by default and requires one automatic draft character", () => {
+  const harness = createHarness();
+
+  assert.equal(harness.registeredFlags.get("prompt-autocomplete")?.default, false);
+  assert.equal(harness.registeredFlags.get("prompt-autocomplete-min-chars")?.default, "1");
+});
+
+test("session start mounts the editor only in TUI mode", async () => {
+  const tui = createHarness({ enabled: true, mode: "tui" });
+  await emit(tui, "session_start");
+  assert.equal(tui.editorSetCalls.length, 1);
+  assert.equal(typeof tui.getEditorFactory(), "function");
+
+  for (const mode of ["rpc", "json", "print"] as const) {
+    const nonTui = createHarness({ enabled: true, mode });
+    await emit(nonTui, "session_start");
+    assert.equal(nonTui.editorSetCalls.length, 0, `${mode} must not mount a custom editor`);
+  }
+});
+
+test("commands refuse to mount a custom editor outside TUI mode", async () => {
+  const harness = createHarness({ mode: "rpc" });
+
+  await command(harness, "on");
+
+  assert.equal(harness.editorSetCalls.length, 0);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /interactive TUI mode/);
+});
+
+test("repeated on, off, and toggle cycles keep editor ownership balanced", async () => {
+  const harness = createHarness();
+  await emit(harness, "session_start");
+  assert.equal(harness.getEditorFactory(), undefined);
+
+  await command(harness, "on");
+  const firstFactory = harness.getEditorFactory();
+  assert.equal(typeof firstFactory, "function");
+  await command(harness, "on");
+  assert.equal(harness.editorSetCalls.length, 1, "repeated on must not remount an owned editor");
+
+  await command(harness, "off");
+  await command(harness, "toggle");
+  const secondFactory = harness.getEditorFactory();
+  assert.equal(typeof secondFactory, "function");
+  assert.notEqual(secondFactory, firstFactory);
+  await command(harness, "toggle");
+  assert.equal(harness.getEditorFactory(), undefined);
+  assert.deepEqual(harness.editorSetCalls, [firstFactory, undefined, secondFactory, undefined]);
+});
+
+test("mount refuses to replace an existing custom editor", async () => {
+  const harness = createHarness({ enabled: true, existingEditorFactory: dummyEditorFactory });
+
+  await emit(harness, "session_start");
+
+  assert.equal(harness.editorSetCalls.length, 0);
+  assert.equal(harness.getEditorFactory(), dummyEditorFactory);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /Another custom editor is already active/);
+});
+
+test("turning autocomplete off restores the editor only while it still owns the factory", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  const installedFactory = harness.getEditorFactory();
+  assert.equal(typeof installedFactory, "function");
+
+  await command(harness, "off");
+
+  assert.deepEqual(harness.editorSetCalls, [installedFactory, undefined]);
+  assert.equal(harness.getEditorFactory(), undefined);
+});
+
+test("session shutdown restores the owned editor and a later start remounts cleanly", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  const firstFactory = harness.getEditorFactory();
+
+  await emit(harness, "session_shutdown");
+  assert.equal(harness.getEditorFactory(), undefined);
+
+  await emit(harness, "session_start");
+  const secondFactory = harness.getEditorFactory();
+  assert.equal(typeof secondFactory, "function");
+  assert.notEqual(secondFactory, firstFactory);
+  assert.deepEqual(harness.editorSetCalls, [firstFactory, undefined, secondFactory]);
+});
+
+test("repeated session starts replace an owned factory instead of orphaning it", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  const firstFactory = harness.getEditorFactory();
+
+  await emit(harness, "session_start");
+  const secondFactory = harness.getEditorFactory();
+
+  assert.equal(typeof secondFactory, "function");
+  assert.notEqual(secondFactory, firstFactory);
+  assert.deepEqual(harness.editorSetCalls, [firstFactory, undefined, secondFactory]);
+  assert.equal(harness.notifications.length, 0);
+});
+
+test("turning autocomplete off never erases a later editor replacement", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  assert.equal(harness.editorSetCalls.length, 1);
+
+  harness.replaceEditorExternally(replacementEditorFactory);
+  await command(harness, "off");
+
+  assert.equal(harness.editorSetCalls.length, 1);
+  assert.equal(harness.getEditorFactory(), replacementEditorFactory);
+});
+
+test("an enabled but blocked extension can retry after the conflicting editor is removed", async () => {
+  const harness = createHarness({ enabled: true, existingEditorFactory: dummyEditorFactory });
+  await emit(harness, "session_start");
+  assert.equal(harness.editorSetCalls.length, 0);
+
+  harness.replaceEditorExternally(undefined);
+  await command(harness, "on");
+
+  assert.equal(harness.editorSetCalls.length, 1);
+  assert.equal(typeof harness.getEditorFactory(), "function");
+});
+
+test("request state has no non-expiring last-result shortcut", async () => {
+  const source = await import("node:fs/promises").then(({ readFile }) =>
+    readFile(new URL("../extensions/prompt-autocomplete/index.ts", import.meta.url), "utf8"),
+  );
+
+  assert.doesNotMatch(source, /lastResolvedKey|lastResolvedSuggestions/);
+  assert.match(source, /new SequenceOwnedSlot<PendingSuggestionRequest>/);
+  assert.match(source, /getCachedRequest\(this\.shared, request\.cacheKey, \{ bypass: options\.manual \}\)/);
+});

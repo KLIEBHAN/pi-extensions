@@ -1,0 +1,117 @@
+name: Release Prompt Autocomplete
+
+on:
+  push:
+    tags:
+      - "pi-prompt-autocomplete-v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate and pack without publication credentials
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.16.0
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run release:check:prompt-autocomplete
+      - name: Pack the exact release artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          npm pack --json --pack-destination "$PWD/dist" ./extensions/prompt-autocomplete > dist/pack.json
+          cp extensions/prompt-autocomplete/media/prompt-autocomplete-demo.mp4 dist/prompt-autocomplete-demo.mp4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: prompt-autocomplete-release-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish npm package and GitHub release
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: prompt-autocomplete-release-${{ github.sha }}
+          path: dist
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.16.0
+      - name: Inspect validated release artifact
+        id: artifact
+        shell: bash
+        run: |
+          node <<'NODE'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const packed = JSON.parse(fs.readFileSync("dist/pack.json", "utf8"));
+          assert.equal(packed.length, 1);
+          const item = packed[0];
+          assert.equal(process.env.GITHUB_REF_NAME, `pi-prompt-autocomplete-v${item.version}`);
+          const tarball = path.resolve("dist", item.filename);
+          assert.ok(fs.statSync(tarball).size > 0);
+          assert.ok(fs.statSync("dist/prompt-autocomplete-demo.mp4").size > 0);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, [
+            `name=${item.name}`,
+            `version=${item.version}`,
+            `integrity=${item.integrity}`,
+            `tarball=${tarball}`,
+          ].join("\n") + "\n");
+          NODE
+      - name: Create draft GitHub release and upload assets
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --draft \
+              --title "Prompt Autocomplete v${{ steps.artifact.outputs.version }}" \
+              --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            "${{ steps.artifact.outputs.tarball }}" \
+            "dist/prompt-autocomplete-demo.mp4#prompt-autocomplete-demo.mp4"
+      - name: Publish to npm with trusted provenance
+        shell: bash
+        run: |
+          package="${{ steps.artifact.outputs.name }}"
+          version="${{ steps.artifact.outputs.version }}"
+          local_integrity="${{ steps.artifact.outputs.integrity }}"
+          if registry_json="$(npm view "$package@$version" dist.integrity --json 2>/dev/null)"; then
+            registry_integrity="$(node -e 'const value = JSON.parse(process.argv[1]); if (typeof value !== "string") process.exit(2); process.stdout.write(value)' "$registry_json")"
+            if [ "$registry_integrity" != "$local_integrity" ]; then
+              echo "Registry integrity mismatch for $package@$version" >&2
+              echo "expected: $local_integrity" >&2
+              echo "registry: $registry_integrity" >&2
+              exit 1
+            fi
+            echo "$package@$version already has the exact validated integrity; continuing a release retry."
+          else
+            npm publish "${{ steps.artifact.outputs.tarball }}" --access public --provenance
+          fi
+      - name: Publish GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

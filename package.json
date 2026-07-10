@@ -6,18 +6,40 @@
   "description": "Reusable extensions for pi",
   "license": "MIT",
   "keywords": ["pi-package"],
+  "files": [
+    "extensions",
+    "themes"
+  ],
   "scripts": {
-    "check": "npm run test",
+    "check": "npm run typecheck && npm run test",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "test:auto-mode": "node --experimental-strip-types --test test/auto-mode-core.test.ts test/auto-mode-index.test.ts"
+    "test:auto-mode": "node --experimental-strip-types --test test/auto-mode-core.test.ts test/auto-mode-index.test.ts",
+    "test:package": "node --experimental-strip-types --test test/package-smoke.test.ts",
+    "test:prompt-autocomplete": "node --experimental-strip-types --test test/prompt-autocomplete-core.test.ts test/prompt-autocomplete-editor.test.ts test/prompt-autocomplete-index.test.ts",
+    "release:check:prompt-autocomplete": "npm run check && node scripts/verify-prompt-autocomplete-release.mjs && npm publish --dry-run --ignore-scripts --access public --provenance=false ./extensions/prompt-autocomplete",
+    "typecheck": "npm run typecheck:production && npm run typecheck:prompt-autocomplete",
+    "typecheck:production": "tsc -p tsconfig.json",
+    "typecheck:prompt-autocomplete": "tsc -p tsconfig.prompt-autocomplete.json"
   },
   "pi": {
     "extensions": ["./extensions"],
     "themes": ["./themes"]
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
+    "@types/node": "24.12.4",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3"
   }
 }

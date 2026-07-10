@@ -4,13 +4,17 @@ import { readFileSync } from "node:fs";
 import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
+  buildPromptAutocompleteCacheKey,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
   createOwnerRefCounter,
   DEFAULT_MAX_ALTERNATIVES,
   DEFAULT_MAX_SUGGESTION_CHARS,
+  DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
+  DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
+  ExpiringLruCache,
   MAX_REQUEST_MAX_TOKENS,
   MIN_REQUEST_MAX_TOKENS,
   extractMessageText,
@@ -23,6 +27,7 @@ import {
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES,
   renderMiniTemplate,
+  SequenceOwnedSlot,
   shouldSkipPromptAutocomplete,
   truncateDraftTail,
   type CoalescedRequestEntry,
@@ -55,7 +60,9 @@ test("computeRequestMaxTokens scales with alternatives and clamps to the budget"
   assert.ok(computeRequestMaxTokens(4, 160) > computeRequestMaxTokens(3, 160));
 });
 
-test("default prompt autocomplete model now follows the active model", () => {
+test("privacy-safe autocomplete defaults require explicit enablement and a non-empty draft", () => {
+  assert.equal(DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED, false);
+  assert.equal(DEFAULT_MIN_PROMPT_CHARS, 1);
   assert.equal(DEFAULT_PREFERRED_MODEL, "current active model");
 });
 
@@ -63,8 +70,70 @@ test("prompt-autocomplete index no longer hardcodes a provider/model default", (
   const source = readFileSync(new URL("../extensions/prompt-autocomplete/index.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /default:\s*"openai\/[^"]+"/);
   assert.match(source, /Optional provider\/model override for prompt autocomplete/);
-  assert.match(source, /description: "Enable inline AI prompt autocomplete in the editor",\n    type: "boolean",\n    default: true,/);
+  assert.match(source, /default:\s*DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED/);
   assert.match(source, /default:\s*DEFAULT_PREFERRED_MODEL/);
+});
+
+test("prompt autocomplete cache identity includes draft, context, and output configuration", () => {
+  const base = {
+    leafId: "leaf-1",
+    modelLabel: "openai/gpt-test",
+    maxAlternatives: 3,
+    maxSuggestionChars: 160,
+    draft: "Review the change",
+    latestAssistantContext: "Implementation finished",
+    latestUserContext: "Please implement it",
+    recentContext: "User: Please implement it\n\nAssistant: Implementation finished",
+  };
+
+  const key = buildPromptAutocompleteCacheKey(base);
+  assert.equal(key, buildPromptAutocompleteCacheKey({ ...base }));
+  assert.notEqual(key, buildPromptAutocompleteCacheKey({ ...base, draft: "Review all changes" }));
+  assert.notEqual(
+    key,
+    buildPromptAutocompleteCacheKey({ ...base, latestAssistantContext: "Tests are still failing" }),
+  );
+  assert.notEqual(key, buildPromptAutocompleteCacheKey({ ...base, maxSuggestionChars: 320 }));
+  assert.doesNotMatch(key, /Implementation finished|Please implement it|Review the change/);
+});
+
+test("expiring LRU cache enforces TTL, manual bypass, and the entry bound", () => {
+  let now = 1_000;
+  const cache = new ExpiringLruCache<string>(60_000, 2, () => now);
+
+  cache.set("positive", "suggestion");
+  cache.set("empty", "");
+  assert.equal(cache.get("positive"), "suggestion");
+  assert.equal(cache.get("positive", { bypass: true }), undefined);
+  assert.equal(cache.get("empty"), "");
+
+  now += 60_000;
+  assert.equal(cache.get("positive"), undefined);
+  assert.equal(cache.get("empty"), undefined);
+  assert.equal(cache.size, 0);
+
+  cache.set("a", "A");
+  cache.set("b", "B");
+  cache.get("a");
+  cache.set("c", "C");
+  assert.equal(cache.get("a"), "A");
+  assert.equal(cache.get("b"), undefined);
+  assert.equal(cache.get("c"), "C");
+});
+
+test("sequence-owned slot does not let an older completion clear newer pending state", () => {
+  const slot = new SequenceOwnedSlot<{ seq: number; key: string }>();
+  slot.set({ seq: 1, key: "same-key" });
+  slot.set({ seq: 2, key: "same-key" });
+
+  assert.equal(slot.clearIfOwned(1), false);
+  assert.deepEqual(slot.current, { seq: 2, key: "same-key" });
+  assert.equal(slot.clearIfOwned(2), true);
+  assert.equal(slot.current, undefined);
+
+  slot.set({ seq: 3, key: "other-key" });
+  assert.deepEqual(slot.take(), { seq: 3, key: "other-key" });
+  assert.equal(slot.current, undefined);
 });
 
 test("prompt-autocomplete requests cap provider retries and timeouts for inline UX", () => {

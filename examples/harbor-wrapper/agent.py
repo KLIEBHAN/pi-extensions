@@ -446,7 +446,7 @@ class PiAgent(BaseAgent):
         else:
             _LOGGER.info("Installing pi coding agent from npm...")
             await environment.exec(
-                "npm install -g @mariozechner/pi-coding-agent 2>&1 | tail -5",
+                "npm install -g @earendil-works/pi-coding-agent 2>&1 | tail -5",
                 timeout_sec=300,
             )
 

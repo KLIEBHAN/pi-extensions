@@ -36,7 +36,7 @@ async function loadAutoModeModuleFromSource(options: {
 
   const coreUrl = new URL("../extensions/auto-mode/core.ts", import.meta.url).href;
   const rewritten = transpiled
-    .replace(/@mariozechner\/pi-ai/g, pathToFileURL(piAiStubPath).href)
+    .replace(/@earendil-works\/pi-ai\/compat/g, pathToFileURL(piAiStubPath).href)
     .replace(/\.\/core\.ts/g, coreUrl);
 
   const modulePath = join(tempDir, "index.mjs");

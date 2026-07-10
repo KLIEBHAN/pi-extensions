@@ -1,10 +1,11 @@
-import { completeSimple, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
-import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@mariozechner/pi-coding-agent";
-import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@mariozechner/pi-tui";
+import { completeSimple, type Api, type Model, type UserMessage } from "@earendil-works/pi-ai/compat";
+import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
   buildLatestUserMessageContext,
+  buildPromptAutocompleteCacheKey,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
@@ -14,6 +15,8 @@ import {
   DEFAULT_MAX_SUGGESTION_CHARS,
   DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
+  DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
+  ExpiringLruCache,
   extractNextSuggestionChunk,
   formatModelLabel,
   MAX_DRAFT_CONTEXT_CHARS,
@@ -21,6 +24,7 @@ import {
   parseBoundedIntFlag,
   parseModelRef,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+  SequenceOwnedSlot,
   shouldSkipPromptAutocomplete,
   truncateDraftTail,
   type CoalescedRequestEntry,
@@ -95,7 +99,6 @@ interface PromptAutocompleteCacheEntry {
   rawResponse?: string;
   error?: string;
   debugState?: string;
-  expiresAt: number;
 }
 
 interface SuggestionRefreshOptions {
@@ -106,6 +109,20 @@ interface SuggestionRefreshOptions {
   manual?: boolean;
 }
 
+type EditorFactory = Exclude<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0], undefined>;
+
+interface EditorMountState {
+  previousFactory: EditorFactory | undefined;
+  installedFactory: EditorFactory;
+}
+
+type CompleteSimpleFunction = typeof completeSimple;
+
+export interface PromptAutocompleteDependencies {
+  completeSimple?: CompleteSimpleFunction;
+  now?: () => number;
+}
+
 interface PromptAutocompleteSharedState {
   enabled: boolean;
   activationId: number;
@@ -114,11 +131,16 @@ interface PromptAutocompleteSharedState {
   currentModel?: Model<Api>;
   modelRegistry?: ExtensionContext["modelRegistry"];
   sessionManager?: ExtensionContext["sessionManager"];
+  completeSimple: CompleteSimpleFunction;
+  now: () => number;
   debugState: string;
+  editorMount?: EditorMountState;
+  editorBlockedReason?: string;
   lastError?: string;
   lastRawResponse?: string;
-  requestCache: Map<string, PromptAutocompleteCacheEntry>;
+  requestCache: ExpiringLruCache<PromptAutocompleteCacheEntry>;
   inFlightRequests: Map<string, CoalescedRequestEntry<PromptAutocompleteCacheEntry>>;
+  ownsEditor?: () => boolean;
   refreshEditor?: (options?: SuggestionRefreshOptions) => void;
   cancelActiveRequest?: () => void;
   setStatusText?: (text: string | undefined) => void;
@@ -139,6 +161,12 @@ interface SuggestionRequest {
   recentContext: string;
 }
 
+interface PendingSuggestionRequest {
+  key: string;
+  seq: number;
+  spinnerOwner: string;
+}
+
 function arraysEqual(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
@@ -149,19 +177,6 @@ function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
 
 function formatPrimaryKey(keys: readonly KeyId[]): string {
   return keys[0] ?? "";
-}
-
-function hashText(text: string): string {
-  let first = 0x811c9dc5;
-  let second = 0x811c9dc5 ^ text.length;
-
-  for (let i = 0; i < text.length; i += 1) {
-    const codeUnit = text.charCodeAt(i);
-    first = Math.imul(first ^ codeUnit, 0x01000193) >>> 0;
-    second = Math.imul(second ^ codeUnit, 0x01000193) >>> 0;
-  }
-
-  return `${first.toString(16).padStart(8, "0")}${second.toString(16).padStart(8, "0")}`;
 }
 
 function resolveSuggestionModel(shared: PromptAutocompleteSharedState): Model<Api> | undefined {
@@ -221,14 +236,22 @@ function clearDebugUi(shared: PromptAutocompleteSharedState): void {
 }
 
 function formatStatus(shared: PromptAutocompleteSharedState): string {
-  pruneRequestCache(shared);
   const resolvedModel = resolveSuggestionModel(shared);
+  const editorState = shared.editorMount
+    ? shared.ownsEditor?.()
+      ? "mounted"
+      : "ownership-lost"
+    : shared.editorBlockedReason
+      ? "blocked"
+      : "unmounted";
   const requestedModel = shared.config.preferredModel
     ? `${shared.config.preferredModel.provider}/${shared.config.preferredModel.id}`
     : "current active model";
 
   return [
     `enabled=${shared.enabled ? "yes" : "no"}`,
+    `editor=${editorState}`,
+    shared.editorBlockedReason ? `editor-blocked=${truncateDebug(shared.editorBlockedReason, 90)}` : undefined,
     `model=${formatModelLabel(resolvedModel)}`,
     `requested-model=${requestedModel}`,
     `while-streaming=${shared.config.allowWhileStreaming ? "yes" : "no"}`,
@@ -247,78 +270,40 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     .join(" | ");
 }
 
-function pruneRequestCache(shared: PromptAutocompleteSharedState): void {
-  const now = Date.now();
-  for (const [key, entry] of shared.requestCache) {
-    if (entry.expiresAt <= now) {
-      shared.requestCache.delete(key);
-    }
-  }
-
-  while (shared.requestCache.size > REQUEST_CACHE_MAX_ENTRIES) {
-    const oldestKey = shared.requestCache.keys().next().value as string | undefined;
-    if (!oldestKey) break;
-    shared.requestCache.delete(oldestKey);
-  }
-}
-
 function getCachedRequest(
   shared: PromptAutocompleteSharedState,
   cacheKey: string,
+  options: { bypass?: boolean } = {},
 ): PromptAutocompleteCacheEntry | undefined {
-  const entry = shared.requestCache.get(cacheKey);
-  if (!entry) return undefined;
-
-  if (entry.expiresAt <= Date.now()) {
-    shared.requestCache.delete(cacheKey);
-    return undefined;
-  }
-
-  shared.requestCache.delete(cacheKey);
-  shared.requestCache.set(cacheKey, entry);
-  return {
-    ...entry,
-    suggestions: [...entry.suggestions],
-  };
+  const entry = shared.requestCache.get(cacheKey, options);
+  return entry ? { ...entry, suggestions: [...entry.suggestions] } : undefined;
 }
 
 function storeCachedRequest(
   shared: PromptAutocompleteSharedState,
   cacheKey: string,
-  entry: Omit<PromptAutocompleteCacheEntry, "expiresAt">,
+  entry: PromptAutocompleteCacheEntry,
 ): PromptAutocompleteCacheEntry {
-  const cachedEntry: PromptAutocompleteCacheEntry = {
-    ...entry,
-    suggestions: [...entry.suggestions],
-    expiresAt: Date.now() + REQUEST_CACHE_TTL_MS,
-  };
-
-  shared.requestCache.delete(cacheKey);
+  const cachedEntry = { ...entry, suggestions: [...entry.suggestions] };
   shared.requestCache.set(cacheKey, cachedEntry);
-  pruneRequestCache(shared);
-  return {
-    ...cachedEntry,
-    suggestions: [...cachedEntry.suggestions],
-  };
+  return { ...cachedEntry, suggestions: [...cachedEntry.suggestions] };
 }
 
 class PromptAutocompleteEditor extends CustomEditor {
   private readonly shared: PromptAutocompleteSharedState;
   private readonly activationId: number;
-  private readonly keybindings: KeybindingsManager;
+  private readonly appKeybindings: KeybindingsManager;
 
   private suggestions: string[] = [];
   private suggestionIndex: number = 0;
   private debounceTimer?: ReturnType<typeof setTimeout>;
   private requestSeq = 0;
-  private pendingRequestKey?: string;
+  private readonly pendingRequests = new SequenceOwnedSlot<PendingSuggestionRequest>();
   private activeRequestSubscription?: CoalescedRequestSubscription<PromptAutocompleteCacheEntry>;
   // One owner token per editor instance; the mount-level refcounter keeps the
   // shared spinner alive until every active owner has released it.
   private activeSpinnerOwner?: string;
   private suspendedUntil = 0;
-  private lastResolvedKey = "";
-  private lastResolvedSuggestions: string[] = [];
   private dismissedKey?: string;
 
   constructor(
@@ -331,7 +316,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     super(tui, theme, keybindings);
     this.shared = shared;
     this.activationId = activationId;
-    this.keybindings = keybindings;
+    this.appKeybindings = keybindings;
   }
 
   override setText(text: string): void {
@@ -573,14 +558,14 @@ class PromptAutocompleteEditor extends CustomEditor {
   private getInlineSuggestionClearReason(data: string): { state: string; details: string } | undefined {
     if (!this.getActiveSuggestion()) return undefined;
 
-    if (NAVIGATION_ACTIONS.some((action) => this.keybindings.matches(data, action))) {
+    if (NAVIGATION_ACTIONS.some((action) => this.appKeybindings.matches(data, action))) {
       return {
         state: "navigated",
         details: "Suggestion cleared during editor navigation",
       };
     }
 
-    if (EDIT_ACTIONS.some((action) => this.keybindings.matches(data, action))) {
+    if (EDIT_ACTIONS.some((action) => this.appKeybindings.matches(data, action))) {
       return {
         state: "editing",
         details: "Suggestion cleared before editor edit command",
@@ -640,7 +625,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       if (!this.shared.config.allowWhileStreaming && this.shared.streaming) {
         return "Waiting for the current agent turn to finish";
       }
-      if (Date.now() < this.suspendedUntil) return "In temporary cooldown after the last error";
+      if (this.shared.now() < this.suspendedUntil) return "In temporary cooldown after the last error";
     }
 
     const model = resolveSuggestionModel(this.shared);
@@ -670,6 +655,14 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
+    if (!this.shared.ownsEditor?.()) {
+      this.cancelPendingRequest();
+      this.shared.editorBlockedReason = "Another extension replaced the prompt-autocomplete editor";
+      updateDebugState(this.shared, "ownership-lost", this.shared.editorBlockedReason);
+      this.setSuggestions([]);
+      return;
+    }
+
     if (this.isShowingAutocomplete()) {
       this.cancelPendingRequest();
       updateDebugState(this.shared, "paused", "Built-in autocomplete is active");
@@ -693,27 +686,16 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
-    if (request.cacheKey === this.dismissedKey) {
+    if (!options.manual && request.cacheKey === this.dismissedKey) {
       this.cancelPendingRequest();
       updateDebugState(this.shared, "dismissed", "Suggestion dismissed for current draft");
       this.setSuggestions([]);
       return;
     }
 
-    if (request.cacheKey === this.lastResolvedKey) {
-      this.cancelPendingRequest();
-      if (this.lastResolvedSuggestions.length === 0) {
-        updateDebugState(this.shared, "no-suggestion", "Cached response had no usable suggestions");
-      }
-      this.setSuggestions(this.lastResolvedSuggestions);
-      return;
-    }
-
-    const cachedEntry = getCachedRequest(this.shared, request.cacheKey);
+    const cachedEntry = getCachedRequest(this.shared, request.cacheKey, { bypass: options.manual });
     if (cachedEntry) {
       this.cancelPendingRequest();
-      this.lastResolvedKey = request.cacheKey;
-      this.lastResolvedSuggestions = cachedEntry.suggestions;
       this.shared.lastRawResponse = cachedEntry.rawResponse;
       this.shared.lastError = cachedEntry.error;
       if (cachedEntry.suggestions.length === 0) {
@@ -723,7 +705,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
-    if (this.pendingRequestKey === request.cacheKey) {
+    if (this.pendingRequests.current?.key === request.cacheKey) {
       updateDebugState(this.shared, "requesting", `Awaiting pending request for ${request.modelLabel}`);
       return;
     }
@@ -733,7 +715,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     const seq = ++this.requestSeq;
     const spinnerOwner = this.makeSpinnerOwner(request, seq);
-    this.pendingRequestKey = request.cacheKey;
+    this.pendingRequests.set({ key: request.cacheKey, seq, spinnerOwner });
     this.activateSpinner(spinnerOwner);
 
     const debounceMs = shouldJoinInFlight || options.immediate ? 0 : this.shared.config.debounceMs;
@@ -775,7 +757,16 @@ class PromptAutocompleteEditor extends CustomEditor {
       draftTail,
       model,
       modelLabel,
-      cacheKey: `${leafId}|${modelLabel}|alts=${this.shared.config.maxAlternatives}|len=${draft.length}|sha=${hashText(draft)}`,
+      cacheKey: buildPromptAutocompleteCacheKey({
+        leafId,
+        modelLabel,
+        maxAlternatives: this.shared.config.maxAlternatives,
+        maxSuggestionChars: this.shared.config.maxSuggestionChars,
+        draft,
+        latestAssistantContext,
+        latestUserContext,
+        recentContext,
+      }),
       maxAlternatives: this.shared.config.maxAlternatives,
       latestAssistantContext,
       latestUserContext,
@@ -785,9 +776,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
   private async fetchSuggestion(request: SuggestionRequest, seq: number, spinnerOwner: string): Promise<void> {
     if (!this.isRequestStillCurrent(request, seq)) {
-      if (this.pendingRequestKey === request.cacheKey) {
-        this.pendingRequestKey = undefined;
-      }
+      this.clearPendingRequestIfOwned(seq);
       this.deactivateSpinner(spinnerOwner);
       return;
     }
@@ -815,8 +804,6 @@ class PromptAutocompleteEditor extends CustomEditor {
         return;
       }
 
-      this.lastResolvedKey = request.cacheKey;
-      this.lastResolvedSuggestions = entry.suggestions;
       this.shared.lastRawResponse = entry.rawResponse;
       this.shared.lastError = entry.error;
 
@@ -828,7 +815,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       }
     } catch (error) {
       if (this.isRequestStillCurrent(request, seq)) {
-        this.suspendedUntil = Date.now() + FAILURE_COOLDOWN_MS;
+        this.suspendedUntil = this.shared.now() + FAILURE_COOLDOWN_MS;
         const message = error instanceof Error ? error.message : String(error);
         this.shared.lastError = message;
         updateDebugState(this.shared, "error", message);
@@ -839,9 +826,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       if (this.activeRequestSubscription === subscription) {
         this.activeRequestSubscription = undefined;
       }
-      if (this.pendingRequestKey === request.cacheKey) {
-        this.pendingRequestKey = undefined;
-      }
+      this.clearPendingRequestIfOwned(seq);
       this.deactivateSpinner(spinnerOwner);
     }
   }
@@ -907,7 +892,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       timestamp: Date.now(),
     };
 
-    const response = await completeSimple(
+    const response = await this.shared.completeSimple(
       request.model,
       {
         systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
@@ -961,6 +946,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
   private isRequestStillCurrent(request: SuggestionRequest, seq: number): boolean {
     if (!this.shared.enabled) return false;
+    if (!this.shared.ownsEditor?.()) return false;
     if (this.activationId !== this.shared.activationId) return false;
     if (seq !== this.requestSeq) return false;
     if (request.activationId !== this.activationId) return false;
@@ -977,6 +963,10 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.setSuggestions([]);
   }
 
+  private clearPendingRequestIfOwned(seq: number): void {
+    this.pendingRequests.clearIfOwned(seq);
+  }
+
   private cancelPendingRequest(): void {
     this.requestSeq += 1;
 
@@ -985,14 +975,48 @@ class PromptAutocompleteEditor extends CustomEditor {
       this.debounceTimer = undefined;
     }
 
-    this.activeRequestSubscription?.release();
+    const pending = this.pendingRequests.take();
+    const subscription = this.activeRequestSubscription;
     this.activeRequestSubscription = undefined;
-    this.pendingRequestKey = undefined;
-    this.deactivateSpinner();
+    subscription?.release();
+    this.deactivateSpinner(pending?.spinnerOwner);
   }
 }
 
-function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
+function releaseEditorRuntime(shared: PromptAutocompleteSharedState): void {
+  shared.cancelActiveRequest?.();
+  shared.activationId += 1;
+  cancelAllCoalescedRequests(shared.inFlightRequests);
+  shared.clearSpinner?.();
+  clearDebugUi(shared);
+  shared.refreshEditor = undefined;
+  shared.cancelActiveRequest = undefined;
+  shared.setStatusText = undefined;
+  shared.setSpinnerActive = undefined;
+  shared.clearSpinner = undefined;
+  shared.ownsEditor = undefined;
+}
+
+function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
+  if (ctx.mode !== "tui") return false;
+
+  if (shared.editorMount) {
+    if (shared.ownsEditor?.()) return true;
+    releaseEditorRuntime(shared);
+    shared.editorMount = undefined;
+  }
+
+  const previousFactory = ctx.ui.getEditorComponent();
+  if (previousFactory) {
+    const reason = "Another custom editor is already active; prompt autocomplete did not replace it";
+    const shouldNotify = shared.editorBlockedReason !== reason;
+    shared.editorBlockedReason = reason;
+    updateDebugState(shared, "blocked-custom-editor", reason);
+    if (shouldNotify) ctx.ui.notify(reason, "warning");
+    return false;
+  }
+
+  shared.editorBlockedReason = undefined;
   shared.activationId += 1;
   const activationId = shared.activationId;
   shared.setStatusText = (text) => {
@@ -1020,9 +1044,10 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
     ctx.ui.setWidget("prompt-autocomplete-spinner", undefined, { placement: "belowEditor" });
   };
   const stopSpinnerTimer = () => {
-    if (!spinnerTimer) return;
-    clearInterval(spinnerTimer);
-    spinnerTimer = undefined;
+    if (spinnerTimer) {
+      clearInterval(spinnerTimer);
+      spinnerTimer = undefined;
+    }
     clearSpinnerWidget();
   };
   shared.setSpinnerActive = (owner, active) => {
@@ -1046,7 +1071,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
     stopSpinnerTimer();
   };
 
-  ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+  const installedFactory: EditorFactory = (tui, theme, keybindings) => {
     const editor = new PromptAutocompleteEditor(tui, theme, keybindings, shared, activationId);
     shared.refreshEditor = (options) => {
       if (activationId !== shared.activationId) return;
@@ -1057,21 +1082,34 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
       editor.cancelActiveRequest();
     };
     return editor;
-  });
+  };
+
+  shared.editorMount = { previousFactory, installedFactory };
+  shared.ownsEditor = () => ctx.ui.getEditorComponent() === installedFactory;
+
+  try {
+    ctx.ui.setEditorComponent(installedFactory);
+  } catch (error) {
+    releaseEditorRuntime(shared);
+    shared.editorMount = undefined;
+    throw error;
+  }
+
   updateDebugState(shared, "mounted", "Editor extension attached");
+  return true;
 }
 
 function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
-  shared.cancelActiveRequest?.();
-  shared.activationId += 1;
-  shared.clearSpinner?.();
-  ctx.ui.setEditorComponent(undefined);
-  clearDebugUi(shared);
-  shared.refreshEditor = undefined;
-  shared.cancelActiveRequest = undefined;
-  shared.setStatusText = undefined;
-  shared.setSpinnerActive = undefined;
-  shared.clearSpinner = undefined;
+  const mount = shared.editorMount;
+  const shouldRestore = ctx.mode === "tui" && !!mount && ctx.ui.getEditorComponent() === mount.installedFactory;
+
+  releaseEditorRuntime(shared);
+  shared.editorMount = undefined;
+  shared.editorBlockedReason = undefined;
+
+  if (shouldRestore && mount) {
+    ctx.ui.setEditorComponent(mount.previousFactory);
+  }
 }
 
 function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
@@ -1079,6 +1117,9 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.cancelActiveRequest = undefined;
   shared.enabled = pi.getFlag("prompt-autocomplete") === true;
   shared.config = parseConfig(pi);
+  shared.editorMount = undefined;
+  shared.editorBlockedReason = undefined;
+  shared.ownsEditor = undefined;
   shared.lastError = undefined;
   shared.lastRawResponse = undefined;
   shared.requestCache.clear();
@@ -1135,14 +1176,17 @@ function setWhileStreaming(
   }
 }
 
-function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
+function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
   shared.enabled = true;
-  mountEditor(ctx, shared);
+  return mountEditor(ctx, shared);
 }
 
 function disablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
   shared.enabled = false;
   unmountEditor(ctx, shared);
+  shared.requestCache.clear();
+  shared.lastRawResponse = undefined;
+  shared.lastError = undefined;
 }
 
 function notifyPromptAutocompleteEnabled(
@@ -1155,10 +1199,14 @@ function notifyPromptAutocompleteEnabled(
     `${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives, ` +
     `${formatPrimaryKey(CYCLE_NEXT_KEYS)} also forces a one-shot suggestion when none is shown (even while the agent works).`;
   const resolvedModel = resolveSuggestionModel(shared);
+  const privacyNotice = "Requests send the current draft and recent conversation context to the selected model and may incur provider usage.";
 
   if (options.includeModel) {
     if (resolvedModel) {
-      ctx.ui.notify(`Prompt autocomplete enabled. ${keyHint} Model: ${formatModelLabel(resolvedModel)}`, "info");
+      ctx.ui.notify(
+        `Prompt autocomplete enabled. ${keyHint} Model: ${formatModelLabel(resolvedModel)} ${privacyNotice}`,
+        "info",
+      );
     } else {
       ctx.ui.notify(
         "Prompt autocomplete enabled, but no usable model/auth is configured yet. Select a model or configure auth first.",
@@ -1168,7 +1216,7 @@ function notifyPromptAutocompleteEnabled(
     return;
   }
 
-  ctx.ui.notify(`Prompt autocomplete enabled. ${keyHint}`, "info");
+  ctx.ui.notify(`Prompt autocomplete enabled. ${keyHint} ${privacyNotice}`, "info");
 }
 
 function createPromptAutocompleteCommandHandlers(
@@ -1198,13 +1246,14 @@ function createPromptAutocompleteCommandHandlers(
       );
     },
     on: () => {
-      if (shared.enabled) {
+      if (shared.enabled && shared.ownsEditor?.()) {
         ctx.ui.notify(`Prompt autocomplete already enabled (${formatStatus(shared)})`, "info");
         return;
       }
 
-      enablePromptAutocomplete(ctx, shared);
-      notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: true });
+      if (enablePromptAutocomplete(ctx, shared)) {
+        notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: true });
+      }
     },
     off: () => {
       if (!shared.enabled) {
@@ -1222,17 +1271,24 @@ function createPromptAutocompleteCommandHandlers(
         return;
       }
 
-      enablePromptAutocomplete(ctx, shared);
-      notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: false });
+      if (enablePromptAutocomplete(ctx, shared)) {
+        notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: false });
+      }
     },
   };
 }
 
-export default function (pi: ExtensionAPI) {
+export function createPromptAutocompleteExtension(
+  dependencies: PromptAutocompleteDependencies = {},
+): (pi: ExtensionAPI) => void {
+  const completeSimpleImpl = dependencies.completeSimple ?? completeSimple;
+  const now = dependencies.now ?? Date.now;
+
+  return function promptAutocompleteExtension(pi: ExtensionAPI): void {
   pi.registerFlag("prompt-autocomplete", {
     description: "Enable inline AI prompt autocomplete in the editor",
     type: "boolean",
-    default: true,
+    default: DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
   });
   pi.registerFlag("prompt-autocomplete-model", {
     description: "Optional provider/model override for prompt autocomplete, e.g. openai/gpt-5.4-mini",
@@ -1275,16 +1331,21 @@ export default function (pi: ExtensionAPI) {
     activationId: 0,
     streaming: false,
     config: parseConfig(pi),
+    completeSimple: completeSimpleImpl,
+    now,
     debugState: "idle",
-    requestCache: new Map(),
+    requestCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
     inFlightRequests: new Map(),
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    if (shared.editorMount) {
+      unmountEditor(ctx, shared);
+    }
     resetSharedForSession(pi, shared);
     bindRuntimeContext(ctx, shared);
 
-    if (!ctx.hasUI || !shared.enabled) return;
+    if (ctx.mode !== "tui" || !shared.enabled) return;
     mountEditor(ctx, shared);
   });
 
@@ -1293,9 +1354,7 @@ export default function (pi: ExtensionAPI) {
     shared.cancelActiveRequest?.();
     shared.requestCache.clear();
     cancelAllCoalescedRequests(shared.inFlightRequests);
-    if (ctx.hasUI) {
-      unmountEditor(ctx, shared);
-    }
+    unmountEditor(ctx, shared);
   });
 
   pi.on("model_select", async (event, ctx) => {
@@ -1320,8 +1379,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("prompt-autocomplete", {
     description: "Enable, disable, or inspect inline prompt autocomplete",
     handler: async (args, ctx) => {
-      if (!ctx.hasUI) {
-        ctx.ui.notify("prompt-autocomplete requires interactive mode", "warning");
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("prompt-autocomplete requires interactive TUI mode", "warning");
         return;
       }
 
@@ -1347,4 +1406,7 @@ export default function (pi: ExtensionAPI) {
       );
     },
   });
+  };
 }
+
+export default createPromptAutocompleteExtension();
