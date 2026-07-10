@@ -1994,8 +1994,9 @@ async function waitForIdleWithTimeout(idle: Promise<void> | void, timeoutMs: num
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
+    // This timer settles an awaited operation, so it must remain referenced even
+    // when no TUI handle is keeping the event loop alive (for example in CI).
     timer = setTimeout(() => reject(new ReplacementIdleTimeoutError(timeoutMs)), timeoutMs);
-    timer.unref?.();
   });
 
   try {

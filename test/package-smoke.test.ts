@@ -22,6 +22,7 @@ function run(command: string, args: string[], cwd = projectRoot): string {
     env: { ...process.env, PI_OFFLINE: "1" },
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 120_000,
+    shell: process.platform === "win32",
   });
 }
 
@@ -147,6 +148,7 @@ test("packed collection installs cleanly and is discovered by the supported Pi v
           GEMINI_API_KEY: "",
         },
         timeout: 120_000,
+        shell: process.platform === "win32",
       },
     );
     assert.equal(help.status, 0, help.stderr);
@@ -281,6 +283,7 @@ test("standalone Prompt Autocomplete package is release-ready and discovers only
           GEMINI_API_KEY: "",
         },
         timeout: 120_000,
+        shell: process.platform === "win32",
       },
     );
     assert.equal(help.status, 0, help.stderr);
