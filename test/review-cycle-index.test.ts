@@ -1,11 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReviewCycleExtension, runFreshReviewAgent } from "../extensions/review-cycle/index.ts";
 
+const harnessTempDirs: string[] = [];
+test.after(async () => {
+  await Promise.all(harnessTempDirs.map((path) => rm(path, { recursive: true, force: true })));
+});
+
 function createHarness(options: { cwd?: string; panelInputs?: string[]; flags?: Record<string, unknown>; isIdle?: () => boolean; waitForIdle?: () => Promise<void> | void } = {}) {
+  const cwd = options.cwd ?? mkdtempSync(join(tmpdir(), "review-cycle-harness-"));
+  if (!options.cwd) harnessTempDirs.push(cwd);
   const handlers = new Map<string, Function>();
   const commands = new Map<string, { handler: Function }>();
   const sentMessages: Array<{ text: string; options?: unknown }> = [];
@@ -40,7 +48,7 @@ function createHarness(options: { cwd?: string; panelInputs?: string[]; flags?: 
   };
 
   const ctx = {
-    cwd: options.cwd ?? "/repo",
+    cwd,
     signal: new AbortController().signal,
     model: { provider: "openai", id: "gpt-review" },
     modelRegistry: {
@@ -738,7 +746,7 @@ test("review-cycle streams reviewer output into a toggleable widget and queues a
   assert.equal(harness.statuses.some((entry) => entry.key === "review-cycle" && entry.value !== undefined), false);
 
   assert.equal(reviewCalls.length, 1);
-  assert.equal(reviewCalls[0]?.cwd, "/repo");
+  assert.equal(reviewCalls[0]?.cwd, harness.ctx.cwd);
   assert.match(reviewCalls[0]?.prompt ?? "", /implement auth hardening/);
 
   assert.equal(harness.sentMessages.length, 2);
@@ -1308,9 +1316,12 @@ CHANGES_REQUESTED
     assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-artifact" && entry.content?.some((line) => line.includes("Review-cycle artifact #1"))));
     assert.ok(harness.widgets.some((entry) => entry.key === "review-cycle-artifact" && entry.content?.some((line) => line.includes("Stage: apply-complete"))));
     await harness.commands.get("review-cycle")?.handler("artifact path", harness.ctx);
-    assert.ok(harness.notifications.some((entry) => entry.message.includes(".pi/review-cycle/latest.md")));
+    assert.ok(harness.notifications.some((entry) => entry.message.includes(join(".pi", "review-cycle", "latest.md"))));
     await harness.commands.get("review-cycle")?.handler("artifact path 1", harness.ctx);
-    assert.ok(harness.notifications.some((entry) => entry.message.includes("Review-cycle artifact #1") && entry.message.includes(".pi/review-cycle/runs/")));
+    assert.ok(harness.notifications.some((entry) =>
+      entry.message.includes("Review-cycle artifact #1")
+      && entry.message.includes(join(".pi", "review-cycle", "runs")),
+    ));
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
