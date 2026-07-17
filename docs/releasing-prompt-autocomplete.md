@@ -12,7 +12,7 @@ npm run release:check:prompt-autocomplete
 npm audit --omit=dev
 ```
 
-The gate performs strict TypeScript checks, the complete repository suite, exact tarball inspection, clean offline installation, Pi discovery/load checks, release-metadata validation, and an npm publish dry run.
+The gate performs strict TypeScript checks, the complete repository suite, exact tarball inspection, clean offline installation, Pi discovery/load checks, and release-metadata validation. For an unpublished version it runs an npm publish dry run. If that exact version already exists after a bootstrap or retry, it packs locally and requires npm's immutable `dist.integrity` to match instead.
 
 Before tagging, also verify the Gallery video locally when `ffprobe` and `ffmpeg` are available:
 
@@ -92,6 +92,18 @@ git push origin pi-prompt-autocomplete-v<version>
 7. publishes the GitHub release only after npm succeeds or that exact integrity match is proven.
 
 The workflow is retry-safe for an existing draft release or an already-published byte-identical npm version. It fails closed if the same version exists with different bytes.
+
+## Recovering an existing tag
+
+If a tag-triggered run fails before creating its release artifact, keep the published tag immutable. Fix the release infrastructure on `main`, verify that `extensions/prompt-autocomplete/` and the release URLs in `README.md` are unchanged from the tag, then dispatch the repaired workflow against the existing tag:
+
+```bash
+gh workflow run release-prompt-autocomplete.yml \
+  --ref main \
+  -f tag=pi-prompt-autocomplete-v<version>
+```
+
+The recovery path fetches the annotated tag, rejects package or release-README drift, and still requires the protected `npm` environment. If that environment permits only release tags, temporarily allow the `main` branch for the recovery deployment and remove that branch rule immediately after the run finishes.
 
 ## Post-release checks
 

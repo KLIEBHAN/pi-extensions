@@ -14,6 +14,7 @@ const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const expectedTag = `pi-prompt-autocomplete-v${manifest.version}`;
 const releaseVideoUrl = `https://github.com/KLIEBHAN/pi-extensions/releases/download/${expectedTag}/prompt-autocomplete-demo.mp4`;
 const suppliedTag = process.argv[2]
+  ?? process.env.RELEASE_TAG
   ?? (process.env.GITHUB_REF_TYPE === "tag" ? process.env.GITHUB_REF_NAME : undefined);
 
 assert.equal(manifest.name, "@kliebhan/pi-prompt-autocomplete");

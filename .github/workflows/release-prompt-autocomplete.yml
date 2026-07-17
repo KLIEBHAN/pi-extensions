@@ -4,9 +4,18 @@ on:
   push:
     tags:
       - "pi-prompt-autocomplete-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing package-qualified release tag to recover
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -19,6 +28,34 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Validate release source and tag
+        shell: bash
+        run: |
+          expected_tag="pi-prompt-autocomplete-v$(node -p 'require("./extensions/prompt-autocomplete/package.json").version')"
+          if [ "$RELEASE_TAG" != "$expected_tag" ]; then
+            echo "Release tag must be $expected_tag, got $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "Recovery dispatches must run from refs/heads/main, got $GITHUB_REF" >&2
+              exit 1
+            fi
+            git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            if [ "$(git cat-file -t "$RELEASE_TAG")" != "tag" ]; then
+              echo "$RELEASE_TAG must be an annotated tag" >&2
+              exit 1
+            fi
+            if ! git diff --quiet "$RELEASE_TAG^{}" HEAD -- extensions/prompt-autocomplete README.md; then
+              echo "Recovery source differs from $RELEASE_TAG" >&2
+              git diff --stat "$RELEASE_TAG^{}" HEAD -- extensions/prompt-autocomplete README.md >&2
+              exit 1
+            fi
+          elif [ "$GITHUB_REF_TYPE" != "tag" ] || [ "$GITHUB_REF_NAME" != "$RELEASE_TAG" ]; then
+            echo "Tag-triggered release context is inconsistent" >&2
+            exit 1
+          fi
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.16.0
@@ -33,7 +70,7 @@ jobs:
           cp extensions/prompt-autocomplete/media/prompt-autocomplete-demo.mp4 dist/prompt-autocomplete-demo.mp4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: prompt-autocomplete-release-${{ github.sha }}
+          name: prompt-autocomplete-release-${{ github.run_id }}
           path: dist/
           if-no-files-found: error
           retention-days: 1
@@ -49,7 +86,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: prompt-autocomplete-release-${{ github.sha }}
+          name: prompt-autocomplete-release-${{ github.run_id }}
           path: dist
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -65,7 +102,7 @@ jobs:
           const packed = JSON.parse(fs.readFileSync("dist/pack.json", "utf8"));
           assert.equal(packed.length, 1);
           const item = packed[0];
-          assert.equal(process.env.GITHUB_REF_NAME, `pi-prompt-autocomplete-v${item.version}`);
+          assert.equal(process.env.RELEASE_TAG, `pi-prompt-autocomplete-v${item.version}`);
           const tarball = path.resolve("dist", item.filename);
           assert.ok(fs.statSync(tarball).size > 0);
           assert.ok(fs.statSync("dist/prompt-autocomplete-demo.mp4").size > 0);
@@ -82,14 +119,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" \
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
               --verify-tag \
               --draft \
               --title "Prompt Autocomplete v${{ steps.artifact.outputs.version }}" \
               --generate-notes
           fi
-          gh release upload "$GITHUB_REF_NAME" --clobber \
+          gh release upload "$RELEASE_TAG" --clobber \
             "${{ steps.artifact.outputs.tarball }}" \
             "dist/prompt-autocomplete-demo.mp4#prompt-autocomplete-demo.mp4"
       - name: Publish to npm with trusted provenance
@@ -98,8 +135,10 @@ jobs:
           package="${{ steps.artifact.outputs.name }}"
           version="${{ steps.artifact.outputs.version }}"
           local_integrity="${{ steps.artifact.outputs.integrity }}"
-          if registry_json="$(npm view "$package@$version" dist.integrity --json 2>/dev/null)"; then
-            registry_integrity="$(node -e 'const value = JSON.parse(process.argv[1]); if (typeof value !== "string") process.exit(2); process.stdout.write(value)' "$registry_json")"
+          registry_dir="$(mktemp -d)"
+          trap 'rm -rf "$registry_dir"' EXIT
+          if npm view "$package@$version" dist.integrity --json >"$registry_dir/stdout" 2>"$registry_dir/stderr"; then
+            registry_integrity="$(node -e 'const fs = require("node:fs"); const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); if (typeof value !== "string") process.exit(2); process.stdout.write(value)' "$registry_dir/stdout")"
             if [ "$registry_integrity" != "$local_integrity" ]; then
               echo "Registry integrity mismatch for $package@$version" >&2
               echo "expected: $local_integrity" >&2
@@ -107,11 +146,15 @@ jobs:
               exit 1
             fi
             echo "$package@$version already has the exact validated integrity; continuing a release retry."
-          else
+          elif grep -Eq 'npm error code E404|"code"[[:space:]]*:[[:space:]]*"E404"' "$registry_dir/stdout" "$registry_dir/stderr"; then
             npm publish "${{ steps.artifact.outputs.tarball }}" --access public --provenance
+          else
+            echo "Could not determine whether $package@$version exists; refusing to publish." >&2
+            cat "$registry_dir/stdout" "$registry_dir/stderr" >&2
+            exit 1
           fi
       - name: Publish GitHub release
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+        run: gh release edit "$RELEASE_TAG" --draft=false

@@ -16,7 +16,7 @@
     "test:auto-mode": "node --experimental-strip-types --test test/auto-mode-core.test.ts test/auto-mode-index.test.ts",
     "test:package": "node --experimental-strip-types --test test/package-smoke.test.ts",
     "test:prompt-autocomplete": "node --experimental-strip-types --test test/prompt-autocomplete-core.test.ts test/prompt-autocomplete-editor.test.ts test/prompt-autocomplete-index.test.ts",
-    "release:check:prompt-autocomplete": "npm run check && node scripts/verify-prompt-autocomplete-release.mjs && npm publish --dry-run --ignore-scripts --access public --provenance=false ./extensions/prompt-autocomplete",
+    "release:check:prompt-autocomplete": "npm run check && node scripts/verify-prompt-autocomplete-release.mjs && node scripts/check-prompt-autocomplete-publishability.mjs",
     "typecheck": "npm run typecheck:production && npm run typecheck:prompt-autocomplete",
     "typecheck:production": "tsc -p tsconfig.json",
     "typecheck:prompt-autocomplete": "tsc -p tsconfig.prompt-autocomplete.json"
