@@ -26,6 +26,7 @@ appendFileSync(process.env.FAKE_NPM_CALLS, JSON.stringify(args) + "\\n");
 const command = args[0];
 const bytes = Buffer.from("deterministic release fixture");
 const integrity = "sha512-" + createHash("sha512").update(bytes).digest("base64");
+const packageVersion = ${JSON.stringify(packageVersion)};
 
 if (command === "view") {
   if (process.env.FAKE_NPM_SCENARIO === "exact") {
@@ -50,12 +51,12 @@ if (command === "view") {
 
 if (command === "pack") {
   const destination = args[args.indexOf("--pack-destination") + 1];
-  const filename = "kliebhan-pi-prompt-autocomplete-${packageVersion}.tgz";
+  const filename = "kliebhan-pi-prompt-autocomplete-" + packageVersion + ".tgz";
   mkdirSync(destination, { recursive: true });
   writeFileSync(resolve(destination, filename), bytes);
   console.log(JSON.stringify([{
     name: "@kliebhan/pi-prompt-autocomplete",
-    version: "${packageVersion}",
+    version: packageVersion,
     filename,
     integrity,
   }]));
