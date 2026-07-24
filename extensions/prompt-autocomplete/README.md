@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.1.0/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.1.1/prompt-autocomplete-demo.mp4)
 
 ## Install
 
