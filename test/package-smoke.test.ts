@@ -234,6 +234,11 @@ test("standalone Prompt Autocomplete package is release-ready and discovers only
     assert.equal(installedManifest.version, standaloneManifest.version);
     assert.ok(installedManifest.description.length > 0);
     assert.ok(installedManifest.keywords.includes("pi-package"));
+    assert.deepEqual(
+      ["extension", "skill", "prompt", "theme"].filter((keyword) => installedManifest.keywords.includes(keyword)),
+      ["extension"],
+      "Gallery type keywords must match the extension-only manifest",
+    );
     assert.deepEqual(installedManifest.pi.extensions, ["./index.ts"]);
     assert.match(installedManifest.pi.video, /^https:\/\//);
     assert.deepEqual(installedManifest.peerDependencies, {

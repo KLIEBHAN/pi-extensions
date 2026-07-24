@@ -2,6 +2,13 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-07-24
+
+### Fixed
+
+- Corrected the Pi Gallery catalog badge from `prompt` to `extension` by aligning reserved type keywords with the package manifest.
+- Added release checks that prevent Gallery type keywords from drifting away from the resources declared by the package.
+
 ## [0.1.1] - 2026-07-24
 
 ### Changed
