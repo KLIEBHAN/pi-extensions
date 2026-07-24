@@ -2,6 +2,8 @@
 
 Prompt Autocomplete is published from `extensions/prompt-autocomplete/` as the independent npm package `@kliebhan/pi-prompt-autocomplete`. The repository root remains a private development/collection package.
 
+GitHub Actions dependencies used by this release follow the immutable-SHA and runtime policy in [`github-actions.md`](github-actions.md).
+
 ## Release gate
 
 From a clean checkout on Node.js 22.19 or newer:
