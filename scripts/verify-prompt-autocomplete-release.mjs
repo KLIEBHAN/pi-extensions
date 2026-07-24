@@ -23,6 +23,11 @@ assert.equal(manifest.publishConfig?.access, "public");
 assert.equal(manifest.publishConfig?.provenance, true);
 assert.deepEqual(manifest.pi?.extensions, ["./index.ts"]);
 assert.ok(manifest.keywords?.includes("pi-package"));
+assert.deepEqual(
+  ["extension", "skill", "prompt", "theme"].filter((keyword) => manifest.keywords?.includes(keyword)),
+  ["extension"],
+  "Gallery type keywords must classify this package only as an extension",
+);
 assert.equal(manifest.repository?.directory, "extensions/prompt-autocomplete");
 assert.match(changelog, new RegExp(`^## \\[${escapeRegex(manifest.version)}\\]`, "m"));
 assert.match(readme, /Privacy, providers, and cost/);

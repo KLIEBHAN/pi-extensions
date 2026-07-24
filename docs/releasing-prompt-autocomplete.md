@@ -118,4 +118,10 @@ npm view @kliebhan/pi-prompt-autocomplete@<version> \
 pi -e npm:@kliebhan/pi-prompt-autocomplete@<version> --help
 ```
 
-Confirm that the Pi package gallery lists the package and that the release-hosted MP4 preview loads. Gallery indexing and review are external to this repository and must not be claimed before they are visible.
+Open `https://pi.dev/packages/@kliebhan/pi-prompt-autocomplete` and use the catalog search on `https://pi.dev/packages` to confirm that:
+
+- the indexed version matches the npm release,
+- the package is classified as `extension` rather than `prompt`, `skill`, or `theme`,
+- the release-hosted MP4 preview opens and plays.
+
+The catalog list infers resource badges from reserved npm keywords, while the detail page can inspect the full `pi` manifest. Keep the exact `extension` keyword and do not add `prompt`, `skill`, or `theme` unless the package actually declares those resource types. Gallery indexing and review are external to this repository and must not be claimed before they are visible.
