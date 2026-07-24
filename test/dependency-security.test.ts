@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
+import { parse } from "yaml";
 
 interface LockPackage {
   version?: string;
@@ -12,9 +13,10 @@ const manifest = JSON.parse(readFileSync(resolve(projectRoot, "package.json"), "
   devDependencies: Record<string, string>;
 };
 const lock = JSON.parse(readFileSync(resolve(projectRoot, "package-lock.json"), "utf8")) as {
+  lockfileVersion: number;
   packages: Record<string, LockPackage>;
 };
-const ciWorkflow = readFileSync(resolve(projectRoot, ".github", "workflows", "ci.yml"), "utf8");
+const ciWorkflowSource = readFileSync(resolve(projectRoot, ".github", "workflows", "ci.yml"), "utf8");
 
 function compareVersions(left: string, right: string): number {
   const leftParts = left.split(".").map(Number);
@@ -32,12 +34,24 @@ function lockedVersions(packageName: string): Array<[path: string, version: stri
     .filter(([path, entry]) =>
       (path === rootPath || path.endsWith(`/${rootPath}`)) && typeof entry.version === "string"
     )
-    .map(([path, entry]) => [path, entry.version!]);
+    .map(([path, entry]) => {
+      assert.match(entry.version!, /^\d+\.\d+\.\d+$/, `${path} must use a three-part numeric version`);
+      return [path, entry.version!];
+    });
 }
 
 test("CI audits the complete development and production dependency tree", () => {
-  assert.match(ciWorkflow, /\n\s+- run: npm audit\s*(?:\n|$)/);
-  assert.doesNotMatch(ciWorkflow, /npm audit[^\n]*--omit(?:=|\s+)dev/);
+  const workflow = parse(ciWorkflowSource) as {
+    jobs?: Record<string, { steps?: Array<{ run?: unknown }> }>;
+  };
+  const releaseAudit = workflow.jobs?.["release-audit"];
+  assert.ok(releaseAudit, "CI must define the release-audit job");
+  assert.ok(Array.isArray(releaseAudit.steps), "release-audit must define steps");
+
+  const auditCommands = releaseAudit.steps
+    .map((step) => step.run)
+    .filter((command): command is string => typeof command === "string" && command.startsWith("npm audit"));
+  assert.deepEqual(auditCommands, ["npm audit"], "release-audit must run one full npm audit without exclusions");
 });
 
 test("Pi development packages stay on one exact version", () => {
@@ -56,6 +70,7 @@ test("Pi development packages stay on one exact version", () => {
 });
 
 test("lockfile excludes the resolved brace-expansion and protobufjs advisory ranges", () => {
+  assert.equal(lock.lockfileVersion, 3, "dependency path checks require npm lockfileVersion 3");
   assert.ok(
     lockedVersions("protobufjs").some(([path]) => path === "node_modules/protobufjs"),
     "root-level dependency entries must be included in advisory checks",
@@ -64,10 +79,18 @@ test("lockfile excludes the resolved brace-expansion and protobufjs advisory ran
   const vulnerableBraceExpansion = lockedVersions("brace-expansion").filter(([, version]) =>
     compareVersions(version, "3.0.0") >= 0 && compareVersions(version, "5.0.7") < 0
   );
-  assert.deepEqual(vulnerableBraceExpansion, [], "GHSA-3jxr-9vmj-r5cp remains in package-lock.json");
+  assert.deepEqual(
+    vulnerableBraceExpansion,
+    [],
+    "package-lock.json must not contain versions affected by GHSA-3jxr-9vmj-r5cp",
+  );
 
   const vulnerableProtobufjs = lockedVersions("protobufjs").filter(([, version]) =>
     compareVersions(version, "7.5.0") >= 0 && compareVersions(version, "7.6.4") <= 0
   );
-  assert.deepEqual(vulnerableProtobufjs, [], "GHSA-j3f2-48v5-ccww remains in package-lock.json");
+  assert.deepEqual(
+    vulnerableProtobufjs,
+    [],
+    "package-lock.json must not contain versions affected by GHSA-j3f2-48v5-ccww",
+  );
 });
