@@ -97,11 +97,17 @@ test("every external workflow action matches the reviewed lock entry", () => {
     verifyWorkflowSource(file, readFileSync(resolve(workflowDirectory, file), "utf8"), usedActions);
   }
 
-  assert.deepEqual([...usedActions].sort(), Object.keys(lock).sort(), "action lock contains unused entries");
+  assert.deepEqual(
+    [...usedActions].sort(),
+    Object.keys(lock).sort(),
+    "workflow actions must exactly match the lock entries",
+  );
 });
 
 test("workflow action policy parses alternate YAML forms and fails closed", () => {
   const cases: Array<[name: string, source: string, expected: RegExp]> = [
+    ["root-sequence.yml", "- jobs", /root-sequence\.yml must be a mapping/],
+    ["jobs-sequence.yml", "jobs:\n  - test", /jobs-sequence\.yml: jobs must be a mapping/],
     [
       "named-step.yml",
       "jobs:\n  test:\n    steps:\n      - name: Checkout\n        uses: actions/checkout@main # mutable ref with words",
@@ -137,4 +143,8 @@ test("workflow action policy parses alternate YAML forms and fails closed", () =
   for (const [name, source, expected] of cases) {
     assert.throws(() => verifyWorkflowSource(name, source), expected, name);
   }
+
+  assert.doesNotThrow(() =>
+    verifyWorkflowSource("local.yml", "jobs: { test: { steps: [ { uses: ./local-action } ] } }"),
+  );
 });
