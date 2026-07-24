@@ -12,6 +12,9 @@ import {
 
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const standalonePackageRoot = join(projectRoot, "extensions", "prompt-autocomplete");
+const standaloneManifest = JSON.parse(readFileSync(join(standalonePackageRoot, "package.json"), "utf8")) as {
+  version: string;
+};
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const piCommand = join(projectRoot, "node_modules", ".bin", process.platform === "win32" ? "pi.cmd" : "pi");
 
@@ -228,7 +231,7 @@ test("standalone Prompt Autocomplete package is release-ready and discovers only
       repository: { directory: string; url: string };
     };
     assert.equal(installedManifest.name, "@kliebhan/pi-prompt-autocomplete");
-    assert.equal(installedManifest.version, "0.1.0");
+    assert.equal(installedManifest.version, standaloneManifest.version);
     assert.ok(installedManifest.description.length > 0);
     assert.ok(installedManifest.keywords.includes("pi-package"));
     assert.deepEqual(installedManifest.pi.extensions, ["./index.ts"]);

@@ -2,6 +2,18 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-24
+
+### Changed
+
+- Verified the standalone package, clean installation, Pi discovery, and editor integration against Pi 0.82.0.
+- Updated the Gallery media link to the immutable v0.1.1 GitHub release asset.
+
+### Security
+
+- Hardened release validation with a full dependency audit and offline advisory-range checks.
+- Prepared publication through npm Trusted Publishing with provenance and immutable Node 24 GitHub Actions.
+
 ## [0.1.0] - 2026-07-10
 
 ### Added
