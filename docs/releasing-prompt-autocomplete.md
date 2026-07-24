@@ -85,7 +85,7 @@ git push origin pi-prompt-autocomplete-v<version>
 
 1. validates and packs in a read-only job without publication credentials,
 2. verifies tag, manifest, changelog, privacy documentation, and Gallery media,
-3. transfers only the validated tarball, pack metadata, and MP4 to the protected `npm` environment,
+3. transfers only the validated tarball, pack metadata, and MP4 to the protected `npm` environment, retaining that handoff artifact for 31 days so multi-day approval delays do not invalidate it,
 4. creates a draft GitHub release and uploads the exact tarball and MP4,
 5. publishes the package with npm provenance when it is not already present,
 6. for a retry, requires npm's immutable `dist.integrity` to equal the validated tarball integrity,
@@ -103,7 +103,9 @@ gh workflow run release-prompt-autocomplete.yml \
   -f tag=pi-prompt-autocomplete-v<version>
 ```
 
-The recovery path fetches the annotated tag, rejects package or release-README drift, and still requires the protected `npm` environment. If that environment permits only release tags, temporarily allow the `main` branch for the recovery deployment and remove that branch rule immediately after the run finishes.
+The recovery path fetches the annotated tag, rejects package or release-README drift, and still requires the protected `npm` environment. The validated handoff artifact is retained for 31 days; approve the deployment within that window. If the artifact is manually deleted or expires, dispatch the entire workflow again so validation and packing run afresh—do not retry only the publish job.
+
+If the environment permits only release tags, temporarily allow the `main` branch for the recovery deployment and remove that branch rule immediately after the run finishes.
 
 ## Post-release checks
 
