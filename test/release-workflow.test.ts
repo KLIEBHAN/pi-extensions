@@ -28,3 +28,14 @@ test("release artifacts are run-scoped and publish uses the validated release ta
   assert.match(workflow, /gh release create "\$RELEASE_TAG"/);
   assert.match(workflow, /gh release edit "\$RELEASE_TAG" --draft=false/);
 });
+
+test("validated artifacts outlive multi-day protected-environment approvals", () => {
+  const match = workflow.match(
+    /name: prompt-autocomplete-release-\$\{\{ github\.run_id \}\}[\s\S]*?retention-days:\s*(\d+)/,
+  );
+  assert.ok(match, "release artifact upload must declare a retention period");
+
+  const retentionDays = Number(match[1]);
+  assert.ok(retentionDays >= 30, `release artifact retention must be at least 30 days, got ${retentionDays}`);
+  assert.ok(retentionDays <= 90, `release artifact retention must not exceed GitHub's standard maximum, got ${retentionDays}`);
+});

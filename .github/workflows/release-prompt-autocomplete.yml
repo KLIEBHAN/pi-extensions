@@ -73,7 +73,8 @@ jobs:
           name: prompt-autocomplete-release-${{ github.run_id }}
           path: dist/
           if-no-files-found: error
-          retention-days: 1
+          # Protected npm deployments may wait several days for manual approval.
+          retention-days: 31
 
   publish:
     name: Publish npm package and GitHub release
