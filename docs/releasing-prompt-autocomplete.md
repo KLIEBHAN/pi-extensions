@@ -11,10 +11,10 @@ From a clean checkout on Node.js 22.19 or newer:
 ```bash
 npm ci --ignore-scripts
 npm run release:check:prompt-autocomplete
-npm audit
+npm run audit:dependencies
 ```
 
-The gate performs strict TypeScript checks, the complete repository suite, exact tarball inspection, clean offline installation, Pi discovery/load checks, and release-metadata validation. The separate full `npm audit` includes development dependencies because the repository toolchain executes during CI; a production-only audit would miss vulnerabilities in that trusted build path. For an unpublished version the gate runs an npm publish dry run. If that exact version already exists after a bootstrap or retry, it packs locally and requires npm's immutable `dist.integrity` to match instead.
+The gate performs strict TypeScript checks, the complete repository suite, exact tarball inspection, clean offline installation, Pi discovery/load checks, and release-metadata validation. The separate audit gate runs a full `npm audit` that includes development dependencies, because the repository toolchain executes during CI; a production-only audit would miss vulnerabilities in that trusted build path. It fails on any advisory that is not explicitly documented and time-boxed in `.github/audit-exceptions.json`; see [`docs/dependency-audit.md`](dependency-audit.md). For an unpublished version the gate runs an npm publish dry run. If that exact version already exists after a bootstrap or retry, it packs locally and requires npm's immutable `dist.integrity` to match instead.
 
 Before tagging, also verify the Gallery video locally when `ffprobe` and `ffmpeg` are available:
 

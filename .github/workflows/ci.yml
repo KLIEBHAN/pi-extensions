@@ -45,4 +45,4 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run release:check:prompt-autocomplete
-      - run: npm audit
+      - run: npm run audit:dependencies

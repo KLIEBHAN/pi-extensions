@@ -1,0 +1,24 @@
+{
+  "$comment": [
+    "Advisories that CI accepts even though `npm audit` reports them.",
+    "An entry is only justified while the vulnerable version is pinned outside this repository's control.",
+    "Each entry is matched exactly: advisory, module, severity, range, and every reported dependency path.",
+    "Anything else fails the audit gate, including an entry that no longer matches a reported advisory.",
+    "`reviewBy` time-boxes the exception. CI fails once that date passes, forcing a fresh decision instead of silent drift.",
+    "See docs/dependency-audit.md before adding, changing, or extending an entry."
+  ],
+  "exceptions": [
+    {
+      "advisory": "GHSA-mh99-v99m-4gvg",
+      "module": "brace-expansion",
+      "severity": "high",
+      "range": "<=5.0.7",
+      "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"],
+      "pinnedBy": "@earendil-works/pi-coding-agent",
+      "reason": "brace-expansion is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent. A dependency shrinkwrap is authoritative for its own subtree, so neither a root overrides entry nor `npm audit fix` can raise it to the patched 5.0.8. Pi 0.82.1 still ships 5.0.7. The package is a development dependency used by the local toolchain and CI on trusted repository inputs, and it is never shipped in the published npm package, which declares Pi as a peer dependency.",
+      "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump brace-expansion to >=5.0.8 in its shrinkwrap.",
+      "acceptedOn": "2026-07-25",
+      "reviewBy": "2026-09-05"
+    }
+  ]
+}
