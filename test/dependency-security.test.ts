@@ -208,12 +208,16 @@ const ACCEPTED = {
   range: "<=5.0.7",
   paths: ["node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"],
   reason: "x".repeat(80),
+  upstreamFix: "Requires the upstream package to raise its shrinkwrapped version.",
   acceptedOn: "2026-07-25",
   reviewBy: "2026-09-05",
 };
 
+// Fixed so the suite does not start failing as real time passes the dates above.
+const TODAY = "2026-07-26";
+
 function declared(overrides: Record<string, unknown> = {}) {
-  return parseExceptions({ exceptions: [{ ...ACCEPTED, ...overrides }] }, "test");
+  return parseExceptions({ exceptions: [{ ...ACCEPTED, ...overrides }] }, "test", TODAY);
 }
 
 function vulnerability(overrides: Record<string, unknown> = {}) {
@@ -236,7 +240,7 @@ function vulnerability(overrides: Record<string, unknown> = {}) {
 function reconcile(
   vulnerabilities: Record<string, unknown>,
   exceptions = declared(),
-  today = "2026-07-26",
+  today = TODAY,
   total?: number,
 ) {
   return reconcileAudit(
@@ -418,7 +422,11 @@ function runGateWithStubbedNpm(report: unknown): { status: number | null; output
   }
 }
 
-test("the audit gate command fails on an undeclared advisory", () => {
+// The stub is a POSIX shell script, so these run only where the release-audit
+// job itself runs. CI executes the full suite on Windows too.
+const posixOnly = { skip: process.platform === "win32" ? "requires a POSIX shell stub" : false };
+
+test("the audit gate command fails on an undeclared advisory", posixOnly, () => {
   const { status, output } = runGateWithStubbedNpm({
     auditReportVersion: 2,
     vulnerabilities: {
@@ -443,7 +451,7 @@ test("the audit gate command fails on an undeclared advisory", () => {
   assert.match(output, /undeclared advisory GHSA-2222-3333-4444/);
 });
 
-test("the audit gate command fails when npm reports a failure it cannot describe", () => {
+test("the audit gate command fails when npm reports a failure it cannot describe", posixOnly, () => {
   const { status, output } = runGateWithStubbedNpm({
     auditReportVersion: 2,
     vulnerabilities: {},
@@ -453,4 +461,73 @@ test("the audit gate command fails when npm reports a failure it cannot describe
   // npm exited non-zero, so an empty report is a broken audit, not a clean tree.
   assert.equal(status, 1);
   assert.match(output, /without reporting any vulnerability/);
+});
+
+test("an effect never validates a declaration on its own", () => {
+  // The source package is reported but carries no reconcilable advisory, so the
+  // declaration has no evidence behind it and the effect must not supply it.
+  const { failures } = reconcile(
+    {
+      "brace-expansion": { name: "brace-expansion", severity: "high", via: [], nodes: [...ACCEPTED.paths] },
+      dependent: { name: "dependent", severity: "critical", via: ["brace-expansion"], nodes: ["node_modules/dependent"] },
+    },
+    declared({ effects: ["dependent"] }),
+  );
+
+  assert.match(failures.join("\n"), /claims cover from GHSA-mh99-v99m-4gvg, but that advisory was not reconciled/);
+});
+
+test("a self-referential effect cannot stand in for an advisory", () => {
+  const { failures } = reconcile(
+    {
+      "brace-expansion": {
+        name: "brace-expansion",
+        severity: "critical",
+        via: ["brace-expansion"],
+        nodes: ["node_modules/anywhere"],
+      },
+    },
+    declared({ effects: ["brace-expansion"] }),
+    "2027-12-31",
+  );
+
+  assert.match(failures.join("\n"), /affected via itself/);
+});
+
+test("an inherited property cannot pose as a reported package", () => {
+  const { failures } = reconcile(
+    { victim: { name: "victim", severity: "critical", via: ["constructor"], nodes: ["node_modules/victim"] } },
+    declared({ module: "constructor", effects: ["victim"] }),
+  );
+
+  assert.match(failures.join("\n"), /via constructor, which npm did not report separately/);
+});
+
+test("the audit gate rejects a report whose key disagrees with the package name", () => {
+  const { failures } = reconcile({ innocent: vulnerability() });
+
+  assert.match(failures.join("\n"), /reported "brace-expansion" under the key "innocent"/);
+});
+
+test("the audit gate rejects a report that states no vulnerability count", () => {
+  const { failures } = reconcileAudit(
+    { auditReportVersion: 2, vulnerabilities: { "brace-expansion": vulnerability() }, metadata: {} },
+    declared(),
+    TODAY,
+  );
+
+  assert.match(failures.join("\n"), /does not state how many vulnerabilities it found/);
+});
+
+test("an exception cannot be future-dated to escape the review deadline", () => {
+  // Moving both dates forward would otherwise satisfy the 120-day cap while
+  // deferring the actual review indefinitely.
+  assert.throws(
+    () => declared({ acceptedOn: "3026-01-01", reviewBy: "3026-04-01" }),
+    /accepted on 3026-01-01, which is in the future/,
+  );
+});
+
+test("an exception must record what would retire it", () => {
+  assert.throws(() => declared({ upstreamFix: undefined }), /must set "upstreamFix"/);
 });

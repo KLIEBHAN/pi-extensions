@@ -59,6 +59,12 @@ function runAudit() {
   if (typeof report.vulnerabilities !== "object" || report.vulnerabilities === null) {
     throw new Error("npm audit report contains no vulnerabilities section");
   }
+  // npm audit exits 0 for a clean tree and 1 when it found advisories.
+  // Anything else (including a signal, where status is null) is a broken run
+  // whose output must not be interpreted at all.
+  if (result.status !== 0 && result.status !== 1) {
+    throw new Error(`npm audit exited unexpectedly (status ${result.status}): ${result.stderr.trim()}`);
+  }
   // A non-zero audit that reports nothing means the report does not describe
   // the failure, so the gate must not conclude the tree is clean.
   if (result.status !== 0 && Object.keys(report.vulnerabilities).length === 0) {
@@ -81,7 +87,7 @@ function parseIsoDate(value) {
   return parsed.toISOString().slice(0, 10) === value ? parsed : undefined;
 }
 
-export function parseExceptions(parsed, source = exceptionsPath) {
+export function parseExceptions(parsed, source = exceptionsPath, today = new Date().toISOString().slice(0, 10)) {
   if (!Array.isArray(parsed.exceptions)) {
     throw new Error(`${source} must contain an "exceptions" array`);
   }
@@ -93,7 +99,7 @@ export function parseExceptions(parsed, source = exceptionsPath) {
     if (!ADVISORY_ID_PATTERN.test(id)) {
       throw new Error(`audit exception "${id}" must reference a canonical GHSA identifier`);
     }
-    for (const field of ["module", "severity", "range", "reason", "acceptedOn", "reviewBy"]) {
+    for (const field of ["module", "severity", "range", "reason", "upstreamFix", "acceptedOn", "reviewBy"]) {
       if (!isNonEmptyString(entry[field])) {
         throw new Error(`audit exception ${id} must set "${field}" to a non-empty string`);
       }
@@ -121,6 +127,11 @@ export function parseExceptions(parsed, source = exceptionsPath) {
     if (!reviewBy) throw new Error(`audit exception ${id} must set reviewBy to a real YYYY-MM-DD date`);
     if (reviewBy <= acceptedOn) {
       throw new Error(`audit exception ${id} must be reviewed after it was accepted`);
+    }
+    // Without this, future-dating both fields would satisfy the lifetime cap
+    // while deferring the actual review indefinitely.
+    if (entry.acceptedOn > today) {
+      throw new Error(`audit exception ${id} is accepted on ${entry.acceptedOn}, which is in the future`);
     }
 
     const lifetimeDays = Math.round((reviewBy - acceptedOn) / 86_400_000);
@@ -209,46 +220,42 @@ function checkAdvisory({ advisory, vulnerability, via, exceptions, matched, toda
 export function reconcileAudit(report, exceptions, today) {
   const failures = [];
   const fail = (message) => failures.push(message);
-  const vulnerabilities = Object.values(report.vulnerabilities ?? {});
+  const section = report.vulnerabilities ?? {};
+  // Own entries only: an inherited property such as `constructor` must never
+  // look like a reported package.
+  const entries = Object.entries(section).filter(([key]) => Object.hasOwn(section, key));
   const matched = new Set();
 
   // npm's own count must agree with the entries present, otherwise the report
   // is truncated or malformed and cannot be reconciled.
   const reportedTotal = report.metadata?.vulnerabilities?.total;
-  if (typeof reportedTotal === "number" && reportedTotal !== vulnerabilities.length) {
-    fail(`npm reported ${reportedTotal} vulnerabilities but described ${vulnerabilities.length}`);
+  if (typeof reportedTotal !== "number") {
+    fail("npm audit report does not state how many vulnerabilities it found");
+  } else if (reportedTotal !== entries.length) {
+    fail(`npm reported ${reportedTotal} vulnerabilities but described ${entries.length}`);
   }
 
-  for (const vulnerability of vulnerabilities) {
-    const via = Array.isArray(vulnerability.via) ? vulnerability.via : [];
-    // Every entry must be positively accounted for. An entry that identifies no
-    // advisory is the shape an undeclared vulnerability would take if the gate
-    // only iterated the advisories it could read.
-    let accounted = false;
+  const vulnerabilities = [];
+  for (const [key, vulnerability] of entries) {
+    if (typeof vulnerability !== "object" || vulnerability === null) {
+      fail(`npm audit reported a malformed entry for ${key}`);
+      continue;
+    }
+    // The key is what other entries reference, so a name that disagrees with it
+    // would let an advisory be reconciled against the wrong package.
+    if (vulnerability.name !== key) {
+      fail(`npm audit reported ${JSON.stringify(vulnerability.name)} under the key ${JSON.stringify(key)}`);
+      continue;
+    }
+    vulnerabilities.push(vulnerability);
+  }
 
-    for (const entry of via) {
-      if (typeof entry === "string") {
-        // An effect of another vulnerable package. It is only covered when the
-        // exception for that package names this one, so a new dependent forces
-        // a fresh decision rather than inheriting cover.
-        if (!report.vulnerabilities[entry]) {
-          fail(`${vulnerability.name} is reported as affected via ${entry}, which npm did not report separately`);
-          continue;
-        }
-        const cover = [...exceptions.values()].find(
-          (exception) => exception.module === entry && (exception.effects ?? []).includes(vulnerability.name),
-        );
-        if (!cover) {
-          fail(
-            `${vulnerability.name} is vulnerable through ${entry}, which no exception covers for this dependent. ` +
-              `Declare it in the "effects" of the ${entry} exception, or fix the dependency.`,
-          );
-          continue;
-        }
-        matched.add(cover.advisory);
-        accounted = true;
-        continue;
-      }
+  // Pass one: only a directly reported advisory, reconciled against its
+  // declaration with full evidence, may satisfy that declaration.
+  const accounted = new Set();
+  for (const vulnerability of vulnerabilities) {
+    for (const entry of vulnerability.via ?? []) {
+      if (typeof entry === "string") continue;
 
       const advisory = advisoryIdFrom(entry);
       if (!advisory) {
@@ -257,10 +264,51 @@ export function reconcileAudit(report, exceptions, today) {
       }
 
       checkAdvisory({ advisory, vulnerability, via: entry, exceptions, matched, today, fail });
-      accounted = true;
+      accounted.add(vulnerability.name);
     }
+  }
 
-    if (!accounted) {
+  // Pass two: an effect is cover only because the package it flows from was
+  // itself reconciled above. An effect never validates a declaration on its
+  // own, so it cannot stand in for the missing evidence of a direct advisory.
+  for (const vulnerability of vulnerabilities) {
+    for (const entry of vulnerability.via ?? []) {
+      if (typeof entry !== "string") continue;
+
+      if (!Object.hasOwn(section, entry)) {
+        fail(`${vulnerability.name} is reported as affected via ${entry}, which npm did not report separately`);
+        continue;
+      }
+      if (entry === vulnerability.name) {
+        fail(`${vulnerability.name} is reported as affected via itself and cannot be reconciled`);
+        continue;
+      }
+      const cover = [...exceptions.values()].find(
+        (exception) => exception.module === entry && (exception.effects ?? []).includes(vulnerability.name),
+      );
+      if (!cover) {
+        fail(
+          `${vulnerability.name} is vulnerable through ${entry}, which no exception covers for this dependent. ` +
+            `Declare it in the "effects" of the ${entry} exception, or fix the dependency.`,
+        );
+        continue;
+      }
+      if (!matched.has(cover.advisory)) {
+        fail(
+          `${vulnerability.name} claims cover from ${cover.advisory}, but that advisory was not reconciled ` +
+            `against a directly reported ${cover.module} vulnerability`,
+        );
+        continue;
+      }
+      accounted.add(vulnerability.name);
+    }
+  }
+
+  // Every entry must be positively accounted for. An entry that identifies no
+  // advisory is the shape an undeclared vulnerability would take if the gate
+  // only iterated the advisories it could read.
+  for (const vulnerability of vulnerabilities) {
+    if (!accounted.has(vulnerability.name)) {
       fail(
         `${vulnerability.name} (${vulnerability.severity ?? "unknown severity"}) is reported as vulnerable but ` +
           "identifies no advisory this gate can reconcile",
