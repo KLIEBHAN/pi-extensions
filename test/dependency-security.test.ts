@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
 
@@ -76,12 +78,24 @@ test("CI audits the complete development and production dependency tree", () => 
   );
 });
 
+test("the audit script is the command CI actually runs", () => {
+  const scripts = (JSON.parse(readFileSync(resolve(projectRoot, "package.json"), "utf8")) as {
+    scripts: Record<string, string>;
+  }).scripts;
+
+  // Without this the workflow assertion above could be satisfied by an npm
+  // script that no longer audits anything.
+  assert.equal(scripts["audit:dependencies"], "node scripts/audit-dependencies.mjs");
+});
+
 test("the audit gate runs a full audit and cannot be narrowed", () => {
-  assert.match(
-    auditGateSource,
-    /"npm",\s*\["audit",\s*"--json"\]/,
-    "the gate must run a complete npm audit",
-  );
+  assert.match(auditGateSource, /"audit",\s*"--json"/, "the gate must run npm audit as JSON");
+  for (const dependencyClass of ["prod", "dev", "optional", "peer"]) {
+    assert.ok(
+      auditGateSource.includes(`"--include=${dependencyClass}"`),
+      `the gate must audit ${dependencyClass} dependencies explicitly`,
+    );
+  }
 
   for (const weakening of ["--audit-level", "--omit", "--production", "--only=prod"]) {
     assert.ok(
@@ -89,6 +103,9 @@ test("the audit gate runs a full audit and cannot be narrowed", () => {
       `the gate must not narrow npm audit with ${weakening}`,
     );
   }
+
+  // Ambient npm configuration must not be able to shrink the audited tree.
+  assert.match(auditGateSource, /npm_config_omit/i);
 
   // An unreadable or unexpected report must fail rather than be read as "clean".
   assert.match(auditGateSource, /auditReportVersion !== 2/);
@@ -199,98 +216,241 @@ function declared(overrides: Record<string, unknown> = {}) {
   return parseExceptions({ exceptions: [{ ...ACCEPTED, ...overrides }] }, "test");
 }
 
-function reportFor(overrides: Record<string, unknown> = {}) {
+function vulnerability(overrides: Record<string, unknown> = {}) {
   return {
-    auditReportVersion: 2,
-    vulnerabilities: {
-      "brace-expansion": {
-        name: "brace-expansion",
+    name: "brace-expansion",
+    severity: "high",
+    via: [
+      {
+        url: "https://github.com/advisories/GHSA-mh99-v99m-4gvg",
+        title: "DoS via unbounded expansion",
         severity: "high",
-        via: [
-          {
-            url: "https://github.com/advisories/GHSA-mh99-v99m-4gvg",
-            title: "DoS via unbounded expansion",
-            severity: "high",
-            range: "<=5.0.7",
-          },
-        ],
         range: "<=5.0.7",
-        nodes: ["node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"],
-        ...overrides,
       },
-    },
-    metadata: { vulnerabilities: { total: 1 } },
+    ],
+    nodes: [...ACCEPTED.paths],
+    ...overrides,
   };
 }
 
+function reconcile(
+  vulnerabilities: Record<string, unknown>,
+  exceptions = declared(),
+  today = "2026-07-26",
+  total?: number,
+) {
+  return reconcileAudit(
+    {
+      auditReportVersion: 2,
+      vulnerabilities,
+      metadata: { vulnerabilities: { total: total ?? Object.keys(vulnerabilities).length } },
+    },
+    exceptions,
+    today,
+  );
+}
+
 test("the audit gate accepts exactly the documented advisory", () => {
-  const { failures, matched } = reconcileAudit(reportFor(), declared(), "2026-07-26");
+  const { failures, matched } = reconcile({ "brace-expansion": vulnerability() });
 
   assert.deepEqual(failures, []);
   assert.deepEqual([...matched], ["GHSA-mh99-v99m-4gvg"]);
 });
 
 test("the audit gate rejects an advisory that was never declared", () => {
-  const report = reportFor();
-  report.vulnerabilities["brace-expansion"].via[0].url = "https://github.com/advisories/GHSA-new-advisory";
+  const { failures } = reconcile({
+    "brace-expansion": vulnerability({
+      via: [
+        {
+          url: "https://github.com/advisories/GHSA-2222-3333-4444",
+          severity: "critical",
+          range: "<=9.9.9",
+        },
+      ],
+    }),
+  });
 
-  const { failures } = reconcileAudit(report, declared(), "2026-07-26");
+  assert.match(failures.join("\n"), /undeclared advisory GHSA-2222-3333-4444/);
+  assert.match(failures.join("\n"), /no longer matches any reported advisory/);
+});
 
-  assert.equal(failures.length, 2, "the new advisory is undeclared and the declaration is now stale");
-  assert.match(failures[0] ?? "", /undeclared advisory GHSA-new-advisory/);
-  assert.match(failures[1] ?? "", /no longer matches any reported advisory/);
+test("the audit gate rejects a vulnerability that identifies no advisory", () => {
+  // The shape an undeclared vulnerability takes if a gate only iterates the
+  // advisories it can read: an entry with no via at all.
+  for (const shape of [{ via: undefined }, { via: [] }]) {
+    const { failures } = reconcile({
+      "brace-expansion": vulnerability(),
+      evil: { name: "evil", severity: "critical", nodes: ["node_modules/evil"], ...shape },
+    });
+
+    assert.match(failures.join("\n"), /evil \(critical\) is reported as vulnerable but identifies no advisory/);
+  }
+});
+
+test("the audit gate rejects a vulnerability chain no exception covers", () => {
+  const { failures } = reconcile({
+    "brace-expansion": vulnerability(),
+    dependent: { name: "dependent", severity: "high", via: ["brace-expansion"], nodes: ["node_modules/dependent"] },
+  });
+
+  assert.match(failures.join("\n"), /dependent is vulnerable through brace-expansion, which no exception covers/);
+});
+
+test("the audit gate accepts a chain only when the exception names the dependent", () => {
+  const { failures } = reconcile(
+    {
+      "brace-expansion": vulnerability(),
+      dependent: { name: "dependent", severity: "high", via: ["brace-expansion"], nodes: ["node_modules/dependent"] },
+    },
+    declared({ effects: ["dependent"] }),
+  );
+
+  assert.deepEqual(failures, []);
+});
+
+test("the audit gate rejects a report whose own count disagrees with its entries", () => {
+  const { failures } = reconcile({ "brace-expansion": vulnerability() }, declared(), "2026-07-26", 5);
+
+  assert.match(failures.join("\n"), /npm reported 5 vulnerabilities but described 1/);
+});
+
+test("the audit gate rejects an advisory reported without reconcilable evidence", () => {
+  const noRange = reconcile({
+    "brace-expansion": vulnerability({
+      via: [{ url: "https://github.com/advisories/GHSA-mh99-v99m-4gvg", severity: "high" }],
+    }),
+  });
+  assert.match(noRange.failures.join("\n"), /without an affected range/);
+
+  const noPaths = reconcile({ "brace-expansion": vulnerability({ nodes: [] }) });
+  assert.match(noPaths.failures.join("\n"), /without any dependency path/);
+});
+
+test("the audit gate rejects an advisory URL that only looks like GitHub's", () => {
+  const { failures } = reconcile({
+    "brace-expansion": vulnerability({
+      via: [
+        {
+          url: "https://evil.example/advisories/GHSA-mh99-v99m-4gvg",
+          severity: "high",
+          range: "<=5.0.7",
+        },
+      ],
+    }),
+  });
+
+  assert.match(failures.join("\n"), /no usable GitHub advisory URL/);
 });
 
 test("the audit gate rejects a declaration that no longer matches any advisory", () => {
-  const { failures } = reconcileAudit(
-    { auditReportVersion: 2, vulnerabilities: {}, metadata: { vulnerabilities: { total: 0 } } },
-    declared(),
-    "2026-07-26",
-  );
+  const { failures } = reconcile({});
 
   assert.equal(failures.length, 1);
   assert.match(failures[0] ?? "", /GHSA-mh99-v99m-4gvg no longer matches any reported advisory/);
 });
 
 test("the audit gate rejects an expired declaration", () => {
-  const { failures } = reconcileAudit(reportFor(), declared(), "2026-09-06");
+  const { failures } = reconcile({ "brace-expansion": vulnerability() }, declared(), "2026-09-06");
 
   assert.equal(failures.length, 1);
   assert.match(failures[0] ?? "", /expired on 2026-09-05/);
 });
 
-test("the audit gate rejects the same advisory reaching a new dependency path", () => {
-  const { failures } = reconcileAudit(
-    reportFor({ nodes: [...ACCEPTED.paths, "node_modules/brace-expansion"] }),
-    declared(),
-    "2026-07-26",
-  );
+test("the audit gate requires the declared paths to match the reported paths exactly", () => {
+  const added = reconcile({
+    "brace-expansion": vulnerability({ nodes: [...ACCEPTED.paths, "node_modules/brace-expansion"] }),
+  });
+  assert.match(added.failures.join("\n"), /undeclared paths: node_modules\/brace-expansion/);
 
-  assert.equal(failures.length, 1);
-  assert.match(failures[0] ?? "", /undeclared paths: node_modules\/brace-expansion/);
+  // A path that is declared but no longer reported would pre-authorise a future
+  // move back into it without review.
+  const surplus = reconcile(
+    { "brace-expansion": vulnerability() },
+    declared({ paths: [...ACCEPTED.paths, "node_modules/brace-expansion"] }),
+  );
+  assert.match(surplus.failures.join("\n"), /declares paths that are no longer reported/);
 });
 
 test("the audit gate rejects an advisory that grew in severity or range", () => {
-  const escalated = reconcileAudit(reportFor(), declared({ severity: "moderate" }), "2026-07-26");
-  assert.match(escalated.failures[0] ?? "", /now high, but the exception was accepted as moderate/);
+  const escalated = reconcile({ "brace-expansion": vulnerability() }, declared({ severity: "moderate" }));
+  assert.match(escalated.failures.join("\n"), /now high, but the exception was accepted as moderate/);
 
-  const widened = reconcileAudit(reportFor(), declared({ range: "<=5.0.6" }), "2026-07-26");
-  assert.match(widened.failures[0] ?? "", /now covers <=5\.0\.7, but the exception was accepted for <=5\.0\.6/);
+  const widened = reconcile({ "brace-expansion": vulnerability() }, declared({ range: "<=5.0.6" }));
+  assert.match(widened.failures.join("\n"), /now covers <=5\.0\.7, but the exception was accepted for <=5\.0\.6/);
 });
 
-test("the audit gate rejects an advisory it cannot identify", () => {
-  const report = reportFor();
-  report.vulnerabilities["brace-expansion"].via = [{ title: "no advisory url", severity: "high" }];
-
-  const { failures } = reconcileAudit(report, declared(), "2026-07-26");
-
-  assert.match(failures[0] ?? "", /has no GitHub advisory URL and cannot be reconciled/);
-});
-
-test("an exception cannot be declared without a justification or a review date", () => {
-  assert.throws(() => declared({ reason: undefined }), /missing "reason"/);
-  assert.throws(() => declared({ reviewBy: undefined }), /missing "reviewBy"/);
+test("an exception cannot be declared broadly, vaguely, or indefinitely", () => {
+  assert.throws(() => declared({ reason: undefined }), /must set "reason"/);
+  assert.throws(() => declared({ reason: "" }), /must set "reason"/);
+  assert.throws(() => declared({ module: "  " }), /must set "module"/);
   assert.throws(() => declared({ paths: [] }), /must list the dependency paths/);
-  assert.throws(() => declared({ advisory: "CVE-2026-1" }), /must reference a GHSA identifier/);
-  assert.throws(() => declared({ reviewBy: "soon" }), /must set reviewBy as YYYY-MM-DD/);
+  assert.throws(() => declared({ paths: ["node_modules/*"] }), /must not use wildcard paths/);
+  assert.throws(() => declared({ paths: ["../etc"] }), /must use lockfile dependency paths/);
+  assert.throws(() => declared({ advisory: "CVE-2026-1" }), /canonical GHSA identifier/);
+  assert.throws(() => declared({ advisory: "GHSA-new-advisory" }), /canonical GHSA identifier/);
+  assert.throws(() => declared({ reviewBy: "soon" }), /real YYYY-MM-DD date/);
+  // A shape-valid but impossible date would otherwise defer review forever.
+  assert.throws(() => declared({ reviewBy: "9999-99-99" }), /real YYYY-MM-DD date/);
+  assert.throws(() => declared({ reviewBy: "2026-07-24" }), /must be reviewed after it was accepted/);
+  assert.throws(() => declared({ reviewBy: "3026-07-25" }), /the maximum is 120/);
+});
+
+// Executing the gate as CI does, with npm stubbed, proves the command really
+// audits and really fails. A gate whose CLI entry point were removed would
+// exit 0 here while every offline reconciliation test still passed.
+function runGateWithStubbedNpm(report: unknown): { status: number | null; output: string } {
+  const stubDir = mkdtempSync(join(tmpdir(), "audit-gate-stub-"));
+  try {
+    const reportPath = join(stubDir, "report.json");
+    writeFileSync(reportPath, JSON.stringify(report));
+    const npmStub = join(stubDir, "npm");
+    // Exit 1 like npm does when advisories exist.
+    writeFileSync(npmStub, `#!/bin/sh\ncat ${JSON.stringify(reportPath)}\nexit 1\n`);
+    chmodSync(npmStub, 0o755);
+
+    const result = spawnSync(process.execPath, [resolve(projectRoot, "scripts", "audit-dependencies.mjs")], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+    });
+    return { status: result.status, output: `${result.stdout}${result.stderr}` };
+  } finally {
+    rmSync(stubDir, { recursive: true, force: true });
+  }
+}
+
+test("the audit gate command fails on an undeclared advisory", () => {
+  const { status, output } = runGateWithStubbedNpm({
+    auditReportVersion: 2,
+    vulnerabilities: {
+      "totally-undeclared": {
+        name: "totally-undeclared",
+        severity: "critical",
+        via: [
+          {
+            url: "https://github.com/advisories/GHSA-2222-3333-4444",
+            title: "synthetic advisory",
+            severity: "critical",
+            range: "<=1.0.0",
+          },
+        ],
+        nodes: ["node_modules/totally-undeclared"],
+      },
+    },
+    metadata: { vulnerabilities: { total: 1 } },
+  });
+
+  assert.equal(status, 1, "an undeclared advisory must fail the gate command");
+  assert.match(output, /undeclared advisory GHSA-2222-3333-4444/);
+});
+
+test("the audit gate command fails when npm reports a failure it cannot describe", () => {
+  const { status, output } = runGateWithStubbedNpm({
+    auditReportVersion: 2,
+    vulnerabilities: {},
+    metadata: { vulnerabilities: { total: 0 } },
+  });
+
+  // npm exited non-zero, so an empty report is a broken audit, not a clean tree.
+  assert.equal(status, 1);
+  assert.match(output, /without reporting any vulnerability/);
 });
