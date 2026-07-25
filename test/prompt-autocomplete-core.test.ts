@@ -9,14 +9,19 @@ import {
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
   createOwnerRefCounter,
+  createPromptAutocompleteUsageStats,
   DEFAULT_MAX_ALTERNATIVES,
   DEFAULT_MAX_SUGGESTION_CHARS,
   DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
   DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
+  describeSettingSource,
   ExpiringLruCache,
+  formatUsageStats,
   MAX_REQUEST_MAX_TOKENS,
   MIN_REQUEST_MAX_TOKENS,
+  recordProviderUsage,
+  resolveOverride,
   extractMessageText,
   extractNextSuggestionChunk,
   normalizePromptSuggestion,
@@ -576,4 +581,79 @@ test("buildLatestAssistantMessageContext returns the newest assistant text", () 
     buildLatestAssistantMessageContext(branch),
     "Neueste Antwort mit konkreten nächsten Schritten",
   );
+});
+
+test("provider usage accumulates only reported numbers", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, {
+    input: 120,
+    output: 30,
+    totalTokens: 150,
+    cost: { total: 0.00042 },
+  });
+  recordProviderUsage(stats, { input: 80, output: 20, cost: { total: 0.0001 } });
+
+  assert.equal(stats.usageReports, 2);
+  assert.equal(stats.inputTokens, 200);
+  assert.equal(stats.outputTokens, 50);
+  // The second report omits totalTokens, so input + output is the fallback.
+  assert.equal(stats.totalTokens, 250);
+  assert.equal(Number(stats.costTotal.toFixed(5)), 0.00052);
+});
+
+test("provider usage ignores missing, malformed, and negative reports", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, undefined);
+  recordProviderUsage(stats, null);
+  recordProviderUsage(stats, "usage");
+  recordProviderUsage(stats, {});
+  recordProviderUsage(stats, { input: Number.NaN, output: Number.POSITIVE_INFINITY });
+  recordProviderUsage(stats, { input: -10, output: -5, cost: { total: -1 } });
+
+  assert.deepEqual(stats, createPromptAutocompleteUsageStats());
+});
+
+test("usage stats separate saved requests from provider requests", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 3;
+  stats.cacheHits = 5;
+  stats.coalescedJoins = 2;
+  stats.failedRequests = 1;
+  recordProviderUsage(stats, { input: 100, output: 20, totalTokens: 120, cost: { total: 0.0004 } });
+
+  const formatted = formatUsageStats(stats);
+
+  assert.match(formatted, /3 req/);
+  assert.match(formatted, /7 saved \(5 cache\/2 joined\)/);
+  assert.match(formatted, /1 failed/);
+  assert.match(formatted, /120 tok/);
+  // Sub-cent totals must stay visible instead of rounding to $0.00.
+  assert.match(formatted, /\$0\.00040 reported/);
+  // Only one of three requests reported usage, so the total is explicitly partial.
+  assert.match(formatted, /\(partial\)/);
+});
+
+test("usage stats omit the partial marker once every request reported usage", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 1;
+  recordProviderUsage(stats, { input: 10, output: 5, totalTokens: 15, cost: { total: 0.25 } });
+
+  const formatted = formatUsageStats(stats);
+
+  assert.match(formatted, /\$0\.2500 reported/);
+  assert.doesNotMatch(formatted, /partial/);
+  assert.doesNotMatch(formatted, /failed/);
+});
+
+test("runtime overrides outrank flags only when explicitly set", () => {
+  assert.equal(resolveOverride(undefined, true), true);
+  assert.equal(resolveOverride(undefined, false), false);
+  assert.equal(resolveOverride(false, true), false);
+  assert.equal(resolveOverride(true, false), true);
+
+  assert.equal(describeSettingSource(undefined), "flag");
+  assert.equal(describeSettingSource(false), "session");
+  assert.equal(describeSettingSource(true), "session");
 });

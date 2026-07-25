@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.1.2/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.0/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -62,6 +62,21 @@ pi \
 - Suggestions pause while the main agent is streaming by default. Use `--prompt-autocomplete-while-streaming` or `/prompt-autocomplete while-streaming on` to change that behavior.
 - `Ctrl+.` with no active suggestion is an explicit one-shot request and may bypass the streaming, cooldown, and minimum-length gates. Model, authentication, slash-command, and path safety checks still apply.
 - Use `--prompt-autocomplete-debug` or `/prompt-autocomplete debug-on` for troubleshooting.
+
+Slash-command toggles (`on`, `off`, `while-streaming`, `debug-*`) outrank the CLI flags for the rest of the process, including in sessions started later. `status` labels each toggle with its source, `(flag)` or `(session)`. Settings you never toggled keep following their flag.
+
+### Usage and cost accounting
+
+`/prompt-autocomplete status` reports what the current session actually spent:
+
+```text
+usage=4 req, 6 saved (5 cache/1 joined), 1832 tok, $0.00214 reported
+```
+
+- `req` counts provider calls that were actually issued; `saved` counts requests answered from the local cache or by joining an identical in-flight request.
+- `failed` appears only when a request errored or was aborted. Tokens already spent on a failed response are still counted.
+- Cost is the figure the provider reported and is never estimated locally. It is marked `(partial)` when at least one response carried no usage report.
+- Counters live in memory, are scoped to the current session, and reset when a new session starts.
 
 ## Privacy, providers, and cost
 

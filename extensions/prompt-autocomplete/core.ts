@@ -298,6 +298,139 @@ export function cancelAllCoalescedRequests<T>(inFlightRequests: Map<string, Coal
   inFlightRequests.clear();
 }
 
+/**
+ * Session-scoped autocomplete accounting.
+ *
+ * Counters are deliberately in-memory and per-session: they exist so a user can
+ * answer "what did autocomplete cost me", not to build a usage history. Cache
+ * hits and coalesced joins are tracked separately from provider requests so the
+ * saved-request count is visible rather than implied.
+ */
+export interface PromptAutocompleteUsageStats {
+  /** Provider calls actually issued, including calls that later failed. */
+  providerRequests: number;
+  /** Issued calls that produced no usable suggestions because of an error or abort. */
+  failedRequests: number;
+  /** Requests served from the local cache without contacting a provider. */
+  cacheHits: number;
+  /** Requests that joined an identical in-flight request instead of issuing a new one. */
+  coalescedJoins: number;
+  /** Responses that carried a usage report. Cost is partial when this is below providerRequests. */
+  usageReports: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  /** Provider-reported cost. Never estimated locally. */
+  costTotal: number;
+}
+
+/** Shape of the provider usage report this module consumes. All fields are optional at runtime. */
+export interface ProviderUsageReport {
+  input?: number;
+  output?: number;
+  totalTokens?: number;
+  cost?: { total?: number };
+}
+
+export function createPromptAutocompleteUsageStats(): PromptAutocompleteUsageStats {
+  return {
+    providerRequests: 0,
+    failedRequests: 0,
+    cacheHits: 0,
+    coalescedJoins: 0,
+    usageReports: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    costTotal: 0,
+  };
+}
+
+function toFiniteNonNegative(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/**
+ * Fold one provider usage report into the session totals.
+ *
+ * Providers disagree about which fields they report, so every field is treated
+ * as optional and non-numeric or negative values contribute zero. A response
+ * only counts as a usage report when it carries at least one usable number.
+ */
+export function recordProviderUsage(stats: PromptAutocompleteUsageStats, usage: unknown): void {
+  if (typeof usage !== "object" || usage === null) return;
+
+  const report = usage as ProviderUsageReport;
+  const input = toFiniteNonNegative(report.input);
+  const output = toFiniteNonNegative(report.output);
+  const reportedTotal = toFiniteNonNegative(report.totalTokens);
+  const cost = toFiniteNonNegative(report.cost?.total);
+  const total = reportedTotal || input + output;
+
+  if (input === 0 && output === 0 && total === 0 && cost === 0) return;
+
+  stats.usageReports += 1;
+  stats.inputTokens += input;
+  stats.outputTokens += output;
+  stats.totalTokens += total;
+  stats.costTotal += cost;
+}
+
+function formatReportedCost(cost: number): string {
+  if (cost <= 0) return "$0";
+  // Autocomplete requests are small; sub-cent totals must stay visible.
+  return cost < 0.01 ? `$${cost.toFixed(5)}` : `$${cost.toFixed(4)}`;
+}
+
+/**
+ * Render session accounting for the status line.
+ *
+ * Cost is labelled as provider-reported and is marked partial when some
+ * responses carried no usage report, so a missing report is never presented as
+ * a cheaper request.
+ */
+export function formatUsageStats(stats: PromptAutocompleteUsageStats): string {
+  const saved = stats.cacheHits + stats.coalescedJoins;
+  const segments = [
+    `${stats.providerRequests} req`,
+    `${saved} saved (${stats.cacheHits} cache/${stats.coalescedJoins} joined)`,
+  ];
+
+  if (stats.failedRequests > 0) {
+    segments.push(`${stats.failedRequests} failed`);
+  }
+
+  segments.push(`${stats.totalTokens} tok`);
+
+  const partial = stats.usageReports < stats.providerRequests;
+  segments.push(`${formatReportedCost(stats.costTotal)} reported${partial ? " (partial)" : ""}`);
+
+  return segments.join(", ");
+}
+
+/**
+ * Runtime overrides set by slash commands.
+ *
+ * These outrank CLI flags for the lifetime of the process. An unset field means
+ * "defer to the flag", which is what lets a new session pick up a changed flag
+ * while still honouring an explicit in-session decision.
+ */
+export interface PromptAutocompleteRuntimeOverrides {
+  enabled?: boolean;
+  allowWhileStreaming?: boolean;
+  debug?: boolean;
+}
+
+export type PromptAutocompleteSettingSource = "flag" | "session";
+
+export function resolveOverride<T>(override: T | undefined, flagValue: T): T {
+  return override ?? flagValue;
+}
+
+export function describeSettingSource(override: unknown): PromptAutocompleteSettingSource {
+  return override === undefined ? "flag" : "session";
+}
+
 interface SuggestionPayload {
   completions?: unknown;
   suggestions?: unknown;

@@ -210,7 +210,7 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 
 `extensions/prompt-autocomplete/` adds inline AI autocomplete while you type your next prompt. It is also packaged independently as [`@kliebhan/pi-prompt-autocomplete`](extensions/prompt-autocomplete/README.md), so users can install it without loading the rest of this collection.
 
-[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.1.2/prompt-autocomplete-demo.mp4)
+[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.0/prompt-autocomplete-demo.mp4)
 
 ```bash
 pi install npm:@kliebhan/pi-prompt-autocomplete
@@ -284,6 +284,8 @@ The extension is disabled by default. Enabling it with the CLI flag or slash com
 - The default suggestion count is 3. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
 - Legacy `Ctrl+Tab` and `Alt+[` / `Alt+]` remain supported as fallbacks when your terminal forwards them.
 - Prompt autocomplete requires exclusive ownership of Pi's custom editor slot. If another custom editor is already active, it refuses to replace it and reports a warning; disabling autocomplete never removes a later replacement editor.
+- `/prompt-autocomplete status` reports the current session's issued requests, requests saved by the cache or by joining an identical in-flight request, tokens, and provider-reported cost. Cost is never estimated locally and is marked `(partial)` when a response carried no usage report.
+- Slash-command toggles outrank the CLI flags for the rest of the process and survive a new session; `status` labels each toggle `(flag)` or `(session)`.
 - For troubleshooting, start with `--prompt-autocomplete-debug` or run `/prompt-autocomplete debug-on` temporarily.
 - If you want to tune the internal autocomplete prompt, edit `extensions/prompt-autocomplete/system-prompt.template.md`; `{{PLACEHOLDER}}` variables are filled in by `extensions/prompt-autocomplete/core.ts`, `{{PLACEHOLDER|fallback}}` uses the fallback text when no variable is provided, and `\{{PLACEHOLDER}}` keeps the placeholder syntax literal.
 

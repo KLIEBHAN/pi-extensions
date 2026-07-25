@@ -238,3 +238,96 @@ test("request state has no non-expiring last-result shortcut", async () => {
   assert.match(source, /new SequenceOwnedSlot<PendingSuggestionRequest>/);
   assert.match(source, /getCachedRequest\(this\.shared, request\.cacheKey, \{ bypass: options\.manual \}\)/);
 });
+
+function lastStatus(harness: ReturnType<typeof createHarness>): string {
+  return harness.notifications.at(-1)?.message ?? "";
+}
+
+test("slash-command activation survives a new session", async () => {
+  const harness = createHarness({ enabled: false });
+  await emit(harness, "session_start");
+  assert.equal(harness.getEditorFactory(), undefined);
+
+  await command(harness, "on");
+  assert.equal(typeof harness.getEditorFactory(), "function");
+
+  await emit(harness, "session_start");
+
+  assert.equal(typeof harness.getEditorFactory(), "function", "a new session must keep the editor mounted");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /enabled=yes\(session\)/);
+});
+
+test("slash-command deactivation survives a new session", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  assert.equal(typeof harness.getEditorFactory(), "function");
+
+  await command(harness, "off");
+  assert.equal(harness.getEditorFactory(), undefined);
+
+  await emit(harness, "session_start");
+
+  assert.equal(harness.getEditorFactory(), undefined, "a new session must not re-enable a disabled extension");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /enabled=no\(session\)/);
+});
+
+test("while-streaming and debug overrides survive a new session", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+
+  await command(harness, "while-streaming on");
+  await command(harness, "debug-on");
+  await emit(harness, "session_start");
+  await command(harness, "status");
+
+  assert.match(lastStatus(harness), /while-streaming=yes\(session\)/);
+  assert.match(lastStatus(harness), /debug=yes\(session\)/);
+});
+
+test("flags still drive settings that were never overridden", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /while-streaming=no\(flag\)/);
+  assert.match(lastStatus(harness), /debug=no\(flag\)/);
+
+  // A flag change between sessions must win while no session override exists.
+  harness.flags.set("prompt-autocomplete-while-streaming", true);
+  await emit(harness, "session_start");
+  await command(harness, "status");
+
+  assert.match(lastStatus(harness), /while-streaming=yes\(flag\)/);
+});
+
+test("an explicit override keeps winning over a later flag change", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  await command(harness, "while-streaming off");
+
+  harness.flags.set("prompt-autocomplete-while-streaming", true);
+  await emit(harness, "session_start");
+  await command(harness, "status");
+
+  assert.match(lastStatus(harness), /while-streaming=no\(session\)/);
+});
+
+test("session shutdown does not record a disable override", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  await emit(harness, "session_shutdown");
+  await emit(harness, "session_start");
+
+  assert.equal(typeof harness.getEditorFactory(), "function", "shutdown must not disable the next session");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /enabled=yes\(flag\)/);
+});
+
+test("status reports session accounting and resets it per session", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+  await command(harness, "status");
+
+  assert.match(lastStatus(harness), /usage=0 req, 0 saved \(0 cache\/0 joined\), 0 tok, \$0 reported/);
+});
