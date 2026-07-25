@@ -298,6 +298,185 @@ export function cancelAllCoalescedRequests<T>(inFlightRequests: Map<string, Coal
   inFlightRequests.clear();
 }
 
+/**
+ * Session-scoped autocomplete accounting.
+ *
+ * Counters are deliberately in-memory and per-session: they exist so a user can
+ * answer "what did autocomplete cost me", not to build a usage history.
+ *
+ * Token counts come from the provider. The cost figure does not: pi derives it
+ * locally by multiplying those tokens with its own model price table
+ * (`calculateCost` in @earendil-works/pi-ai), so it is an estimate that can
+ * disagree with an actual invoice. Naming reflects that.
+ */
+export interface PromptAutocompleteUsageStats {
+  /** Provider calls actually issued, including calls that later failed. */
+  providerRequests: number;
+  /** Issued calls that produced no usable suggestions because of an error or abort. */
+  failedRequests: number;
+  /** Requests served from the local cache without contacting a provider. */
+  cacheHits: number;
+  /** Responses that carried token counts. Totals are partial when this is below providerRequests. */
+  tokenReports: number;
+  /** Responses that carried a cost figure. */
+  costReports: number;
+  totalTokens: number;
+  /** Locally estimated cost, summed from pi's model price table. */
+  estimatedCost: number;
+}
+
+/** Shape of the usage report this module consumes. Every field is optional at runtime. */
+export interface ProviderUsageReport {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  totalTokens?: number;
+  cost?: { total?: number };
+}
+
+export function createPromptAutocompleteUsageStats(): PromptAutocompleteUsageStats {
+  return {
+    providerRequests: 0,
+    failedRequests: 0,
+    cacheHits: 0,
+    tokenReports: 0,
+    costReports: 0,
+    totalTokens: 0,
+    estimatedCost: 0,
+  };
+}
+
+interface NumericField {
+  /** Whether the field carried a usable number. Zero counts; malformed does not. */
+  present: boolean;
+  value: number;
+}
+
+const MISSING_FIELD: NumericField = { present: false, value: 0 };
+
+/**
+ * Read one numeric field exactly once, without trusting the object.
+ *
+ * The usage object is plain data in practice, but a throwing getter must not be
+ * able to turn accounting into a failed suggestion, and a side-effecting getter
+ * must not be able to report one value to the total and another to the
+ * completeness check. Zero is a legitimate report; negative and non-finite
+ * values are malformed and count as missing.
+ */
+function readNumericField(source: Record<string, unknown> | undefined, key: string): NumericField {
+  if (!source) return MISSING_FIELD;
+
+  let value: unknown;
+  try {
+    value = source[key];
+  } catch {
+    return MISSING_FIELD;
+  }
+
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return MISSING_FIELD;
+  return { present: true, value };
+}
+
+function readCostRecord(usage: Record<string, unknown>): Record<string, unknown> | undefined {
+  let cost: unknown;
+  try {
+    cost = usage.cost;
+  } catch {
+    return undefined;
+  }
+
+  return typeof cost === "object" && cost !== null ? (cost as Record<string, unknown>) : undefined;
+}
+
+/**
+ * Fold one usage report into the session totals.
+ *
+ * Providers disagree about which fields they populate, so each field is
+ * optional. Token and cost reports are counted separately because a response
+ * can carry tokens without a cost figure. An explicit total wins over the
+ * component fields; otherwise the components are summed, including cached
+ * tokens, which are billed as well.
+ */
+export function recordProviderUsage(stats: PromptAutocompleteUsageStats, usage: unknown): void {
+  if (typeof usage !== "object" || usage === null) return;
+
+  const report = usage as Record<string, unknown>;
+  const costRecord = readCostRecord(report);
+
+  const reportedTotal = readNumericField(report, "totalTokens");
+  const components = [
+    readNumericField(report, "input"),
+    readNumericField(report, "output"),
+    readNumericField(report, "cacheRead"),
+    readNumericField(report, "cacheWrite"),
+  ];
+  const cost = readNumericField(costRecord, "total");
+
+  const hasTokenReport = reportedTotal.present || components.some((field) => field.present);
+  if (!hasTokenReport && !cost.present) return;
+
+  if (hasTokenReport) stats.tokenReports += 1;
+  if (cost.present) stats.costReports += 1;
+
+  stats.totalTokens += reportedTotal.present
+    ? reportedTotal.value
+    : components.reduce((sum, field) => sum + field.value, 0);
+  stats.estimatedCost += cost.value;
+}
+
+function formatEstimatedCost(cost: number): string {
+  if (cost <= 0) return "$0";
+  // Autocomplete requests are cheap; a real cost must never render as $0.
+  if (cost < 0.00001) return "<$0.00001";
+  return cost < 0.01 ? `$${cost.toFixed(5)}` : `$${cost.toFixed(4)}`;
+}
+
+/**
+ * Render session accounting for the status line.
+ *
+ * Cost is labelled as an estimate because pi derives it from a local price
+ * table rather than from the provider. Totals are marked partial when some
+ * responses reported nothing, so silence is never shown as a cheaper request.
+ */
+export function formatUsageStats(stats: PromptAutocompleteUsageStats): string {
+  const segments = [`${stats.providerRequests} req`, `${stats.cacheHits} cached`];
+
+  if (stats.failedRequests > 0) {
+    segments.push(`${stats.failedRequests} failed`);
+  }
+
+  const tokensPartial = stats.tokenReports < stats.providerRequests;
+  const costPartial = stats.costReports < stats.providerRequests;
+  segments.push(`${stats.totalTokens} tok${tokensPartial ? "+" : ""}`);
+  segments.push(`~${formatEstimatedCost(stats.estimatedCost)} est${costPartial ? "+" : ""}`);
+
+  return segments.join(", ");
+}
+
+/**
+ * Runtime overrides set by slash commands.
+ *
+ * These outrank CLI flags for the lifetime of the process. An unset field means
+ * "defer to the flag", which is what lets a new session pick up a changed flag
+ * while still honouring an explicit in-session decision.
+ */
+export interface PromptAutocompleteRuntimeOverrides {
+  enabled?: boolean;
+  allowWhileStreaming?: boolean;
+  debug?: boolean;
+}
+
+export type PromptAutocompleteSettingSource = "flag" | "session";
+
+export function resolveOverride<T>(override: T | undefined, flagValue: T): T {
+  return override ?? flagValue;
+}
+
+export function describeSettingSource(override: unknown): PromptAutocompleteSettingSource {
+  return override === undefined ? "flag" : "session";
+}
+
 interface SuggestionPayload {
   completions?: unknown;
   suggestions?: unknown;

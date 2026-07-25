@@ -10,6 +10,8 @@ import {
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
   createOwnerRefCounter,
+  createPromptAutocompleteUsageStats,
+  describeSettingSource,
   DEFAULT_DEBOUNCE_MS,
   DEFAULT_MAX_ALTERNATIVES,
   DEFAULT_MAX_SUGGESTION_CHARS,
@@ -19,17 +21,22 @@ import {
   ExpiringLruCache,
   extractNextSuggestionChunk,
   formatModelLabel,
+  formatUsageStats,
   MAX_DRAFT_CONTEXT_CHARS,
   normalizePromptSuggestions,
   parseBoundedIntFlag,
   parseModelRef,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+  recordProviderUsage,
+  resolveOverride,
   SequenceOwnedSlot,
   shouldSkipPromptAutocomplete,
   truncateDraftTail,
   type CoalescedRequestEntry,
   type CoalescedRequestSubscription,
   type ModelRef,
+  type PromptAutocompleteRuntimeOverrides,
+  type PromptAutocompleteUsageStats,
 } from "./core.ts";
 
 const GHOST_TEXT_STYLE = "\x1b[2m";
@@ -128,6 +135,10 @@ interface PromptAutocompleteSharedState {
   activationId: number;
   streaming: boolean;
   config: PromptAutocompleteConfig;
+  /** Slash-command decisions that outrank flags for the lifetime of the process. */
+  runtimeOverrides: PromptAutocompleteRuntimeOverrides;
+  /** Session-scoped request accounting; reset together with the cache. */
+  usageStats: PromptAutocompleteUsageStats;
   currentModel?: Model<Api>;
   modelRegistry?: ExtensionContext["modelRegistry"];
   sessionManager?: ExtensionContext["sessionManager"];
@@ -219,6 +230,28 @@ function parseConfig(pi: ExtensionAPI): PromptAutocompleteConfig {
   };
 }
 
+/**
+ * Recompute enablement and config from flags, then re-apply runtime overrides.
+ *
+ * Called on every session start. Without the override layer a new session would
+ * silently discard `/prompt-autocomplete on`, `while-streaming`, and `debug-*`
+ * decisions and revert to the flags the process happened to start with.
+ */
+function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
+  const flagEnabled = pi.getFlag("prompt-autocomplete") === true;
+  const flagConfig = parseConfig(pi);
+
+  shared.enabled = resolveOverride(shared.runtimeOverrides.enabled, flagEnabled);
+  shared.config = {
+    ...flagConfig,
+    allowWhileStreaming: resolveOverride(
+      shared.runtimeOverrides.allowWhileStreaming,
+      flagConfig.allowWhileStreaming,
+    ),
+    debug: resolveOverride(shared.runtimeOverrides.debug, flagConfig.debug),
+  };
+}
+
 function truncateDebug(text: string, maxLength = 140): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
@@ -249,18 +282,19 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     : "current active model";
 
   return [
-    `enabled=${shared.enabled ? "yes" : "no"}`,
+    `enabled=${shared.enabled ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.enabled)})`,
     `editor=${editorState}`,
     shared.editorBlockedReason ? `editor-blocked=${truncateDebug(shared.editorBlockedReason, 90)}` : undefined,
     `model=${formatModelLabel(resolvedModel)}`,
     `requested-model=${requestedModel}`,
-    `while-streaming=${shared.config.allowWhileStreaming ? "yes" : "no"}`,
-    `debug=${shared.config.debug ? "yes" : "no"}`,
+    `while-streaming=${shared.config.allowWhileStreaming ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.allowWhileStreaming)})`,
+    `debug=${shared.config.debug ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.debug)})`,
     `debounce=${shared.config.debounceMs}ms`,
     `min-chars=${shared.config.minPromptChars}`,
     `max-suggestion-chars=${shared.config.maxSuggestionChars}`,
     `max-alternatives=${shared.config.maxAlternatives}`,
     `cache-size=${shared.requestCache.size}`,
+    `usage=${formatUsageStats(shared.usageStats)}`,
     `state=${shared.debugState || "idle"}`,
     shared.lastError ? `error=${truncateDebug(shared.lastError, 90)}` : undefined,
     shared.lastRawResponse ? `raw=${truncateDebug(shared.lastRawResponse, 90)}` : undefined,
@@ -695,6 +729,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     const cachedEntry = getCachedRequest(this.shared, request.cacheKey, { bypass: options.manual });
     if (cachedEntry) {
+      this.shared.usageStats.cacheHits += 1;
       this.cancelPendingRequest();
       this.shared.lastRawResponse = cachedEntry.rawResponse;
       this.shared.lastError = cachedEntry.error;
@@ -892,22 +927,35 @@ class PromptAutocompleteEditor extends CustomEditor {
       timestamp: Date.now(),
     };
 
-    const response = await this.shared.completeSimple(
-      request.model,
-      {
-        systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
-        messages: [userMessage],
-      },
-      {
-        apiKey: auth.apiKey,
-        headers: auth.headers,
-        signal,
-        maxTokens: computeRequestMaxTokens(request.maxAlternatives, this.shared.config.maxSuggestionChars),
-        timeoutMs: REQUEST_TIMEOUT_MS,
-        maxRetries: REQUEST_MAX_RETRIES,
-        maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
-      },
-    );
+    const stats = this.shared.usageStats;
+    stats.providerRequests += 1;
+
+    let response: Awaited<ReturnType<CompleteSimpleFunction>>;
+    try {
+      response = await this.shared.completeSimple(
+        request.model,
+        {
+          systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+          messages: [userMessage],
+        },
+        {
+          apiKey: auth.apiKey,
+          headers: auth.headers,
+          signal,
+          maxTokens: computeRequestMaxTokens(request.maxAlternatives, this.shared.config.maxSuggestionChars),
+          timeoutMs: REQUEST_TIMEOUT_MS,
+          maxRetries: REQUEST_MAX_RETRIES,
+          maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
+        },
+      );
+    } catch (error) {
+      stats.failedRequests += 1;
+      throw error;
+    }
+
+    // Tokens spent on a failed or aborted response are still spent, so usage is
+    // recorded before the stop-reason check rejects the request.
+    recordProviderUsage(stats, response.usage);
 
     const contentTypes = response.content.map((block) => block.type).join(", ") || "(none)";
     const text = response.content
@@ -919,9 +967,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     const rawResponse = text || responseError || `[types=${contentTypes}; stopReason=${response.stopReason}]`;
 
     if (response.stopReason === "error" || response.stopReason === "aborted") {
+      stats.failedRequests += 1;
       throw new Error(responseError || `Provider returned stopReason=${response.stopReason}`);
     }
     if (signal.aborted) {
+      stats.failedRequests += 1;
       throw new Error("Request was aborted");
     }
 
@@ -1115,8 +1165,8 @@ function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedSt
 function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
   shared.cancelActiveRequest?.();
   shared.cancelActiveRequest = undefined;
-  shared.enabled = pi.getFlag("prompt-autocomplete") === true;
-  shared.config = parseConfig(pi);
+  applyEffectiveConfig(pi, shared);
+  shared.usageStats = createPromptAutocompleteUsageStats();
   shared.editorMount = undefined;
   shared.editorBlockedReason = undefined;
   shared.ownsEditor = undefined;
@@ -1141,6 +1191,7 @@ function refreshEditorImmediately(shared: PromptAutocompleteSharedState, state: 
 
 function setDebugDisplay(shared: PromptAutocompleteSharedState, enabled: boolean): void {
   shared.config.debug = enabled;
+  shared.runtimeOverrides.debug = enabled;
   if (enabled) {
     updateDebugState(shared, shared.debugState || "ready");
   } else {
@@ -1166,6 +1217,7 @@ function setWhileStreaming(
   }
 
   shared.config.allowWhileStreaming = next;
+  shared.runtimeOverrides.allowWhileStreaming = next;
   ctx.ui.notify(`Prompt autocomplete while-streaming ${next ? "enabled" : "disabled"}`, "info");
 
   if (shared.enabled) {
@@ -1178,11 +1230,13 @@ function setWhileStreaming(
 
 function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
   shared.enabled = true;
+  shared.runtimeOverrides.enabled = true;
   return mountEditor(ctx, shared);
 }
 
 function disablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
   shared.enabled = false;
+  shared.runtimeOverrides.enabled = false;
   unmountEditor(ctx, shared);
   shared.requestCache.clear();
   shared.lastRawResponse = undefined;
@@ -1247,6 +1301,9 @@ function createPromptAutocompleteCommandHandlers(
     },
     on: () => {
       if (shared.enabled && shared.ownsEditor?.()) {
+        // Already in the requested state, but the user still expressed intent:
+        // record it so a later session does not fall back to the flag.
+        shared.runtimeOverrides.enabled = true;
         ctx.ui.notify(`Prompt autocomplete already enabled (${formatStatus(shared)})`, "info");
         return;
       }
@@ -1257,6 +1314,7 @@ function createPromptAutocompleteCommandHandlers(
     },
     off: () => {
       if (!shared.enabled) {
+        shared.runtimeOverrides.enabled = false;
         ctx.ui.notify("Prompt autocomplete is already disabled", "info");
         return;
       }
@@ -1331,6 +1389,8 @@ export function createPromptAutocompleteExtension(
     activationId: 0,
     streaming: false,
     config: parseConfig(pi),
+    runtimeOverrides: {},
+    usageStats: createPromptAutocompleteUsageStats(),
     completeSimple: completeSimpleImpl,
     now,
     debugState: "idle",
@@ -1350,6 +1410,7 @@ export function createPromptAutocompleteExtension(
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // Teardown, not a user decision: leave runtimeOverrides untouched.
     shared.enabled = false;
     shared.cancelActiveRequest?.();
     shared.requestCache.clear();

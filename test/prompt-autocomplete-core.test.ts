@@ -9,14 +9,19 @@ import {
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
   createOwnerRefCounter,
+  createPromptAutocompleteUsageStats,
   DEFAULT_MAX_ALTERNATIVES,
   DEFAULT_MAX_SUGGESTION_CHARS,
   DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
   DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
+  describeSettingSource,
   ExpiringLruCache,
+  formatUsageStats,
   MAX_REQUEST_MAX_TOKENS,
   MIN_REQUEST_MAX_TOKENS,
+  recordProviderUsage,
+  resolveOverride,
   extractMessageText,
   extractNextSuggestionChunk,
   normalizePromptSuggestion,
@@ -576,4 +581,178 @@ test("buildLatestAssistantMessageContext returns the newest assistant text", () 
     buildLatestAssistantMessageContext(branch),
     "Neueste Antwort mit konkreten nächsten Schritten",
   );
+});
+
+test("usage accumulates reported tokens and locally estimated cost", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, {
+    input: 120,
+    output: 30,
+    totalTokens: 150,
+    cost: { total: 0.00042 },
+  });
+  recordProviderUsage(stats, { input: 80, output: 20, cost: { total: 0.0001 } });
+
+  assert.equal(stats.tokenReports, 2);
+  assert.equal(stats.costReports, 2);
+  // The second report omits totalTokens, so the component tokens are the fallback.
+  assert.equal(stats.totalTokens, 250);
+  assert.equal(Number(stats.estimatedCost.toFixed(5)), 0.00052);
+});
+
+test("the token fallback includes cached tokens because they are billed too", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, { input: 10, output: 5, cacheRead: 100, cacheWrite: 20 });
+
+  assert.equal(stats.totalTokens, 135);
+});
+
+test("a reported total wins over the component tokens instead of adding to them", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, { input: 10, output: 5, cacheRead: 100, totalTokens: 115 });
+
+  assert.equal(stats.totalTokens, 115);
+});
+
+test("usage ignores missing, malformed, and negative reports", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, undefined);
+  recordProviderUsage(stats, null);
+  recordProviderUsage(stats, "usage");
+  recordProviderUsage(stats, {});
+  recordProviderUsage(stats, { input: Number.NaN, output: Number.POSITIVE_INFINITY });
+  recordProviderUsage(stats, { input: -10, output: -5, cost: { total: -1 } });
+
+  assert.deepEqual(stats, createPromptAutocompleteUsageStats());
+});
+
+test("a legitimate all-zero report counts as reported rather than as missing", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 1;
+
+  recordProviderUsage(stats, { input: 0, output: 0, totalTokens: 0, cost: { total: 0 } });
+
+  assert.equal(stats.tokenReports, 1);
+  assert.equal(stats.costReports, 1);
+  // Nothing is missing, so nothing may be flagged as incomplete.
+  assert.equal(formatUsageStats(stats), "1 req, 0 cached, 0 tok, ~$0 est");
+});
+
+test("a throwing usage object cannot break accounting", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  const hostile = {
+    get input(): number {
+      throw new Error("hostile getter");
+    },
+    output: 5,
+    get cost(): { total: number } {
+      throw new Error("hostile getter");
+    },
+  };
+
+  recordProviderUsage(stats, hostile);
+
+  assert.equal(stats.tokenReports, 1);
+  assert.equal(stats.costReports, 0);
+  assert.equal(stats.totalTokens, 5);
+});
+
+test("usage stats mark token and cost totals partial independently", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 3;
+  stats.cacheHits = 5;
+  stats.failedRequests = 1;
+  // Tokens without a cost figure: the cost total is incomplete, the token total is not.
+  recordProviderUsage(stats, { input: 100, output: 20, totalTokens: 120 });
+  recordProviderUsage(stats, { input: 40, output: 10, totalTokens: 50, cost: { total: 0.0004 } });
+  recordProviderUsage(stats, { input: 10, output: 5, totalTokens: 15, cost: { total: 0.0002 } });
+
+  const formatted = formatUsageStats(stats);
+
+  assert.match(formatted, /3 req/);
+  assert.match(formatted, /5 cached/);
+  assert.match(formatted, /1 failed/);
+  // Every request reported tokens, so the token total is complete.
+  assert.match(formatted, /185 tok,/);
+  // Only two of three reported a cost, so the estimate is explicitly incomplete.
+  assert.match(formatted, /~\$0\.00060 est\+/);
+});
+
+test("cost is presented as an estimate and never rounds a real cost to zero", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 1;
+  recordProviderUsage(stats, { totalTokens: 15, cost: { total: 0.000001 } });
+
+  // A real but tiny cost must not be displayed as $0.
+  assert.match(formatUsageStats(stats), /~<\$0\.00001 est/);
+
+  const larger = createPromptAutocompleteUsageStats();
+  larger.providerRequests = 1;
+  recordProviderUsage(larger, { totalTokens: 15, cost: { total: 0.25 } });
+  assert.match(formatUsageStats(larger), /~\$0\.2500 est/);
+  assert.doesNotMatch(formatUsageStats(larger), /\+/);
+});
+
+
+test("runtime overrides outrank flags only when explicitly set", () => {
+  assert.equal(resolveOverride(undefined, true), true);
+  assert.equal(resolveOverride(undefined, false), false);
+  assert.equal(resolveOverride(false, true), false);
+  assert.equal(resolveOverride(true, false), true);
+
+  assert.equal(describeSettingSource(undefined), "flag");
+  assert.equal(describeSettingSource(false), "session");
+  assert.equal(describeSettingSource(true), "session");
+});
+
+test("cache-only token reports still establish a token report", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 1;
+
+  recordProviderUsage(stats, { cacheRead: 100, cacheWrite: 20 });
+
+  assert.equal(stats.tokenReports, 1);
+  assert.equal(stats.totalTokens, 120);
+  // Tokens were reported, so only the cost may be flagged as incomplete.
+  assert.match(formatUsageStats(stats), /120 tok, ~\$0 est\+/);
+});
+
+test("an explicit zero total wins over the component tokens", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, { input: 5, output: 3, totalTokens: 0 });
+
+  assert.equal(stats.tokenReports, 1);
+  assert.equal(stats.totalTokens, 0);
+});
+
+test("a side-effecting usage getter cannot report different values to totals and completeness", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 1;
+  let totalReads = 0;
+  let costReads = 0;
+  const shifting = {
+    get totalTokens(): number {
+      totalReads += 1;
+      return totalReads === 1 ? -1 : 100;
+    },
+    get cost(): { total: number } {
+      costReads += 1;
+      return { total: costReads === 1 ? 1 : -1 };
+    },
+  };
+
+  recordProviderUsage(stats, shifting);
+
+  // Each field is read exactly once, so the first observed value decides both
+  // the accumulated total and whether the metric counts as reported.
+  assert.equal(totalReads, 1);
+  assert.equal(stats.totalTokens, 0);
+  assert.equal(stats.tokenReports, 0);
+  assert.equal(stats.costReports, 1);
+  assert.equal(stats.estimatedCost, 1);
 });

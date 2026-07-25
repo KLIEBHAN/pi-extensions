@@ -37,12 +37,17 @@ const editorTheme: EditorTheme = {
   },
 };
 
-function makeCompletion(completions: string[]): CompletionResult {
+function makeCompletion(completions: string[], usage?: unknown): CompletionResult {
   return {
     role: "assistant",
     content: [{ type: "text", text: JSON.stringify({ completions }) }],
     stopReason: "stop",
+    ...(usage === undefined ? {} : { usage }),
   } as CompletionResult;
+}
+
+function makeUsage(input: number, output: number, cost: number): unknown {
+  return { input, output, totalTokens: input + output, cost: { total: cost } };
 }
 
 function deferred<T>() {
@@ -656,4 +661,97 @@ test("multiple alternatives cycle without issuing another provider request", asy
   assert.match(renderedText(editor), /second/);
   assert.match(renderedText(editor), /‹2\/3›/);
   assert.equal(calls, 1);
+});
+
+test("accounting records usage and never bills a cache hit", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" the implementation carefully"], makeUsage(120, 30, 0.00042));
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+
+  editor.setText("Review");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+
+  // Leaving and re-entering the same draft must be served from the cache.
+  editor.setText("Review the report");
+  await flushAsyncWork();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.equal(calls, 2, "only the two distinct drafts may reach the provider");
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+
+  assert.match(status, /usage=2 req, 1 cached, 300 tok, ~\$0\.00084 est/);
+  // Both requests reported tokens and cost, so nothing may be flagged incomplete.
+  assert.doesNotMatch(status, /tok\+/);
+  assert.doesNotMatch(status, /est\+/);
+  assert.doesNotMatch(status, /failed/);
+});
+
+test("accounting marks a failed request and flags the totals as incomplete", async () => {
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("provider unavailable");
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+
+  assert.match(status, /usage=1 req, 0 cached, 1 failed, 0 tok\+, ~\$0 est\+/);
+});
+
+test("accounting counts a provider error response as failed while keeping its usage", async () => {
+  const harness = createEditorHarness({
+    completeSimple: (async () =>
+      ({
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "quota exceeded",
+        usage: makeUsage(40, 0, 0.0001),
+      }) as unknown as CompletionResult) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+
+  assert.match(status, /usage=1 req/);
+  assert.match(status, /1 failed/);
+  // Tokens spent on a rejected response were still spent.
+  assert.match(status, /40 tok/);
+  assert.match(status, /~\$0\.00010 est/);
+});
+
+test("accounting resets when a new session starts", async () => {
+  const harness = createEditorHarness({
+    completeSimple: (async () =>
+      makeCompletion([" carefully"], makeUsage(120, 30, 0.00042))) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+
+  editor.setText("Review");
+  await flushAsyncWork();
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 0 cached, 150 tok/);
+
+  await harness.emit("session_start", { reason: "new-session" });
+  await harness.command("status");
+
+  assert.match(harness.notifications.at(-1) ?? "", /usage=0 req, 0 cached, 0 tok, ~\$0 est/);
 });

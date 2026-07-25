@@ -2,6 +2,17 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+### Added
+
+- Session accounting for autocomplete requests: `/prompt-autocomplete status` now reports issued requests, requests served from the cache, failed requests, provider-reported tokens, and an estimated cost derived from pi's local model price table. Tokens and cost are marked independently with a trailing `+` when a request did not report that metric.
+- Status output now names the source of each toggle, so a session override is distinguishable from a CLI flag.
+
+### Fixed
+
+- `/prompt-autocomplete on`, `off`, `while-streaming`, and the debug toggles no longer revert to their CLI-flag values when a new session starts.
+
 ## [0.1.2] - 2026-07-24
 
 ### Fixed
