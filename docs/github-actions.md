@@ -36,7 +36,7 @@ This policy covers the runtime used internally by an action. It is independent o
    ```bash
    node --experimental-strip-types --test test/workflow-actions.test.ts
    npm run check
-   npm audit
+   npm run audit:dependencies
    actionlint .github/workflows/*.yml
    ```
 
