@@ -23,6 +23,9 @@ const ADVISORY_URL_PREFIX = "https://github.com/advisories/";
 const ADVISORY_ID_PATTERN = /^GHSA-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}$/;
 // An exception is a deferral, not a decision to live with the risk.
 const MAX_EXCEPTION_DAYS = 120;
+// npm's severity ladder, lowest first. A package's own severity is the highest
+// of the advisories reported against it.
+const SEVERITY_ORDER = ["info", "low", "moderate", "high", "critical"];
 
 function runAudit() {
   // npm reads omit/include settings from the environment and from .npmrc, so a
@@ -228,11 +231,22 @@ export function reconcileAudit(report, exceptions, today) {
 
   // npm's own count must agree with the entries present, otherwise the report
   // is truncated or malformed and cannot be reconciled.
-  const reportedTotal = report.metadata?.vulnerabilities?.total;
+  const metadata = report.metadata?.vulnerabilities;
+  const reportedTotal = metadata?.total;
   if (typeof reportedTotal !== "number") {
     fail("npm audit report does not state how many vulnerabilities it found");
   } else if (reportedTotal !== entries.length) {
     fail(`npm reported ${reportedTotal} vulnerabilities but described ${entries.length}`);
+  }
+
+  // The severity buckets must account for the same vulnerabilities as the
+  // total, so an aggregate cannot report findings the entries never describe.
+  const bucketed = SEVERITY_ORDER.reduce((sum, severity) => {
+    const count = metadata?.[severity];
+    return sum + (typeof count === "number" ? count : 0);
+  }, 0);
+  if (typeof reportedTotal === "number" && bucketed !== reportedTotal) {
+    fail(`npm reported ${reportedTotal} vulnerabilities but ${bucketed} across its severity buckets`);
   }
 
   const vulnerabilities = [];
@@ -254,6 +268,8 @@ export function reconcileAudit(report, exceptions, today) {
   // declaration with full evidence, may satisfy that declaration.
   const accounted = new Set();
   for (const vulnerability of vulnerabilities) {
+    const directSeverities = [];
+
     for (const entry of vulnerability.via ?? []) {
       if (typeof entry === "string") continue;
 
@@ -262,9 +278,33 @@ export function reconcileAudit(report, exceptions, today) {
         fail(`advisory for ${vulnerability.name} has no usable GitHub advisory URL and cannot be reconciled: ${JSON.stringify(entry)}`);
         continue;
       }
+      // A direct advisory names the package it was reported against. A mismatch
+      // means the entry describes something other than what its key claims.
+      for (const field of ["name", "dependency"]) {
+        if (entry[field] !== undefined && entry[field] !== vulnerability.name) {
+          fail(`advisory ${advisory} reports ${field} ${JSON.stringify(entry[field])} under ${vulnerability.name}`);
+        }
+      }
 
+      directSeverities.push(entry.severity);
       checkAdvisory({ advisory, vulnerability, via: entry, exceptions, matched, today, fail });
       accounted.add(vulnerability.name);
+    }
+
+    // The package severity is the highest of its own advisories. A higher
+    // aggregate would describe a finding the advisories never account for.
+    if (directSeverities.length > 0) {
+      const highest = directSeverities.reduce(
+        (worst, severity) =>
+          SEVERITY_ORDER.indexOf(severity) > SEVERITY_ORDER.indexOf(worst) ? severity : worst,
+        directSeverities[0],
+      );
+      if (vulnerability.severity !== highest) {
+        fail(
+          `${vulnerability.name} is reported as ${vulnerability.severity ?? "unknown severity"} but its ` +
+            `advisories account for at most ${highest}`,
+        );
+      }
     }
   }
 

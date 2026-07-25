@@ -228,6 +228,8 @@ function vulnerability(overrides: Record<string, unknown> = {}) {
       {
         url: "https://github.com/advisories/GHSA-mh99-v99m-4gvg",
         title: "DoS via unbounded expansion",
+        name: "brace-expansion",
+        dependency: "brace-expansion",
         severity: "high",
         range: "<=5.0.7",
       },
@@ -242,12 +244,22 @@ function reconcile(
   exceptions = declared(),
   today = TODAY,
   total?: number,
+  severities: { high?: number; critical?: number } = {},
 ) {
   return reconcileAudit(
     {
       auditReportVersion: 2,
       vulnerabilities,
-      metadata: { vulnerabilities: { total: total ?? Object.keys(vulnerabilities).length } },
+      metadata: {
+        vulnerabilities: {
+          info: 0,
+          low: 0,
+          moderate: 0,
+          high: severities.high ?? Object.keys(vulnerabilities).length,
+          critical: severities.critical ?? 0,
+          total: total ?? Object.keys(vulnerabilities).length,
+        },
+      },
     },
     exceptions,
     today,
@@ -530,4 +542,44 @@ test("an exception cannot be future-dated to escape the review deadline", () => 
 
 test("an exception must record what would retire it", () => {
   assert.throws(() => declared({ upstreamFix: undefined }), /must set "upstreamFix"/);
+});
+
+test("the audit gate rejects a package severity its advisories do not account for", () => {
+  // A truncated report could otherwise signal a critical finding in the
+  // aggregate while describing only the accepted high advisory.
+  const { failures } = reconcile(
+    { "brace-expansion": vulnerability({ severity: "critical" }) },
+    declared(),
+    TODAY,
+    1,
+    { high: 0, critical: 1 },
+  );
+
+  assert.match(failures.join("\n"), /reported as critical but its advisories account for at most high/);
+});
+
+test("the audit gate rejects severity buckets that disagree with the total", () => {
+  const { failures } = reconcile({ "brace-expansion": vulnerability() }, declared(), TODAY, 1, {
+    high: 1,
+    critical: 1,
+  });
+
+  assert.match(failures.join("\n"), /1 vulnerabilities but 2 across its severity buckets/);
+});
+
+test("the audit gate rejects an advisory naming a package other than its own", () => {
+  const { failures } = reconcile({
+    "brace-expansion": vulnerability({
+      via: [
+        {
+          url: "https://github.com/advisories/GHSA-mh99-v99m-4gvg",
+          name: "some-other-package",
+          severity: "high",
+          range: "<=5.0.7",
+        },
+      ],
+    }),
+  });
+
+  assert.match(failures.join("\n"), /reports name "some-other-package" under brace-expansion/);
 });

@@ -2,6 +2,8 @@
 
 CI audits the complete dependency tree, development dependencies included. The repository toolchain executes during CI and release builds, so a production-only audit would leave that trusted path unchecked.
 
+This gate exists because of a specific upstream situation, not as permanent infrastructure. **When the exception list is empty and no new exception is expected, replace the gate with a bare `npm audit` step and delete it.** Reconciliation logic that outlives its reason becomes a place to hide things.
+
 ```bash
 npm run audit:dependencies
 ```
@@ -17,11 +19,16 @@ The gate runs a full `npm audit --json` across production, development, optional
 - the advisory is reported without an affected range or without any dependency path,
 - the reported dependency paths and the declared paths are not exactly equal,
 - an advisory carries no canonical GitHub advisory URL,
-- npm's own vulnerability count disagrees with the entries it described,
-- npm exits non-zero without reporting any vulnerability,
+- npm's own vulnerability count disagrees with the entries it described, or with its severity buckets,
+- a package's reported severity is higher than its own advisories account for,
+- an advisory names a package other than the one it is reported under,
+- a report key disagrees with the package name it describes,
+- npm exits with any status other than 0 or 1, or exits non-zero without reporting any vulnerability,
 - the report is unparsable or uses an unexpected schema version.
 
 An unreadable, incomplete, or self-inconsistent report is a failure, never an implicit pass. The gate also strips ambient `npm_config_omit` settings, so neither a workflow `env` entry nor an `.npmrc` can shrink the audited tree without changing the gate itself.
+
+The gate still trusts npm to report the advisories it knows about. It verifies that a report is internally consistent, not that the registry told the truth.
 
 ## What an exception may and may not say
 
