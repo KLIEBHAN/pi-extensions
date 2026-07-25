@@ -6,7 +6,7 @@ All notable changes to this package are documented here. This project follows [S
 
 ### Added
 
-- Session accounting for autocomplete requests: `/prompt-autocomplete status` now reports issued requests, requests saved by the cache or by joining an in-flight request, failed requests, tokens, and provider-reported cost.
+- Session accounting for autocomplete requests: `/prompt-autocomplete status` now reports issued requests, requests served from the cache, failed requests, provider-reported tokens, and an estimated cost derived from pi's local model price table. Totals are marked with a trailing `+` when a response reported nothing.
 - Status output now names the source of each toggle, so a session override is distinguishable from a CLI flag.
 
 ### Fixed

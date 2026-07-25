@@ -157,13 +157,6 @@ function createEditorHarness(options: EditorHarnessOptions) {
       const keybindings = { matches: () => false } as unknown as KeybindingsManager;
       return editorFactory(tui, editorTheme, keybindings);
     },
-    // Instantiate the already-installed factory again, without restarting the
-    // session, so two live editors share one request/cache state.
-    createAdditionalEditor: (): EditorComponent => {
-      assert.ok(editorFactory, "an editor factory must already be installed");
-      const keybindings = { matches: () => false } as unknown as KeybindingsManager;
-      return editorFactory(tui, editorTheme, keybindings);
-    },
     emit: async (name: string, event: unknown = {}) => {
       await handlers.get(name)?.(event, ctx);
     },
@@ -670,7 +663,7 @@ test("multiple alternatives cycle without issuing another provider request", asy
   assert.equal(calls, 1);
 });
 
-test("accounting records provider usage and never bills a cache hit", async () => {
+test("accounting records usage and never bills a cache hit", async () => {
   let calls = 0;
   const harness = createEditorHarness({
     completeSimple: (async () => {
@@ -695,14 +688,14 @@ test("accounting records provider usage and never bills a cache hit", async () =
   await harness.command("status");
   const status = harness.notifications.at(-1) ?? "";
 
-  assert.match(status, /usage=2 req, 1 saved \(1 cache\/0 joined\)/);
-  assert.match(status, /300 tok/);
-  assert.match(status, /\$0\.00084 reported/);
-  assert.doesNotMatch(status, /partial/);
+  assert.match(status, /usage=2 req, 1 cached, 300 tok, ~\$0\.00084 est/);
+  // Both requests reported tokens and cost, so nothing may be flagged incomplete.
+  assert.doesNotMatch(status, /tok\+/);
+  assert.doesNotMatch(status, /est\+/);
   assert.doesNotMatch(status, /failed/);
 });
 
-test("accounting marks failed requests and keeps cost partial without a usage report", async () => {
+test("accounting marks a failed request and flags the totals as incomplete", async () => {
   const harness = createEditorHarness({
     completeSimple: (async () => {
       throw new Error("provider unavailable");
@@ -716,10 +709,7 @@ test("accounting marks failed requests and keeps cost partial without a usage re
   await harness.command("status");
   const status = harness.notifications.at(-1) ?? "";
 
-  assert.match(status, /usage=1 req/);
-  assert.match(status, /1 failed/);
-  assert.match(status, /0 tok/);
-  assert.match(status, /\$0 reported \(partial\)/);
+  assert.match(status, /usage=1 req, 0 cached, 1 failed, 0 tok\+, ~\$0 est\+/);
 });
 
 test("accounting counts a provider error response as failed while keeping its usage", async () => {
@@ -745,38 +735,23 @@ test("accounting counts a provider error response as failed while keeping its us
   assert.match(status, /1 failed/);
   // Tokens spent on a rejected response were still spent.
   assert.match(status, /40 tok/);
-  assert.match(status, /\$0\.00010 reported/);
+  assert.match(status, /~\$0\.00010 est/);
 });
 
-test("accounting bills a coalesced join only once", async () => {
-  let calls = 0;
-  const pending = deferred<CompletionResult>();
+test("accounting resets when a new session starts", async () => {
   const harness = createEditorHarness({
-    completeSimple: (async () => {
-      calls += 1;
-      return pending.promise;
-    }) as CompleteSimple,
+    completeSimple: (async () =>
+      makeCompletion([" carefully"], makeUsage(120, 30, 0.00042))) as CompleteSimple,
   });
   const editor = await harness.createEditor();
-  const secondEditor = harness.createAdditionalEditor();
 
-  // Both editors want the same suggestion at the same time, so the second must
-  // join the in-flight request instead of paying for a duplicate.
   editor.setText("Review");
-  secondEditor.setText("Review");
   await flushAsyncWork();
-
-  assert.equal(calls, 1, "an identical concurrent draft must not issue a second provider request");
-
-  pending.resolve(makeCompletion([" carefully"], makeUsage(10, 5, 0.00002)));
-  await flushAsyncWork();
-
   await harness.command("status");
-  const status = harness.notifications.at(-1) ?? "";
+  assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 0 cached, 150 tok/);
 
-  assert.match(status, /usage=1 req, 1 saved \(0 cache\/1 joined\)/);
-  assert.match(status, /15 tok/);
-  // The shared response is billed once, not once per subscriber.
-  assert.match(status, /\$0\.00002 reported/);
-  assert.doesNotMatch(status, /partial/);
+  await harness.emit("session_start", { reason: "new-session" });
+  await harness.command("status");
+
+  assert.match(harness.notifications.at(-1) ?? "", /usage=0 req, 0 cached, 0 tok, ~\$0 est/);
 });

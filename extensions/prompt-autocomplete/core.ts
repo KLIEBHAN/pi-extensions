@@ -302,9 +302,12 @@ export function cancelAllCoalescedRequests<T>(inFlightRequests: Map<string, Coal
  * Session-scoped autocomplete accounting.
  *
  * Counters are deliberately in-memory and per-session: they exist so a user can
- * answer "what did autocomplete cost me", not to build a usage history. Cache
- * hits and coalesced joins are tracked separately from provider requests so the
- * saved-request count is visible rather than implied.
+ * answer "what did autocomplete cost me", not to build a usage history.
+ *
+ * Token counts come from the provider. The cost figure does not: pi derives it
+ * locally by multiplying those tokens with its own model price table
+ * (`calculateCost` in @earendil-works/pi-ai), so it is an estimate that can
+ * disagree with an actual invoice. Naming reflects that.
  */
 export interface PromptAutocompleteUsageStats {
   /** Provider calls actually issued, including calls that later failed. */
@@ -313,21 +316,21 @@ export interface PromptAutocompleteUsageStats {
   failedRequests: number;
   /** Requests served from the local cache without contacting a provider. */
   cacheHits: number;
-  /** Requests that joined an identical in-flight request instead of issuing a new one. */
-  coalescedJoins: number;
-  /** Responses that carried a usage report. Cost is partial when this is below providerRequests. */
-  usageReports: number;
-  inputTokens: number;
-  outputTokens: number;
+  /** Responses that carried token counts. Totals are partial when this is below providerRequests. */
+  tokenReports: number;
+  /** Responses that carried a cost figure. */
+  costReports: number;
   totalTokens: number;
-  /** Provider-reported cost. Never estimated locally. */
-  costTotal: number;
+  /** Locally estimated cost, summed from pi's model price table. */
+  estimatedCost: number;
 }
 
-/** Shape of the provider usage report this module consumes. All fields are optional at runtime. */
+/** Shape of the usage report this module consumes. Every field is optional at runtime. */
 export interface ProviderUsageReport {
   input?: number;
   output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
   totalTokens?: number;
   cost?: { total?: number };
 }
@@ -337,73 +340,123 @@ export function createPromptAutocompleteUsageStats(): PromptAutocompleteUsageSta
     providerRequests: 0,
     failedRequests: 0,
     cacheHits: 0,
-    coalescedJoins: 0,
-    usageReports: 0,
-    inputTokens: 0,
-    outputTokens: 0,
+    tokenReports: 0,
+    costReports: 0,
     totalTokens: 0,
-    costTotal: 0,
+    estimatedCost: 0,
   };
 }
 
-function toFiniteNonNegative(value: unknown): number {
+/**
+ * Read one numeric field without trusting the object.
+ *
+ * The usage object is plain data in practice, but a throwing getter must not be
+ * able to turn accounting into a failed suggestion, so access is guarded.
+ */
+function readNonNegativeNumber(source: Record<string, unknown> | undefined, key: string): number {
+  if (!source) return 0;
+
+  let value: unknown;
+  try {
+    value = source[key];
+  } catch {
+    return 0;
+  }
+
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+function readCostRecord(usage: Record<string, unknown>): Record<string, unknown> | undefined {
+  let cost: unknown;
+  try {
+    cost = usage.cost;
+  } catch {
+    return undefined;
+  }
+
+  return typeof cost === "object" && cost !== null ? (cost as Record<string, unknown>) : undefined;
+}
+
 /**
- * Fold one provider usage report into the session totals.
+ * Whether a field carries a usable report.
  *
- * Providers disagree about which fields they report, so every field is treated
- * as optional and non-numeric or negative values contribute zero. A response
- * only counts as a usage report when it carries at least one usable number.
+ * Zero is a legitimate report, but a negative or non-finite value is malformed
+ * data and must count as missing rather than as a report of nothing.
+ */
+function hasOwnNumericField(source: Record<string, unknown> | undefined, key: string): boolean {
+  if (!source) return false;
+
+  try {
+    const value = source[key];
+    return typeof value === "number" && Number.isFinite(value) && value >= 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fold one usage report into the session totals.
+ *
+ * Providers disagree about which fields they populate, so each field is
+ * optional and anything non-numeric or negative contributes zero. Token and
+ * cost reports are counted separately because a response can carry tokens
+ * without a cost figure, and a legitimate all-zero report still counts as a
+ * report rather than as missing data.
  */
 export function recordProviderUsage(stats: PromptAutocompleteUsageStats, usage: unknown): void {
   if (typeof usage !== "object" || usage === null) return;
 
-  const report = usage as ProviderUsageReport;
-  const input = toFiniteNonNegative(report.input);
-  const output = toFiniteNonNegative(report.output);
-  const reportedTotal = toFiniteNonNegative(report.totalTokens);
-  const cost = toFiniteNonNegative(report.cost?.total);
-  const total = reportedTotal || input + output;
+  const report = usage as Record<string, unknown>;
+  const costRecord = readCostRecord(report);
 
-  if (input === 0 && output === 0 && total === 0 && cost === 0) return;
+  const input = readNonNegativeNumber(report, "input");
+  const output = readNonNegativeNumber(report, "output");
+  const cacheRead = readNonNegativeNumber(report, "cacheRead");
+  const cacheWrite = readNonNegativeNumber(report, "cacheWrite");
+  const reportedTotal = readNonNegativeNumber(report, "totalTokens");
+  // Cached tokens are billed too, so the fallback must not drop them.
+  const total = reportedTotal || input + output + cacheRead + cacheWrite;
 
-  stats.usageReports += 1;
-  stats.inputTokens += input;
-  stats.outputTokens += output;
+  const hasTokenReport =
+    hasOwnNumericField(report, "totalTokens") ||
+    hasOwnNumericField(report, "input") ||
+    hasOwnNumericField(report, "output");
+  const hasCostReport = hasOwnNumericField(costRecord, "total");
+
+  if (!hasTokenReport && !hasCostReport) return;
+
+  if (hasTokenReport) stats.tokenReports += 1;
+  if (hasCostReport) stats.costReports += 1;
+
   stats.totalTokens += total;
-  stats.costTotal += cost;
+  stats.estimatedCost += readNonNegativeNumber(costRecord, "total");
 }
 
-function formatReportedCost(cost: number): string {
+function formatEstimatedCost(cost: number): string {
   if (cost <= 0) return "$0";
-  // Autocomplete requests are small; sub-cent totals must stay visible.
+  // Autocomplete requests are cheap; a real cost must never render as $0.
+  if (cost < 0.00001) return "<$0.00001";
   return cost < 0.01 ? `$${cost.toFixed(5)}` : `$${cost.toFixed(4)}`;
 }
 
 /**
  * Render session accounting for the status line.
  *
- * Cost is labelled as provider-reported and is marked partial when some
- * responses carried no usage report, so a missing report is never presented as
- * a cheaper request.
+ * Cost is labelled as an estimate because pi derives it from a local price
+ * table rather than from the provider. Totals are marked partial when some
+ * responses reported nothing, so silence is never shown as a cheaper request.
  */
 export function formatUsageStats(stats: PromptAutocompleteUsageStats): string {
-  const saved = stats.cacheHits + stats.coalescedJoins;
-  const segments = [
-    `${stats.providerRequests} req`,
-    `${saved} saved (${stats.cacheHits} cache/${stats.coalescedJoins} joined)`,
-  ];
+  const segments = [`${stats.providerRequests} req`, `${stats.cacheHits} cached`];
 
   if (stats.failedRequests > 0) {
     segments.push(`${stats.failedRequests} failed`);
   }
 
-  segments.push(`${stats.totalTokens} tok`);
-
-  const partial = stats.usageReports < stats.providerRequests;
-  segments.push(`${formatReportedCost(stats.costTotal)} reported${partial ? " (partial)" : ""}`);
+  const tokensPartial = stats.tokenReports < stats.providerRequests;
+  const costPartial = stats.costReports < stats.providerRequests;
+  segments.push(`${stats.totalTokens} tok${tokensPartial ? "+" : ""}`);
+  segments.push(`~${formatEstimatedCost(stats.estimatedCost)} est${costPartial ? "+" : ""}`);
 
   return segments.join(", ");
 }

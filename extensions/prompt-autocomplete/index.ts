@@ -824,10 +824,6 @@ class PromptAutocompleteEditor extends CustomEditor {
       (signal) => this.fetchSuggestionUncached(request, signal),
     );
 
-    if (!subscription.created) {
-      this.shared.usageStats.coalescedJoins += 1;
-    }
-
     this.activeRequestSubscription = subscription;
     updateDebugState(
       this.shared,
@@ -1305,6 +1301,9 @@ function createPromptAutocompleteCommandHandlers(
     },
     on: () => {
       if (shared.enabled && shared.ownsEditor?.()) {
+        // Already in the requested state, but the user still expressed intent:
+        // record it so a later session does not fall back to the flag.
+        shared.runtimeOverrides.enabled = true;
         ctx.ui.notify(`Prompt autocomplete already enabled (${formatStatus(shared)})`, "info");
         return;
       }
@@ -1315,6 +1314,7 @@ function createPromptAutocompleteCommandHandlers(
     },
     off: () => {
       if (!shared.enabled) {
+        shared.runtimeOverrides.enabled = false;
         ctx.ui.notify("Prompt autocomplete is already disabled", "info");
         return;
       }

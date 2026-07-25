@@ -583,7 +583,7 @@ test("buildLatestAssistantMessageContext returns the newest assistant text", () 
   );
 });
 
-test("provider usage accumulates only reported numbers", () => {
+test("usage accumulates reported tokens and locally estimated cost", () => {
   const stats = createPromptAutocompleteUsageStats();
 
   recordProviderUsage(stats, {
@@ -594,15 +594,30 @@ test("provider usage accumulates only reported numbers", () => {
   });
   recordProviderUsage(stats, { input: 80, output: 20, cost: { total: 0.0001 } });
 
-  assert.equal(stats.usageReports, 2);
-  assert.equal(stats.inputTokens, 200);
-  assert.equal(stats.outputTokens, 50);
-  // The second report omits totalTokens, so input + output is the fallback.
+  assert.equal(stats.tokenReports, 2);
+  assert.equal(stats.costReports, 2);
+  // The second report omits totalTokens, so the component tokens are the fallback.
   assert.equal(stats.totalTokens, 250);
-  assert.equal(Number(stats.costTotal.toFixed(5)), 0.00052);
+  assert.equal(Number(stats.estimatedCost.toFixed(5)), 0.00052);
 });
 
-test("provider usage ignores missing, malformed, and negative reports", () => {
+test("the token fallback includes cached tokens because they are billed too", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, { input: 10, output: 5, cacheRead: 100, cacheWrite: 20 });
+
+  assert.equal(stats.totalTokens, 135);
+});
+
+test("a reported total wins over the component tokens instead of adding to them", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, { input: 10, output: 5, cacheRead: 100, totalTokens: 115 });
+
+  assert.equal(stats.totalTokens, 115);
+});
+
+test("usage ignores missing, malformed, and negative reports", () => {
   const stats = createPromptAutocompleteUsageStats();
 
   recordProviderUsage(stats, undefined);
@@ -615,37 +630,73 @@ test("provider usage ignores missing, malformed, and negative reports", () => {
   assert.deepEqual(stats, createPromptAutocompleteUsageStats());
 });
 
-test("usage stats separate saved requests from provider requests", () => {
+test("a legitimate all-zero report counts as reported rather than as missing", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 1;
+
+  recordProviderUsage(stats, { input: 0, output: 0, totalTokens: 0, cost: { total: 0 } });
+
+  assert.equal(stats.tokenReports, 1);
+  assert.equal(stats.costReports, 1);
+  // Nothing is missing, so nothing may be flagged as incomplete.
+  assert.equal(formatUsageStats(stats), "1 req, 0 cached, 0 tok, ~$0 est");
+});
+
+test("a throwing usage object cannot break accounting", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  const hostile = {
+    get input(): number {
+      throw new Error("hostile getter");
+    },
+    output: 5,
+    get cost(): { total: number } {
+      throw new Error("hostile getter");
+    },
+  };
+
+  recordProviderUsage(stats, hostile);
+
+  assert.equal(stats.tokenReports, 1);
+  assert.equal(stats.costReports, 0);
+  assert.equal(stats.totalTokens, 5);
+});
+
+test("usage stats mark token and cost totals partial independently", () => {
   const stats = createPromptAutocompleteUsageStats();
   stats.providerRequests = 3;
   stats.cacheHits = 5;
-  stats.coalescedJoins = 2;
   stats.failedRequests = 1;
-  recordProviderUsage(stats, { input: 100, output: 20, totalTokens: 120, cost: { total: 0.0004 } });
+  // Tokens without a cost figure: the cost total is incomplete, the token total is not.
+  recordProviderUsage(stats, { input: 100, output: 20, totalTokens: 120 });
+  recordProviderUsage(stats, { input: 40, output: 10, totalTokens: 50, cost: { total: 0.0004 } });
+  recordProviderUsage(stats, { input: 10, output: 5, totalTokens: 15, cost: { total: 0.0002 } });
 
   const formatted = formatUsageStats(stats);
 
   assert.match(formatted, /3 req/);
-  assert.match(formatted, /7 saved \(5 cache\/2 joined\)/);
+  assert.match(formatted, /5 cached/);
   assert.match(formatted, /1 failed/);
-  assert.match(formatted, /120 tok/);
-  // Sub-cent totals must stay visible instead of rounding to $0.00.
-  assert.match(formatted, /\$0\.00040 reported/);
-  // Only one of three requests reported usage, so the total is explicitly partial.
-  assert.match(formatted, /\(partial\)/);
+  // Every request reported tokens, so the token total is complete.
+  assert.match(formatted, /185 tok,/);
+  // Only two of three reported a cost, so the estimate is explicitly incomplete.
+  assert.match(formatted, /~\$0\.00060 est\+/);
 });
 
-test("usage stats omit the partial marker once every request reported usage", () => {
+test("cost is presented as an estimate and never rounds a real cost to zero", () => {
   const stats = createPromptAutocompleteUsageStats();
   stats.providerRequests = 1;
-  recordProviderUsage(stats, { input: 10, output: 5, totalTokens: 15, cost: { total: 0.25 } });
+  recordProviderUsage(stats, { totalTokens: 15, cost: { total: 0.000001 } });
 
-  const formatted = formatUsageStats(stats);
+  // A real but tiny cost must not be displayed as $0.
+  assert.match(formatUsageStats(stats), /~<\$0\.00001 est/);
 
-  assert.match(formatted, /\$0\.2500 reported/);
-  assert.doesNotMatch(formatted, /partial/);
-  assert.doesNotMatch(formatted, /failed/);
+  const larger = createPromptAutocompleteUsageStats();
+  larger.providerRequests = 1;
+  recordProviderUsage(larger, { totalTokens: 15, cost: { total: 0.25 } });
+  assert.match(formatUsageStats(larger), /~\$0\.2500 est/);
+  assert.doesNotMatch(formatUsageStats(larger), /\+/);
 });
+
 
 test("runtime overrides outrank flags only when explicitly set", () => {
   assert.equal(resolveOverride(undefined, true), true);

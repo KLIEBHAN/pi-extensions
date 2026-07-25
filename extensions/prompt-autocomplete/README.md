@@ -70,12 +70,14 @@ Slash-command toggles (`on`, `off`, `while-streaming`, `debug-*`) outrank the CL
 `/prompt-autocomplete status` reports what the current session actually spent:
 
 ```text
-usage=4 req, 6 saved (5 cache/1 joined), 1832 tok, $0.00214 reported
+usage=4 req, 5 cached, 1832 tok, ~$0.00214 est
 ```
 
-- `req` counts provider calls that were actually issued; `saved` counts requests answered from the local cache or by joining an identical in-flight request.
+- `req` counts provider calls that were actually issued; `cached` counts requests answered from the local cache without contacting a provider.
 - `failed` appears only when a request errored or was aborted. Tokens already spent on a failed response are still counted.
-- Cost is the figure the provider reported and is never estimated locally. It is marked `(partial)` when at least one response carried no usage report.
+- Token counts come from the provider.
+- **The cost is an estimate, not an invoice.** Pi derives it locally by multiplying the reported tokens with its own model price table, so it can disagree with what your provider actually bills.
+- A trailing `+` (`1832 tok+`, `~$0.00214 est+`) means at least one response reported nothing, so the real total is higher than shown.
 - Counters live in memory, are scoped to the current session, and reset when a new session starts.
 
 ## Privacy, providers, and cost

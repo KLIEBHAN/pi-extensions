@@ -329,5 +329,20 @@ test("status reports session accounting and resets it per session", async () => 
   await emit(harness, "session_start");
   await command(harness, "status");
 
-  assert.match(lastStatus(harness), /usage=0 req, 0 saved \(0 cache\/0 joined\), 0 tok, \$0 reported/);
+  assert.match(lastStatus(harness), /usage=0 req, 0 cached, 0 tok, ~\$0 est/);
+});
+
+test("a redundant on or off still records the user's intent", async () => {
+  const enabled = createHarness({ enabled: true });
+  await emit(enabled, "session_start");
+  // Already enabled by the flag: the redundant command must still be durable.
+  await command(enabled, "on");
+  await command(enabled, "status");
+  assert.match(lastStatus(enabled), /enabled=yes\(session\)/);
+
+  const disabled = createHarness({ enabled: false });
+  await emit(disabled, "session_start");
+  await command(disabled, "off");
+  await command(disabled, "status");
+  assert.match(lastStatus(disabled), /enabled=no\(session\)/);
 });
