@@ -347,23 +347,35 @@ export function createPromptAutocompleteUsageStats(): PromptAutocompleteUsageSta
   };
 }
 
+interface NumericField {
+  /** Whether the field carried a usable number. Zero counts; malformed does not. */
+  present: boolean;
+  value: number;
+}
+
+const MISSING_FIELD: NumericField = { present: false, value: 0 };
+
 /**
- * Read one numeric field without trusting the object.
+ * Read one numeric field exactly once, without trusting the object.
  *
  * The usage object is plain data in practice, but a throwing getter must not be
- * able to turn accounting into a failed suggestion, so access is guarded.
+ * able to turn accounting into a failed suggestion, and a side-effecting getter
+ * must not be able to report one value to the total and another to the
+ * completeness check. Zero is a legitimate report; negative and non-finite
+ * values are malformed and count as missing.
  */
-function readNonNegativeNumber(source: Record<string, unknown> | undefined, key: string): number {
-  if (!source) return 0;
+function readNumericField(source: Record<string, unknown> | undefined, key: string): NumericField {
+  if (!source) return MISSING_FIELD;
 
   let value: unknown;
   try {
     value = source[key];
   } catch {
-    return 0;
+    return MISSING_FIELD;
   }
 
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return MISSING_FIELD;
+  return { present: true, value };
 }
 
 function readCostRecord(usage: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -378,30 +390,13 @@ function readCostRecord(usage: Record<string, unknown>): Record<string, unknown>
 }
 
 /**
- * Whether a field carries a usable report.
- *
- * Zero is a legitimate report, but a negative or non-finite value is malformed
- * data and must count as missing rather than as a report of nothing.
- */
-function hasOwnNumericField(source: Record<string, unknown> | undefined, key: string): boolean {
-  if (!source) return false;
-
-  try {
-    const value = source[key];
-    return typeof value === "number" && Number.isFinite(value) && value >= 0;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Fold one usage report into the session totals.
  *
  * Providers disagree about which fields they populate, so each field is
- * optional and anything non-numeric or negative contributes zero. Token and
- * cost reports are counted separately because a response can carry tokens
- * without a cost figure, and a legitimate all-zero report still counts as a
- * report rather than as missing data.
+ * optional. Token and cost reports are counted separately because a response
+ * can carry tokens without a cost figure. An explicit total wins over the
+ * component fields; otherwise the components are summed, including cached
+ * tokens, which are billed as well.
  */
 export function recordProviderUsage(stats: PromptAutocompleteUsageStats, usage: unknown): void {
   if (typeof usage !== "object" || usage === null) return;
@@ -409,27 +404,25 @@ export function recordProviderUsage(stats: PromptAutocompleteUsageStats, usage: 
   const report = usage as Record<string, unknown>;
   const costRecord = readCostRecord(report);
 
-  const input = readNonNegativeNumber(report, "input");
-  const output = readNonNegativeNumber(report, "output");
-  const cacheRead = readNonNegativeNumber(report, "cacheRead");
-  const cacheWrite = readNonNegativeNumber(report, "cacheWrite");
-  const reportedTotal = readNonNegativeNumber(report, "totalTokens");
-  // Cached tokens are billed too, so the fallback must not drop them.
-  const total = reportedTotal || input + output + cacheRead + cacheWrite;
+  const reportedTotal = readNumericField(report, "totalTokens");
+  const components = [
+    readNumericField(report, "input"),
+    readNumericField(report, "output"),
+    readNumericField(report, "cacheRead"),
+    readNumericField(report, "cacheWrite"),
+  ];
+  const cost = readNumericField(costRecord, "total");
 
-  const hasTokenReport =
-    hasOwnNumericField(report, "totalTokens") ||
-    hasOwnNumericField(report, "input") ||
-    hasOwnNumericField(report, "output");
-  const hasCostReport = hasOwnNumericField(costRecord, "total");
-
-  if (!hasTokenReport && !hasCostReport) return;
+  const hasTokenReport = reportedTotal.present || components.some((field) => field.present);
+  if (!hasTokenReport && !cost.present) return;
 
   if (hasTokenReport) stats.tokenReports += 1;
-  if (hasCostReport) stats.costReports += 1;
+  if (cost.present) stats.costReports += 1;
 
-  stats.totalTokens += total;
-  stats.estimatedCost += readNonNegativeNumber(costRecord, "total");
+  stats.totalTokens += reportedTotal.present
+    ? reportedTotal.value
+    : components.reduce((sum, field) => sum + field.value, 0);
+  stats.estimatedCost += cost.value;
 }
 
 function formatEstimatedCost(cost: number): string {

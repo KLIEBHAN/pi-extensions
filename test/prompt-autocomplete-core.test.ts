@@ -708,3 +708,51 @@ test("runtime overrides outrank flags only when explicitly set", () => {
   assert.equal(describeSettingSource(false), "session");
   assert.equal(describeSettingSource(true), "session");
 });
+
+test("cache-only token reports still establish a token report", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 1;
+
+  recordProviderUsage(stats, { cacheRead: 100, cacheWrite: 20 });
+
+  assert.equal(stats.tokenReports, 1);
+  assert.equal(stats.totalTokens, 120);
+  // Tokens were reported, so only the cost may be flagged as incomplete.
+  assert.match(formatUsageStats(stats), /120 tok, ~\$0 est\+/);
+});
+
+test("an explicit zero total wins over the component tokens", () => {
+  const stats = createPromptAutocompleteUsageStats();
+
+  recordProviderUsage(stats, { input: 5, output: 3, totalTokens: 0 });
+
+  assert.equal(stats.tokenReports, 1);
+  assert.equal(stats.totalTokens, 0);
+});
+
+test("a side-effecting usage getter cannot report different values to totals and completeness", () => {
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 1;
+  let totalReads = 0;
+  let costReads = 0;
+  const shifting = {
+    get totalTokens(): number {
+      totalReads += 1;
+      return totalReads === 1 ? -1 : 100;
+    },
+    get cost(): { total: number } {
+      costReads += 1;
+      return { total: costReads === 1 ? 1 : -1 };
+    },
+  };
+
+  recordProviderUsage(stats, shifting);
+
+  // Each field is read exactly once, so the first observed value decides both
+  // the accumulated total and whether the metric counts as reported.
+  assert.equal(totalReads, 1);
+  assert.equal(stats.totalTokens, 0);
+  assert.equal(stats.tokenReports, 0);
+  assert.equal(stats.costReports, 1);
+  assert.equal(stats.estimatedCost, 1);
+});
