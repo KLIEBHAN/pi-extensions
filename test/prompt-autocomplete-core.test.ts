@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
@@ -367,6 +368,10 @@ test("partial suggestions advance only across stable word boundaries", () => {
     parsePartialPromptSuggestion("Review", '{"completions":[" the implementation carefully"'),
     " the implementation carefully",
   );
+  assert.equal(parsePartialPromptSuggestion("Review", '[" the imple'), " the");
+  assert.equal(parsePartialPromptSuggestion("Review", '{"suggestions":[" the imple'), " the");
+  assert.equal(parsePartialPromptSuggestion("Review", '{"alternatives":[" the imple'), " the");
+  assert.equal(parsePartialPromptSuggestion("Review", '{"items":[" the imple'), " the");
 });
 
 test("partial suggestions never expose JSON, prose, or unresolved normalization prefixes", () => {
@@ -383,6 +388,22 @@ test("partial suggestions decode complete escapes but withhold incomplete ones",
   assert.equal(parsePartialPromptSuggestion("", '{"completions":["safe broken\\'), "safe");
   assert.equal(parsePartialPromptSuggestion("", '{"completions":["safe broken\\u12'), "safe");
   assert.equal(parsePartialPromptSuggestion("", '{"completions":["safe \\u4F60 next'), "safe 你");
+});
+
+test("core loads safely without Intl.Segmenter and disables uncertain partial graphemes", () => {
+  const moduleUrl = new URL("../extensions/prompt-autocomplete/core.ts?without-segmenter", import.meta.url).href;
+  const script = [
+    'Object.defineProperty(Intl, "Segmenter", { value: undefined, configurable: true });',
+    `const core = await import(${JSON.stringify(moduleUrl)});`,
+    'console.log(core.normalizePromptSuggestion("", "abcdefghijklmnopq", 16));',
+    'console.log(String(core.parsePartialPromptSuggestion("", \'{"completions":["続きを確\')));',
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "…\nundefined");
 });
 
 test("partial suggestions are grapheme-safe for CJK, combining marks, flags, and ZWJ emoji", () => {
@@ -548,10 +569,14 @@ test("coalesced request progress reaches subscribers, replays to late joiners, a
   assert.deepEqual(lateProgress, ["first"], "late subscribers receive the latest immutable snapshot");
   assert.equal(first.subscriberCount(), 3, "duplicate readable IDs must still be distinct subscriptions");
 
+  publishProgress?.("live");
+  assert.deepEqual(firstProgress, ["first", "live"]);
+  assert.deepEqual(lateProgress, ["first", "live"]);
+
   throwing.release();
   publishProgress?.("second");
-  assert.deepEqual(firstProgress, ["first", "second"]);
-  assert.deepEqual(lateProgress, ["first", "second"]);
+  assert.deepEqual(firstProgress, ["first", "live", "second"]);
+  assert.deepEqual(lateProgress, ["first", "live", "second"]);
 
   first.release();
   resolveRequest?.("done");

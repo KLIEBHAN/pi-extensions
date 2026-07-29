@@ -574,6 +574,40 @@ test("stream-off and complete-only DI use the compatibility completion path", as
   }
 });
 
+test("runtime stream toggles stay on complete-only DI without invoking a stream", async () => {
+  let completes = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      completes += 1;
+      return makeCompletion([` completed-${completes}`]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Compat");
+  await flushAsyncWork();
+  assert.equal(completes, 1);
+
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /stream=yes\(flag\).*request-path=complete-compat/);
+
+  await harness.command("stream off");
+  await flushAsyncWork();
+  assert.equal(completes, 1, "the toggle itself must not issue a completion");
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /stream=no\(session\).*request-path=complete/);
+
+  await harness.command("stream on");
+  await flushAsyncWork();
+  assert.equal(completes, 1);
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /stream=yes\(session\).*request-path=complete-compat/);
+
+  editor.setText("Compat next");
+  await flushAsyncWork();
+  assert.equal(completes, 2);
+  assert.match(renderedText(editor), /completed-2/);
+});
+
 test("provider request contains bounded conversation context and inline UX limits", async () => {
   let capturedModel: unknown;
   let capturedContext: any;

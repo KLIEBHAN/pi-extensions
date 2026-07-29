@@ -1078,9 +1078,21 @@ function findFirstStreamingSuggestion(text: string): StreamingJsonString | undef
   return undefined;
 }
 
-const STREAMING_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const STREAMING_GRAPHEME_SEGMENTER = (() => {
+  if (typeof Intl.Segmenter !== "function") return undefined;
+  try {
+    return new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  } catch {
+    return undefined;
+  }
+})();
 
 function dropLastGrapheme(text: string): string {
+  if (!STREAMING_GRAPHEME_SEGMENTER) {
+    // Safety over partial UX on minimal-ICU builds: without a grapheme
+    // segmenter we cannot prove that a ZWJ/combining sequence is complete.
+    return "";
+  }
   const segments = [...STREAMING_GRAPHEME_SEGMENTER.segment(text)];
   const last = segments.at(-1);
   return last ? text.slice(0, last.index) : "";
@@ -1090,6 +1102,12 @@ function truncateSuggestionAtGraphemeBoundary(text: string, maxChars: number): s
   if (text.length <= maxChars) return text;
   if (maxChars <= 0) return "";
   if (maxChars === 1) return "…";
+
+  if (!STREAMING_GRAPHEME_SEGMENTER) {
+    // Do not guess a UTF-16/code-point boundary on minimal-ICU builds. A single
+    // ellipsis is bounded and cannot split an unknown grapheme cluster.
+    return "…";
+  }
 
   const available = maxChars - 1;
   let end = 0;

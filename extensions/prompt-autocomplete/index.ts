@@ -181,6 +181,7 @@ interface PromptAutocompleteSharedState {
 
 interface SuggestionRequest {
   activationId: number;
+  leafId: string;
   draft: string;
   draftTail: string;
   model: Model<Api>;
@@ -908,6 +909,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     return {
       activationId: this.activationId,
+      leafId,
       draft,
       draftTail,
       model,
@@ -1166,8 +1168,13 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (this.getText() !== request.draft) return false;
     if (this.isShowingAutocomplete()) return false;
 
-    const currentRequest = this.buildRequest();
-    return currentRequest?.cacheKey === request.cacheKey;
+    const currentModel = resolveSuggestionModel(this.shared);
+    if (formatModelLabel(currentModel) !== request.modelLabel) return false;
+
+    // Session entries are immutable and the leaf identifies the exact branch
+    // from which all bounded context sections were derived. Checking it avoids
+    // rebuilding/scanning and hashing that context for every streamed token.
+    return (this.shared.sessionManager?.getLeafId?.() ?? "") === request.leafId;
   }
 
   cancelActiveRequest(): void {
