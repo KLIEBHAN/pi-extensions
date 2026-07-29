@@ -56,6 +56,7 @@ export const PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT = renderMiniTemplate(
 
 export const DEFAULT_PREFERRED_MODEL = "current active model";
 export const DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED = false;
+export const DEFAULT_STREAM_RESPONSES = true;
 export const DEFAULT_DEBOUNCE_MS = 350;
 export const DEFAULT_MIN_PROMPT_CHARS = 1;
 export const DEFAULT_MAX_SUGGESTION_CHARS = 160;
@@ -173,10 +174,13 @@ export class SequenceOwnedSlot<T extends { seq: number }> {
   }
 }
 
-export interface CoalescedRequestEntry<T> {
+export interface CoalescedRequestEntry<T, P = never> {
   promise: Promise<T>;
   controller: AbortController;
-  subscribers: Set<string>;
+  subscribers: Set<symbol>;
+  progressSubscribers: Map<symbol, (progress: P) => void>;
+  latestProgress?: P;
+  hasProgress: boolean;
   settled: boolean;
 }
 
@@ -218,29 +222,47 @@ export function createOwnerRefCounter(): OwnerRefCounter {
   };
 }
 
-export function acquireCoalescedRequest<T>(
-  inFlightRequests: Map<string, CoalescedRequestEntry<T>>,
+export function acquireCoalescedRequest<T, P = never>(
+  inFlightRequests: Map<string, CoalescedRequestEntry<T, P>>,
   key: string,
   subscriberId: string,
-  start: (signal: AbortSignal) => Promise<T>,
+  start: (signal: AbortSignal, publish: (progress: P) => void) => Promise<T>,
+  onProgress?: (progress: P) => void,
 ): CoalescedRequestSubscription<T> {
   let entry = inFlightRequests.get(key);
   let created = false;
+  let runStart: (() => void) | undefined;
 
   if (!entry) {
     const controller = new AbortController();
-    const subscribers = new Set<string>();
-    let runStart: () => void = () => undefined;
+    const subscribers = new Set<symbol>();
+    const progressSubscribers = new Map<symbol, (progress: P) => void>();
     const promise = new Promise<T>((resolve, reject) => {
       runStart = () => {
         try {
-          Promise.resolve(start(controller.signal)).then(resolve, reject);
+          Promise.resolve(
+            start(controller.signal, (progress) => {
+              if (!entry) return;
+              entry.latestProgress = progress;
+              entry.hasProgress = true;
+              // Snapshot the callbacks so one subscriber may release itself
+              // without skipping another subscriber. A UI callback must never
+              // turn a successful provider request into a failed shared request.
+              for (const callback of [...entry.progressSubscribers.values()]) {
+                try {
+                  callback(progress);
+                } catch {
+                  // Subscriber failures are isolated from the shared request.
+                }
+              }
+            }),
+          ).then(resolve, reject);
         } catch (error) {
           reject(error);
         }
       };
     });
-    let entryForFinally: CoalescedRequestEntry<T> | undefined;
+    let entryForFinally: CoalescedRequestEntry<T, P> | undefined;
     const settledPromise = promise.finally(() => {
       if (!entryForFinally) return;
       entryForFinally.settled = true;
@@ -248,9 +270,11 @@ export function acquireCoalescedRequest<T>(
         inFlightRequests.delete(key);
       }
     });
-    const nextEntry: CoalescedRequestEntry<T> = {
+    const nextEntry: CoalescedRequestEntry<T, P> = {
       controller,
       subscribers,
+      progressSubscribers,
+      hasProgress: false,
       settled: false,
       promise: settledPromise,
     };
@@ -259,14 +283,28 @@ export function acquireCoalescedRequest<T>(
     entry = nextEntry;
     inFlightRequests.set(key, entry);
     created = true;
-    // Start only after the entry is visible in the map, so synchronous start
-    // failures still settle through the shared promise and clean up the map.
-    runStart();
   }
 
-  entry.subscribers.add(subscriberId);
-  let released = false;
+  // A symbol makes subscriptions collision-proof even if two editor instances
+  // happen to produce the same human-readable activation/sequence label.
+  const subscriberToken = Symbol(subscriberId);
+  entry.subscribers.add(subscriberToken);
+  if (onProgress) {
+    entry.progressSubscribers.set(subscriberToken, onProgress);
+    if (entry.hasProgress) {
+      try {
+        onProgress(entry.latestProgress as P);
+      } catch {
+        // Replay has the same isolation contract as live progress.
+      }
+    }
+  }
 
+  // Start only after the first subscriber is registered, so synchronous
+  // progress cannot race past it. The entry is already visible for coalescing.
+  runStart?.();
+
+  let released = false;
   return {
     promise: entry.promise,
     created,
@@ -277,10 +315,11 @@ export function acquireCoalescedRequest<T>(
       if (released) return;
       released = true;
 
+      entry?.subscribers.delete(subscriberToken);
+      entry?.progressSubscribers.delete(subscriberToken);
+
       const current = inFlightRequests.get(key);
       if (current !== entry) return;
-
-      current.subscribers.delete(subscriberId);
       if (current.subscribers.size === 0 && !current.settled) {
         current.controller.abort();
         inFlightRequests.delete(key);
@@ -289,7 +328,7 @@ export function acquireCoalescedRequest<T>(
   };
 }
 
-export function cancelAllCoalescedRequests<T>(inFlightRequests: Map<string, CoalescedRequestEntry<T>>): void {
+export function cancelAllCoalescedRequests<T, P>(inFlightRequests: Map<string, CoalescedRequestEntry<T, P>>): void {
   for (const entry of inFlightRequests.values()) {
     if (!entry.settled) {
       entry.controller.abort();
@@ -464,6 +503,7 @@ export function formatUsageStats(stats: PromptAutocompleteUsageStats): string {
 export interface PromptAutocompleteRuntimeOverrides {
   enabled?: boolean;
   allowWhileStreaming?: boolean;
+  streamResponses?: boolean;
   debug?: boolean;
 }
 
@@ -493,6 +533,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function trimAndCollapse(text: string): string {
   return text.trim().replace(/\s+/g, " ");
+}
+
+function stripUnsafeTerminalControls(text: string): string {
+  // Keep tab/newline because multiline suggestions intentionally support both.
+  // Everything else in C0/C1 can alter terminal state (ESC/CSI/OSC), move the
+  // cursor, or hide text and must never reach the renderer.
+  return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
+}
+
+function truncateAtFirstUnpairedSurrogate(text: string): string {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        index += 1;
+        continue;
+      }
+      return text.slice(0, index);
+    }
+    if (code >= 0xDC00 && code <= 0xDFFF) {
+      return text.slice(0, index);
+    }
+  }
+  return text;
 }
 
 function truncateWithEllipsis(text: string, maxChars: number): string {
@@ -917,6 +982,206 @@ function salvageTruncatedJsonSuggestions(text: string): string[] {
   return [];
 }
 
+interface StreamingJsonString {
+  value: string;
+  complete: boolean;
+}
+
+/** Decode only the complete part of an unterminated JSON string literal. */
+function readStreamingJsonString(text: string, startIndex: number): StreamingJsonString | undefined {
+  if (text[startIndex] !== '"') return undefined;
+
+  const complete = readJsonStringLiteral(text, startIndex);
+  if (complete) return { value: complete.value, complete: true };
+
+  let safeEnd = startIndex + 1;
+  let i = safeEnd;
+  while (i < text.length) {
+    const char = text[i];
+    if (char === '"') break;
+    if (char === "\\") {
+      const escaped = text[i + 1];
+      if (escaped === undefined) break;
+      if (escaped === "u") {
+        const digits = text.slice(i + 2, i + 6);
+        if (!/^[0-9a-fA-F]{4}$/.test(digits)) break;
+        i += 6;
+        safeEnd = i;
+        continue;
+      }
+      if (!/["\\/bfnrt]/.test(escaped)) break;
+      i += 2;
+      safeEnd = i;
+      continue;
+    }
+    // Raw control characters are invalid inside JSON strings. Do not turn a
+    // malformed response into editor text just because the stream is partial.
+    if (char.charCodeAt(0) < 0x20) break;
+    i += 1;
+    safeEnd = i;
+  }
+
+  try {
+    const parsed = JSON.parse(`${text.slice(startIndex, safeEnd)}"`) as unknown;
+    if (typeof parsed !== "string") return undefined;
+    // A provider chunk may split a UTF-16 surrogate pair. Truncate at the first
+    // unmatched half even when more decoded characters follow it.
+    const value = truncateAtFirstUnpairedSurrogate(parsed);
+    return { value, complete: false };
+  } catch {
+    return undefined;
+  }
+}
+
+function readFirstStreamingArrayString(text: string, startIndex: number): StreamingJsonString | undefined {
+  let i = startIndex;
+  while (i < text.length) {
+    i = skipJsonWhitespace(text, i);
+    if (text[i] === ",") {
+      i += 1;
+      continue;
+    }
+    if (text[i] === "]") return undefined;
+    if (text[i] === '"') return readStreamingJsonString(text, i);
+
+    const skipped = skipJsonValue(text, i);
+    if (!skipped.complete || skipped.end <= i) return undefined;
+    i = skipped.end;
+  }
+  return undefined;
+}
+
+function findFirstStreamingSuggestion(text: string): StreamingJsonString | undefined {
+  const stripped = stripCodeFences(text).trim();
+  if (stripped.startsWith("[")) {
+    return readFirstStreamingArrayString(stripped, 1);
+  }
+
+  let i = 0;
+  while (i < stripped.length) {
+    if (stripped[i] !== "{") {
+      i += 1;
+      continue;
+    }
+
+    const starts = findTopLevelSuggestionArrayStartsInObject(stripped, i);
+    for (const key of SUGGESTION_ARRAY_KEYS) {
+      const start = starts[key];
+      if (typeof start !== "number") continue;
+      return readFirstStreamingArrayString(stripped, start);
+    }
+
+    const skipped = skipJsonValue(stripped, i);
+    i = skipped.complete && skipped.end > i ? skipped.end : i + 1;
+  }
+
+  return undefined;
+}
+
+const STREAMING_GRAPHEME_SEGMENTER = (() => {
+  if (typeof Intl.Segmenter !== "function") return undefined;
+  try {
+    return new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  } catch {
+    return undefined;
+  }
+})();
+
+function dropLastGrapheme(text: string): string {
+  if (!STREAMING_GRAPHEME_SEGMENTER) {
+    // Safety over partial UX on minimal-ICU builds: without a grapheme
+    // segmenter we cannot prove that a ZWJ/combining sequence is complete.
+    return "";
+  }
+  const segments = [...STREAMING_GRAPHEME_SEGMENTER.segment(text)];
+  const last = segments.at(-1);
+  return last ? text.slice(0, last.index) : "";
+}
+
+function truncateSuggestionAtGraphemeBoundary(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 0) return "";
+  if (maxChars === 1) return "…";
+
+  if (!STREAMING_GRAPHEME_SEGMENTER) {
+    // Do not guess a UTF-16/code-point boundary on minimal-ICU builds. A single
+    // ellipsis is bounded and cannot split an unknown grapheme cluster.
+    return "…";
+  }
+
+  const available = maxChars - 1;
+  let end = 0;
+  for (const segment of STREAMING_GRAPHEME_SEGMENTER.segment(text)) {
+    const nextEnd = segment.index + segment.segment.length;
+    if (nextEnd > available) break;
+    end = nextEnd;
+  }
+  return `${text.slice(0, end)}…`;
+}
+
+function completedStreamingPrefix(text: string): string {
+  const safe = dropLastGrapheme(text);
+  if (!safe) return "";
+
+  // Any whitespace-delimited language advances only after a full chunk. This
+  // covers accented Latin text as well as ASCII and avoids treating one accent
+  // as evidence that the unfinished word is a no-space script.
+  let boundaryEnd = 0;
+  for (const match of safe.matchAll(/\S\s+/gu)) {
+    boundaryEnd = (match.index ?? 0) + match[0].length;
+  }
+  if (boundaryEnd > 0) return safe.slice(0, boundaryEnd);
+  if (/\s/u.test(safe)) return "";
+
+  // Scripts that conventionally omit spaces can still advance one complete
+  // grapheme behind. Require the whole prefix to be made from those scripts or
+  // symbols, so an emoji followed by a partial Latin word does not leak it.
+  return /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Extended_Pictographic}\p{Regional_Indicator}\p{M}\p{P}\p{S}\u200D]+$/u.test(safe)
+    ? safe
+    : "";
+}
+
+function unresolvedNormalizationPrefix(draft: string, suggestion: string): boolean {
+  const trimmedStart = suggestion.replace(/^[ \t]+/, "");
+  const comparable = trimmedStart.trimEnd();
+  if (!comparable) return true;
+
+  // The final normalizer removes repeated draft/current-word prefixes. Wait
+  // until the model has emitted enough text for that transformation to settle.
+  if (draft.toLocaleLowerCase().startsWith(comparable.toLocaleLowerCase())) return true;
+  const currentWord = getTrailingWordFragment(draft);
+  if (currentWord.toLocaleLowerCase().startsWith(comparable.toLocaleLowerCase())) return true;
+
+  // Wrapping quotes, fences, and labels are removed only once their closing
+  // syntax arrives. Publishing them early would force the ghost text to shrink.
+  if (/^["'`]/.test(trimmedStart)) return true;
+  if (/^(?:continuation|completion|suggestion)\s*:?[ \t]*$/i.test(trimmedStart)) return true;
+  return false;
+}
+
+/**
+ * Parse the first model suggestion from an in-progress JSON response.
+ *
+ * Only structured suggestion arrays are eligible, so partial JSON/prose can
+ * never leak into the editor. Incomplete strings are held one grapheme behind;
+ * ASCII text additionally waits for a completed whitespace-delimited chunk.
+ */
+export function parsePartialPromptSuggestion(
+  draft: string,
+  rawResponse: string,
+  maxChars = DEFAULT_MAX_SUGGESTION_CHARS,
+): string | undefined {
+  const parsed = findFirstStreamingSuggestion(rawResponse);
+  if (!parsed) return undefined;
+
+  const candidate = parsed.complete ? parsed.value : completedStreamingPrefix(parsed.value);
+  if (!candidate || (!parsed.complete && unresolvedNormalizationPrefix(draft, candidate))) {
+    return undefined;
+  }
+
+  return normalizePromptSuggestion(draft, candidate, maxChars);
+}
+
 function toStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string");
@@ -1145,7 +1410,7 @@ export function normalizePromptSuggestion(
   rawSuggestion: string,
   maxChars = DEFAULT_MAX_SUGGESTION_CHARS,
 ): string | undefined {
-  let suggestion = rawSuggestion.replace(/\r/g, "");
+  let suggestion = stripUnsafeTerminalControls(truncateAtFirstUnpairedSurrogate(rawSuggestion)).replace(/\r/g, "");
   if (!suggestion.trim()) return undefined;
   if (/^<NO_COMPLETION>$/i.test(suggestion.trim())) return undefined;
 
@@ -1162,7 +1427,7 @@ export function normalizePromptSuggestion(
 
   suggestion = normalizeLeadingBoundarySpacing(draft, suggestion);
   suggestion = maybePrefixSpace(draft, suggestion);
-  suggestion = truncateWithEllipsis(suggestion, maxChars);
+  suggestion = truncateSuggestionAtGraphemeBoundary(suggestion, maxChars);
 
   if (!suggestion.trim()) return undefined;
   return suggestion;

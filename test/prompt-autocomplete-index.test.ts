@@ -18,7 +18,7 @@ function createHarness(options: HarnessOptions = {}) {
   const flags = new Map<string, boolean | string>();
   if (options.enabled !== undefined) flags.set("prompt-autocomplete", options.enabled);
 
-  const registeredFlags = new Map<string, { default?: boolean | string }>();
+  const registeredFlags = new Map<string, { type: "boolean" | "string"; default?: boolean | string }>();
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, CommandHandler>();
   const notifications: Array<{ message: string; type?: string }> = [];
@@ -56,7 +56,7 @@ function createHarness(options: HarnessOptions = {}) {
   } as unknown as ExtensionContext;
 
   const pi = {
-    registerFlag(name: string, definition: { default?: boolean | string }) {
+    registerFlag(name: string, definition: { type: "boolean" | "string"; default?: boolean | string }) {
       registeredFlags.set(name, definition);
       if (!flags.has(name) && definition.default !== undefined) {
         flags.set(name, definition.default);
@@ -104,11 +104,13 @@ async function command(
 const dummyEditorFactory = (() => ({ })) as unknown as EditorFactory;
 const replacementEditorFactory = (() => ({ })) as unknown as EditorFactory;
 
-test("prompt autocomplete is disabled by default and requires one automatic draft character", () => {
+test("prompt autocomplete is disabled by default while response streaming defaults on", () => {
   const harness = createHarness();
 
   assert.equal(harness.registeredFlags.get("prompt-autocomplete")?.default, false);
   assert.equal(harness.registeredFlags.get("prompt-autocomplete-min-chars")?.default, "1");
+  assert.equal(harness.registeredFlags.get("prompt-autocomplete-stream")?.type, "string");
+  assert.equal(harness.registeredFlags.get("prompt-autocomplete-stream")?.default, "on");
 });
 
 test("session start mounts the editor only in TUI mode", async () => {
@@ -273,15 +275,18 @@ test("slash-command deactivation survives a new session", async () => {
   assert.match(lastStatus(harness), /enabled=no\(session\)/);
 });
 
-test("while-streaming and debug overrides survive a new session", async () => {
+test("stream, while-streaming, and debug overrides survive a new session", async () => {
   const harness = createHarness({ enabled: true });
   await emit(harness, "session_start");
 
+  await command(harness, "stream off");
   await command(harness, "while-streaming on");
   await command(harness, "debug-on");
   await emit(harness, "session_start");
   await command(harness, "status");
 
+  assert.match(lastStatus(harness), /stream=no\(session\)/);
+  assert.match(lastStatus(harness), /request-path=complete/);
   assert.match(lastStatus(harness), /while-streaming=yes\(session\)/);
   assert.match(lastStatus(harness), /debug=yes\(session\)/);
 });
@@ -291,6 +296,8 @@ test("flags still drive settings that were never overridden", async () => {
   await emit(harness, "session_start");
   await command(harness, "status");
   assert.match(lastStatus(harness), /while-streaming=no\(flag\)/);
+  assert.match(lastStatus(harness), /stream=yes\(flag\)/);
+  assert.match(lastStatus(harness), /request-path=stream/);
   assert.match(lastStatus(harness), /debug=no\(flag\)/);
 
   // A flag change between sessions must win while no session override exists.
@@ -301,16 +308,36 @@ test("flags still drive settings that were never overridden", async () => {
   assert.match(lastStatus(harness), /while-streaming=yes\(flag\)/);
 });
 
-test("an explicit override keeps winning over a later flag change", async () => {
+test("explicit overrides keep winning over later flag changes", async () => {
   const harness = createHarness({ enabled: true });
   await emit(harness, "session_start");
   await command(harness, "while-streaming off");
+  await command(harness, "stream off");
 
   harness.flags.set("prompt-autocomplete-while-streaming", true);
+  harness.flags.set("prompt-autocomplete-stream", "on");
   await emit(harness, "session_start");
   await command(harness, "status");
 
   assert.match(lastStatus(harness), /while-streaming=no\(session\)/);
+  assert.match(lastStatus(harness), /stream=no\(session\)/);
+});
+
+test("stream command toggles immediately and rejects invalid values", async () => {
+  const harness = createHarness({ enabled: true });
+  await emit(harness, "session_start");
+
+  await command(harness, "stream off");
+  assert.match(harness.notifications.at(-1)?.message ?? "", /streaming disabled \(completion path\)/);
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /stream=no\(session\).*request-path=complete/);
+
+  await command(harness, "stream toggle");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /stream=yes\(session\).*request-path=stream/);
+
+  await command(harness, "stream maybe");
+  assert.match(harness.notifications.at(-1)?.message ?? "", /Usage: \/prompt-autocomplete stream/);
 });
 
 test("session shutdown does not record a disable override", async () => {

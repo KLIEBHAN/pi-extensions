@@ -156,6 +156,7 @@ test("packed collection installs cleanly and is discovered by the supported Pi v
     );
     assert.equal(help.status, 0, help.stderr);
     assert.match(help.stdout, /--prompt-autocomplete\b/);
+    assert.match(help.stdout, /--prompt-autocomplete-stream\s+<value>/);
     assert.doesNotMatch(`${help.stdout}\n${help.stderr}`, /Failed to load extension|ERR_MODULE_NOT_FOUND/);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
@@ -296,6 +297,7 @@ test("standalone Prompt Autocomplete package is release-ready and discovers only
     );
     assert.equal(help.status, 0, help.stderr);
     assert.match(help.stdout, /--prompt-autocomplete\b/);
+    assert.match(help.stdout, /--prompt-autocomplete-stream\s+<value>/);
     assert.doesNotMatch(`${help.stdout}\n${help.stderr}`, /Failed to load extension|ERR_MODULE_NOT_FOUND/);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { stripVTControlCharacters } from "node:util";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -23,6 +24,7 @@ type Handler = (event: any, ctx: ExtensionContext) => Promise<unknown> | unknown
 type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown> | unknown;
 type EditorFactory = Exclude<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0], undefined>;
 type CompleteSimple = NonNullable<PromptAutocompleteDependencies["completeSimple"]>;
+type StreamSimple = NonNullable<PromptAutocompleteDependencies["streamSimple"]>;
 type CompletionResult = Awaited<ReturnType<CompleteSimple>>;
 
 const passthrough = (text: string): string => text;
@@ -60,6 +62,54 @@ function deferred<T>() {
   return { promise, reject, resolve };
 }
 
+function makeRawCompletion(
+  text: string,
+  options: { stopReason?: "stop" | "length" | "error" | "aborted"; usage?: unknown; errorMessage?: string } = {},
+): CompletionResult {
+  return {
+    role: "assistant",
+    content: text ? [{ type: "text", text }] : [],
+    stopReason: options.stopReason ?? "stop",
+    ...(options.usage === undefined ? {} : { usage: options.usage }),
+    ...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
+  } as CompletionResult;
+}
+
+function controlledStream() {
+  const stream = createAssistantMessageEventStream();
+  return {
+    stream,
+    delta(rawText: string, delta = "") {
+      stream.push({
+        type: "text_delta",
+        contentIndex: 0,
+        delta,
+        partial: makeRawCompletion(rawText),
+      });
+    },
+    textEnd(rawText: string) {
+      stream.push({
+        type: "text_end",
+        contentIndex: 0,
+        content: rawText,
+        partial: makeRawCompletion(rawText),
+      });
+    },
+    done(completions: string[], usage?: unknown) {
+      stream.push({ type: "done", reason: "stop", message: makeCompletion(completions, usage) });
+      stream.end();
+    },
+    error(message: string, usage?: unknown, reason: "error" | "aborted" = "error") {
+      stream.push({
+        type: "error",
+        reason,
+        error: makeRawCompletion("", { stopReason: reason, usage, errorMessage: message }),
+      });
+      stream.end();
+    },
+  };
+}
+
 async function flushAsyncWork(): Promise<void> {
   for (let index = 0; index < 4; index += 1) {
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -69,6 +119,8 @@ async function flushAsyncWork(): Promise<void> {
 interface EditorHarnessOptions {
   authConfigured?: boolean;
   completeSimple: CompleteSimple;
+  streamSimple?: StreamSimple;
+  streamSetting?: "on" | "off";
   debounceMs?: number;
   maxAlternatives?: number;
   now?: () => number;
@@ -81,6 +133,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
     ["prompt-autocomplete-debounce-ms", String(options.debounceMs ?? 0)],
     ["prompt-autocomplete-max-alternatives", String(options.maxAlternatives ?? 3)],
   ]);
+  if (options.streamSetting) flags.set("prompt-autocomplete-stream", options.streamSetting);
   if (options.preferredModel) flags.set("prompt-autocomplete-model", options.preferredModel);
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, CommandHandler>();
@@ -89,6 +142,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
   let editorFactory: EditorFactory | undefined;
   let renderRequests = 0;
   let branch: unknown[] = [];
+  let leafId = "leaf-1";
   let model = { provider: "test-provider", id: "model-a" };
 
   const ui = {
@@ -106,7 +160,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
   };
   const sessionManager = {
     getBranch: () => branch,
-    getLeafId: () => "leaf-1",
+    getLeafId: () => leafId,
   };
   const ctx = {
     mode: "tui",
@@ -135,6 +189,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
 
   createPromptAutocompleteExtension({
     completeSimple: options.completeSimple,
+    streamSimple: options.streamSimple,
     now: options.now,
   })(pi);
 
@@ -170,6 +225,9 @@ function createEditorHarness(options: EditorHarnessOptions) {
     },
     setBranch: (nextBranch: unknown[]) => {
       branch = nextBranch;
+    },
+    setLeafId: (nextLeafId: string) => {
+      leafId = nextLeafId;
     },
     setModel: (nextModel: { provider: string; id: string }) => {
       model = nextModel;
@@ -212,6 +270,342 @@ test("editor renders and accepts full and word-level suggestions", async () => {
   editor.handleInput("\t");
   assert.equal(editor.getText(), "Review the implementation carefully");
   assert.ok(harness.getRenderRequests() > 0);
+});
+
+test("streaming renders monotonic first-suggestion progress before terminal alternatives", async () => {
+  const provider = controlledStream();
+  let streamCalls = 0;
+  let capturedOptions: any;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    streamSimple: ((_model, _context, options) => {
+      streamCalls += 1;
+      capturedOptions = options;
+      return provider.stream;
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.equal(streamCalls, 1);
+  assert.ok(capturedOptions.signal instanceof AbortSignal);
+  assert.equal(capturedOptions.timeoutMs, 8_000);
+  assert.equal(capturedOptions.maxRetries, 0);
+
+  provider.delta('{"completions":[" the imple', " the imple");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /the/);
+  assert.doesNotMatch(renderedText(editor), /imple/);
+  assert.doesNotMatch(renderedText(editor), /completions|\{\"/);
+  assert.equal(
+    harness.widgets.filter((entry) => entry.key === "prompt-autocomplete-spinner").at(-1)?.content,
+    undefined,
+    "the spinner should leave once useful ghost text is visible",
+  );
+
+  provider.delta('{"completions":[" the implementation care', "mentation care");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /the implementation/);
+  assert.doesNotMatch(renderedText(editor), /care/);
+  assert.doesNotMatch(renderedText(editor), /‹/);
+
+  // text_end carries cumulative content as well as content. It must not be
+  // appended to the prior deltas, which would duplicate the JSON.
+  const completeJson = JSON.stringify({ completions: [" the implementation carefully", " with tests"] });
+  provider.textEnd(completeJson);
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /the implementation carefully/);
+  assert.doesNotMatch(renderedText(editor), /‹/, "alternatives stay terminal-only");
+
+  provider.done([" the implementation carefully", " with tests"], makeUsage(80, 20, 0.0003));
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /‹1\/2›/);
+
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 0 cached, 100 tok, ~\$0\.00030 est/);
+});
+
+test("accepting streamed partial text aborts without issuing an automatic second request", async () => {
+  for (const acceptance of ["full", "word"] as const) {
+    const provider = controlledStream();
+    let calls = 0;
+    let signal: AbortSignal | undefined;
+    const harness = createEditorHarness({
+      completeSimple: (async () => {
+        throw new Error("completion path must not run");
+      }) as CompleteSimple,
+      streamSimple: ((_model, _context, options) => {
+        calls += 1;
+        signal = options?.signal;
+        return provider.stream;
+      }) as StreamSimple,
+    });
+    const editor = await harness.createEditor();
+    editor.setText("Draft");
+    await flushAsyncWork();
+
+    provider.delta('{"completions":[" accepted next word', " accepted next word");
+    await flushAsyncWork();
+    assert.match(renderedText(editor), /accepted next/);
+
+    editor.handleInput(acceptance === "full" ? "\t" : CTRL_SPACE);
+    assert.equal(editor.getText(), acceptance === "full" ? "Draft accepted next" : "Draft accepted ");
+    assert.equal(signal?.aborted, true);
+    assert.equal(calls, 1, "accepting a partial must not immediately buy another request");
+
+    // The single consumer still receives the terminal aborted message so usage
+    // already spent before cancellation remains visible in accounting.
+    provider.error("Request was aborted", makeUsage(40, 5, 0.0001), "aborted");
+    await flushAsyncWork();
+    assert.doesNotMatch(renderedText(editor), /accepted next word/);
+    assert.equal(calls, 1);
+
+    await harness.command("status");
+    assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 0 cached, 1 failed, 45 tok, ~\$0\.00010 est/);
+  }
+});
+
+test("a request settles after the drain grace when a provider never terminates", async () => {
+  const provider = controlledStream();
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    // This fake deliberately ignores both AbortSignal and timeoutMs and never
+    // emits a terminal event.
+    streamSimple: (() => provider.stream) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  await flushAsyncWork();
+  provider.delta('{"completions":[" accepted partial text', " accepted partial text");
+  await flushAsyncWork();
+
+  editor.handleInput("\t");
+  assert.equal(editor.getText(), "Draft accepted partial");
+  await new Promise<void>((resolve) => setTimeout(resolve, 300));
+  await flushAsyncWork();
+
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /1 failed/);
+  assert.match(harness.notifications.at(-1) ?? "", /0 tok\+/, "late usage is explicitly incomplete");
+});
+
+test("stream errors clear partial text and enter the existing cooldown", async () => {
+  const provider = controlledStream();
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    streamSimple: (() => {
+      calls += 1;
+      return provider.stream;
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+  provider.delta('{"completions":[" with tests and', " with tests and");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /with tests/);
+
+  provider.error("stream failed", makeUsage(25, 4, 0.00008));
+  await flushAsyncWork();
+  assert.doesNotMatch(renderedText(editor), /with tests/);
+
+  editor.setText("Review again");
+  await flushAsyncWork();
+  assert.equal(calls, 1, "automatic retry must respect the error cooldown");
+});
+
+test("newer drafts and conversation branches reject stale streamed progress", async () => {
+  const first = controlledStream();
+  const second = controlledStream();
+  const third = controlledStream();
+  const streams = [first, second, third];
+  const signals: AbortSignal[] = [];
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    streamSimple: ((_model, _context, options) => {
+      signals.push(options?.signal as AbortSignal);
+      return streams[calls++]!.stream;
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+
+  editor.setText("First");
+  await flushAsyncWork();
+  editor.setText("Second");
+  await flushAsyncWork();
+  assert.equal(signals[0]?.aborted, true);
+  first.delta('{"completions":[" stale draft text', " stale draft text");
+  await flushAsyncWork();
+  assert.doesNotMatch(renderedText(editor), /stale draft/);
+
+  second.delta('{"completions":[" current draft text', " current draft text");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /current draft/);
+
+  harness.setLeafId("leaf-2");
+  harness.setBranch([{ type: "message", message: { role: "assistant", content: "Different branch" } }]);
+  await harness.emit("session_tree", { oldLeafId: "leaf-1", newLeafId: "leaf-2" });
+  await flushAsyncWork();
+  assert.equal(signals[1]?.aborted, true);
+  second.delta('{"completions":[" stale branch text', " stale branch text");
+  await flushAsyncWork();
+  assert.doesNotMatch(renderedText(editor), /current draft|stale branch/);
+
+  third.delta('{"completions":[" fresh branch text', " fresh branch text");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /fresh branch/);
+
+  first.error("aborted", undefined, "aborted");
+  second.error("aborted", undefined, "aborted");
+  third.done([" fresh branch text"]);
+  await flushAsyncWork();
+});
+
+test("turning response streaming off cancels active work and applies on the next edit", async () => {
+  const provider = controlledStream();
+  let streamSignal: AbortSignal | undefined;
+  let streamCalls = 0;
+  let completeCalls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      completeCalls += 1;
+      return makeCompletion([" completed path"]);
+    }) as CompleteSimple,
+    streamSimple: ((_model, _context, options) => {
+      streamCalls += 1;
+      streamSignal = options?.signal;
+      return provider.stream;
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Use");
+  await flushAsyncWork();
+  provider.delta('{"completions":[" streamed partial text', " streamed partial text");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /streamed partial/);
+
+  await harness.command("stream off");
+  await flushAsyncWork();
+  assert.equal(streamSignal?.aborted, true);
+  assert.equal(streamCalls, 1);
+  assert.equal(completeCalls, 0, "a presentation toggle must not buy a replacement request");
+  assert.doesNotMatch(renderedText(editor), /streamed partial|completed path/);
+
+  provider.error("aborted", undefined, "aborted");
+  await flushAsyncWork();
+  assert.doesNotMatch(renderedText(editor), /streamed partial|completed path/);
+
+  editor.setText("Use again");
+  await flushAsyncWork();
+  assert.equal(completeCalls, 1, "the next user edit uses the newly selected completion path");
+  assert.match(renderedText(editor), /completed path/);
+
+  await harness.command("stream off");
+  await flushAsyncWork();
+  assert.equal(completeCalls, 1, "a redundant stream command must be request-idempotent");
+  assert.match(renderedText(editor), /completed path/, "a redundant command should preserve a terminal suggestion");
+});
+
+test("a stream ending without a terminal event fails closed and clears partial text", async () => {
+  const provider = controlledStream();
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    streamSimple: (() => provider.stream) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+  provider.delta('{"completions":[" partial result text', " partial result text");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /partial result/);
+
+  provider.stream.end();
+  await flushAsyncWork();
+  assert.doesNotMatch(renderedText(editor), /partial result/);
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /1 failed/);
+  assert.match(harness.notifications.at(-1) ?? "", /ended without a terminal event/);
+});
+
+test("stream-off and complete-only DI use the compatibility completion path", async () => {
+  for (const scenario of ["flag-off", "complete-only"] as const) {
+    let completes = 0;
+    let streams = 0;
+    const harness = createEditorHarness({
+      streamSetting: scenario === "flag-off" ? "off" : undefined,
+      completeSimple: (async () => {
+        completes += 1;
+        return makeCompletion([" completed"]);
+      }) as CompleteSimple,
+      ...(scenario === "flag-off"
+        ? {
+            streamSimple: (() => {
+              streams += 1;
+              return controlledStream().stream;
+            }) as StreamSimple,
+          }
+        : {}),
+    });
+    const editor = await harness.createEditor();
+    editor.setText("Use");
+    await flushAsyncWork();
+
+    assert.equal(completes, 1);
+    assert.equal(streams, 0);
+    assert.match(renderedText(editor), /completed/);
+    await harness.command("status");
+    assert.match(
+      harness.notifications.at(-1) ?? "",
+      scenario === "flag-off" ? /stream=no\(flag\).*request-path=complete/ : /stream=yes\(flag\).*request-path=complete-compat/,
+    );
+  }
+});
+
+test("runtime stream toggles stay on complete-only DI without invoking a stream", async () => {
+  let completes = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      completes += 1;
+      return makeCompletion([` completed-${completes}`]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Compat");
+  await flushAsyncWork();
+  assert.equal(completes, 1);
+
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /stream=yes\(flag\).*request-path=complete-compat/);
+
+  await harness.command("stream off");
+  await flushAsyncWork();
+  assert.equal(completes, 1, "the toggle itself must not issue a completion");
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /stream=no\(session\).*request-path=complete/);
+
+  await harness.command("stream on");
+  await flushAsyncWork();
+  assert.equal(completes, 1);
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /stream=yes\(session\).*request-path=complete-compat/);
+
+  editor.setText("Compat next");
+  await flushAsyncWork();
+  assert.equal(completes, 2);
+  assert.match(renderedText(editor), /completed-2/);
 });
 
 test("provider request contains bounded conversation context and inline UX limits", async () => {

@@ -6,8 +6,15 @@ All notable changes to this package are documented here. This project follows [S
 
 ### Added
 
+- Streamed ghost text for the first suggestion, enabled by default without additional provider requests. Partial Latin text advances only at stable word boundaries, no-space scripts remain grapheme-safe, and ranked alternatives appear after the terminal response.
+- `--prompt-autocomplete-stream on|off` and `/prompt-autocomplete stream on|off|toggle` select between streamed previews and complete-response rendering. The slash-command choice survives later session starts in the same process.
+- Accepting visible partial text cancels its stream and does not automatically issue a second paid request.
 - Session accounting for autocomplete requests: `/prompt-autocomplete status` now reports issued requests, requests served from the cache, failed requests, provider-reported tokens, and an estimated cost derived from pi's local model price table. Tokens and cost are marked independently with a trailing `+` when a request did not report that metric.
 - Status output now names the source of each toggle, so a session override is distinguishable from a CLI flag.
+
+### Security
+
+- Strip terminal C0/C1 control characters and reject unpaired UTF-16 surrogates before suggestions reach the TUI; length limits now truncate only at complete grapheme boundaries.
 
 ### Fixed
 

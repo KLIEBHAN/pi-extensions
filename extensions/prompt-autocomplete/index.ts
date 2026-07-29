@@ -1,4 +1,12 @@
-import { completeSimple, type Api, type Model, type UserMessage } from "@earendil-works/pi-ai/compat";
+import {
+  completeSimple,
+  streamSimple,
+  type Api,
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Model,
+  type UserMessage,
+} from "@earendil-works/pi-ai/compat";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import {
@@ -18,6 +26,7 @@ import {
   DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
   DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
+  DEFAULT_STREAM_RESPONSES,
   ExpiringLruCache,
   extractNextSuggestionChunk,
   formatModelLabel,
@@ -26,6 +35,7 @@ import {
   normalizePromptSuggestions,
   parseBoundedIntFlag,
   parseModelRef,
+  parsePartialPromptSuggestion,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   recordProviderUsage,
   resolveOverride,
@@ -48,6 +58,12 @@ const SPINNER_INTERVAL_MS = 80;
 const SPINNER_LABEL = "Generating suggestion";
 // Inline autocomplete should fail fast instead of inheriting long provider retry/timeout defaults.
 const REQUEST_TIMEOUT_MS = 8_000;
+// A compliant provider emits its terminal aborted message immediately, which
+// lets accounting retain any usage. These bounds settle our caller even when a
+// custom provider ignores both contracts; JavaScript cannot forcibly terminate
+// that provider's already-pending iterator.next().
+const STREAM_ABORT_DRAIN_TIMEOUT_MS = 250;
+const STREAM_HARD_TIMEOUT_GRACE_MS = 500;
 const REQUEST_MAX_RETRIES = 0;
 const REQUEST_MAX_RETRY_DELAY_MS = 2_000;
 // Brief cooldown avoids hammering providers after transient auth/network failures while keeping the UI responsive.
@@ -93,6 +109,7 @@ const EDIT_ACTIONS = [
 
 interface PromptAutocompleteConfig {
   allowWhileStreaming: boolean;
+  streamResponses: boolean;
   debug: boolean;
   debounceMs: number;
   minPromptChars: number;
@@ -124,16 +141,18 @@ interface EditorMountState {
 }
 
 type CompleteSimpleFunction = typeof completeSimple;
+type StreamSimpleFunction = typeof streamSimple;
 
 export interface PromptAutocompleteDependencies {
   completeSimple?: CompleteSimpleFunction;
+  streamSimple?: StreamSimpleFunction;
   now?: () => number;
 }
 
 interface PromptAutocompleteSharedState {
   enabled: boolean;
   activationId: number;
-  streaming: boolean;
+  agentStreaming: boolean;
   config: PromptAutocompleteConfig;
   /** Slash-command decisions that outrank flags for the lifetime of the process. */
   runtimeOverrides: PromptAutocompleteRuntimeOverrides;
@@ -143,6 +162,7 @@ interface PromptAutocompleteSharedState {
   modelRegistry?: ExtensionContext["modelRegistry"];
   sessionManager?: ExtensionContext["sessionManager"];
   completeSimple: CompleteSimpleFunction;
+  streamSimple?: StreamSimpleFunction;
   now: () => number;
   debugState: string;
   editorMount?: EditorMountState;
@@ -150,7 +170,7 @@ interface PromptAutocompleteSharedState {
   lastError?: string;
   lastRawResponse?: string;
   requestCache: ExpiringLruCache<PromptAutocompleteCacheEntry>;
-  inFlightRequests: Map<string, CoalescedRequestEntry<PromptAutocompleteCacheEntry>>;
+  inFlightRequests: Map<string, CoalescedRequestEntry<PromptAutocompleteCacheEntry, string>>;
   ownsEditor?: () => boolean;
   refreshEditor?: (options?: SuggestionRefreshOptions) => void;
   cancelActiveRequest?: () => void;
@@ -161,12 +181,15 @@ interface PromptAutocompleteSharedState {
 
 interface SuggestionRequest {
   activationId: number;
+  leafId: string;
   draft: string;
   draftTail: string;
   model: Model<Api>;
   modelLabel: string;
   cacheKey: string;
   maxAlternatives: number;
+  maxSuggestionChars: number;
+  useStreaming: boolean;
   latestAssistantContext: string;
   latestUserContext: string;
   recentContext: string;
@@ -180,6 +203,77 @@ interface PendingSuggestionRequest {
 
 function arraysEqual(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+function extractAssistantText(message: AssistantMessage): string {
+  return message.content
+    .filter((block): block is { type: "text"; text: string } => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+}
+
+async function consumeAssistantStream(
+  stream: AssistantMessageEventStream,
+  signal: AbortSignal,
+  abortProvider: () => void,
+  onPartial: (message: AssistantMessage) => void,
+): Promise<AssistantMessage> {
+  const iterator = stream[Symbol.asyncIterator]();
+  let hardTimer: ReturnType<typeof setTimeout> | undefined;
+  let abortTimer: ReturnType<typeof setTimeout> | undefined;
+  let rejectAbortDrain: ((error: Error) => void) | undefined;
+  let terminal: AssistantMessage | undefined;
+
+  const hardDeadline = new Promise<never>((_resolve, reject) => {
+    hardTimer = setTimeout(() => {
+      // `timeoutMs` is provider-owned. Abort the actual request signal as a
+      // second line of defence for providers that respect cancellation but
+      // accidentally ignore their timeout option.
+      abortProvider();
+      reject(new Error("Provider stream exceeded the local response deadline"));
+    }, REQUEST_TIMEOUT_MS + STREAM_HARD_TIMEOUT_GRACE_MS);
+  });
+  const abortDeadline = new Promise<never>((_resolve, reject) => {
+    rejectAbortDrain = reject;
+  });
+  const beginAbortDrain = () => {
+    if (abortTimer) return;
+    abortTimer = setTimeout(
+      () => rejectAbortDrain?.(new Error("Provider stream did not terminate after cancellation")),
+      STREAM_ABORT_DRAIN_TIMEOUT_MS,
+    );
+  };
+  signal.addEventListener("abort", beginAbortDrain, { once: true });
+  if (signal.aborted) beginAbortDrain();
+
+  try {
+    while (!terminal) {
+      const next = await Promise.race([iterator.next(), hardDeadline, abortDeadline]);
+      if (next.done) {
+        throw new Error("Provider stream ended without a terminal event");
+      }
+
+      const event = next.value;
+      if (event.type === "done") {
+        terminal = event.message;
+      } else if (event.type === "error") {
+        terminal = event.error;
+      } else if (event.type === "text_delta" || event.type === "text_end") {
+        onPartial(event.partial);
+      }
+    }
+    return terminal;
+  } finally {
+    signal.removeEventListener("abort", beginAbortDrain);
+    if (hardTimer) clearTimeout(hardTimer);
+    if (abortTimer) clearTimeout(abortTimer);
+    if (!terminal) {
+      // Do not await a non-compliant iterator's return path. The provider already
+      // has an aborted signal; this merely gives a cooperative iterator a chance
+      // to release local resources while allowing our request promise to settle.
+      void Promise.resolve(iterator.return?.()).catch(() => undefined);
+    }
+  }
 }
 
 function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
@@ -208,9 +302,19 @@ function resolveSuggestionModel(shared: PromptAutocompleteSharedState): Model<Ap
   return undefined;
 }
 
+function parseOnOffFlag(value: boolean | string | undefined, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["on", "true", "1", "yes"].includes(normalized)) return true;
+  if (["off", "false", "0", "no"].includes(normalized)) return false;
+  return fallback;
+}
+
 function parseConfig(pi: ExtensionAPI): PromptAutocompleteConfig {
   return {
     allowWhileStreaming: pi.getFlag("prompt-autocomplete-while-streaming") === true,
+    streamResponses: parseOnOffFlag(pi.getFlag("prompt-autocomplete-stream"), DEFAULT_STREAM_RESPONSES),
     debug: pi.getFlag("prompt-autocomplete-debug") === true,
     debounceMs: parseBoundedIntFlag(pi.getFlag("prompt-autocomplete-debounce-ms"), DEFAULT_DEBOUNCE_MS, 0, 5_000),
     minPromptChars: parseBoundedIntFlag(pi.getFlag("prompt-autocomplete-min-chars"), DEFAULT_MIN_PROMPT_CHARS, 0, 500),
@@ -248,6 +352,7 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
       shared.runtimeOverrides.allowWhileStreaming,
       flagConfig.allowWhileStreaming,
     ),
+    streamResponses: resolveOverride(shared.runtimeOverrides.streamResponses, flagConfig.streamResponses),
     debug: resolveOverride(shared.runtimeOverrides.debug, flagConfig.debug),
   };
 }
@@ -288,6 +393,8 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     `model=${formatModelLabel(resolvedModel)}`,
     `requested-model=${requestedModel}`,
     `while-streaming=${shared.config.allowWhileStreaming ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.allowWhileStreaming)})`,
+    `stream=${shared.config.streamResponses ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.streamResponses)})`,
+    `request-path=${shared.config.streamResponses && shared.streamSimple ? "stream" : shared.config.streamResponses ? "complete-compat" : "complete"}`,
     `debug=${shared.config.debug ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.debug)})`,
     `debounce=${shared.config.debounceMs}ms`,
     `min-chars=${shared.config.minPromptChars}`,
@@ -330,6 +437,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
   private suggestions: string[] = [];
   private suggestionIndex: number = 0;
+  private suggestionsProvisional = false;
   private debounceTimer?: ReturnType<typeof setTimeout>;
   private requestSeq = 0;
   private readonly pendingRequests = new SequenceOwnedSlot<PendingSuggestionRequest>();
@@ -497,7 +605,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     return this.suggestions[this.suggestionIndex];
   }
 
-  private setSuggestions(nextSuggestions: string[]): void {
+  private setSuggestions(
+    nextSuggestions: string[],
+    options: { provisional?: boolean } = {},
+  ): void {
+    const provisional = options.provisional ?? false;
     const currentActive = this.getActiveSuggestion();
     let nextIndex = 0;
 
@@ -514,12 +626,17 @@ class PromptAutocompleteEditor extends CustomEditor {
       nextIndex = 0;
     }
 
-    if (arraysEqual(this.suggestions, nextSuggestions) && this.suggestionIndex === nextIndex) {
+    if (
+      arraysEqual(this.suggestions, nextSuggestions)
+      && this.suggestionIndex === nextIndex
+      && this.suggestionsProvisional === provisional
+    ) {
       return;
     }
 
     this.suggestions = [...nextSuggestions];
     this.suggestionIndex = nextIndex;
+    this.suggestionsProvisional = nextSuggestions.length > 0 && provisional;
 
     if (nextSuggestions.length > 0) {
       updateDebugState(
@@ -613,10 +730,13 @@ class PromptAutocompleteEditor extends CustomEditor {
     const suggestion = this.getActiveSuggestion();
     if (!suggestion) return;
 
+    const wasProvisional = this.suggestionsProvisional;
     this.dismissedKey = undefined;
-    this.clearInlineSuggestion("accepted", "Accepted full suggestion");
+    this.clearInlineSuggestion("accepted", wasProvisional ? "Accepted streamed partial suggestion" : "Accepted full suggestion");
     super.insertTextAtCursor(suggestion);
-    this.refreshSuggestion();
+    // A provisional accept is explicit cancellation of the request. Starting a
+    // fresh paid request immediately would turn one Tab press into two calls.
+    if (!wasProvisional) this.refreshSuggestion();
   }
 
   private acceptInlineSuggestionByWord(): void {
@@ -626,10 +746,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     const chunk = extractNextSuggestionChunk(suggestion) ?? suggestion;
     if (!chunk) return;
 
+    const wasProvisional = this.suggestionsProvisional;
     this.dismissedKey = undefined;
     this.clearInlineSuggestion("accepted-word", `Accepted chunk: ${chunk}`);
     super.insertTextAtCursor(chunk);
-    this.refreshSuggestion();
+    if (!wasProvisional) this.refreshSuggestion();
   }
 
   private shouldRenderInlineSuggestion(): boolean {
@@ -656,7 +777,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     // (streaming gate, post-error cooldown, min-chars). Model/auth and slash/path
     // checks still apply because those can never produce a useful suggestion.
     if (!options.manual) {
-      if (!this.shared.config.allowWhileStreaming && this.shared.streaming) {
+      if (!this.shared.config.allowWhileStreaming && this.shared.agentStreaming) {
         return "Waiting for the current agent turn to finish";
       }
       if (this.shared.now() < this.suspendedUntil) return "In temporary cooldown after the last error";
@@ -788,6 +909,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     return {
       activationId: this.activationId,
+      leafId,
       draft,
       draftTail,
       model,
@@ -803,6 +925,8 @@ class PromptAutocompleteEditor extends CustomEditor {
         recentContext,
       }),
       maxAlternatives: this.shared.config.maxAlternatives,
+      maxSuggestionChars: this.shared.config.maxSuggestionChars,
+      useStreaming: this.shared.config.streamResponses && !!this.shared.streamSimple,
       latestAssistantContext,
       latestUserContext,
       recentContext,
@@ -821,7 +945,8 @@ class PromptAutocompleteEditor extends CustomEditor {
       this.shared.inFlightRequests,
       request.cacheKey,
       subscriberId,
-      (signal) => this.fetchSuggestionUncached(request, signal),
+      (signal, publish) => this.fetchSuggestionUncached(request, signal, publish),
+      (suggestion) => this.showStreamedSuggestion(request, seq, spinnerOwner, suggestion),
     );
 
     this.activeRequestSubscription = subscription;
@@ -866,9 +991,28 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
   }
 
+  private showStreamedSuggestion(
+    request: SuggestionRequest,
+    seq: number,
+    spinnerOwner: string,
+    suggestion: string,
+  ): void {
+    if (!this.isRequestStillCurrent(request, seq)) return;
+    if (request.cacheKey === this.dismissedKey) return;
+
+    const current = this.getActiveSuggestion();
+    // Progress is strictly monotonic. If a provider revises earlier text, keep
+    // the last honest preview and let the terminal response replace it.
+    if (current && (!suggestion.startsWith(current) || suggestion.length <= current.length)) return;
+
+    this.setSuggestions([suggestion], { provisional: true });
+    this.deactivateSpinner(spinnerOwner);
+  }
+
   private async fetchSuggestionUncached(
     request: SuggestionRequest,
     signal: AbortSignal,
+    publish: (suggestion: string) => void,
   ): Promise<PromptAutocompleteCacheEntry> {
     if (!this.shared.modelRegistry) {
       throw new Error("No model registry available");
@@ -930,24 +1074,47 @@ class PromptAutocompleteEditor extends CustomEditor {
     const stats = this.shared.usageStats;
     stats.providerRequests += 1;
 
-    let response: Awaited<ReturnType<CompleteSimpleFunction>>;
+    const context = {
+      systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+      messages: [userMessage],
+    };
+    const requestOptions = {
+      apiKey: auth.apiKey,
+      headers: auth.headers,
+      signal,
+      maxTokens: computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars),
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      maxRetries: REQUEST_MAX_RETRIES,
+      maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
+    };
+
+    let response: AssistantMessage;
     try {
-      response = await this.shared.completeSimple(
-        request.model,
-        {
-          systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
-          messages: [userMessage],
-        },
-        {
-          apiKey: auth.apiKey,
-          headers: auth.headers,
-          signal,
-          maxTokens: computeRequestMaxTokens(request.maxAlternatives, this.shared.config.maxSuggestionChars),
-          timeoutMs: REQUEST_TIMEOUT_MS,
-          maxRetries: REQUEST_MAX_RETRIES,
-          maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
-        },
-      );
+      if (request.useStreaming && this.shared.streamSimple) {
+        const hardDeadlineController = new AbortController();
+        const streamSignal = AbortSignal.any([signal, hardDeadlineController.signal]);
+        const stream = this.shared.streamSimple(request.model, context, {
+          ...requestOptions,
+          signal: streamSignal,
+        });
+        let lastPublished = "";
+
+        // Exactly one consumer receives the terminal message. Partial text is
+        // fanned out through coalescing; after UI cancellation the callback is
+        // gone, but the bounded drain can still retain terminal usage.
+        response = await consumeAssistantStream(stream, streamSignal, () => hardDeadlineController.abort(), (partial) => {
+          // `partial` is cumulative. Appending delta plus text_end.content would
+          // duplicate the completed block on providers that emit both.
+          const partialText = extractAssistantText(partial);
+          const suggestion = parsePartialPromptSuggestion(request.draft, partialText, request.maxSuggestionChars);
+          if (!suggestion || suggestion === lastPublished) return;
+          if (lastPublished && !suggestion.startsWith(lastPublished)) return;
+          lastPublished = suggestion;
+          publish(suggestion);
+        });
+      } else {
+        response = await this.shared.completeSimple(request.model, context, requestOptions);
+      }
     } catch (error) {
       stats.failedRequests += 1;
       throw error;
@@ -958,10 +1125,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     recordProviderUsage(stats, response.usage);
 
     const contentTypes = response.content.map((block) => block.type).join(", ") || "(none)";
-    const text = response.content
-      .filter((block): block is { type: "text"; text: string } => block.type === "text")
-      .map((block) => block.text)
-      .join("");
+    const text = extractAssistantText(response);
 
     const responseError = response.errorMessage?.trim();
     const rawResponse = text || responseError || `[types=${contentTypes}; stopReason=${response.stopReason}]`;
@@ -978,7 +1142,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     const normalized = normalizePromptSuggestions(
       request.draft,
       text,
-      this.shared.config.maxSuggestionChars,
+      request.maxSuggestionChars,
       request.maxAlternatives,
     );
 
@@ -1005,7 +1169,12 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (this.isShowingAutocomplete()) return false;
 
     const currentModel = resolveSuggestionModel(this.shared);
-    return formatModelLabel(currentModel) === request.modelLabel;
+    if (formatModelLabel(currentModel) !== request.modelLabel) return false;
+
+    // Session entries are immutable and the leaf identifies the exact branch
+    // from which all bounded context sections were derived. Checking it avoids
+    // rebuilding/scanning and hashing that context for every streamed token.
+    return (this.shared.sessionManager?.getLeafId?.() ?? "") === request.leafId;
   }
 
   cancelActiveRequest(): void {
@@ -1181,7 +1350,7 @@ function bindRuntimeContext(ctx: ExtensionContext, shared: PromptAutocompleteSha
   shared.currentModel = ctx.model as Model<Api> | undefined;
   shared.modelRegistry = ctx.modelRegistry;
   shared.sessionManager = ctx.sessionManager;
-  shared.streaming = false;
+  shared.agentStreaming = false;
 }
 
 function refreshEditorImmediately(shared: PromptAutocompleteSharedState, state: string, details: string): void {
@@ -1223,8 +1392,43 @@ function setWhileStreaming(
   if (shared.enabled) {
     // Only label it "waiting" when disabling actually suppresses right now (agent
     // streaming); otherwise the refresh below requests suggestions immediately.
-    const willSuppress = !next && shared.streaming;
+    const willSuppress = !next && shared.agentStreaming;
     refreshEditorImmediately(shared, willSuppress ? "waiting" : "ready", `While-streaming ${next ? "enabled" : "disabled"}`);
+  }
+}
+
+function setStreamResponses(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  arg: string | undefined,
+): void {
+  let next: boolean;
+  if (arg === "on") {
+    next = true;
+  } else if (arg === "off") {
+    next = false;
+  } else if (arg === undefined || arg === "toggle") {
+    next = !shared.config.streamResponses;
+  } else {
+    ctx.ui.notify("Usage: /prompt-autocomplete stream [on|off|toggle]", "warning");
+    return;
+  }
+
+  const changed = shared.config.streamResponses !== next;
+  shared.config.streamResponses = next;
+  shared.runtimeOverrides.streamResponses = next;
+  const path = next && shared.streamSimple ? "streaming" : next ? "completion compatibility" : "completion";
+  ctx.ui.notify(
+    `Prompt autocomplete response streaming ${next ? "enabled" : "disabled"} (${path} path)${changed ? "; applies to next request" : ""}`,
+    "info",
+  );
+
+  if (shared.enabled && changed) {
+    // Presentation changes must not silently buy a replacement request. Cancel
+    // active work and clear provisional text; the next edit or manual trigger
+    // uses the selected path.
+    shared.cancelActiveRequest?.();
+    updateDebugState(shared, "ready", `Response streaming ${next ? "enabled" : "disabled"}; waiting for next request`);
   }
 }
 
@@ -1340,6 +1544,9 @@ export function createPromptAutocompleteExtension(
   dependencies: PromptAutocompleteDependencies = {},
 ): (pi: ExtensionAPI) => void {
   const completeSimpleImpl = dependencies.completeSimple ?? completeSimple;
+  // Existing deterministic harnesses inject only completeSimple. Never let such
+  // a harness fall through to the real network-capable stream implementation.
+  const streamSimpleImpl = dependencies.streamSimple ?? (dependencies.completeSimple ? undefined : streamSimple);
   const now = dependencies.now ?? Date.now;
 
   return function promptAutocompleteExtension(pi: ExtensionAPI): void {
@@ -1357,6 +1564,13 @@ export function createPromptAutocompleteExtension(
     description: "Allow prompt autocomplete while the main agent is still working",
     type: "boolean",
     default: false,
+  });
+  pi.registerFlag("prompt-autocomplete-stream", {
+    description: "Render streamed response progress as ghost text (on|off)",
+    // Pi's boolean extension flags can only be switched on. A string flag is
+    // required so a feature that defaults on can still be disabled at startup.
+    type: "string",
+    default: DEFAULT_STREAM_RESPONSES ? "on" : "off",
   });
   pi.registerFlag("prompt-autocomplete-debug", {
     description: "Show prompt autocomplete debug state below the editor",
@@ -1387,11 +1601,12 @@ export function createPromptAutocompleteExtension(
   const shared: PromptAutocompleteSharedState = {
     enabled: false,
     activationId: 0,
-    streaming: false,
+    agentStreaming: false,
     config: parseConfig(pi),
     runtimeOverrides: {},
     usageStats: createPromptAutocompleteUsageStats(),
     completeSimple: completeSimpleImpl,
+    streamSimple: streamSimpleImpl,
     now,
     debugState: "idle",
     requestCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
@@ -1425,14 +1640,20 @@ export function createPromptAutocompleteExtension(
     refreshEditorImmediately(shared, "model-changed", formatModelLabel(event.model as Model<Api>));
   });
 
+  pi.on("session_tree", async (_event, ctx) => {
+    shared.sessionManager = ctx.sessionManager;
+    if (!shared.enabled) return;
+    refreshEditorImmediately(shared, "context-changed", "Conversation branch changed");
+  });
+
   pi.on("agent_start", async () => {
-    shared.streaming = true;
+    shared.agentStreaming = true;
     if (!shared.enabled || shared.config.allowWhileStreaming) return;
     refreshEditorImmediately(shared, "waiting", "Main agent is still working");
   });
 
   pi.on("agent_end", async () => {
-    shared.streaming = false;
+    shared.agentStreaming = false;
     if (!shared.enabled) return;
     refreshEditorImmediately(shared, "ready", "Agent finished; autocomplete can request suggestions again");
   });
@@ -1452,6 +1673,10 @@ export function createPromptAutocompleteExtension(
         setWhileStreaming(ctx, shared, parts[1]);
         return;
       }
+      if (command === "stream") {
+        setStreamResponses(ctx, shared, parts[1]);
+        return;
+      }
 
       const handlers = createPromptAutocompleteCommandHandlers(ctx, shared);
       const handler = handlers[command];
@@ -1462,7 +1687,7 @@ export function createPromptAutocompleteExtension(
       }
 
       ctx.ui.notify(
-        "Usage: /prompt-autocomplete [on|off|toggle|status|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
+        "Usage: /prompt-autocomplete [on|off|toggle|status|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
         "warning",
       );
     },

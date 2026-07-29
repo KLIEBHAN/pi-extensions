@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
@@ -28,6 +29,7 @@ import {
   normalizePromptSuggestions,
   normalizeTemplateText,
   parseBoundedIntFlag,
+  parsePartialPromptSuggestion,
   parseModelRef,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES,
@@ -227,6 +229,14 @@ test("normalizePromptSuggestion strips wrappers and sentinel responses", () => {
   );
 });
 
+test("suggestion normalization strips terminal controls and truncates at grapheme boundaries", () => {
+  assert.equal(normalizePromptSuggestion("", "safe \u001b[2J\u0008 next"), "safe [2J next");
+  assert.equal(normalizePromptSuggestion("", "abc\uD83D x"), "abc");
+  assert.equal(normalizePromptSuggestion("", "abc\uDC69 x"), "abc");
+  assert.equal(normalizePromptSuggestion("", "12345678901234👩‍💻tail", 16), "12345678901234…");
+  assert.doesNotMatch(normalizePromptSuggestion("", "12345678901234👩‍💻tail", 16) ?? "", /�|\u200D/);
+});
+
 test("normalizePromptSuggestion does not add an extra leading space when draft already ends with one", () => {
   assert.equal(
     normalizePromptSuggestion("Kannst du mir helfen, ", " eine Pi Extension zu bauen"),
@@ -351,6 +361,73 @@ test("normalizePromptSuggestions keeps plain-text responses as fallback suggesti
   ]);
 });
 
+test("partial suggestions advance only across stable word boundaries", () => {
+  assert.equal(parsePartialPromptSuggestion("Review", '{"completions":[" the imple'), " the");
+  assert.equal(parsePartialPromptSuggestion("Review", '{"completions":[" the implementation care'), " the implementation");
+  assert.equal(
+    parsePartialPromptSuggestion("Review", '{"completions":[" the implementation carefully"'),
+    " the implementation carefully",
+  );
+  assert.equal(parsePartialPromptSuggestion("Review", '[" the imple'), " the");
+  assert.equal(parsePartialPromptSuggestion("Review", '{"suggestions":[" the imple'), " the");
+  assert.equal(parsePartialPromptSuggestion("Review", '{"alternatives":[" the imple'), " the");
+  assert.equal(parsePartialPromptSuggestion("Review", '{"items":[" the imple'), " the");
+});
+
+test("partial suggestions never expose JSON, prose, or unresolved normalization prefixes", () => {
+  assert.equal(parsePartialPromptSuggestion("Review", '{"completions":["Rev'), undefined);
+  assert.equal(parsePartialPromptSuggestion("Review the", '{"completions":["Review the care'), undefined);
+  assert.equal(parsePartialPromptSuggestion("Review", '{"completions":["suggestion: care'), undefined);
+  assert.equal(parsePartialPromptSuggestion("Review", '{"completions":["\\\"quoted'), undefined);
+  assert.equal(parsePartialPromptSuggestion("Review", '{"unknown":[" raw JSON'), undefined);
+  assert.equal(parsePartialPromptSuggestion("Review", "Here is a suggestion"), undefined);
+});
+
+test("partial suggestions decode complete escapes but withhold incomplete ones", () => {
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["line\\nnext ch'), "line\nnext");
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["safe broken\\'), "safe");
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["safe broken\\u12'), "safe");
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["safe \\u4F60 next'), "safe 你");
+});
+
+test("core loads safely without Intl.Segmenter and disables uncertain partial graphemes", () => {
+  const moduleUrl = new URL("../extensions/prompt-autocomplete/core.ts?without-segmenter", import.meta.url).href;
+  const script = [
+    'Object.defineProperty(Intl, "Segmenter", { value: undefined, configurable: true });',
+    `const core = await import(${JSON.stringify(moduleUrl)});`,
+    'console.log(core.normalizePromptSuggestion("", "abcdefghijklmnopq", 16));',
+    'console.log(String(core.parsePartialPromptSuggestion("", \'{"completions":["続きを確\')));',
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "…\nundefined");
+});
+
+test("partial suggestions are grapheme-safe for CJK, combining marks, flags, and ZWJ emoji", () => {
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["続きを確'), "続きを");
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["é'), undefined);
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["é n'), "é");
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":[" résumé incom'), "résumé");
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["🇩🇪 n'), "🇩🇪");
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["👩‍💻 n'), "👩‍💻");
+  assert.doesNotMatch(parsePartialPromptSuggestion("", '{"completions":["\\uD83D') ?? "", /�/);
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["abc\\uD83D x'), undefined);
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["abc\\uDC69 x'), undefined);
+  assert.equal(
+    parsePartialPromptSuggestion("", '{"completions":["\\uD83D\\uDC69\\u200D\\uD83D\\uDCBB n'),
+    "👩‍💻",
+  );
+});
+
+test("partial suggestions strip escaped terminal controls before rendering", () => {
+  const partial = parsePartialPromptSuggestion("", '{"completions":["safe \\u001b[2J next');
+  assert.equal(partial, "safe [2J");
+  assert.doesNotMatch(partial ?? "", /\u001b|\u0008/);
+});
+
 test("extractNextSuggestionChunk returns the next word-like chunk", () => {
   assert.equal(extractNextSuggestionChunk(" und Tests für Edge Cases ergänzen"), " und ");
   assert.equal(extractNextSuggestionChunk("\n  eine Liste mit Schritten"), "\n  eine ");
@@ -449,6 +526,62 @@ test("coalesced requests share a single promise and abort only after the last su
   assert.equal(await second.promise, "done");
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(inFlight.size, 0);
+});
+
+test("coalesced request progress reaches subscribers, replays to late joiners, and isolates callbacks", async () => {
+  const inFlight = new Map<string, CoalescedRequestEntry<string, string>>();
+  const firstProgress: string[] = [];
+  const lateProgress: string[] = [];
+  let publishProgress: ((progress: string) => void) | undefined;
+  let resolveRequest: ((value: string) => void) | undefined;
+
+  const first = acquireCoalescedRequest(
+    inFlight,
+    "same-key",
+    "same-readable-id",
+    async (_signal, publish) => {
+      publishProgress = publish;
+      publish("first");
+      return await new Promise<string>((resolve) => {
+        resolveRequest = resolve;
+      });
+    },
+    (progress) => firstProgress.push(progress),
+  );
+  const throwing = acquireCoalescedRequest(
+    inFlight,
+    "same-key",
+    "same-readable-id",
+    async () => "unexpected",
+    () => {
+      throw new Error("subscriber failure");
+    },
+  );
+  const late = acquireCoalescedRequest(
+    inFlight,
+    "same-key",
+    "late",
+    async () => "unexpected",
+    (progress) => lateProgress.push(progress),
+  );
+
+  assert.deepEqual(firstProgress, ["first"]);
+  assert.deepEqual(lateProgress, ["first"], "late subscribers receive the latest immutable snapshot");
+  assert.equal(first.subscriberCount(), 3, "duplicate readable IDs must still be distinct subscriptions");
+
+  publishProgress?.("live");
+  assert.deepEqual(firstProgress, ["first", "live"]);
+  assert.deepEqual(lateProgress, ["first", "live"]);
+
+  throwing.release();
+  publishProgress?.("second");
+  assert.deepEqual(firstProgress, ["first", "live", "second"]);
+  assert.deepEqual(lateProgress, ["first", "live", "second"]);
+
+  first.release();
+  resolveRequest?.("done");
+  assert.equal(await late.promise, "done");
+  late.release();
 });
 
 test("coalesced requests abort when the final subscriber cancels", () => {

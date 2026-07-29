@@ -219,7 +219,8 @@ pi install npm:@kliebhan/pi-prompt-autocomplete
 ### What it adds
 
 - ghost-text style prompt suggestions directly in the editor after explicit enablement and at least one non-whitespace draft character by default
-- shows 3 alternatives by default, with configurable limit via flag
+- streams the first suggestion into ghost text by default without making an extra provider request; Latin text advances at word boundaries and no-space scripts stay grapheme-safe
+- shows 3 alternatives after the response completes, with configurable limit via flag
 - `Tab` accepts the whole current suggestion
 - `Ctrl+Space` accepts the next word/chunk from the current suggestion
 - `Ctrl+,` and `Ctrl+.` cycle through alternative suggestions; when there is nothing to cycle, `Ctrl+.` forces a one-shot suggestion (even while the agent is working and while-streaming is off)
@@ -231,7 +232,7 @@ pi install npm:@kliebhan/pi-prompt-autocomplete
 - configurable alternative count via `--prompt-autocomplete-max-alternatives <1-5>`
 - clean default UI: debug/status lines stay hidden unless you opt into debug mode
 - the internal autocomplete system prompt lives in `extensions/prompt-autocomplete/system-prompt.template.md` and is rendered through a tiny mini-template helper with `{{PLACEHOLDER}}`, `{{PLACEHOLDER|fallback}}`, and escaped literals via `\{{PLACEHOLDER}}`, so prompt tuning stays decoupled from TypeScript while still allowing reusable prompt fragments
-- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle` and `/prompt-autocomplete while-streaming on|off|toggle`
+- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle`, `/prompt-autocomplete stream on|off|toggle`, and `/prompt-autocomplete while-streaming on|off|toggle`
 
 ### Usage
 
@@ -252,6 +253,8 @@ Or enable it for the current session from inside pi:
 ```text
 /prompt-autocomplete on
 /prompt-autocomplete status
+/prompt-autocomplete stream off
+/prompt-autocomplete stream on
 /prompt-autocomplete while-streaming on
 /prompt-autocomplete while-streaming toggle
 /prompt-autocomplete debug-on
@@ -265,12 +268,13 @@ Optional dedicated fast model:
 pi -e ./extensions/prompt-autocomplete \
   --prompt-autocomplete \
   --prompt-autocomplete-model openai/gpt-5.4-mini \
+  --prompt-autocomplete-stream on \
   --prompt-autocomplete-max-alternatives 3
 ```
 
 ### Privacy and provider usage
 
-Prompt autocomplete makes additional model requests. Each request can include the current draft, the latest user and assistant messages, and a bounded recent-conversation summary. By default it uses the active model; `--prompt-autocomplete-model provider/model` may send that context to a different provider. Requests may incur token costs and consume provider rate limits. Successful results are cached in memory for up to 60 seconds and are cleared when the session resets or the extension is disabled.
+Prompt autocomplete makes additional model requests. Streaming changes when the first suggestion becomes visible, not what one request sends. Toggling response streaming cancels active autocomplete work but does not start a replacement request; the selected path applies to the next edit or manual one-shot. Each request can include the current draft, the latest user and assistant messages, and a bounded recent-conversation summary. By default it uses the active model; `--prompt-autocomplete-model provider/model` may send that context to a different provider. Requests may incur token costs and consume provider rate limits. Successful results are cached in memory for up to 60 seconds and are cleared when the session resets or the extension is disabled.
 
 The extension is disabled by default. Enabling it with the CLI flag or slash command is explicit consent to these autocomplete requests. Automatic empty-draft requests remain disabled by the default `--prompt-autocomplete-min-chars 1`; set the value to `0` to opt into them. A manual `Ctrl+.` one-shot is treated as explicit intent and can bypass the minimum-character gate.
 
@@ -278,14 +282,16 @@ The extension is disabled by default. Enabling it with the CLI flag or slash com
 
 - The extension suggests when the cursor is at the end of a draft that meets `--prompt-autocomplete-min-chars` (default: `1`). Set it to `0` to opt into automatic empty-draft next-prompt suggestions.
 - Built-in slash-command and file/path autocomplete keep working.
-- By default it pauses while the main agent is streaming so it can use the finished conversation context. Override at startup with `--prompt-autocomplete-while-streaming`, or toggle it per session with `/prompt-autocomplete while-streaming on|off|toggle`.
+- Autocomplete responses stream into ghost text by default. Disable this at startup with `--prompt-autocomplete-stream off`, or toggle it for the process with `/prompt-autocomplete stream on|off|toggle`. Partial Latin text advances only at complete word boundaries; CJK, combining characters, flags, and emoji remain grapheme-safe. Alternatives appear only after the terminal response.
+- `Tab` accepts all visible partial text; `Ctrl+Space` accepts only its next visible word/chunk. Both cancel that stream without automatically starting a second paid request.
+- By default suggestions pause while the **main agent** is streaming so they can use the finished conversation context. This is separate from response streaming. Override it at startup with `--prompt-autocomplete-while-streaming`, or toggle it per session with `/prompt-autocomplete while-streaming on|off|toggle`.
 - Even while-streaming is off, press `Ctrl+.` with no active suggestion to force a single one-shot completion during an agent turn; it ignores the streaming gate, the post-error cooldown, and the min-chars threshold for that one request (model/auth and slash/path checks still apply).
 - Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling (and `Ctrl+.` doubles as the one-shot trigger).
 - The default suggestion count is 3. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
 - Legacy `Ctrl+Tab` and `Alt+[` / `Alt+]` remain supported as fallbacks when your terminal forwards them.
 - Prompt autocomplete requires exclusive ownership of Pi's custom editor slot. If another custom editor is already active, it refuses to replace it and reports a warning; disabling autocomplete never removes a later replacement editor.
 - `/prompt-autocomplete status` reports the current session's issued requests, requests served from the cache, failed requests when any occurred, tokens, and estimated cost. Token counts come from the provider, but the cost is derived locally from pi's model price table and is therefore an estimate, not an invoice. A trailing `+` means at least one request did not report that metric, so the true total may be higher; tokens and cost are marked independently.
-- Slash-command toggles outrank the CLI flags for the rest of the process and survive a new session; `status` labels each toggle `(flag)` or `(session)`.
+- Slash-command toggles, including response streaming, outrank the CLI flags for the rest of the process and survive a new session; `status` labels each toggle `(flag)` or `(session)` and names the active `stream`, `complete`, or `complete-compat` request path.
 - For troubleshooting, start with `--prompt-autocomplete-debug` or run `/prompt-autocomplete debug-on` temporarily.
 - If you want to tune the internal autocomplete prompt, edit `extensions/prompt-autocomplete/system-prompt.template.md`; `{{PLACEHOLDER}}` variables are filled in by `extensions/prompt-autocomplete/core.ts`, `{{PLACEHOLDER|fallback}}` uses the fallback text when no variable is provided, and `\{{PLACEHOLDER}}` keeps the placeholder syntax literal.
 
