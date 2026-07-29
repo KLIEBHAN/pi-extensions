@@ -18,7 +18,7 @@ function createHarness(options: HarnessOptions = {}) {
   const flags = new Map<string, boolean | string>();
   if (options.enabled !== undefined) flags.set("prompt-autocomplete", options.enabled);
 
-  const registeredFlags = new Map<string, { default?: boolean | string }>();
+  const registeredFlags = new Map<string, { type: "boolean" | "string"; default?: boolean | string }>();
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, CommandHandler>();
   const notifications: Array<{ message: string; type?: string }> = [];
@@ -56,7 +56,7 @@ function createHarness(options: HarnessOptions = {}) {
   } as unknown as ExtensionContext;
 
   const pi = {
-    registerFlag(name: string, definition: { default?: boolean | string }) {
+    registerFlag(name: string, definition: { type: "boolean" | "string"; default?: boolean | string }) {
       registeredFlags.set(name, definition);
       if (!flags.has(name) && definition.default !== undefined) {
         flags.set(name, definition.default);
@@ -109,6 +109,7 @@ test("prompt autocomplete is disabled by default while response streaming defaul
 
   assert.equal(harness.registeredFlags.get("prompt-autocomplete")?.default, false);
   assert.equal(harness.registeredFlags.get("prompt-autocomplete-min-chars")?.default, "1");
+  assert.equal(harness.registeredFlags.get("prompt-autocomplete-stream")?.type, "string");
   assert.equal(harness.registeredFlags.get("prompt-autocomplete-stream")?.default, "on");
 });
 

@@ -3,6 +3,7 @@ import {
   streamSimple,
   type Api,
   type AssistantMessage,
+  type AssistantMessageEventStream,
   type Model,
   type UserMessage,
 } from "@earendil-works/pi-ai/compat";
@@ -57,6 +58,11 @@ const SPINNER_INTERVAL_MS = 80;
 const SPINNER_LABEL = "Generating suggestion";
 // Inline autocomplete should fail fast instead of inheriting long provider retry/timeout defaults.
 const REQUEST_TIMEOUT_MS = 8_000;
+// A compliant provider emits its terminal aborted message immediately, which
+// lets accounting retain any usage. These local bounds keep a custom provider
+// that ignores both signal and timeout from pinning a consumer forever.
+const STREAM_ABORT_DRAIN_TIMEOUT_MS = 250;
+const STREAM_HARD_TIMEOUT_GRACE_MS = 500;
 const REQUEST_MAX_RETRIES = 0;
 const REQUEST_MAX_RETRY_DELAY_MS = 2_000;
 // Brief cooldown avoids hammering providers after transient auth/network failures while keeping the UI responsive.
@@ -202,6 +208,66 @@ function extractAssistantText(message: AssistantMessage): string {
     .filter((block): block is { type: "text"; text: string } => block.type === "text")
     .map((block) => block.text)
     .join("");
+}
+
+async function consumeAssistantStream(
+  stream: AssistantMessageEventStream,
+  signal: AbortSignal,
+  onPartial: (message: AssistantMessage) => void,
+): Promise<AssistantMessage> {
+  const iterator = stream[Symbol.asyncIterator]();
+  let hardTimer: ReturnType<typeof setTimeout> | undefined;
+  let abortTimer: ReturnType<typeof setTimeout> | undefined;
+  let rejectAbortDrain: ((error: Error) => void) | undefined;
+  let terminal: AssistantMessage | undefined;
+
+  const hardDeadline = new Promise<never>((_resolve, reject) => {
+    hardTimer = setTimeout(
+      () => reject(new Error("Provider stream exceeded the local response deadline")),
+      REQUEST_TIMEOUT_MS + STREAM_HARD_TIMEOUT_GRACE_MS,
+    );
+  });
+  const abortDeadline = new Promise<never>((_resolve, reject) => {
+    rejectAbortDrain = reject;
+  });
+  const beginAbortDrain = () => {
+    if (abortTimer) return;
+    abortTimer = setTimeout(
+      () => rejectAbortDrain?.(new Error("Provider stream did not terminate after cancellation")),
+      STREAM_ABORT_DRAIN_TIMEOUT_MS,
+    );
+  };
+  signal.addEventListener("abort", beginAbortDrain, { once: true });
+  if (signal.aborted) beginAbortDrain();
+
+  try {
+    while (!terminal) {
+      const next = await Promise.race([iterator.next(), hardDeadline, abortDeadline]);
+      if (next.done) {
+        throw new Error("Provider stream ended without a terminal event");
+      }
+
+      const event = next.value;
+      if (event.type === "done") {
+        terminal = event.message;
+      } else if (event.type === "error") {
+        terminal = event.error;
+      } else if (event.type === "text_delta" || event.type === "text_end") {
+        onPartial(event.partial);
+      }
+    }
+    return terminal;
+  } finally {
+    signal.removeEventListener("abort", beginAbortDrain);
+    if (hardTimer) clearTimeout(hardTimer);
+    if (abortTimer) clearTimeout(abortTimer);
+    if (!terminal) {
+      // Do not await a non-compliant iterator's return path. The provider already
+      // has an aborted signal; this merely gives a cooperative iterator a chance
+      // to release local resources while allowing our request promise to settle.
+      void Promise.resolve(iterator.return?.()).catch(() => undefined);
+    }
+  }
 }
 
 function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
@@ -1019,37 +1085,21 @@ class PromptAutocompleteEditor extends CustomEditor {
     try {
       if (request.useStreaming && this.shared.streamSimple) {
         const stream = this.shared.streamSimple(request.model, context, requestOptions);
-        let terminal: AssistantMessage | undefined;
         let lastPublished = "";
 
-        // Exactly one consumer iterates the provider stream. Partial text is
-        // fanned out through the coalescing layer; terminal events stay here so
-        // aborted responses can still contribute their usage report.
-        for await (const event of stream) {
-          if (event.type === "done") {
-            terminal = event.message;
-            continue;
-          }
-          if (event.type === "error") {
-            terminal = event.error;
-            continue;
-          }
-          if (event.type !== "text_delta" && event.type !== "text_end") continue;
-
+        // Exactly one consumer receives the terminal message. Partial text is
+        // fanned out through coalescing; after UI cancellation the callback is
+        // gone, but the bounded drain can still retain terminal usage.
+        response = await consumeAssistantStream(stream, signal, (partial) => {
           // `partial` is cumulative. Appending delta plus text_end.content would
           // duplicate the completed block on providers that emit both.
-          const partialText = extractAssistantText(event.partial);
+          const partialText = extractAssistantText(partial);
           const suggestion = parsePartialPromptSuggestion(request.draft, partialText, request.maxSuggestionChars);
-          if (!suggestion || suggestion === lastPublished) continue;
-          if (lastPublished && !suggestion.startsWith(lastPublished)) continue;
+          if (!suggestion || suggestion === lastPublished) return;
+          if (lastPublished && !suggestion.startsWith(lastPublished)) return;
           lastPublished = suggestion;
           publish(suggestion);
-        }
-
-        if (!terminal) {
-          throw new Error("Provider stream ended without a terminal event");
-        }
-        response = terminal;
+        });
       } else {
         response = await this.shared.completeSimple(request.model, context, requestOptions);
       }
@@ -1347,15 +1397,21 @@ function setStreamResponses(
     return;
   }
 
+  const changed = shared.config.streamResponses !== next;
   shared.config.streamResponses = next;
   shared.runtimeOverrides.streamResponses = next;
   const path = next && shared.streamSimple ? "streaming" : next ? "completion compatibility" : "completion";
-  ctx.ui.notify(`Prompt autocomplete response streaming ${next ? "enabled" : "disabled"} (${path} path)`, "info");
+  ctx.ui.notify(
+    `Prompt autocomplete response streaming ${next ? "enabled" : "disabled"} (${path} path)${changed ? "; applies to next request" : ""}`,
+    "info",
+  );
 
-  if (shared.enabled) {
-    // This cancels the current path immediately and rebuilds the same logical
-    // request through the newly selected path (or serves a terminal cache hit).
-    refreshEditorImmediately(shared, "ready", `Response streaming ${next ? "enabled" : "disabled"}`);
+  if (shared.enabled && changed) {
+    // Presentation changes must not silently buy a replacement request. Cancel
+    // active work and clear provisional text; the next edit or manual trigger
+    // uses the selected path.
+    shared.cancelActiveRequest?.();
+    updateDebugState(shared, "ready", `Response streaming ${next ? "enabled" : "disabled"}; waiting for next request`);
   }
 }
 

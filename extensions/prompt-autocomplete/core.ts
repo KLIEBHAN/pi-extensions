@@ -535,6 +535,31 @@ function trimAndCollapse(text: string): string {
   return text.trim().replace(/\s+/g, " ");
 }
 
+function stripUnsafeTerminalControls(text: string): string {
+  // Keep tab/newline because multiline suggestions intentionally support both.
+  // Everything else in C0/C1 can alter terminal state (ESC/CSI/OSC), move the
+  // cursor, or hide text and must never reach the renderer.
+  return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
+}
+
+function truncateAtFirstUnpairedSurrogate(text: string): string {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        index += 1;
+        continue;
+      }
+      return text.slice(0, index);
+    }
+    if (code >= 0xDC00 && code <= 0xDFFF) {
+      return text.slice(0, index);
+    }
+  }
+  return text;
+}
+
 function truncateWithEllipsis(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   if (maxChars <= 1) return "…";
@@ -999,9 +1024,9 @@ function readStreamingJsonString(text: string, startIndex: number): StreamingJso
   try {
     const parsed = JSON.parse(`${text.slice(startIndex, safeEnd)}"`) as unknown;
     if (typeof parsed !== "string") return undefined;
-    // A provider chunk may split a UTF-16 surrogate pair. Never expose the
-    // dangling half as a replacement glyph.
-    const value = parsed.replace(/[\uD800-\uDBFF]$/, "");
+    // A provider chunk may split a UTF-16 surrogate pair. Truncate at the first
+    // unmatched half even when more decoded characters follow it.
+    const value = truncateAtFirstUnpairedSurrogate(parsed);
     return { value, complete: false };
   } catch {
     return undefined;
@@ -1059,6 +1084,21 @@ function dropLastGrapheme(text: string): string {
   const segments = [...STREAMING_GRAPHEME_SEGMENTER.segment(text)];
   const last = segments.at(-1);
   return last ? text.slice(0, last.index) : "";
+}
+
+function truncateSuggestionAtGraphemeBoundary(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 0) return "";
+  if (maxChars === 1) return "…";
+
+  const available = maxChars - 1;
+  let end = 0;
+  for (const segment of STREAMING_GRAPHEME_SEGMENTER.segment(text)) {
+    const nextEnd = segment.index + segment.segment.length;
+    if (nextEnd > available) break;
+    end = nextEnd;
+  }
+  return `${text.slice(0, end)}…`;
 }
 
 function completedStreamingPrefix(text: string): string {
@@ -1352,7 +1392,7 @@ export function normalizePromptSuggestion(
   rawSuggestion: string,
   maxChars = DEFAULT_MAX_SUGGESTION_CHARS,
 ): string | undefined {
-  let suggestion = rawSuggestion.replace(/\r/g, "");
+  let suggestion = stripUnsafeTerminalControls(truncateAtFirstUnpairedSurrogate(rawSuggestion)).replace(/\r/g, "");
   if (!suggestion.trim()) return undefined;
   if (/^<NO_COMPLETION>$/i.test(suggestion.trim())) return undefined;
 
@@ -1369,7 +1409,7 @@ export function normalizePromptSuggestion(
 
   suggestion = normalizeLeadingBoundarySpacing(draft, suggestion);
   suggestion = maybePrefixSpace(draft, suggestion);
-  suggestion = truncateWithEllipsis(suggestion, maxChars);
+  suggestion = truncateSuggestionAtGraphemeBoundary(suggestion, maxChars);
 
   if (!suggestion.trim()) return undefined;
   return suggestion;

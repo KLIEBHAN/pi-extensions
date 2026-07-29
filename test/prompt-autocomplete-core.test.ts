@@ -228,6 +228,14 @@ test("normalizePromptSuggestion strips wrappers and sentinel responses", () => {
   );
 });
 
+test("suggestion normalization strips terminal controls and truncates at grapheme boundaries", () => {
+  assert.equal(normalizePromptSuggestion("", "safe \u001b[2J\u0008 next"), "safe [2J next");
+  assert.equal(normalizePromptSuggestion("", "abc\uD83D x"), "abc");
+  assert.equal(normalizePromptSuggestion("", "abc\uDC69 x"), "abc");
+  assert.equal(normalizePromptSuggestion("", "12345678901234👩‍💻tail", 16), "12345678901234…");
+  assert.doesNotMatch(normalizePromptSuggestion("", "12345678901234👩‍💻tail", 16) ?? "", /�|\u200D/);
+});
+
 test("normalizePromptSuggestion does not add an extra leading space when draft already ends with one", () => {
   assert.equal(
     normalizePromptSuggestion("Kannst du mir helfen, ", " eine Pi Extension zu bauen"),
@@ -385,10 +393,18 @@ test("partial suggestions are grapheme-safe for CJK, combining marks, flags, and
   assert.equal(parsePartialPromptSuggestion("", '{"completions":["🇩🇪 n'), "🇩🇪");
   assert.equal(parsePartialPromptSuggestion("", '{"completions":["👩‍💻 n'), "👩‍💻");
   assert.doesNotMatch(parsePartialPromptSuggestion("", '{"completions":["\\uD83D') ?? "", /�/);
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["abc\\uD83D x'), undefined);
+  assert.equal(parsePartialPromptSuggestion("", '{"completions":["abc\\uDC69 x'), undefined);
   assert.equal(
     parsePartialPromptSuggestion("", '{"completions":["\\uD83D\\uDC69\\u200D\\uD83D\\uDCBB n'),
     "👩‍💻",
   );
+});
+
+test("partial suggestions strip escaped terminal controls before rendering", () => {
+  const partial = parsePartialPromptSuggestion("", '{"completions":["safe \\u001b[2J next');
+  assert.equal(partial, "safe [2J");
+  assert.doesNotMatch(partial ?? "", /\u001b|\u0008/);
 });
 
 test("extractNextSuggestionChunk returns the next word-like chunk", () => {

@@ -368,6 +368,31 @@ test("accepting streamed partial text aborts without issuing an automatic second
   }
 });
 
+test("a provider that ignores cancellation cannot retain the stream consumer indefinitely", async () => {
+  const provider = controlledStream();
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    // This fake deliberately ignores both AbortSignal and timeoutMs and never
+    // emits a terminal event.
+    streamSimple: (() => provider.stream) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  await flushAsyncWork();
+  provider.delta('{"completions":[" accepted partial text', " accepted partial text");
+  await flushAsyncWork();
+
+  editor.handleInput("\t");
+  assert.equal(editor.getText(), "Draft accepted partial");
+  await new Promise<void>((resolve) => setTimeout(resolve, 300));
+  await flushAsyncWork();
+
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /1 failed/);
+});
+
 test("stream errors clear partial text and enter the existing cooldown", async () => {
   const provider = controlledStream();
   let calls = 0;
@@ -446,7 +471,7 @@ test("newer drafts and conversation branches reject stale streamed progress", as
   await flushAsyncWork();
 });
 
-test("turning response streaming off cancels an active stream and refreshes through completion", async () => {
+test("turning response streaming off cancels active work and applies on the next edit", async () => {
   const provider = controlledStream();
   let streamSignal: AbortSignal | undefined;
   let streamCalls = 0;
@@ -473,13 +498,22 @@ test("turning response streaming off cancels an active stream and refreshes thro
   await flushAsyncWork();
   assert.equal(streamSignal?.aborted, true);
   assert.equal(streamCalls, 1);
-  assert.equal(completeCalls, 1);
-  assert.doesNotMatch(renderedText(editor), /streamed partial/);
-  assert.match(renderedText(editor), /completed path/);
+  assert.equal(completeCalls, 0, "a presentation toggle must not buy a replacement request");
+  assert.doesNotMatch(renderedText(editor), /streamed partial|completed path/);
 
   provider.error("aborted", undefined, "aborted");
   await flushAsyncWork();
-  assert.match(renderedText(editor), /completed path/, "the old terminal event must not clear the new result");
+  assert.doesNotMatch(renderedText(editor), /streamed partial|completed path/);
+
+  editor.setText("Use again");
+  await flushAsyncWork();
+  assert.equal(completeCalls, 1, "the next user edit uses the newly selected completion path");
+  assert.match(renderedText(editor), /completed path/);
+
+  await harness.command("stream off");
+  await flushAsyncWork();
+  assert.equal(completeCalls, 1, "a redundant stream command must be request-idempotent");
+  assert.match(renderedText(editor), /completed path/, "a redundant command should preserve a terminal suggestion");
 });
 
 test("a stream ending without a terminal event fails closed and clears partial text", async () => {
