@@ -59,8 +59,9 @@ const SPINNER_LABEL = "Generating suggestion";
 // Inline autocomplete should fail fast instead of inheriting long provider retry/timeout defaults.
 const REQUEST_TIMEOUT_MS = 8_000;
 // A compliant provider emits its terminal aborted message immediately, which
-// lets accounting retain any usage. These local bounds keep a custom provider
-// that ignores both signal and timeout from pinning a consumer forever.
+// lets accounting retain any usage. These bounds settle our caller even when a
+// custom provider ignores both contracts; JavaScript cannot forcibly terminate
+// that provider's already-pending iterator.next().
 const STREAM_ABORT_DRAIN_TIMEOUT_MS = 250;
 const STREAM_HARD_TIMEOUT_GRACE_MS = 500;
 const REQUEST_MAX_RETRIES = 0;
