@@ -213,6 +213,7 @@ function extractAssistantText(message: AssistantMessage): string {
 async function consumeAssistantStream(
   stream: AssistantMessageEventStream,
   signal: AbortSignal,
+  abortProvider: () => void,
   onPartial: (message: AssistantMessage) => void,
 ): Promise<AssistantMessage> {
   const iterator = stream[Symbol.asyncIterator]();
@@ -222,10 +223,13 @@ async function consumeAssistantStream(
   let terminal: AssistantMessage | undefined;
 
   const hardDeadline = new Promise<never>((_resolve, reject) => {
-    hardTimer = setTimeout(
-      () => reject(new Error("Provider stream exceeded the local response deadline")),
-      REQUEST_TIMEOUT_MS + STREAM_HARD_TIMEOUT_GRACE_MS,
-    );
+    hardTimer = setTimeout(() => {
+      // `timeoutMs` is provider-owned. Abort the actual request signal as a
+      // second line of defence for providers that respect cancellation but
+      // accidentally ignore their timeout option.
+      abortProvider();
+      reject(new Error("Provider stream exceeded the local response deadline"));
+    }, REQUEST_TIMEOUT_MS + STREAM_HARD_TIMEOUT_GRACE_MS);
   });
   const abortDeadline = new Promise<never>((_resolve, reject) => {
     rejectAbortDrain = reject;
@@ -1084,13 +1088,18 @@ class PromptAutocompleteEditor extends CustomEditor {
     let response: AssistantMessage;
     try {
       if (request.useStreaming && this.shared.streamSimple) {
-        const stream = this.shared.streamSimple(request.model, context, requestOptions);
+        const hardDeadlineController = new AbortController();
+        const streamSignal = AbortSignal.any([signal, hardDeadlineController.signal]);
+        const stream = this.shared.streamSimple(request.model, context, {
+          ...requestOptions,
+          signal: streamSignal,
+        });
         let lastPublished = "";
 
         // Exactly one consumer receives the terminal message. Partial text is
         // fanned out through coalescing; after UI cancellation the callback is
         // gone, but the bounded drain can still retain terminal usage.
-        response = await consumeAssistantStream(stream, signal, (partial) => {
+        response = await consumeAssistantStream(stream, streamSignal, () => hardDeadlineController.abort(), (partial) => {
           // `partial` is cumulative. Appending delta plus text_end.content would
           // duplicate the completed block on providers that emit both.
           const partialText = extractAssistantText(partial);

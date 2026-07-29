@@ -368,7 +368,7 @@ test("accepting streamed partial text aborts without issuing an automatic second
   }
 });
 
-test("a provider that ignores cancellation cannot retain the stream consumer indefinitely", async () => {
+test("a request settles after the drain grace when a provider never terminates", async () => {
   const provider = controlledStream();
   const harness = createEditorHarness({
     completeSimple: (async () => {
@@ -391,6 +391,7 @@ test("a provider that ignores cancellation cannot retain the stream consumer ind
 
   await harness.command("status");
   assert.match(harness.notifications.at(-1) ?? "", /1 failed/);
+  assert.match(harness.notifications.at(-1) ?? "", /0 tok\+/, "late usage is explicitly incomplete");
 });
 
 test("stream errors clear partial text and enter the existing cooldown", async () => {

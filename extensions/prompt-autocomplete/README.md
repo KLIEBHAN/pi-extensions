@@ -80,7 +80,7 @@ usage=4 req, 5 cached, 1832 tok, ~$0.00214 est
 ```
 
 - `req` counts provider calls that were actually issued; `cached` counts requests answered from the local cache without contacting a provider.
-- `failed` appears only when a request errored or was aborted. Tokens already spent on a failed response are still counted.
+- `failed` appears only when a request errored or was aborted. Tokens from a failed response are counted when the provider returns its terminal usage report within the bounded cancellation drain; otherwise `tok+`/`est+` marks the totals incomplete.
 - Token counts come from the provider.
 - **The cost is an estimate, not an invoice.** Pi derives it locally by multiplying the reported tokens with its own model price table, so it can disagree with what your provider actually bills.
 - A trailing `+` (`1832 tok+`, `~$0.00214 est+`) means at least one request did not report that metric, so the true total may be higher than shown. Tokens and cost are marked independently, because a response can report tokens without a cost figure.
