@@ -87,11 +87,21 @@ export interface PromptAutocompleteCacheIdentity {
   recentContext: string;
 }
 
+export type PromptAutocompletePrefixContextIdentity = Omit<PromptAutocompleteCacheIdentity, "draft">;
+
+function hashPromptAutocompleteIdentity(identity: object): string {
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+}
+
 export function buildPromptAutocompleteCacheKey(identity: PromptAutocompleteCacheIdentity): string {
-  const digest = createHash("sha256")
-    .update(JSON.stringify(identity))
-    .digest("hex");
-  return `${identity.modelLabel}|${digest}`;
+  return `${identity.modelLabel}|${hashPromptAutocompleteIdentity(identity)}`;
+}
+
+/** Identify every request discriminator except the evolving prompt draft. */
+export function buildPromptAutocompletePrefixContextKey(
+  identity: PromptAutocompletePrefixContextIdentity,
+): string {
+  return `${identity.modelLabel}|prefix|${hashPromptAutocompleteIdentity(identity)}`;
 }
 
 export class ExpiringLruCache<T> {
@@ -126,10 +136,23 @@ export class ExpiringLruCache<T> {
     return entry.value;
   }
 
-  set(key: string, value: T): void {
+  set(key: string, value: T, options: { expiresAt?: number } = {}): void {
+    const now = this.now();
+    const expiresAt = options.expiresAt ?? now + this.ttlMs;
     this.entries.delete(key);
-    this.entries.set(key, { value, expiresAt: this.now() + this.ttlMs });
+    if (expiresAt <= now) return;
+    this.entries.set(key, { value, expiresAt });
     this.prune();
+  }
+
+  getExpiration(key: string): number | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= this.now()) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    return entry.expiresAt;
   }
 
   clear(): void {
@@ -355,6 +378,8 @@ export interface PromptAutocompleteUsageStats {
   failedRequests: number;
   /** Requests served from the local cache without contacting a provider. */
   cacheHits: number;
+  /** Cache hits obtained by consuming a prefix of a previous suggestion. */
+  prefixReuseHits: number;
   /** Responses that carried token counts. Totals are partial when this is below providerRequests. */
   tokenReports: number;
   /** Responses that carried a cost figure. */
@@ -379,6 +404,7 @@ export function createPromptAutocompleteUsageStats(): PromptAutocompleteUsageSta
     providerRequests: 0,
     failedRequests: 0,
     cacheHits: 0,
+    prefixReuseHits: 0,
     tokenReports: 0,
     costReports: 0,
     totalTokens: 0,
@@ -1451,6 +1477,75 @@ export function normalizePromptSuggestions(
   }
 
   return normalized;
+}
+
+export interface PromptAutocompletePrefixReuseResult {
+  /** Suggestions normalized for the extended draft. */
+  suggestions: string[];
+  /** Original cached suggestions, parallel to `suggestions`, for selection continuity. */
+  origins: string[];
+}
+
+function isSafeConsumedSuggestionPrefix(
+  cachedDraft: string,
+  suggestion: string,
+  consumedLength: number,
+): boolean {
+  if (consumedLength <= 0 || consumedLength > suggestion.length) return false;
+
+  const target = cachedDraft + suggestion;
+  const boundary = cachedDraft.length + consumedLength;
+  if (!STREAMING_GRAPHEME_SEGMENTER) {
+    // Minimal-ICU fallback: accept only a newly consumed ASCII prefix that is
+    // not followed by a combining/variation/joining code point. For richer
+    // text, decline reuse rather than guess across the draft/suggestion seam.
+    const consumed = suggestion.slice(0, consumedLength);
+    const remainder = suggestion.slice(consumedLength);
+    return /^[\x00-\x7F]*$/.test(consumed) && !/^[\p{M}\u200D]/u.test(remainder);
+  }
+
+  if (boundary === target.length) return true;
+  // `containing` asks ICU for the segment at the seam without materializing or
+  // walking every grapheme in an arbitrarily long draft.
+  return STREAMING_GRAPHEME_SEGMENTER.segment(target).containing(boundary)?.index === boundary;
+}
+
+/**
+ * Reuse terminal cached suggestions when the draft only consumed their prefix.
+ *
+ * Matching is deliberately exact and forward-only. Cached origins have already
+ * passed the production normalizer; slicing them directly preserves the target
+ * exactly. Re-running model-response heuristics on a suffix could delete a
+ * legitimate repeated word or alter punctuation/indentation.
+ */
+export function reusePromptAutocompleteSuggestions(
+  cachedDraft: string,
+  currentDraft: string,
+  cachedSuggestions: readonly string[],
+  maxChars = DEFAULT_MAX_SUGGESTION_CHARS,
+  maxAlternatives = DEFAULT_MAX_ALTERNATIVES,
+): PromptAutocompletePrefixReuseResult | undefined {
+  if (currentDraft.length <= cachedDraft.length || !currentDraft.startsWith(cachedDraft)) {
+    return undefined;
+  }
+
+  const consumed = currentDraft.slice(cachedDraft.length);
+  const suggestions: string[] = [];
+  const origins: string[] = [];
+
+  for (const origin of cachedSuggestions) {
+    if (!origin.startsWith(consumed)) continue;
+    if (!isSafeConsumedSuggestionPrefix(cachedDraft, origin, consumed.length)) continue;
+
+    const suggestion = truncateSuggestionAtGraphemeBoundary(origin.slice(consumed.length), maxChars);
+    if (!suggestion.trim() || suggestions.includes(suggestion)) continue;
+
+    suggestions.push(suggestion);
+    origins.push(origin);
+    if (suggestions.length >= maxAlternatives) break;
+  }
+
+  return suggestions.length > 0 ? { suggestions, origins } : undefined;
 }
 
 export function extractNextSuggestionChunk(suggestion: string): string | undefined {

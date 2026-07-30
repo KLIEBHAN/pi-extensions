@@ -220,6 +220,7 @@ pi install npm:@kliebhan/pi-prompt-autocomplete
 
 - ghost-text style prompt suggestions directly in the editor after explicit enablement and at least one non-whitespace draft character by default
 - streams the first suggestion into ghost text by default without making an extra provider request; Latin text advances at word boundaries and no-space scripts stay grapheme-safe
+- reuses a still-valid terminal suggestion locally while you type its prefix, showing only the remaining suffix instead of issuing another provider request
 - shows 3 alternatives after the response completes, with configurable limit via flag
 - `Tab` accepts the whole current suggestion
 - `Ctrl+Space` accepts the next word/chunk from the current suggestion
@@ -274,7 +275,7 @@ pi -e ./extensions/prompt-autocomplete \
 
 ### Privacy and provider usage
 
-Prompt autocomplete makes additional model requests. Streaming changes when the first suggestion becomes visible, not what one request sends. Toggling response streaming cancels active autocomplete work but does not start a replacement request; the selected path applies to the next edit or manual one-shot. Each request can include the current draft, the latest user and assistant messages, and a bounded recent-conversation summary. By default it uses the active model; `--prompt-autocomplete-model provider/model` may send that context to a different provider. Requests may incur token costs and consume provider rate limits. Successful results are cached in memory for up to 60 seconds and are cleared when the session resets or the extension is disabled.
+Prompt autocomplete makes additional model requests. Streaming changes when the first suggestion becomes visible, not what one request sends. Toggling response streaming cancels active autocomplete work but does not start a replacement request; the selected path applies to the next edit or manual one-shot. Each request can include the current draft, the latest user and assistant messages, and a bounded recent-conversation summary. By default it uses the active model; `--prompt-autocomplete-model provider/model` may send that context to a different provider. Requests may incur token costs and consume provider rate limits. Successful results are cached in memory for up to 60 seconds. Typing an exact prefix of a still-valid terminal suggestion can reuse its remaining suffix locally; any change to context, model, branch, output configuration, or expiry—or divergent text—forces a fresh request. The bounded caches are cleared when the session resets or the extension is disabled.
 
 The extension is disabled by default. Enabling it with the CLI flag or slash command is explicit consent to these autocomplete requests. Automatic empty-draft requests remain disabled by the default `--prompt-autocomplete-min-chars 1`; set the value to `0` to opt into them. A manual `Ctrl+.` one-shot is treated as explicit intent and can bypass the minimum-character gate.
 
