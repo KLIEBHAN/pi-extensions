@@ -239,6 +239,11 @@ function renderedText(editor: EditorComponent, width = 80): string {
   return editor.render(width).map((line) => stripVTControlCharacters(line)).join("\n");
 }
 
+function insertAtCursor(editor: EditorComponent, text: string): void {
+  assert.ok(editor.insertTextAtCursor);
+  editor.insertTextAtCursor(text);
+}
+
 const CTRL_DOT = "\x1b[46;5u";
 const CTRL_SPACE = "\x1b[32;5u";
 
@@ -737,18 +742,23 @@ test("manual one-shot bypasses a settled cache entry", async () => {
     maxAlternatives: 1,
     completeSimple: (async () => {
       calls += 1;
-      return makeCompletion([calls === 1 ? " cached" : " refreshed"]);
+      return makeCompletion([calls === 1 ? " cached value" : " refreshed"]);
     }) as CompleteSimple,
   });
   const editor = await harness.createEditor();
   editor.setText("Use");
   await flushAsyncWork();
   assert.equal(calls, 1);
-  assert.match(renderedText(editor), /cached/);
+  assert.match(renderedText(editor), /cached value/);
 
   editor.setText("Use");
   await flushAsyncWork();
   assert.equal(calls, 1, "same draft should reuse the settled cache");
+
+  insertAtCursor(editor, " cached");
+  await flushAsyncWork();
+  assert.equal(calls, 1, "an extended draft should reuse the cached prefix");
+  assert.match(renderedText(editor), /value/);
 
   editor.handleInput(CTRL_DOT);
   await flushAsyncWork();
@@ -1055,6 +1065,144 @@ test("multiple alternatives cycle without issuing another provider request", asy
   assert.match(renderedText(editor), /second/);
   assert.match(renderedText(editor), /‹2\/3›/);
   assert.equal(calls, 1);
+});
+
+test("typing a cached suggestion prefix reuses its remainder without another provider request", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" the implementation carefully"], makeUsage(40, 10, 0.0002));
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+
+  for (const character of " the") {
+    editor.handleInput(character);
+    await flushAsyncWork();
+  }
+
+  assert.equal(editor.getText(), "Review the");
+  assert.match(renderedText(editor), /implementation carefully/);
+  assert.equal(calls, 1, "every matching edit must stay local");
+
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 4 cached, 50 tok, ~\$0\.00020 est/);
+});
+
+test("streamed partial text is never eligible for prefix reuse before the terminal response", async () => {
+  const providers = [controlledStream(), controlledStream()];
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    streamSimple: (() => providers[calls++]!.stream) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  providers[0]!.delta('{"completions":[" the implementation care');
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /the implementation/);
+
+  insertAtCursor(editor, " the");
+  await flushAsyncWork();
+  assert.equal(calls, 2, "a provisional preview must not populate either cache");
+
+  providers[0]!.error("cancelled", makeUsage(10, 2, 0.0001), "aborted");
+  providers[1]!.done([" implementation carefully"]);
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /implementation carefully/);
+});
+
+test("prefix reuse filters alternatives and preserves the selected surviving origin", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" alpha one", " beta two", " beta three"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  editor.handleInput(CTRL_DOT);
+  editor.handleInput(CTRL_DOT);
+  assert.match(renderedText(editor), /beta three/);
+  assert.match(renderedText(editor), /‹3\/3›/);
+
+  editor.handleInput(CTRL_SPACE);
+  await flushAsyncWork();
+
+  assert.equal(editor.getText(), "Review beta ");
+  assert.equal(calls, 1);
+  assert.match(renderedText(editor), /three/);
+  assert.match(renderedText(editor), /‹2\/2›/);
+});
+
+test("prefix reuse misses on divergence, changed context, changed leaf, and expiry", async () => {
+  const scenarios = ["diverged", "context", "leaf", "expired"] as const;
+
+  for (const scenario of scenarios) {
+    let calls = 0;
+    let now = 1_000;
+    const harness = createEditorHarness({
+      now: () => now,
+      completeSimple: (async () => {
+        calls += 1;
+        return makeCompletion([calls === 1 ? " the implementation" : " fallback"]);
+      }) as CompleteSimple,
+    });
+    harness.setBranch([
+      { type: "message", message: { role: "user", content: "Initial context" } },
+      { type: "message", message: makeRawCompletion("Initial answer") },
+    ]);
+    const editor = await harness.createEditor();
+    editor.setText("Review");
+    await flushAsyncWork();
+    assert.equal(calls, 1);
+
+    if (scenario === "context") {
+      harness.setBranch([
+        { type: "message", message: { role: "user", content: "Changed context" } },
+        { type: "message", message: makeRawCompletion("Changed answer") },
+      ]);
+    } else if (scenario === "leaf") {
+      harness.setLeafId("leaf-2");
+    } else if (scenario === "expired") {
+      now += 60_001;
+    }
+
+    insertAtCursor(editor, scenario === "diverged" ? " x" : " the");
+    await flushAsyncWork();
+    assert.equal(calls, 2, `${scenario} must issue a fresh request`);
+  }
+});
+
+test("a new session clears prefix-reuse entries with the exact cache", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([calls === 1 ? " the implementation" : " fresh session"]);
+    }) as CompleteSimple,
+  });
+  const firstEditor = await harness.createEditor();
+  firstEditor.setText("Review");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+
+  const secondEditor = await harness.createEditor();
+  secondEditor.setText("Review the");
+  await flushAsyncWork();
+  assert.equal(calls, 2);
+  assert.match(renderedText(secondEditor), /fresh session/);
 });
 
 test("accounting records usage and never bills a cache hit", async () => {

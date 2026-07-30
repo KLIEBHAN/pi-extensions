@@ -79,7 +79,7 @@ Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) outr
 usage=4 req, 5 cached, 1832 tok, ~$0.00214 est
 ```
 
-- `req` counts provider calls that were actually issued; `cached` counts requests answered from the local cache without contacting a provider.
+- `req` counts provider calls that were actually issued; `cached` counts requests answered from the local cache without contacting a provider. This includes exact-draft hits and prefix reuse while you type through a cached suggestion.
 - `failed` appears only when a request errored or was aborted. Tokens from a failed response are counted when the provider returns its terminal usage report within the bounded cancellation drain; otherwise `tok+`/`est+` marks the totals incomplete.
 - Token counts come from the provider.
 - **The cost is an estimate, not an invoice.** Pi derives it locally by multiplying the reported tokens with its own model price table, so it can disagree with what your provider actually bills.
@@ -98,7 +98,7 @@ The active conversation leaf identity is used only in the local in-memory cache 
 
 By default, requests use the active model. A dedicated `--prompt-autocomplete-model` may send this context to a different provider. Requests can incur token charges and consume provider rate limits.
 
-Successful results are cached only in memory for up to 60 seconds. The cache is bounded and is cleared on session reset or when the extension is disabled. Provider failures are not cached.
+Successful results are cached only in memory for up to 60 seconds; a terminal entry retains its base draft in process memory for the prefix comparison. If the draft then grows by an exact prefix of a cached suggestion, Prompt Autocomplete removes the text you typed and shows the remaining suffix locally instead of issuing another provider request. Prefix reuse is forward-only, stays scoped to the same conversation leaf, model, bounded context and output configuration, and never uses partial streamed text. Divergence, expiry or any context change falls through to a fresh request. The caches are bounded and are cleared on session reset or when the extension is disabled. Provider failures are not cached.
 
 The extension makes no autocomplete request while disabled. Automatic empty-draft requests are also disabled by default.
 

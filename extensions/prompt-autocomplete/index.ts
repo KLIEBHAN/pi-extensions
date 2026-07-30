@@ -14,6 +14,7 @@ import {
   buildLatestAssistantMessageContext,
   buildLatestUserMessageContext,
   buildPromptAutocompleteCacheKey,
+  buildPromptAutocompletePrefixContextKey,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
@@ -39,6 +40,7 @@ import {
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   recordProviderUsage,
   resolveOverride,
+  reusePromptAutocompleteSuggestions,
   SequenceOwnedSlot,
   shouldSkipPromptAutocomplete,
   truncateDraftTail,
@@ -119,6 +121,8 @@ interface PromptAutocompleteConfig {
 }
 
 interface PromptAutocompleteCacheEntry {
+  draft: string;
+  prefixContextKey: string;
   suggestions: string[];
   rawResponse?: string;
   error?: string;
@@ -128,6 +132,8 @@ interface PromptAutocompleteCacheEntry {
 interface SuggestionRefreshOptions {
   clearExisting?: boolean;
   immediate?: boolean;
+  /** Stable terminal-cache identity to retain across a word/chunk acceptance. */
+  preferredOrigin?: string;
   // Manual one-shot trigger: bypasses the streaming gate and error cooldown so the
   // user can force a single suggestion while the main agent is still working.
   manual?: boolean;
@@ -170,6 +176,7 @@ interface PromptAutocompleteSharedState {
   lastError?: string;
   lastRawResponse?: string;
   requestCache: ExpiringLruCache<PromptAutocompleteCacheEntry>;
+  prefixReuseCache: ExpiringLruCache<PromptAutocompleteCacheEntry>;
   inFlightRequests: Map<string, CoalescedRequestEntry<PromptAutocompleteCacheEntry, string>>;
   ownsEditor?: () => boolean;
   refreshEditor?: (options?: SuggestionRefreshOptions) => void;
@@ -187,6 +194,7 @@ interface SuggestionRequest {
   model: Model<Api>;
   modelLabel: string;
   cacheKey: string;
+  prefixContextKey: string;
   maxAlternatives: number;
   maxSuggestionChars: number;
   useStreaming: boolean;
@@ -411,13 +419,45 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     .join(" | ");
 }
 
+function cloneCacheEntry(entry: PromptAutocompleteCacheEntry): PromptAutocompleteCacheEntry {
+  return { ...entry, suggestions: [...entry.suggestions] };
+}
+
 function getCachedRequest(
   shared: PromptAutocompleteSharedState,
   cacheKey: string,
   options: { bypass?: boolean } = {},
 ): PromptAutocompleteCacheEntry | undefined {
   const entry = shared.requestCache.get(cacheKey, options);
-  return entry ? { ...entry, suggestions: [...entry.suggestions] } : undefined;
+  return entry ? cloneCacheEntry(entry) : undefined;
+}
+
+interface PrefixReusedCacheEntry {
+  entry: PromptAutocompleteCacheEntry;
+  origins: string[];
+}
+
+function getPrefixReusedRequest(
+  shared: PromptAutocompleteSharedState,
+  request: SuggestionRequest,
+  options: { bypass?: boolean } = {},
+): PrefixReusedCacheEntry | undefined {
+  const cached = shared.prefixReuseCache.get(request.prefixContextKey, options);
+  if (!cached) return undefined;
+
+  const reused = reusePromptAutocompleteSuggestions(
+    cached.draft,
+    request.draft,
+    cached.suggestions,
+    request.maxSuggestionChars,
+    request.maxAlternatives,
+  );
+  if (!reused) return undefined;
+
+  return {
+    entry: { ...cloneCacheEntry(cached), draft: request.draft, suggestions: reused.suggestions },
+    origins: reused.origins,
+  };
 }
 
 function storeCachedRequest(
@@ -425,9 +465,10 @@ function storeCachedRequest(
   cacheKey: string,
   entry: PromptAutocompleteCacheEntry,
 ): PromptAutocompleteCacheEntry {
-  const cachedEntry = { ...entry, suggestions: [...entry.suggestions] };
+  const cachedEntry = cloneCacheEntry(entry);
   shared.requestCache.set(cacheKey, cachedEntry);
-  return { ...cachedEntry, suggestions: [...cachedEntry.suggestions] };
+  shared.prefixReuseCache.set(entry.prefixContextKey, cachedEntry);
+  return cloneCacheEntry(cachedEntry);
 }
 
 class PromptAutocompleteEditor extends CustomEditor {
@@ -436,6 +477,8 @@ class PromptAutocompleteEditor extends CustomEditor {
   private readonly appKeybindings: KeybindingsManager;
 
   private suggestions: string[] = [];
+  /** Stable terminal-cache identities parallel to the displayed suggestions. */
+  private suggestionOrigins: string[] = [];
   private suggestionIndex: number = 0;
   private suggestionsProvisional = false;
   private debounceTimer?: ReturnType<typeof setTimeout>;
@@ -605,16 +648,23 @@ class PromptAutocompleteEditor extends CustomEditor {
     return this.suggestions[this.suggestionIndex];
   }
 
+  private getActiveSuggestionOrigin(): string | undefined {
+    return this.suggestionOrigins[this.suggestionIndex];
+  }
+
   private setSuggestions(
     nextSuggestions: string[],
-    options: { provisional?: boolean } = {},
+    options: { provisional?: boolean; origins?: string[]; preferredOrigin?: string } = {},
   ): void {
     const provisional = options.provisional ?? false;
-    const currentActive = this.getActiveSuggestion();
+    const nextOrigins = options.origins?.length === nextSuggestions.length
+      ? [...options.origins]
+      : [...nextSuggestions];
+    const currentOrigin = options.preferredOrigin ?? this.getActiveSuggestionOrigin();
     let nextIndex = 0;
 
-    if (currentActive) {
-      const preservedIndex = nextSuggestions.indexOf(currentActive);
+    if (currentOrigin) {
+      const preservedIndex = nextOrigins.indexOf(currentOrigin);
       if (preservedIndex !== -1) {
         nextIndex = preservedIndex;
       }
@@ -628,6 +678,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     if (
       arraysEqual(this.suggestions, nextSuggestions)
+      && arraysEqual(this.suggestionOrigins, nextOrigins)
       && this.suggestionIndex === nextIndex
       && this.suggestionsProvisional === provisional
     ) {
@@ -635,6 +686,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
 
     this.suggestions = [...nextSuggestions];
+    this.suggestionOrigins = nextOrigins;
     this.suggestionIndex = nextIndex;
     this.suggestionsProvisional = nextSuggestions.length > 0 && provisional;
 
@@ -743,6 +795,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     const suggestion = this.getActiveSuggestion();
     if (!suggestion) return;
 
+    const origin = this.getActiveSuggestionOrigin();
     const chunk = extractNextSuggestionChunk(suggestion) ?? suggestion;
     if (!chunk) return;
 
@@ -750,7 +803,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.dismissedKey = undefined;
     this.clearInlineSuggestion("accepted-word", `Accepted chunk: ${chunk}`);
     super.insertTextAtCursor(chunk);
-    if (!wasProvisional) this.refreshSuggestion();
+    if (!wasProvisional) this.refreshSuggestion({ preferredOrigin: origin });
   }
 
   private shouldRenderInlineSuggestion(): boolean {
@@ -798,6 +851,7 @@ class PromptAutocompleteEditor extends CustomEditor {
   }
 
   private refreshSuggestion(options: SuggestionRefreshOptions = {}): void {
+    const preferredOrigin = options.preferredOrigin ?? this.getActiveSuggestionOrigin();
     if (options.clearExisting) {
       this.cancelPendingRequest();
       this.setSuggestions([]);
@@ -857,7 +911,29 @@ class PromptAutocompleteEditor extends CustomEditor {
       if (cachedEntry.suggestions.length === 0) {
         updateDebugState(this.shared, "cache-hit", cachedEntry.debugState || "Cached no-suggestion result");
       }
-      this.setSuggestions(cachedEntry.suggestions);
+      this.setSuggestions(cachedEntry.suggestions, {
+        origins: cachedEntry.suggestions,
+        preferredOrigin,
+      });
+      return;
+    }
+
+    const prefixReused = getPrefixReusedRequest(this.shared, request, { bypass: options.manual });
+    if (prefixReused) {
+      this.shared.usageStats.cacheHits += 1;
+      this.shared.usageStats.prefixReuseHits += 1;
+      this.cancelPendingRequest();
+      this.shared.lastRawResponse = prefixReused.entry.rawResponse;
+      this.shared.lastError = prefixReused.entry.error;
+      this.setSuggestions(prefixReused.entry.suggestions, {
+        origins: prefixReused.origins,
+        preferredOrigin,
+      });
+      updateDebugState(
+        this.shared,
+        "prefix-cache-hit",
+        `${prefixReused.entry.suggestions.length} suggestion(s) reused without a provider request`,
+      );
       return;
     }
 
@@ -907,6 +983,16 @@ class PromptAutocompleteEditor extends CustomEditor {
     const modelLabel = formatModelLabel(model);
     const leafId = this.shared.sessionManager?.getLeafId?.() ?? "";
 
+    const prefixContextIdentity = {
+      leafId,
+      modelLabel,
+      maxAlternatives: this.shared.config.maxAlternatives,
+      maxSuggestionChars: this.shared.config.maxSuggestionChars,
+      latestAssistantContext,
+      latestUserContext,
+      recentContext,
+    };
+
     return {
       activationId: this.activationId,
       leafId,
@@ -914,16 +1000,8 @@ class PromptAutocompleteEditor extends CustomEditor {
       draftTail,
       model,
       modelLabel,
-      cacheKey: buildPromptAutocompleteCacheKey({
-        leafId,
-        modelLabel,
-        maxAlternatives: this.shared.config.maxAlternatives,
-        maxSuggestionChars: this.shared.config.maxSuggestionChars,
-        draft,
-        latestAssistantContext,
-        latestUserContext,
-        recentContext,
-      }),
+      cacheKey: buildPromptAutocompleteCacheKey({ ...prefixContextIdentity, draft }),
+      prefixContextKey: buildPromptAutocompletePrefixContextKey(prefixContextIdentity),
       maxAlternatives: this.shared.config.maxAlternatives,
       maxSuggestionChars: this.shared.config.maxSuggestionChars,
       useStreaming: this.shared.config.streamResponses && !!this.shared.streamSimple,
@@ -1152,6 +1230,8 @@ class PromptAutocompleteEditor extends CustomEditor {
         : `${normalized.length} suggestion(s) ready`;
 
     return storeCachedRequest(this.shared, request.cacheKey, {
+      draft: request.draft,
+      prefixContextKey: request.prefixContextKey,
       suggestions: normalized,
       rawResponse,
       debugState,
@@ -1342,6 +1422,7 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.lastError = undefined;
   shared.lastRawResponse = undefined;
   shared.requestCache.clear();
+  shared.prefixReuseCache.clear();
   cancelAllCoalescedRequests(shared.inFlightRequests);
   shared.debugState = shared.enabled ? "configured" : "disabled";
 }
@@ -1443,6 +1524,7 @@ function disablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocomp
   shared.runtimeOverrides.enabled = false;
   unmountEditor(ctx, shared);
   shared.requestCache.clear();
+  shared.prefixReuseCache.clear();
   shared.lastRawResponse = undefined;
   shared.lastError = undefined;
 }
@@ -1610,6 +1692,7 @@ export function createPromptAutocompleteExtension(
     now,
     debugState: "idle",
     requestCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
+    prefixReuseCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
     inFlightRequests: new Map(),
   };
 
@@ -1629,6 +1712,7 @@ export function createPromptAutocompleteExtension(
     shared.enabled = false;
     shared.cancelActiveRequest?.();
     shared.requestCache.clear();
+    shared.prefixReuseCache.clear();
     cancelAllCoalescedRequests(shared.inFlightRequests);
     unmountEditor(ctx, shared);
   });

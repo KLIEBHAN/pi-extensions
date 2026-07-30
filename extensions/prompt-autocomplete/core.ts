@@ -87,11 +87,21 @@ export interface PromptAutocompleteCacheIdentity {
   recentContext: string;
 }
 
+export type PromptAutocompletePrefixContextIdentity = Omit<PromptAutocompleteCacheIdentity, "draft">;
+
+function hashPromptAutocompleteIdentity(identity: object): string {
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+}
+
 export function buildPromptAutocompleteCacheKey(identity: PromptAutocompleteCacheIdentity): string {
-  const digest = createHash("sha256")
-    .update(JSON.stringify(identity))
-    .digest("hex");
-  return `${identity.modelLabel}|${digest}`;
+  return `${identity.modelLabel}|${hashPromptAutocompleteIdentity(identity)}`;
+}
+
+/** Identify every request discriminator except the evolving prompt draft. */
+export function buildPromptAutocompletePrefixContextKey(
+  identity: PromptAutocompletePrefixContextIdentity,
+): string {
+  return `${identity.modelLabel}|prefix|${hashPromptAutocompleteIdentity(identity)}`;
 }
 
 export class ExpiringLruCache<T> {
@@ -355,6 +365,8 @@ export interface PromptAutocompleteUsageStats {
   failedRequests: number;
   /** Requests served from the local cache without contacting a provider. */
   cacheHits: number;
+  /** Cache hits obtained by consuming a prefix of a previous suggestion. */
+  prefixReuseHits: number;
   /** Responses that carried token counts. Totals are partial when this is below providerRequests. */
   tokenReports: number;
   /** Responses that carried a cost figure. */
@@ -379,6 +391,7 @@ export function createPromptAutocompleteUsageStats(): PromptAutocompleteUsageSta
     providerRequests: 0,
     failedRequests: 0,
     cacheHits: 0,
+    prefixReuseHits: 0,
     tokenReports: 0,
     costReports: 0,
     totalTokens: 0,
@@ -1451,6 +1464,70 @@ export function normalizePromptSuggestions(
   }
 
   return normalized;
+}
+
+export interface PromptAutocompletePrefixReuseResult {
+  /** Suggestions normalized for the extended draft. */
+  suggestions: string[];
+  /** Original cached suggestions, parallel to `suggestions`, for selection continuity. */
+  origins: string[];
+}
+
+function isSafeConsumedSuggestionPrefix(suggestion: string, consumedLength: number): boolean {
+  if (consumedLength <= 0 || consumedLength > suggestion.length) return false;
+
+  if (!STREAMING_GRAPHEME_SEGMENTER) {
+    // Minimal-ICU fallback: accept only an ASCII prefix that is not followed by
+    // a combining/variation/joining code point. For richer text, decline reuse
+    // rather than split an unknown cluster.
+    const consumed = suggestion.slice(0, consumedLength);
+    const remainder = suggestion.slice(consumedLength);
+    return /^[\x00-\x7F]*$/.test(consumed) && !/^[\p{M}\u200D]/u.test(remainder);
+  }
+
+  for (const segment of STREAMING_GRAPHEME_SEGMENTER.segment(suggestion)) {
+    const end = segment.index + segment.segment.length;
+    if (end === consumedLength) return true;
+    if (end > consumedLength) return false;
+  }
+  return consumedLength === suggestion.length;
+}
+
+/**
+ * Reuse terminal cached suggestions when the draft only consumed their prefix.
+ *
+ * Matching is deliberately exact and forward-only. The remainder goes through
+ * the production normalizer again so whitespace, partial-word, terminal-safety,
+ * Unicode and configured-length behavior stay identical to a fresh response.
+ */
+export function reusePromptAutocompleteSuggestions(
+  cachedDraft: string,
+  currentDraft: string,
+  cachedSuggestions: readonly string[],
+  maxChars = DEFAULT_MAX_SUGGESTION_CHARS,
+  maxAlternatives = DEFAULT_MAX_ALTERNATIVES,
+): PromptAutocompletePrefixReuseResult | undefined {
+  if (currentDraft.length <= cachedDraft.length || !currentDraft.startsWith(cachedDraft)) {
+    return undefined;
+  }
+
+  const consumed = currentDraft.slice(cachedDraft.length);
+  const suggestions: string[] = [];
+  const origins: string[] = [];
+
+  for (const origin of cachedSuggestions) {
+    if (!origin.startsWith(consumed)) continue;
+    if (!isSafeConsumedSuggestionPrefix(origin, consumed.length)) continue;
+
+    const suggestion = normalizePromptSuggestion(currentDraft, origin.slice(consumed.length), maxChars);
+    if (!suggestion || suggestions.includes(suggestion)) continue;
+
+    suggestions.push(suggestion);
+    origins.push(origin);
+    if (suggestions.length >= maxAlternatives) break;
+  }
+
+  return suggestions.length > 0 ? { suggestions, origins } : undefined;
 }
 
 export function extractNextSuggestionChunk(suggestion: string): string | undefined {

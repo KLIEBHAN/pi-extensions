@@ -6,6 +6,7 @@ import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
   buildPromptAutocompleteCacheKey,
+  buildPromptAutocompletePrefixContextKey,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
@@ -23,6 +24,7 @@ import {
   MIN_REQUEST_MAX_TOKENS,
   recordProviderUsage,
   resolveOverride,
+  reusePromptAutocompleteSuggestions,
   extractMessageText,
   extractNextSuggestionChunk,
   normalizePromptSuggestion,
@@ -102,6 +104,19 @@ test("prompt autocomplete cache identity includes draft, context, and output con
   );
   assert.notEqual(key, buildPromptAutocompleteCacheKey({ ...base, maxSuggestionChars: 320 }));
   assert.doesNotMatch(key, /Implementation finished|Please implement it|Review the change/);
+
+  const { draft: _draft, ...prefixIdentity } = base;
+  const prefixKey = buildPromptAutocompletePrefixContextKey(prefixIdentity);
+  assert.equal(prefixKey, buildPromptAutocompletePrefixContextKey({ ...prefixIdentity }));
+  assert.notEqual(
+    prefixKey,
+    buildPromptAutocompletePrefixContextKey({ ...prefixIdentity, leafId: "leaf-2" }),
+  );
+  assert.notEqual(
+    prefixKey,
+    buildPromptAutocompletePrefixContextKey({ ...prefixIdentity, recentContext: "changed" }),
+  );
+  assert.doesNotMatch(prefixKey, /Implementation finished|Please implement it/);
 });
 
 test("expiring LRU cache enforces TTL, manual bypass, and the entry bound", () => {
@@ -287,6 +302,76 @@ test("normalizePromptSuggestions parses JSON alternatives and deduplicates them"
   );
 });
 
+test("prefix reuse consumes exact typed deltas and re-normalizes the remainder", () => {
+  assert.deepEqual(
+    reusePromptAutocompleteSuggestions(
+      "Review",
+      "Review the",
+      [" the implementation carefully", " with focused tests"],
+    ),
+    {
+      suggestions: [" implementation carefully"],
+      origins: [" the implementation carefully"],
+    },
+  );
+  assert.deepEqual(
+    reusePromptAutocompleteSuggestions("Schrei", "Schreib", ["be eine Antwort"]),
+    { suggestions: ["e eine Antwort"], origins: ["be eine Antwort"] },
+  );
+  assert.equal(
+    reusePromptAutocompleteSuggestions("Review", "Review something else", [" the implementation"]),
+    undefined,
+  );
+  assert.equal(
+    reusePromptAutocompleteSuggestions("Review", "Review", [" the implementation"]),
+    undefined,
+  );
+  assert.equal(
+    reusePromptAutocompleteSuggestions("Review all", "Review", [" the implementation"]),
+    undefined,
+  );
+});
+
+test("prefix reuse filters alternatives while retaining stable origin identities", () => {
+  assert.deepEqual(
+    reusePromptAutocompleteSuggestions(
+      "Review",
+      "Review beta",
+      [" alpha one", " beta two", " beta three", " gamma four"],
+    ),
+    {
+      suggestions: [" two", " three"],
+      origins: [" beta two", " beta three"],
+    },
+  );
+});
+
+test("prefix reuse is Unicode- and grapheme-safe for CJK, emoji, and combining marks", () => {
+  assert.deepEqual(
+    reusePromptAutocompleteSuggestions("続きを", "続きを確", ["確認して報告"]),
+    { suggestions: ["認して報告"], origins: ["確認して報告"] },
+  );
+  assert.deepEqual(
+    reusePromptAutocompleteSuggestions("Use", "Use 👩‍💻", [" 👩‍💻 mode"]),
+    { suggestions: [" mode"], origins: [" 👩‍💻 mode"] },
+  );
+  assert.equal(
+    reusePromptAutocompleteSuggestions("Cafe", "Cafee", ["e\u0301 noir"]),
+    undefined,
+    "do not consume only the base code point of a combining grapheme",
+  );
+  assert.equal(
+    reusePromptAutocompleteSuggestions("Flag", "Flag 🇩", [" 🇩🇪 locale"]),
+    undefined,
+    "do not consume half of a regional-indicator pair",
+  );
+  assert.equal(
+    reusePromptAutocompleteSuggestions("Use", "Use 👩", [" 👩‍💻 mode"]),
+    undefined,
+    "do not consume only the first code point of a ZWJ sequence",
+  );
+});
+
 test("normalizePromptSuggestions salvages complete entries from truncated JSON responses", () => {
   const truncated =
     '{"completions":["Prüfe, ob die Suiten mit eigenen Factory-Mocks auch auf den manuellen Mock umstellbar sind","Konvertiere den manuellen Mock von module.exports';
@@ -397,13 +482,18 @@ test("core loads safely without Intl.Segmenter and disables uncertain partial gr
     `const core = await import(${JSON.stringify(moduleUrl)});`,
     'console.log(core.normalizePromptSuggestion("", "abcdefghijklmnopq", 16));',
     'console.log(String(core.parsePartialPromptSuggestion("", \'{"completions":["続きを確\')));',
+    'console.log(JSON.stringify(core.reusePromptAutocompleteSuggestions("Review", "Review the", [" the result"])));',
+    'console.log(String(core.reusePromptAutocompleteSuggestions("", "e", ["e\\u0301 noir"])));',
   ].join("\n");
   const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], {
     encoding: "utf8",
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "…\nundefined");
+  assert.equal(
+    result.stdout.trim(),
+    '…\nundefined\n{"suggestions":[" result"],"origins":[" the result"]}\nundefined',
+  );
 });
 
 test("partial suggestions are grapheme-safe for CJK, combining marks, flags, and ZWJ emoji", () => {
