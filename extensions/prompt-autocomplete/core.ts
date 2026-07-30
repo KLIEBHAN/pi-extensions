@@ -136,10 +136,23 @@ export class ExpiringLruCache<T> {
     return entry.value;
   }
 
-  set(key: string, value: T): void {
+  set(key: string, value: T, options: { expiresAt?: number } = {}): void {
+    const now = this.now();
+    const expiresAt = options.expiresAt ?? now + this.ttlMs;
     this.entries.delete(key);
-    this.entries.set(key, { value, expiresAt: this.now() + this.ttlMs });
+    if (expiresAt <= now) return;
+    this.entries.set(key, { value, expiresAt });
     this.prune();
+  }
+
+  getExpiration(key: string): number | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= this.now()) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    return entry.expiresAt;
   }
 
   clear(): void {
@@ -1473,32 +1486,37 @@ export interface PromptAutocompletePrefixReuseResult {
   origins: string[];
 }
 
-function isSafeConsumedSuggestionPrefix(suggestion: string, consumedLength: number): boolean {
+function isSafeConsumedSuggestionPrefix(
+  cachedDraft: string,
+  suggestion: string,
+  consumedLength: number,
+): boolean {
   if (consumedLength <= 0 || consumedLength > suggestion.length) return false;
 
+  const target = cachedDraft + suggestion;
+  const boundary = cachedDraft.length + consumedLength;
   if (!STREAMING_GRAPHEME_SEGMENTER) {
-    // Minimal-ICU fallback: accept only an ASCII prefix that is not followed by
-    // a combining/variation/joining code point. For richer text, decline reuse
-    // rather than split an unknown cluster.
+    // Minimal-ICU fallback: accept only a newly consumed ASCII prefix that is
+    // not followed by a combining/variation/joining code point. For richer
+    // text, decline reuse rather than guess across the draft/suggestion seam.
     const consumed = suggestion.slice(0, consumedLength);
     const remainder = suggestion.slice(consumedLength);
     return /^[\x00-\x7F]*$/.test(consumed) && !/^[\p{M}\u200D]/u.test(remainder);
   }
 
-  for (const segment of STREAMING_GRAPHEME_SEGMENTER.segment(suggestion)) {
-    const end = segment.index + segment.segment.length;
-    if (end === consumedLength) return true;
-    if (end > consumedLength) return false;
-  }
-  return consumedLength === suggestion.length;
+  if (boundary === target.length) return true;
+  // `containing` asks ICU for the segment at the seam without materializing or
+  // walking every grapheme in an arbitrarily long draft.
+  return STREAMING_GRAPHEME_SEGMENTER.segment(target).containing(boundary)?.index === boundary;
 }
 
 /**
  * Reuse terminal cached suggestions when the draft only consumed their prefix.
  *
- * Matching is deliberately exact and forward-only. The remainder goes through
- * the production normalizer again so whitespace, partial-word, terminal-safety,
- * Unicode and configured-length behavior stay identical to a fresh response.
+ * Matching is deliberately exact and forward-only. Cached origins have already
+ * passed the production normalizer; slicing them directly preserves the target
+ * exactly. Re-running model-response heuristics on a suffix could delete a
+ * legitimate repeated word or alter punctuation/indentation.
  */
 export function reusePromptAutocompleteSuggestions(
   cachedDraft: string,
@@ -1517,10 +1535,10 @@ export function reusePromptAutocompleteSuggestions(
 
   for (const origin of cachedSuggestions) {
     if (!origin.startsWith(consumed)) continue;
-    if (!isSafeConsumedSuggestionPrefix(origin, consumed.length)) continue;
+    if (!isSafeConsumedSuggestionPrefix(cachedDraft, origin, consumed.length)) continue;
 
-    const suggestion = normalizePromptSuggestion(currentDraft, origin.slice(consumed.length), maxChars);
-    if (!suggestion || suggestions.includes(suggestion)) continue;
+    const suggestion = truncateSuggestionAtGraphemeBoundary(origin.slice(consumed.length), maxChars);
+    if (!suggestion.trim() || suggestions.includes(suggestion)) continue;
 
     suggestions.push(suggestion);
     origins.push(origin);

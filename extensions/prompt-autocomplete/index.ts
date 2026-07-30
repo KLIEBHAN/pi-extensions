@@ -432,6 +432,16 @@ function getCachedRequest(
   return entry ? cloneCacheEntry(entry) : undefined;
 }
 
+function rearmPrefixReuseFromExactHit(
+  shared: PromptAutocompleteSharedState,
+  cacheKey: string,
+  entry: PromptAutocompleteCacheEntry,
+): void {
+  const expiresAt = shared.requestCache.getExpiration(cacheKey);
+  if (expiresAt === undefined) return;
+  shared.prefixReuseCache.set(entry.prefixContextKey, cloneCacheEntry(entry), { expiresAt });
+}
+
 interface PrefixReusedCacheEntry {
   entry: PromptAutocompleteCacheEntry;
   origins: string[];
@@ -905,6 +915,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     const cachedEntry = getCachedRequest(this.shared, request.cacheKey, { bypass: options.manual });
     if (cachedEntry) {
       this.shared.usageStats.cacheHits += 1;
+      rearmPrefixReuseFromExactHit(this.shared, request.cacheKey, cachedEntry);
       this.cancelPendingRequest();
       this.shared.lastRawResponse = cachedEntry.rawResponse;
       this.shared.lastError = cachedEntry.error;

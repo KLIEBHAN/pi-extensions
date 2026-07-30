@@ -1093,6 +1093,27 @@ test("typing a cached suggestion prefix reuses its remainder without another pro
   assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 4 cached, 50 tok, ~\$0\.00020 est/);
 });
 
+test("accepting a reused repeated-word suffix reconstructs the exact cached target", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" foo foobar later"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Say");
+  await flushAsyncWork();
+
+  insertAtCursor(editor, " foo");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+  assert.match(renderedText(editor), /foobar later/);
+
+  editor.handleInput("\t");
+  assert.equal(editor.getText(), "Say foo foobar later");
+});
+
 test("streamed partial text is never eligible for prefix reuse before the terminal response", async () => {
   const providers = [controlledStream(), controlledStream()];
   let calls = 0;
@@ -1182,6 +1203,44 @@ test("prefix reuse misses on divergence, changed context, changed leaf, and expi
     insertAtCursor(editor, scenario === "diverged" ? " x" : " the");
     await flushAsyncWork();
     assert.equal(calls, 2, `${scenario} must issue a fresh request`);
+  }
+});
+
+test("an older exact cache hit re-arms prefix reuse without extending its TTL", async () => {
+  for (const scenario of ["still-valid", "expired-after-rearm"] as const) {
+    let calls = 0;
+    let now = 1_000;
+    const harness = createEditorHarness({
+      now: () => now,
+      completeSimple: (async () => {
+        calls += 1;
+        if (calls === 1) return makeCompletion([" the implementation"]);
+        if (calls === 2) return makeCompletion([" diverged result"]);
+        return makeCompletion([" fresh result"]);
+      }) as CompleteSimple,
+    });
+    const editor = await harness.createEditor();
+    editor.setText("Review");
+    await flushAsyncWork();
+    assert.equal(calls, 1);
+
+    now += 10_000;
+    editor.setText("Review x");
+    await flushAsyncWork();
+    assert.equal(calls, 2);
+
+    now = scenario === "still-valid" ? 20_000 : 60_999;
+    editor.setText("Review");
+    await flushAsyncWork();
+    assert.equal(calls, 2, "the older exact entry should still be available");
+    assert.match(renderedText(editor), /the implementation/);
+
+    if (scenario === "expired-after-rearm") now = 61_001;
+    insertAtCursor(editor, " the");
+    await flushAsyncWork();
+
+    assert.equal(calls, scenario === "still-valid" ? 2 : 3);
+    assert.match(renderedText(editor), scenario === "still-valid" ? /implementation/ : /fresh result/);
   }
 });
 

@@ -141,6 +141,17 @@ test("expiring LRU cache enforces TTL, manual bypass, and the entry bound", () =
   assert.equal(cache.get("a"), "A");
   assert.equal(cache.get("b"), undefined);
   assert.equal(cache.get("c"), "C");
+
+  const original = new ExpiringLruCache<string>(60_000, 2, () => now);
+  const secondary = new ExpiringLruCache<string>(60_000, 2, () => now);
+  original.set("source", "value");
+  const originalExpiration = original.getExpiration("source");
+  assert.equal(originalExpiration, now + 60_000);
+  now += 50_000;
+  secondary.set("copy", "value", { expiresAt: originalExpiration });
+  assert.equal(secondary.get("copy"), "value");
+  now += 10_000;
+  assert.equal(secondary.get("copy"), undefined, "copying an entry must not restart its TTL");
 });
 
 test("sequence-owned slot does not let an older completion clear newer pending state", () => {
@@ -302,7 +313,7 @@ test("normalizePromptSuggestions parses JSON alternatives and deduplicates them"
   );
 });
 
-test("prefix reuse consumes exact typed deltas and re-normalizes the remainder", () => {
+test("prefix reuse consumes exact typed deltas and preserves the normalized target", () => {
   assert.deepEqual(
     reusePromptAutocompleteSuggestions(
       "Review",
@@ -318,6 +329,20 @@ test("prefix reuse consumes exact typed deltas and re-normalizes the remainder",
     reusePromptAutocompleteSuggestions("Schrei", "Schreib", ["be eine Antwort"]),
     { suggestions: ["e eine Antwort"], origins: ["be eine Antwort"] },
   );
+  for (const [cachedDraft, currentDraft, origin] of [
+    ["Say", "Say foo", " foo foobar later"],
+    ["Review", "Review the", " the theorem"],
+    ["List", "List\n", "\n  item"],
+    ["Call", "Call)", ")result"],
+  ] as const) {
+    const reused = reusePromptAutocompleteSuggestions(cachedDraft, currentDraft, [origin]);
+    assert.ok(reused);
+    assert.equal(
+      currentDraft + reused.suggestions[0],
+      cachedDraft + origin,
+      "reuse must preserve the exact normalized cached target",
+    );
+  }
   assert.equal(
     reusePromptAutocompleteSuggestions("Review", "Review something else", [" the implementation"]),
     undefined,
@@ -369,6 +394,16 @@ test("prefix reuse is Unicode- and grapheme-safe for CJK, emoji, and combining m
     reusePromptAutocompleteSuggestions("Use", "Use 👩", [" 👩‍💻 mode"]),
     undefined,
     "do not consume only the first code point of a ZWJ sequence",
+  );
+  assert.equal(
+    reusePromptAutocompleteSuggestions("Use 👩", "Use 👩\u200D", ["\u200D💻 mode"]),
+    undefined,
+    "the grapheme boundary must include the cached-draft seam",
+  );
+  assert.equal(
+    reusePromptAutocompleteSuggestions("Flag 🇦", "Flag 🇦🇧🇨", ["🇧🇨🇩 locale"]),
+    undefined,
+    "regional-indicator pairing depends on the cached draft",
   );
 });
 
