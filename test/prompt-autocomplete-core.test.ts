@@ -19,9 +19,11 @@ import {
   DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
   describeSettingSource,
   ExpiringLruCache,
+  formatPromptAutocompleteStats,
   formatUsageStats,
   MAX_REQUEST_MAX_TOKENS,
   MIN_REQUEST_MAX_TOKENS,
+  recordProviderLatency,
   recordProviderUsage,
   resolveOverride,
   reusePromptAutocompleteSuggestions,
@@ -838,6 +840,50 @@ test("buildLatestAssistantMessageContext returns the newest assistant text", () 
   assert.equal(
     buildLatestAssistantMessageContext(branch),
     "Neueste Antwort mit konkreten nächsten Schritten",
+  );
+});
+
+test("session stats format reachable metrics and preserve incomplete usage markers", () => {
+  const empty = createPromptAutocompleteUsageStats();
+  assert.equal(
+    formatPromptAutocompleteStats(empty),
+    [
+      "Prompt Autocomplete — current session",
+      "Requests: 0 issued, 0 failed",
+      "Cache: 0 hits (0 exact, 0 prefix)",
+      "Suggestions: 0 shown, 0 accepted (0 full, 0 word/chunk)",
+      "Usage: 0 tok, ~$0 est",
+      "Mean provider latency: n/a",
+    ].join("\n"),
+  );
+
+  const stats = createPromptAutocompleteUsageStats();
+  stats.providerRequests = 3;
+  stats.failedRequests = 1;
+  stats.cacheHits = 5;
+  stats.prefixReuseHits = 3;
+  stats.suggestionsShown = 8;
+  stats.fullAccepts = 2;
+  stats.chunkAccepts = 1;
+  recordProviderUsage(stats, { totalTokens: 120, cost: { total: 0.0006 } });
+  recordProviderUsage(stats, { totalTokens: 50 });
+  recordProviderLatency(stats, 200);
+  recordProviderLatency(stats, 50);
+  recordProviderLatency(stats, -1);
+  recordProviderLatency(stats, Number.NaN);
+
+  assert.equal(stats.latencySamples, 2);
+  assert.equal(stats.totalLatencyMs, 250);
+  assert.equal(
+    formatPromptAutocompleteStats(stats),
+    [
+      "Prompt Autocomplete — current session",
+      "Requests: 3 issued, 1 failed",
+      "Cache: 5 hits (2 exact, 3 prefix)",
+      "Suggestions: 8 shown, 3 accepted (2 full, 1 word/chunk)",
+      "Usage: 170 tok+, ~$0.00060 est+",
+      "Mean provider latency: 125 ms (2 samples)",
+    ].join("\n"),
   );
 });
 

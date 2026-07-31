@@ -380,6 +380,16 @@ export interface PromptAutocompleteUsageStats {
   cacheHits: number;
   /** Cache hits obtained by consuming a prefix of a previous suggestion. */
   prefixReuseHits: number;
+  /** Individual candidates newly presented in the editor. */
+  suggestionsShown: number;
+  /** Full-suggestion accept actions, including visible streamed partials. */
+  fullAccepts: number;
+  /** Word/chunk accept actions, including visible streamed partials. */
+  chunkAccepts: number;
+  /** Provider calls with a measured completion or rejection latency. */
+  latencySamples: number;
+  /** Sum used to derive mean provider latency without retaining request history. */
+  totalLatencyMs: number;
   /** Responses that carried token counts. Totals are partial when this is below providerRequests. */
   tokenReports: number;
   /** Responses that carried a cost figure. */
@@ -405,6 +415,11 @@ export function createPromptAutocompleteUsageStats(): PromptAutocompleteUsageSta
     failedRequests: 0,
     cacheHits: 0,
     prefixReuseHits: 0,
+    suggestionsShown: 0,
+    fullAccepts: 0,
+    chunkAccepts: 0,
+    latencySamples: 0,
+    totalLatencyMs: 0,
     tokenReports: 0,
     costReports: 0,
     totalTokens: 0,
@@ -497,6 +512,21 @@ function formatEstimatedCost(cost: number): string {
   return cost < 0.01 ? `$${cost.toFixed(5)}` : `$${cost.toFixed(4)}`;
 }
 
+export function recordProviderLatency(stats: PromptAutocompleteUsageStats, elapsedMs: number): void {
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return;
+  stats.latencySamples += 1;
+  stats.totalLatencyMs += elapsedMs;
+}
+
+function formatUsageTotals(stats: PromptAutocompleteUsageStats): string {
+  const tokensPartial = stats.tokenReports < stats.providerRequests;
+  const costPartial = stats.costReports < stats.providerRequests;
+  return [
+    `${stats.totalTokens} tok${tokensPartial ? "+" : ""}`,
+    `~${formatEstimatedCost(stats.estimatedCost)} est${costPartial ? "+" : ""}`,
+  ].join(", ");
+}
+
 /**
  * Render session accounting for the status line.
  *
@@ -511,12 +541,26 @@ export function formatUsageStats(stats: PromptAutocompleteUsageStats): string {
     segments.push(`${stats.failedRequests} failed`);
   }
 
-  const tokensPartial = stats.tokenReports < stats.providerRequests;
-  const costPartial = stats.costReports < stats.providerRequests;
-  segments.push(`${stats.totalTokens} tok${tokensPartial ? "+" : ""}`);
-  segments.push(`~${formatEstimatedCost(stats.estimatedCost)} est${costPartial ? "+" : ""}`);
-
+  segments.push(formatUsageTotals(stats));
   return segments.join(", ");
+}
+
+/** Render the reachable, user-facing metrics for the current session. */
+export function formatPromptAutocompleteStats(stats: PromptAutocompleteUsageStats): string {
+  const exactCacheHits = Math.max(0, stats.cacheHits - stats.prefixReuseHits);
+  const accepts = stats.fullAccepts + stats.chunkAccepts;
+  const meanLatency = stats.latencySamples > 0
+    ? `${Math.round(stats.totalLatencyMs / stats.latencySamples)} ms (${stats.latencySamples} sample${stats.latencySamples === 1 ? "" : "s"})`
+    : "n/a";
+
+  return [
+    "Prompt Autocomplete — current session",
+    `Requests: ${stats.providerRequests} issued, ${stats.failedRequests} failed`,
+    `Cache: ${stats.cacheHits} hits (${exactCacheHits} exact, ${stats.prefixReuseHits} prefix)`,
+    `Suggestions: ${stats.suggestionsShown} shown, ${accepts} accepted (${stats.fullAccepts} full, ${stats.chunkAccepts} word/chunk)`,
+    `Usage: ${formatUsageTotals(stats)}`,
+    `Mean provider latency: ${meanLatency}`,
+  ].join("\n");
 }
 
 /**
