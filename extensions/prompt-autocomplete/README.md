@@ -39,7 +39,8 @@ Or enable it for the current interactive session:
 | Next alternative / manual one-shot | `Ctrl+.` |
 | Previous alternative | `Ctrl+,` |
 | Dismiss the suggestion for this draft | `Escape` |
-| Enable, disable, or inspect | `/prompt-autocomplete on\|off\|toggle\|status` |
+| Enable, disable, or inspect configuration | `/prompt-autocomplete on\|off\|toggle\|status` |
+| Show current-session effectiveness and cost | `/prompt-autocomplete stats` |
 | Toggle streamed response previews | `/prompt-autocomplete stream on\|off\|toggle` |
 
 Legacy fallbacks are available for terminals that forward them: `Ctrl+Tab`, `Alt+[`, and `Alt+]`.
@@ -73,18 +74,29 @@ Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) outr
 
 ### Usage and cost accounting
 
-`/prompt-autocomplete status` reports what the current session actually spent:
+`/prompt-autocomplete stats` gives the current session a dedicated, readable report:
 
 ```text
-usage=4 req, 5 cached, 1832 tok, ~$0.00214 est
+Prompt Autocomplete — current session
+Requests: 4 issued, 1 failed
+Cache: 5 hits (2 exact, 3 prefix)
+Suggestions: 8 offered, 3 accepted (2 full, 1 word/chunk)
+Usage: 1832 tokens, estimated cost ~$0.00214
+Mean provider latency: 410 ms (4 samples)
 ```
 
-- `req` counts provider calls that were actually issued; `cached` counts requests answered from the local cache without contacting a provider. This includes exact-draft hits and prefix reuse while you type through a cached suggestion.
-- `failed` appears only when a request errored or was aborted. Tokens from a failed response are counted when the provider returns its terminal usage report within the bounded cancellation drain; otherwise `tok+`/`est+` marks the totals incomplete.
+`/prompt-autocomplete status` keeps its existing compact `usage=4 req, 5 cached, …` field for configuration troubleshooting.
+
+- `issued` counts provider calls actually made. Cache hits add no provider request, tokens, cost, or latency sample.
+- Cache hits distinguish exact-draft results from prefix reuse while you type through a cached suggestion.
+- `offered` counts active ghost-text suggestions handed to the editor. Streamed revisions of the same active suggestion do not inflate it; cycling to another alternative counts a new offer. A terminal that is too narrow to draw ghost text can still count an offer.
+- Full and word/chunk acceptance are counted separately, including acceptance of visible streamed partials.
+- `failed` includes provider errors and aborted requests. Tokens from a failed response are counted when the provider returns its terminal usage report within the bounded cancellation drain; otherwise `tok+`/`est+` marks the totals incomplete.
+- Mean provider latency measures local elapsed time from each actual provider invocation until it resolves or rejects; cache hits are excluded.
 - Token counts come from the provider.
 - **The cost is an estimate, not an invoice.** Pi derives it locally by multiplying the reported tokens with its own model price table, so it can disagree with what your provider actually bills.
-- A trailing `+` (`1832 tok+`, `~$0.00214 est+`) means at least one request did not report that metric, so the true total may be higher than shown. Tokens and cost are marked independently, because a response can report tokens without a cost figure.
-- Counters live in memory, are scoped to the current session, and reset when a new session starts.
+- A trailing `+` (`1832 tokens+`, `estimated cost ~$0.00214+`; compact `status`: `1832 tok+`, `~$0.00214 est+`) means at least one request did not report that metric, so the true total may be higher than shown. Tokens and cost are marked independently, because a response can report tokens without a cost figure.
+- Counters live only in memory, are scoped to the current session, and reset when a new session starts.
 
 ## Privacy, providers, and cost
 

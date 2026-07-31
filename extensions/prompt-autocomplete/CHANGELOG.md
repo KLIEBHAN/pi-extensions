@@ -11,6 +11,7 @@ All notable changes to this package are documented here. This project follows [S
 - Accepting visible partial text cancels its stream and does not automatically issue a second paid request.
 - Forward prefix reuse serves the remaining suffix of a still-valid terminal cache entry while the user types through it, avoiding another provider request without crossing model, branch, context, output-configuration, TTL, or grapheme boundaries.
 - Session accounting for autocomplete requests: `/prompt-autocomplete status` now reports issued requests, requests served from the cache, failed requests, provider-reported tokens, and an estimated cost derived from pi's local model price table. Tokens and cost are marked independently with a trailing `+` when a request did not report that metric.
+- `/prompt-autocomplete stats` presents current-session requests, failures, exact and prefix cache hits, active suggestions offered, full and word/chunk acceptance, token/cost totals, and mean provider latency without a live overlay or persistence.
 - Status output now names the source of each toggle, so a session override is distinguishable from a CLI flag.
 
 ### Security

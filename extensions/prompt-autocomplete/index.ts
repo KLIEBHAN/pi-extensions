@@ -31,6 +31,7 @@ import {
   ExpiringLruCache,
   extractNextSuggestionChunk,
   formatModelLabel,
+  formatPromptAutocompleteStats,
   formatUsageStats,
   MAX_DRAFT_CONTEXT_CHARS,
   normalizePromptSuggestions,
@@ -38,6 +39,7 @@ import {
   parseModelRef,
   parsePartialPromptSuggestion,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+  recordProviderLatency,
   recordProviderUsage,
   resolveOverride,
   reusePromptAutocompleteSuggestions,
@@ -695,6 +697,13 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
+    // Count active ghost-text offers, not hidden alternatives or every streamed
+    // revision of the same candidate. Cycling records a new offer when another
+    // alternative becomes active.
+    if (nextSuggestions.length > 0 && this.suggestions.length === 0) {
+      this.shared.usageStats.suggestionsOffered += 1;
+    }
+
     this.suggestions = [...nextSuggestions];
     this.suggestionOrigins = nextOrigins;
     this.suggestionIndex = nextIndex;
@@ -716,6 +725,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     const nextIndex = (this.suggestionIndex + delta + this.suggestions.length) % this.suggestions.length;
     if (nextIndex === this.suggestionIndex) return;
     this.suggestionIndex = nextIndex;
+    this.shared.usageStats.suggestionsOffered += 1;
     this.dismissedKey = undefined;
     updateDebugState(this.shared, "cycled", `Now showing ${nextIndex + 1}/${this.suggestions.length}`);
     this.tui.requestRender();
@@ -793,6 +803,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (!suggestion) return;
 
     const wasProvisional = this.suggestionsProvisional;
+    this.shared.usageStats.fullAccepts += 1;
     this.dismissedKey = undefined;
     this.clearInlineSuggestion("accepted", wasProvisional ? "Accepted streamed partial suggestion" : "Accepted full suggestion");
     super.insertTextAtCursor(suggestion);
@@ -810,6 +821,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (!chunk) return;
 
     const wasProvisional = this.suggestionsProvisional;
+    this.shared.usageStats.chunkAccepts += 1;
     this.dismissedKey = undefined;
     this.clearInlineSuggestion("accepted-word", `Accepted chunk: ${chunk}`);
     super.insertTextAtCursor(chunk);
@@ -1177,6 +1189,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
     };
 
+    const providerStartedAt = this.shared.now();
     let response: AssistantMessage;
     try {
       if (request.useStreaming && this.shared.streamSimple) {
@@ -1207,6 +1220,8 @@ class PromptAutocompleteEditor extends CustomEditor {
     } catch (error) {
       stats.failedRequests += 1;
       throw error;
+    } finally {
+      recordProviderLatency(stats, this.shared.now() - providerStartedAt);
     }
 
     // Tokens spent on a failed or aborted response are still spent, so usage is
@@ -1578,6 +1593,9 @@ function createPromptAutocompleteCommandHandlers(
     status: () => {
       ctx.ui.notify(formatStatus(shared), "info");
     },
+    stats: () => {
+      ctx.ui.notify(formatPromptAutocompleteStats(shared.usageStats), "info");
+    },
     "debug-on": () => {
       setDebugDisplay(shared, true);
       ctx.ui.notify("Prompt autocomplete debug display enabled", "info");
@@ -1754,7 +1772,7 @@ export function createPromptAutocompleteExtension(
   });
 
   pi.registerCommand("prompt-autocomplete", {
-    description: "Enable, disable, or inspect inline prompt autocomplete",
+    description: "Enable, disable, or inspect inline prompt autocomplete and session stats",
     handler: async (args, ctx) => {
       if (ctx.mode !== "tui") {
         ctx.ui.notify("prompt-autocomplete requires interactive TUI mode", "warning");
@@ -1782,7 +1800,7 @@ export function createPromptAutocompleteExtension(
       }
 
       ctx.ui.notify(
-        "Usage: /prompt-autocomplete [on|off|toggle|status|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
+        "Usage: /prompt-autocomplete [on|off|toggle|status|stats|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
         "warning",
       );
     },

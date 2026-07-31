@@ -331,6 +331,8 @@ test("streaming renders monotonic first-suggestion progress before terminal alte
 
   await harness.command("status");
   assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 0 cached, 100 tok, ~\$0\.00030 est/);
+  await harness.command("stats");
+  assert.match(harness.notifications.at(-1) ?? "", /Suggestions: 1 offered, 0 accepted/);
 });
 
 test("accepting streamed partial text aborts without issuing an automatic second request", async () => {
@@ -370,6 +372,13 @@ test("accepting streamed partial text aborts without issuing an automatic second
 
     await harness.command("status");
     assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 0 cached, 1 failed, 45 tok, ~\$0\.00010 est/);
+    await harness.command("stats");
+    assert.match(
+      harness.notifications.at(-1) ?? "",
+      acceptance === "full"
+        ? /Suggestions: 1 offered, 1 accepted \(1 full, 0 word\/chunk\)/
+        : /Suggestions: 1 offered, 1 accepted \(0 full, 1 word\/chunk\)/,
+    );
   }
 });
 
@@ -1065,6 +1074,8 @@ test("multiple alternatives cycle without issuing another provider request", asy
   assert.match(renderedText(editor), /second/);
   assert.match(renderedText(editor), /‹2\/3›/);
   assert.equal(calls, 1);
+  await harness.command("stats");
+  assert.match(harness.notifications.at(-1) ?? "", /Suggestions: 2 offered, 0 accepted/);
 });
 
 test("typing a cached suggestion prefix reuses its remainder without another provider request", async () => {
@@ -1264,6 +1275,104 @@ test("a new session clears prefix-reuse entries with the exact cache", async () 
   assert.match(renderedText(secondEditor), /fresh session/);
 });
 
+test("stats reports provider, cache, presentation, acceptance, usage, and latency metrics", async () => {
+  let calls = 0;
+  let now = 1_000;
+  const harness = createEditorHarness({
+    now: () => now,
+    completeSimple: (async () => {
+      calls += 1;
+      if (calls === 1) {
+        now += 120;
+        return makeCompletion(
+          [" the implementation carefully", " with focused tests", " now"],
+          makeUsage(80, 20, 0.0003),
+        );
+      }
+      now += 80;
+      return makeCompletion([], makeUsage(40, 10, 0.0001));
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  editor.handleInput(CTRL_SPACE);
+  await flushAsyncWork();
+  assert.equal(editor.getText(), "Review the ");
+
+  editor.handleInput("\t");
+  await flushAsyncWork();
+  assert.equal(editor.getText(), "Review the implementation carefully");
+  assert.equal(calls, 2);
+
+  editor.setText("Review");
+  await flushAsyncWork();
+  assert.equal(calls, 2, "returning to the first draft must be an exact cache hit");
+
+  const expectedStats = [
+    "Prompt Autocomplete — current session",
+    "Requests: 2 issued, 0 failed",
+    "Cache: 2 hits (1 exact, 1 prefix)",
+    "Suggestions: 3 offered, 2 accepted (1 full, 1 word/chunk)",
+    "Usage: 150 tokens, estimated cost ~$0.00040",
+    "Mean provider latency: 100 ms (2 samples)",
+  ].join("\n");
+
+  await harness.command("stats");
+  assert.equal(harness.notifications.at(-1), expectedStats);
+  await harness.command("off");
+  await harness.command("stats");
+  assert.equal(harness.notifications.at(-1), expectedStats, "disabling must not erase current-session stats");
+});
+
+test("in-flight stats settle after disable but cannot contaminate a new session", async () => {
+  for (const lifecycle of ["disable", "new-session"] as const) {
+    let calls = 0;
+    let now = 1_000;
+    const pending = deferred<CompletionResult>();
+    const harness = createEditorHarness({
+      now: () => now,
+      completeSimple: (async () => {
+        calls += 1;
+        return pending.promise;
+      }) as CompleteSimple,
+    });
+    const editor = await harness.createEditor();
+    editor.setText("Pending");
+    await flushAsyncWork();
+    assert.equal(calls, 1);
+
+    await harness.command("stats");
+    assert.match(harness.notifications.at(-1) ?? "", /Requests: 1 issued, 0 failed/);
+    assert.match(harness.notifications.at(-1) ?? "", /Usage: 0 tokens\+, estimated cost ~\$0\+/);
+    assert.match(harness.notifications.at(-1) ?? "", /Mean provider latency: n\/a/);
+
+    if (lifecycle === "disable") {
+      await harness.command("off");
+    } else {
+      await harness.emit("session_start", { reason: "new-session" });
+    }
+
+    now = 1_250;
+    pending.resolve(makeCompletion([" late result"], makeUsage(10, 5, 0.0001)));
+    await flushAsyncWork();
+    await harness.command("stats");
+
+    const stats = harness.notifications.at(-1) ?? "";
+    if (lifecycle === "disable") {
+      assert.match(stats, /Requests: 1 issued, 1 failed/);
+      assert.match(stats, /Suggestions: 0 offered, 0 accepted/);
+      assert.match(stats, /Usage: 15 tokens, estimated cost ~\$0\.00010/);
+      assert.match(stats, /Mean provider latency: 250 ms \(1 sample\)/);
+    } else {
+      assert.match(stats, /Requests: 0 issued, 0 failed/);
+      assert.match(stats, /Suggestions: 0 offered, 0 accepted/);
+      assert.match(stats, /Mean provider latency: n\/a/);
+    }
+  }
+});
+
 test("accounting records usage and never bills a cache hit", async () => {
   let calls = 0;
   const harness = createEditorHarness({
@@ -1311,6 +1420,8 @@ test("accounting marks a failed request and flags the totals as incomplete", asy
   const status = harness.notifications.at(-1) ?? "";
 
   assert.match(status, /usage=1 req, 0 cached, 1 failed, 0 tok\+, ~\$0 est\+/);
+  await harness.command("stats");
+  assert.match(harness.notifications.at(-1) ?? "", /Mean provider latency: \d+ ms \(1 sample\)/);
 });
 
 test("accounting counts a provider error response as failed while keeping its usage", async () => {
@@ -1350,9 +1461,12 @@ test("accounting resets when a new session starts", async () => {
   await flushAsyncWork();
   await harness.command("status");
   assert.match(harness.notifications.at(-1) ?? "", /usage=1 req, 0 cached, 150 tok/);
+  await harness.command("stats");
+  assert.match(harness.notifications.at(-1) ?? "", /Requests: 1 issued.*Suggestions: 1 offered/s);
 
   await harness.emit("session_start", { reason: "new-session" });
   await harness.command("status");
-
   assert.match(harness.notifications.at(-1) ?? "", /usage=0 req, 0 cached, 0 tok, ~\$0 est/);
+  await harness.command("stats");
+  assert.match(harness.notifications.at(-1) ?? "", /Requests: 0 issued.*Suggestions: 0 offered/s);
 });

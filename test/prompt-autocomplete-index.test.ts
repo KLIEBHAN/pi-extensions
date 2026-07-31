@@ -351,12 +351,27 @@ test("session shutdown does not record a disable override", async () => {
   assert.match(lastStatus(harness), /enabled=yes\(flag\)/);
 });
 
-test("status reports session accounting and resets it per session", async () => {
+test("status stays compatible while stats reports an empty current session", async () => {
   const harness = createHarness({ enabled: true });
   await emit(harness, "session_start");
   await command(harness, "status");
-
   assert.match(lastStatus(harness), /usage=0 req, 0 cached, 0 tok, ~\$0 est/);
+
+  await command(harness, "stats");
+  assert.equal(
+    lastStatus(harness),
+    [
+      "Prompt Autocomplete — current session",
+      "Requests: 0 issued, 0 failed",
+      "Cache: 0 hits (0 exact, 0 prefix)",
+      "Suggestions: 0 offered, 0 accepted (0 full, 0 word/chunk)",
+      "Usage: 0 tokens, estimated cost ~$0",
+      "Mean provider latency: n/a",
+    ].join("\n"),
+  );
+
+  await command(harness, "unknown");
+  assert.match(lastStatus(harness), /\|stats\|/);
 });
 
 test("a redundant on or off still records the user's intent", async () => {
