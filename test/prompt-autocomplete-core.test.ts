@@ -851,8 +851,8 @@ test("session stats format reachable metrics and preserve incomplete usage marke
       "Prompt Autocomplete — current session",
       "Requests: 0 issued, 0 failed",
       "Cache: 0 hits (0 exact, 0 prefix)",
-      "Suggestions: 0 shown, 0 accepted (0 full, 0 word/chunk)",
-      "Usage: 0 tok, ~$0 est",
+      "Suggestions: 0 offered, 0 accepted (0 full, 0 word/chunk)",
+      "Usage: 0 tokens, estimated cost ~$0",
       "Mean provider latency: n/a",
     ].join("\n"),
   );
@@ -862,7 +862,7 @@ test("session stats format reachable metrics and preserve incomplete usage marke
   stats.failedRequests = 1;
   stats.cacheHits = 5;
   stats.prefixReuseHits = 3;
-  stats.suggestionsShown = 8;
+  stats.suggestionsOffered = 8;
   stats.fullAccepts = 2;
   stats.chunkAccepts = 1;
   recordProviderUsage(stats, { totalTokens: 120, cost: { total: 0.0006 } });
@@ -880,8 +880,8 @@ test("session stats format reachable metrics and preserve incomplete usage marke
       "Prompt Autocomplete — current session",
       "Requests: 3 issued, 1 failed",
       "Cache: 5 hits (2 exact, 3 prefix)",
-      "Suggestions: 8 shown, 3 accepted (2 full, 1 word/chunk)",
-      "Usage: 170 tok+, ~$0.00060 est+",
+      "Suggestions: 8 offered, 3 accepted (2 full, 1 word/chunk)",
+      "Usage: 170 tokens+, estimated cost ~$0.00060+",
       "Mean provider latency: 125 ms (2 samples)",
     ].join("\n"),
   );

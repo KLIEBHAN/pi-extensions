@@ -380,8 +380,8 @@ export interface PromptAutocompleteUsageStats {
   cacheHits: number;
   /** Cache hits obtained by consuming a prefix of a previous suggestion. */
   prefixReuseHits: number;
-  /** Individual candidates newly presented in the editor. */
-  suggestionsShown: number;
+  /** Active ghost-text suggestions offered to the editor. */
+  suggestionsOffered: number;
   /** Full-suggestion accept actions, including visible streamed partials. */
   fullAccepts: number;
   /** Word/chunk accept actions, including visible streamed partials. */
@@ -415,7 +415,7 @@ export function createPromptAutocompleteUsageStats(): PromptAutocompleteUsageSta
     failedRequests: 0,
     cacheHits: 0,
     prefixReuseHits: 0,
-    suggestionsShown: 0,
+    suggestionsOffered: 0,
     fullAccepts: 0,
     chunkAccepts: 0,
     latencySamples: 0,
@@ -527,6 +527,16 @@ function formatUsageTotals(stats: PromptAutocompleteUsageStats): string {
   ].join(", ");
 }
 
+function formatDetailedUsageTotals(stats: PromptAutocompleteUsageStats): string {
+  const tokensPartial = stats.tokenReports < stats.providerRequests;
+  const costPartial = stats.costReports < stats.providerRequests;
+  const tokenUnit = stats.totalTokens === 1 ? "token" : "tokens";
+  return [
+    `${stats.totalTokens} ${tokenUnit}${tokensPartial ? "+" : ""}`,
+    `estimated cost ~${formatEstimatedCost(stats.estimatedCost)}${costPartial ? "+" : ""}`,
+  ].join(", ");
+}
+
 /**
  * Render session accounting for the status line.
  *
@@ -557,8 +567,8 @@ export function formatPromptAutocompleteStats(stats: PromptAutocompleteUsageStat
     "Prompt Autocomplete — current session",
     `Requests: ${stats.providerRequests} issued, ${stats.failedRequests} failed`,
     `Cache: ${stats.cacheHits} hits (${exactCacheHits} exact, ${stats.prefixReuseHits} prefix)`,
-    `Suggestions: ${stats.suggestionsShown} shown, ${accepts} accepted (${stats.fullAccepts} full, ${stats.chunkAccepts} word/chunk)`,
-    `Usage: ${formatUsageTotals(stats)}`,
+    `Suggestions: ${stats.suggestionsOffered} offered, ${accepts} accepted (${stats.fullAccepts} full, ${stats.chunkAccepts} word/chunk)`,
+    `Usage: ${formatDetailedUsageTotals(stats)}`,
     `Mean provider latency: ${meanLatency}`,
   ].join("\n");
 }

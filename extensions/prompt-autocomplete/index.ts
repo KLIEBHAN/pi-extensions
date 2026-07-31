@@ -697,11 +697,11 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
-    // Count visible ghost-text impressions, not hidden alternatives or every
-    // streamed revision of the same active candidate. Cycling records its own
-    // impression when a different alternative becomes active.
+    // Count active ghost-text offers, not hidden alternatives or every streamed
+    // revision of the same candidate. Cycling records a new offer when another
+    // alternative becomes active.
     if (nextSuggestions.length > 0 && this.suggestions.length === 0) {
-      this.shared.usageStats.suggestionsShown += 1;
+      this.shared.usageStats.suggestionsOffered += 1;
     }
 
     this.suggestions = [...nextSuggestions];
@@ -725,7 +725,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     const nextIndex = (this.suggestionIndex + delta + this.suggestions.length) % this.suggestions.length;
     if (nextIndex === this.suggestionIndex) return;
     this.suggestionIndex = nextIndex;
-    this.shared.usageStats.suggestionsShown += 1;
+    this.shared.usageStats.suggestionsOffered += 1;
     this.dismissedKey = undefined;
     updateDebugState(this.shared, "cycled", `Now showing ${nextIndex + 1}/${this.suggestions.length}`);
     this.tui.requestRender();

@@ -364,8 +364,8 @@ test("status stays compatible while stats reports an empty current session", asy
       "Prompt Autocomplete — current session",
       "Requests: 0 issued, 0 failed",
       "Cache: 0 hits (0 exact, 0 prefix)",
-      "Suggestions: 0 shown, 0 accepted (0 full, 0 word/chunk)",
-      "Usage: 0 tok, ~$0 est",
+      "Suggestions: 0 offered, 0 accepted (0 full, 0 word/chunk)",
+      "Usage: 0 tokens, estimated cost ~$0",
       "Mean provider latency: n/a",
     ].join("\n"),
   );
