@@ -165,7 +165,12 @@ const piAiSimpleApi = piAi as unknown as {
   streamSimple?: StreamSimpleFunction;
 };
 
-function requireSimpleApiFunction<T>(name: "completeSimple" | "streamSimple", impl: T | undefined): T {
+type SimpleApiFunction = CompleteSimpleFunction | StreamSimpleFunction;
+
+function requireSimpleApiFunction<F extends SimpleApiFunction>(
+  name: "completeSimple" | "streamSimple",
+  impl: F | undefined,
+): F {
   if (typeof impl !== "function") {
     throw new Error(
       `prompt-autocomplete requires ${name}() from @earendil-works/pi-ai; this host does not provide it`,
