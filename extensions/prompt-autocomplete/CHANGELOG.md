@@ -6,7 +6,7 @@ All notable changes to this package are documented here. This project follows [S
 
 ### Security
 
-- Sanitize every untrusted string before it reaches the terminal. Provider errors, raw responses, requested model identifiers, and host diagnostics are stripped of complete escape sequences, including DCS, SOS, PM, and APC payloads that Node's own helper leaves behind, and of any remaining C0/C1 control such as a bare ESC or a carriage return. Tabs and newlines are preserved.
+- Sanitize every untrusted string before it reaches the terminal. Provider errors, raw responses, model identifiers, and host diagnostics are stripped of complete escape sequences, including the DCS, SOS, PM, and APC payloads that Node's own helper leaves behind, of any remaining C0/C1 control such as a bare ESC or a carriage return, and of bidirectional or invisible formatting characters that could make a diagnostic display something other than its content. Tabs and newlines are preserved, sanitization runs in a single linear scan so an unbounded provider error cannot stall the terminal, and diagnostic input is capped before display.
 - An explicitly requested `--prompt-autocomplete-model` is now honoured or refused, never substituted. An unknown, unauthenticated, or malformed value suppresses autocomplete requests and reports the reason once instead of silently sending the draft and recent conversation context to the active model, which may belong to a different provider.
 
 ### Changed

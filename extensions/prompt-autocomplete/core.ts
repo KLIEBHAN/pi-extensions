@@ -6,11 +6,18 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
 const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
 const PROMPT_AUTOCOMPLETE_RESPONSE_KEY = "completions";
-/** DCS, SOS, PM, and APC openers with their string terminator (ST or BEL). */
-const STRING_CONTROL_SEQUENCE_PATTERN =
-  /(?:\u001B[P^_X]|[\u0090\u0098\u009E\u009F])[\s\S]*?(?:\u001B\\|[\u009C\u0007])/g;
-/** The same openers without a terminator; a terminal keeps consuming to the end. */
-const UNTERMINATED_STRING_CONTROL_SEQUENCE_PATTERN = /(?:\u001B[P^_X]|[\u0090\u0098\u009E\u009F])[\s\S]*$/;
+/** DCS, SOS, PM, and APC introducers in their C1 form. */
+const C1_STRING_SEQUENCE_OPENERS = new Set(["\u0090", "\u0098", "\u009E", "\u009F"]);
+/** The same introducers in their ESC-prefixed form. */
+const ESCAPED_STRING_SEQUENCE_OPENERS = new Set(["P", "X", "^", "_"]);
+/**
+ * Bidirectional overrides, isolates, and invisible separators.
+ *
+ * They cannot change terminal state, but they can make a diagnostic display
+ * text that differs from its actual content, which defeats the purpose of
+ * naming a rejected model or a failing provider.
+ */
+const DECEPTIVE_FORMAT_CHARACTERS = /[\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060\u2066-\u2069\uFEFF]/g;
 
 export function normalizeTemplateText(template: string): string {
   return template.replace(/\r\n/g, "\n").trim();
@@ -1349,17 +1356,53 @@ export function sanitizeTerminalText(text: string): string {
   const wellFormed = typeof (text as { toWellFormed?: () => string }).toWellFormed === "function"
     ? text.toWellFormed()
     : truncateAtFirstUnpairedSurrogate(text);
-  // `stripVTControlCharacters` does not cover the string sequences DCS, SOS, PM,
-  // and APC, whose payload would otherwise survive as visible text. A terminal
-  // consumes everything up to the string terminator, so an unterminated opener
-  // discards the remainder here too.
-  const withoutStringSequences = wellFormed
-    .replace(STRING_CONTROL_SEQUENCE_PATTERN, "")
-    .replace(UNTERMINATED_STRING_CONTROL_SEQUENCE_PATTERN, "");
-  // Everything except tab and newline goes, including carriage return, which a
-  // terminal would otherwise use to overwrite the line that was already drawn.
-  return stripVTControlCharacters(withoutStringSequences)
-    .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "");
+  return stripVTControlCharacters(removeStringControlSequences(wellFormed))
+    // Everything except tab and newline goes, including carriage return, which a
+    // terminal would otherwise use to overwrite the line that was already drawn.
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "")
+    .replace(DECEPTIVE_FORMAT_CHARACTERS, "");
+}
+
+/**
+ * Drop DCS, SOS, PM, and APC sequences including their payload.
+ *
+ * `stripVTControlCharacters` leaves these string sequences behind, and a
+ * terminal consumes everything up to the string terminator, so an unterminated
+ * introducer discards the remainder here as well. This is a single forward scan
+ * rather than a regex: a pattern with a lazy body backtracks quadratically when
+ * an input carries many unterminated introducers, and provider error text is
+ * not length-bounded.
+ */
+function removeStringControlSequences(text: string): string {
+  let result = "";
+  let index = 0;
+
+  while (index < text.length) {
+    const char = text[index] as string;
+    const isC1Opener = C1_STRING_SEQUENCE_OPENERS.has(char);
+    const isEscapedOpener = char === "\u001B" && ESCAPED_STRING_SEQUENCE_OPENERS.has(text[index + 1] ?? "");
+    if (!isC1Opener && !isEscapedOpener) {
+      result += char;
+      index += 1;
+      continue;
+    }
+
+    index += isC1Opener ? 1 : 2;
+    while (index < text.length) {
+      const candidate = text[index] as string;
+      if (candidate === "\u0007" || candidate === "\u009C") {
+        index += 1;
+        break;
+      }
+      if (candidate === "\u001B" && text[index + 1] === "\\") {
+        index += 2;
+        break;
+      }
+      index += 1;
+    }
+  }
+
+  return result;
 }
 
 /** Which model an autocomplete request may use. */

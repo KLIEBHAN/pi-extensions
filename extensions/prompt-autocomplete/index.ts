@@ -63,6 +63,8 @@ const CURSOR_TOKEN = "\x1b[7m \x1b[0m";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 const SPINNER_INTERVAL_MS = 80;
 const SPINNER_LABEL = "Generating suggestion";
+/** Diagnostics are displayed as a short prefix; longer input is never needed. */
+const MAX_DIAGNOSTIC_INPUT_CHARS = 8_192;
 // Inline autocomplete should fail fast instead of inheriting long provider retry/timeout defaults.
 const REQUEST_TIMEOUT_MS = 8_000;
 // A compliant provider emits its terminal aborted message immediately, which
@@ -224,8 +226,8 @@ interface PromptAutocompleteSharedState {
   editorBlockedReason?: string;
   /** Mount-bound notification channel; cleared together with the editor runtime. */
   notify?: (message: string, type?: "info" | "warning" | "error") => void;
-  /** Last refused model request already reported, to avoid repeating it. */
-  reportedModelRefusal?: string;
+  /** Refused model requests already reported, to avoid repeating them. */
+  reportedModelRefusals: Set<string>;
   /**
    * Set once a mount attempt proved whether this host installs custom editors.
    *
@@ -381,8 +383,8 @@ function resolveSuggestionModelResolution(
   if (selection.kind === "invalid") {
     return {
       reason: `Requested autocomplete model ${requested} is not a provider/model reference`,
-      refusedRequest: `Prompt autocomplete is inactive: ${requested} is not a provider/model reference. `
-        + "Requests are not sent to the active model instead.",
+      refusedRequest: "Prompt autocomplete is inactive and requests are not sent to the active model instead: "
+        + `${requested} is not a provider/model reference.`,
     };
   }
 
@@ -391,15 +393,15 @@ function resolveSuggestionModelResolution(
     if (!preferred) {
       return {
         reason: `Requested autocomplete model ${requested} is unknown`,
-        refusedRequest: `Prompt autocomplete is inactive: model ${requested} is unknown. `
-          + "Requests are not sent to the active model instead.",
+        refusedRequest: "Prompt autocomplete is inactive and requests are not sent to the active model instead: "
+          + `model ${requested} is unknown.`,
       };
     }
     if (!registry.hasConfiguredAuth(preferred)) {
       return {
         reason: `Requested autocomplete model ${requested} has no configured auth`,
-        refusedRequest: `Prompt autocomplete is inactive: model ${requested} has no configured auth. `
-          + "Requests are not sent to the active model instead.",
+        refusedRequest: "Prompt autocomplete is inactive and requests are not sent to the active model instead: "
+          + `model ${requested} has no configured auth.`,
       };
     }
     return { model: preferred as Model<Api> };
@@ -423,9 +425,11 @@ function resolveSuggestionModel(shared: PromptAutocompleteSharedState): Model<Ap
  * misconfigured flag would flood the terminal.
  */
 function notifyRefusedModelRequest(shared: PromptAutocompleteSharedState, message: string): void {
-  if (shared.reportedModelRefusal === message) return;
-  shared.reportedModelRefusal = message;
-  shared.notify?.(truncateDebug(message, 200), "warning");
+  // Remember every distinct reason: a registry that flips between "unknown" and
+  // "no configured auth" would otherwise re-notify on each alternation.
+  if (shared.reportedModelRefusals.has(message)) return;
+  shared.reportedModelRefusals.add(message);
+  shared.notify?.(truncateDebug(message, 240), "warning");
 }
 
 function parseOnOffFlag(value: boolean | string | undefined, fallback: boolean): boolean {
@@ -483,13 +487,22 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
   };
 }
 
+/** Drop a trailing lone surrogate produced by slicing sanitized text. */
+function truncateAtSafeBoundary(text: string): string {
+  const lastCode = text.charCodeAt(text.length - 1);
+  return lastCode >= 0xD800 && lastCode <= 0xDBFF ? text.slice(0, -1) : text;
+}
+
 function truncateDebug(text: string, maxLength = 140): string {
   // Every diagnostic string can contain untrusted provider or host text, so the
   // terminal-control scrub happens here, before whitespace collapsing keeps a
-  // sanitized fragment on one line.
-  const normalized = sanitizeTerminalText(text).replace(/\s+/g, " ").trim();
+  // sanitized fragment on one line. Provider error bodies are not length-bounded,
+  // and only a short prefix is ever displayed, so the input is capped first.
+  const bounded = text.length > MAX_DIAGNOSTIC_INPUT_CHARS ? text.slice(0, MAX_DIAGNOSTIC_INPUT_CHARS) : text;
+  const normalized = sanitizeTerminalText(bounded).replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, maxLength - 1)}…`;
+  // Slicing can split a surrogate pair that sanitization had just repaired.
+  return `${truncateAtSafeBoundary(normalized.slice(0, maxLength - 1))}…`;
 }
 
 function updateDebugState(shared: PromptAutocompleteSharedState, state: string, details?: string): void {
@@ -517,7 +530,7 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     `enabled=${shared.enabled ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.enabled)})`,
     `editor=${editorState}`,
     shared.editorBlockedReason ? `editor-blocked=${truncateDebug(shared.editorBlockedReason, 90)}` : undefined,
-    `model=${formatModelLabel(resolvedModel)}`,
+    `model=${truncateDebug(formatModelLabel(resolvedModel), 90)}`,
     `requested-model=${requestedModel}`,
     `while-streaming=${shared.config.allowWhileStreaming ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.allowWhileStreaming)})`,
     `stream=${shared.config.streamResponses ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.streamResponses)})`,
@@ -1616,6 +1629,7 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.ownsEditor = undefined;
   shared.lastError = undefined;
   shared.lastRawResponse = undefined;
+  shared.reportedModelRefusals.clear();
   shared.requestCache.clear();
   shared.prefixReuseCache.clear();
   cancelAllCoalescedRequests(shared.inFlightRequests);
@@ -1733,6 +1747,8 @@ function disablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocomp
   shared.prefixReuseCache.clear();
   shared.lastRawResponse = undefined;
   shared.lastError = undefined;
+  // Re-enabling must be able to report a refused model again.
+  shared.reportedModelRefusals.clear();
 }
 
 function notifyPromptAutocompleteEnabled(
@@ -1744,18 +1760,23 @@ function notifyPromptAutocompleteEnabled(
     `Tab accepts all, ${formatPrimaryKey(WORD_ACCEPT_KEYS)} accepts one word, ` +
     `${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives, ` +
     `${formatPrimaryKey(CYCLE_NEXT_KEYS)} also forces a one-shot suggestion when none is shown (even while the agent works).`;
-  const resolvedModel = resolveSuggestionModel(shared);
+  const resolution = resolveSuggestionModelResolution(shared);
+  const resolvedModel = resolution.model;
   const privacyNotice = "Requests send the current draft and recent conversation context to the selected model and may incur provider usage.";
 
   if (options.includeModel) {
     if (resolvedModel) {
       ctx.ui.notify(
-        `Prompt autocomplete enabled. ${keyHint} Model: ${formatModelLabel(resolvedModel)} ${privacyNotice}`,
+        `Prompt autocomplete enabled. ${keyHint} Model: ${truncateDebug(formatModelLabel(resolvedModel), 90)} ${privacyNotice}`,
         "info",
       );
     } else {
       ctx.ui.notify(
-        "Prompt autocomplete enabled, but no usable model/auth is configured yet. Select a model or configure auth first.",
+        resolution.refusedRequest
+          // A refused explicit request needs its own reason: "configure auth"
+          // would point at the active model, which is deliberately not used.
+          ? `Prompt autocomplete enabled, but no request can be issued. ${truncateDebug(resolution.refusedRequest, 200)}`
+          : "Prompt autocomplete enabled, but no usable model/auth is configured yet. Select a model or configure auth first.",
         "warning",
       );
     }
@@ -1906,6 +1927,7 @@ export function createPromptAutocompleteExtension(
     requestCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
     prefixReuseCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
     inFlightRequests: new Map(),
+    reportedModelRefusals: new Set(),
   };
 
   pi.on("session_start", async (_event, ctx) => {

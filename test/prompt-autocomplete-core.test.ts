@@ -1181,3 +1181,38 @@ test("model selection descriptions are terminal-safe and mark invalid values", (
     "bad (invalid)",
   );
 });
+
+test("string control sequences are removed in both C1 and escaped form", () => {
+  for (const opener of ["\u0090", "\u0098", "\u009E", "\u009F"]) {
+    assert.equal(sanitizeTerminalText(`before${opener}payload\u009Cafter`), "beforeafter");
+  }
+  for (const opener of ["\u001BP", "\u001BX", "\u001B^", "\u001B_"]) {
+    assert.equal(sanitizeTerminalText(`before${opener}payload\u001B\\after`), "beforeafter");
+    assert.equal(sanitizeTerminalText(`before${opener}payload\u0007after`), "beforeafter");
+  }
+
+  // A terminal consumes an unterminated introducer to the end of the stream, so
+  // the remainder is dropped here as well instead of becoming visible text.
+  assert.equal(sanitizeTerminalText("kept\u001B_dropped tail"), "kept");
+  assert.equal(sanitizeTerminalText("kept\u0090dropped tail"), "kept");
+});
+
+test("sanitization stays linear on hostile input", () => {
+  // A lazy regex body backtracks quadratically on repeated unterminated
+  // introducers; provider error text is not length-bounded.
+  const hostile = "\u001B_".repeat(100_000);
+  const started = process.hrtime.bigint();
+  const sanitized = sanitizeTerminalText(hostile);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  assert.equal(sanitized, "");
+  assert.ok(elapsedMs < 500, `sanitizing 200KB of introducers took ${elapsedMs.toFixed(1)}ms`);
+});
+
+test("text that would misrepresent itself is removed", () => {
+  // A bidi override could make a rejected model identifier display as another.
+  assert.equal(sanitizeTerminalText("safe \u202Elaever ton"), "safe laever ton");
+  assert.equal(sanitizeTerminalText("open\u202Eai/x"), "openai/x");
+  assert.equal(sanitizeTerminalText("a\u200Bb\u2066c\u2069d\uFEFFe"), "abcde");
+  assert.equal(sanitizeTerminalText("line\u2028split"), "linesplit");
+});

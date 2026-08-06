@@ -1619,3 +1619,67 @@ test("provider errors reach the terminal without control sequences", async () =>
   assert.doesNotMatch(status, /\u001B|\u0007/);
   assert.match(status, /provider exploded/);
 });
+
+test("diagnostics stay well formed and bounded for hostile provider text", async () => {
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      // An unbounded body with many unterminated introducers is the shape that
+      // used to make sanitization quadratic.
+      throw new Error(`${"\u001B_".repeat(50_000)}boom ${"😀".repeat(200)}`);
+    }) as CompleteSimple,
+  });
+
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  const started = process.hrtime.bigint();
+  await flushAsyncWork();
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(elapsedMs < 1_000, `handling a hostile error took ${elapsedMs.toFixed(1)}ms`);
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+  assert.doesNotMatch(status, /\u001B/);
+  assert.equal(status.isWellFormed(), true);
+});
+
+test("a refused model is reported again after disabling and re-enabling", async () => {
+  const harness = createEditorHarness({
+    preferredModel: "missing/model-x",
+    findModel: (provider: string, id: string) => (provider === "test-provider" ? { provider, id } : undefined),
+    completeSimple: (async () => makeCompletion([" leaked"])) as CompleteSimple,
+  });
+
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  await flushAsyncWork();
+  assert.match(harness.notifications.at(-1) ?? "", /is unknown/);
+
+  await harness.command("off");
+  await harness.command("on");
+  // Enabling must not claim that auth is missing: the active model is fine and
+  // deliberately unused.
+  const enableNotice = harness.notifications.at(-1) ?? "";
+  assert.match(enableNotice, /is unknown/);
+  assert.match(enableNotice, /not sent to the active model/);
+
+  const reEnabledEditor = await harness.createEditor();
+  reEnabledEditor.setText("Draft again");
+  await flushAsyncWork();
+  assert.match(harness.notifications.at(-1) ?? "", /is unknown/);
+});
+
+test("the notification channel is inert after the editor runtime is released", async () => {
+  const harness = createEditorHarness({
+    preferredModel: "missing/model-x",
+    findModel: (provider: string, id: string) => (provider === "test-provider" ? { provider, id } : undefined),
+    completeSimple: (async () => makeCompletion([" leaked"])) as CompleteSimple,
+  });
+
+  const editor = await harness.createEditor();
+  await harness.emit("session_shutdown");
+
+  const notificationCount = harness.notifications.length;
+  editor.setText("Draft after shutdown");
+  await flushAsyncWork();
+  assert.equal(harness.notifications.length, notificationCount);
+});
