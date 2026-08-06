@@ -32,6 +32,7 @@ import {
   formatModelLabel,
   formatPromptAutocompleteStats,
   formatUsageStats,
+  hostSupportsStreamedResponses,
   isInteractiveEditorHost,
   MAX_DRAFT_CONTEXT_CHARS,
   normalizePromptSuggestions,
@@ -219,7 +220,13 @@ interface PromptAutocompleteSharedState {
   debugState: string;
   editorMount?: EditorMountState;
   editorBlockedReason?: string;
-  /** Set once a mount attempt proved whether this host installs custom editors. */
+  /**
+   * Set once a mount attempt proved whether this host installs custom editors.
+   *
+   * A process cannot change its front-end, so this is deliberately never reset:
+   * a host that dropped the editor factory once would drop it again. Restarting
+   * the host is the only way to re-probe.
+   */
   hostInstallsEditors?: boolean;
   lastError?: string;
   lastRawResponse?: string;
@@ -1493,6 +1500,9 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
     releaseEditorRuntime(shared);
     shared.editorMount = undefined;
     shared.hostInstallsEditors = false;
+    // Nothing can render or request here, so the extension must not stay marked
+    // enabled, no matter which path attempted the mount.
+    shared.enabled = false;
     const reason = "This host does not install custom editors; prompt autocomplete stays inactive";
     const shouldNotify = shared.editorBlockedReason !== reason;
     shared.editorBlockedReason = reason;
@@ -1629,8 +1639,9 @@ function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompl
   shared.runtimeOverrides.enabled = true;
 
   if (!mountEditor(ctx, shared) && shared.hostInstallsEditors === false) {
-    // The host accepted the editor factory without installing it: nothing can
-    // ever render or request, so do not leave the extension marked enabled.
+    // The host accepted the editor factory without installing it. mountEditor
+    // already cleared `enabled`; also drop the session override so the refused
+    // activation is not replayed as a user decision in a later session.
     shared.enabled = previousEnabled;
     shared.runtimeOverrides.enabled = previousOverride;
     return false;
@@ -1749,17 +1760,12 @@ export function createPromptAutocompleteExtension(
   dependencies: PromptAutocompleteDependencies = {},
 ): (pi: ExtensionAPI) => void {
   const completeSimpleImpl = dependencies.completeSimple ?? hostCompleteSimple;
-  // A host that exposes the simple API without streaming must use the
-  // completion path instead of failing every request. When the module exposes
-  // neither function the extension is not running inside a host that maps them,
-  // so capability stays unknown and is reported only when a request runs.
-  const hostStreamingUnsupported =
-    typeof piAiSimpleApi.completeSimple === "function" && typeof piAiSimpleApi.streamSimple !== "function";
+  const hostStreaming = hostSupportsStreamedResponses(piAiSimpleApi);
   // Existing deterministic harnesses inject only completeSimple. Never let such
   // a harness fall through to the real network-capable stream implementation.
   const streamSimpleImpl =
     dependencies.streamSimple
-    ?? (dependencies.completeSimple || hostStreamingUnsupported ? undefined : hostStreamSimple);
+    ?? (dependencies.completeSimple || !hostStreaming ? undefined : hostStreamSimple);
   const now = dependencies.now ?? Date.now;
 
   return function promptAutocompleteExtension(pi: ExtensionAPI): void {

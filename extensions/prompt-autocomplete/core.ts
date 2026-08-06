@@ -1659,6 +1659,22 @@ export interface EditorHostCapabilities {
  * some forks expose a no-op editor slot in headless front-ends. The caller must
  * still verify the installation after mounting.
  */
+/**
+ * Whether streamed responses can be requested from the host's pi-ai module.
+ *
+ * A host that exposes the simple completion API without `streamSimple` must use
+ * the completion path instead of failing every request. When the module exposes
+ * neither function the extension is not running inside a host that maps them,
+ * so streaming support stays unknown and is reported only once a request runs.
+ */
+export function hostSupportsStreamedResponses(api: {
+  completeSimple?: unknown;
+  streamSimple?: unknown;
+}): boolean {
+  if (typeof api.streamSimple === "function") return true;
+  return typeof api.completeSimple !== "function";
+}
+
 export function isInteractiveEditorHost(host: EditorHostCapabilities): boolean {
   if (typeof host.mode === "string") return host.mode === "tui";
   if (host.mode !== undefined) return false;

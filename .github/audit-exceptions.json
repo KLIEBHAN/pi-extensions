@@ -13,11 +13,12 @@
       "module": "brace-expansion",
       "severity": "high",
       "range": ">=4.0.0 <5.0.8",
-      "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"],
-      "effects": ["@earendil-works/pi-coding-agent"],
+      "paths": [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"
+      ],
       "pinnedBy": "@earendil-works/pi-coding-agent",
-      "reason": "brace-expansion is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent. A dependency shrinkwrap is authoritative for its own subtree, so neither a root overrides entry nor `npm audit fix` can raise it to a patched release. Pi 0.82.0 still ships 5.0.7. The package is a development dependency used by the local toolchain and CI on trusted repository inputs, and it is never shipped in the published npm package, which declares Pi as a peer dependency.",
-      "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump brace-expansion to >=5.0.9 in its shrinkwrap.",
+      "reason": "brace-expansion is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent. A dependency shrinkwrap is authoritative for its own subtree, so neither a root overrides entry nor `npm audit fix` can raise it to a patched release. Pi 0.82.0 and 0.83.0 both still ship 5.0.7. The package is a development dependency used by the local toolchain and CI on trusted repository inputs, and it is never shipped in the published npm package, which declares Pi as a peer dependency.",
+      "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump brace-expansion to >=5.0.8 in its shrinkwrap.",
       "acceptedOn": "2026-07-25",
       "reviewBy": "2026-09-05"
     },
@@ -26,8 +27,9 @@
       "module": "brace-expansion",
       "severity": "high",
       "range": ">=4.0.0 <5.0.9",
-      "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"],
-      "effects": ["@earendil-works/pi-coding-agent"],
+      "paths": [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"
+      ],
       "pinnedBy": "@earendil-works/pi-coding-agent",
       "reason": "Follow-up denial-of-service advisory for the same shrinkwrap-pinned brace-expansion copy: the CVE-2026-14257 mitigation can still be bypassed through unbounded intermediate arrays. The same pinning, trust, and shipping analysis as GHSA-mh99-v99m-4gvg applies; the package stays a development-only dependency of the local toolchain and CI, and is absent from the published npm package.",
       "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump brace-expansion to >=5.0.9 in its shrinkwrap.",
@@ -39,10 +41,14 @@
       "module": "undici",
       "severity": "moderate",
       "range": ">=8.0.0 <8.9.0",
-      "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/undici"],
-      "effects": ["@earendil-works/pi-coding-agent"],
+      "paths": [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/undici"
+      ],
+      "effects": [
+        "@earendil-works/pi-coding-agent"
+      ],
       "pinnedBy": "@earendil-works/pi-coding-agent",
-      "reason": "undici 8.5.0 is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent, so no root override can raise it. Downstream response desynchronization through the retry interceptor requires an attacker-controlled or intercepted HTTP peer; the audited installation is a development dependency used by the local toolchain and CI against trusted registry endpoints, and undici is never shipped in the published npm package, which declares Pi as a peer dependency.",
+      "reason": "undici 8.5.0 is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent, so no root override can raise it. Pi 0.83.0 still pins the same version. Downstream response desynchronization through the retry interceptor requires an attacker-controlled or intercepted HTTP peer; the audited installation is a development dependency used by the local toolchain and CI against trusted registry endpoints, and undici is never shipped in the published npm package, which declares Pi as a peer dependency.",
       "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump undici to >=8.9.0 in its shrinkwrap.",
       "acceptedOn": "2026-08-06",
       "reviewBy": "2026-09-05"
@@ -52,8 +58,12 @@
       "module": "undici",
       "severity": "high",
       "range": ">=8.0.0 <8.9.0",
-      "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/undici"],
-      "effects": ["@earendil-works/pi-coding-agent"],
+      "paths": [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/undici"
+      ],
+      "effects": [
+        "@earendil-works/pi-coding-agent"
+      ],
       "pinnedBy": "@earendil-works/pi-coding-agent",
       "reason": "Same shrinkwrap-pinned undici copy. Cross-user disclosure and parse-time crashes through degenerate private cache directives require a shared cache fed by a hostile origin. This repository's Pi installation is a development dependency without a shared undici cache, is used only by the local toolchain and CI against trusted registry endpoints, and is never shipped in the published npm package.",
       "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump undici to >=8.9.0 in its shrinkwrap.",
@@ -65,8 +75,12 @@
       "module": "undici",
       "severity": "moderate",
       "range": ">=8.0.0 <8.9.0",
-      "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/undici"],
-      "effects": ["@earendil-works/pi-coding-agent"],
+      "paths": [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/undici"
+      ],
+      "effects": [
+        "@earendil-works/pi-coding-agent"
+      ],
       "pinnedBy": "@earendil-works/pi-coding-agent",
       "reason": "Same shrinkwrap-pinned undici copy. CRLF injection through a blob-like body `type` property requires attacker-controlled request bodies inside the agent process; the audited installation is a development dependency of the local toolchain and CI and is never shipped in the published npm package.",
       "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump undici to >=8.9.0 in its shrinkwrap.",
@@ -78,8 +92,12 @@
       "module": "undici",
       "severity": "moderate",
       "range": ">=8.0.0 <8.9.0",
-      "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/undici"],
-      "effects": ["@earendil-works/pi-coding-agent"],
+      "paths": [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/undici"
+      ],
+      "effects": [
+        "@earendil-works/pi-coding-agent"
+      ],
       "pinnedBy": "@earendil-works/pi-coding-agent",
       "reason": "Same shrinkwrap-pinned undici copy. Cross-user information disclosure through whitespace around equals in Cache-Control directives requires a shared response cache; the audited installation is a development dependency of the local toolchain and CI without such a cache, and undici is never shipped in the published npm package.",
       "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump undici to >=8.9.0 in its shrinkwrap.",
@@ -91,8 +109,12 @@
       "module": "undici",
       "severity": "moderate",
       "range": ">=8.0.0 <8.9.0",
-      "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/undici"],
-      "effects": ["@earendil-works/pi-coding-agent"],
+      "paths": [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/undici"
+      ],
+      "effects": [
+        "@earendil-works/pi-coding-agent"
+      ],
       "pinnedBy": "@earendil-works/pi-coding-agent",
       "reason": "Same shrinkwrap-pinned undici copy. Cookie attribute injection through unsanitized domain and unparsed setCookie fields requires hostile cookie input inside the agent process; the audited installation is a development dependency of the local toolchain and CI, and undici is never shipped in the published npm package.",
       "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump undici to >=8.9.0 in its shrinkwrap.",

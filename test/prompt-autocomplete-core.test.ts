@@ -21,6 +21,7 @@ import {
   ExpiringLruCache,
   formatPromptAutocompleteStats,
   formatUsageStats,
+  hostSupportsStreamedResponses,
   isInteractiveEditorHost,
   MAX_REQUEST_MAX_TOKENS,
   MIN_REQUEST_MAX_TOKENS,
@@ -1094,4 +1095,21 @@ test("non-string mode values fail closed instead of falling back", () => {
   assert.equal(isInteractiveEditorHost({ mode: {}, hasUI: true, canInstallEditor: true }), false);
   // Only an omitted mode selects the fork fallback; a cleared field fails closed.
   assert.equal(isInteractiveEditorHost({ mode: null, hasUI: true, canInstallEditor: true }), false);
+});
+
+test("streamed responses require the host to expose streamSimple", () => {
+  const noop = () => undefined;
+
+  // Pi and prime-agent both expose the complete pair.
+  assert.equal(hostSupportsStreamedResponses({ completeSimple: noop, streamSimple: noop }), true);
+
+  // A host that maps only the completion API must use the completion path
+  // instead of failing every request.
+  assert.equal(hostSupportsStreamedResponses({ completeSimple: noop }), false);
+  assert.equal(hostSupportsStreamedResponses({ completeSimple: noop, streamSimple: {} }), false);
+
+  // Outside a host that maps the module at all, capability stays unknown and
+  // the injected or lazily resolved implementation decides.
+  assert.equal(hostSupportsStreamedResponses({}), true);
+  assert.equal(hostSupportsStreamedResponses({ streamSimple: noop }), true);
 });
