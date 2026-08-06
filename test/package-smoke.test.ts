@@ -303,3 +303,28 @@ test("standalone Prompt Autocomplete package is release-ready and discovers only
     rmSync(tempRoot, { recursive: true, force: true });
   }
 });
+
+test("the supported Pi version still maps the pi-ai root specifier to the simple completion API", async () => {
+  // The extension imports "@earendil-works/pi-ai" because forked hosts never
+  // mapped the "/compat" subpath. Pi only exposes completeSimple/streamSimple
+  // under the root specifier through its extension alias tables, so this is a
+  // CI canary: it fails the day Pi stops aliasing the root to compat.
+  const loaderSource = readFileSync(
+    join(projectRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "extensions", "loader.js"),
+    "utf8",
+  );
+  assert.match(
+    loaderSource,
+    /"@earendil-works\/pi-ai":\s*piAiCompatEntry/,
+    "Pi must alias the pi-ai root specifier to its compat entrypoint for extensions",
+  );
+  assert.match(
+    loaderSource,
+    /"@earendil-works\/pi-ai":\s*_bundledPiAiCompat/,
+    "Pi must also map the pi-ai root specifier to compat in its bundled module table",
+  );
+
+  const compat = await import("@earendil-works/pi-ai/compat");
+  assert.equal(typeof compat.completeSimple, "function");
+  assert.equal(typeof compat.streamSimple, "function");
+});

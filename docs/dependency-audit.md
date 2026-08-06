@@ -86,5 +86,11 @@ Once upstream ships the fix, upgrade the dependency and delete the entry. The ga
 | Advisory | Module | Pinned by | Review by |
 | --- | --- | --- | --- |
 | [GHSA-mh99-v99m-4gvg](https://github.com/advisories/GHSA-mh99-v99m-4gvg) | `brace-expansion` | `@earendil-works/pi-coding-agent` shrinkwrap | 2026-09-05 |
+| [GHSA-rgw5-rvv9-x895](https://github.com/advisories/GHSA-rgw5-rvv9-x895) | `brace-expansion` | `@earendil-works/pi-coding-agent` shrinkwrap | 2026-09-05 |
+| [GHSA-8xcm-r25x-g524](https://github.com/advisories/GHSA-8xcm-r25x-g524) | `undici` | `@earendil-works/pi-coding-agent` shrinkwrap | 2026-09-05 |
+| [GHSA-4cwx-7wf7-3272](https://github.com/advisories/GHSA-4cwx-7wf7-3272) | `undici` | `@earendil-works/pi-coding-agent` shrinkwrap | 2026-09-05 |
+| [GHSA-m8rv-5g2x-5cg5](https://github.com/advisories/GHSA-m8rv-5g2x-5cg5) | `undici` | `@earendil-works/pi-coding-agent` shrinkwrap | 2026-09-05 |
+| [GHSA-jr45-8vmc-qm54](https://github.com/advisories/GHSA-jr45-8vmc-qm54) | `undici` | `@earendil-works/pi-coding-agent` shrinkwrap | 2026-09-05 |
+| [GHSA-v3r7-h72x-cjcm](https://github.com/advisories/GHSA-v3r7-h72x-cjcm) | `undici` | `@earendil-works/pi-coding-agent` shrinkwrap | 2026-09-05 |
 
-`brace-expansion` is a development-only transitive dependency of the Pi toolchain. It is never shipped in `@kliebhan/pi-prompt-autocomplete`, which declares Pi as a peer dependency, and CI runs it only against repository-controlled inputs. Retiring the entry requires `@earendil-works/pi-coding-agent` to bump its shrinkwrapped `brace-expansion` to `>=5.0.8`.
+`brace-expansion` and `undici` are development-only transitive dependencies of the Pi toolchain, pinned by the shrinkwrap published inside `@earendil-works/pi-coding-agent`. Neither is shipped in `@kliebhan/pi-prompt-autocomplete`, which declares Pi as a peer dependency, and CI runs them only against repository-controlled inputs and trusted registry endpoints. Retiring them requires `@earendil-works/pi-coding-agent` to ship `brace-expansion >=5.0.9` and `undici >=8.9.0` in its shrinkwrap.
