@@ -59,7 +59,13 @@ import {
 const GHOST_TEXT_STYLE = "\x1b[2m";
 const GHOST_INDICATOR_STYLE = "\x1b[90m";
 const RESET = "\x1b[0m";
-const CURSOR_TOKEN = "\x1b[7m \x1b[0m";
+// Hosts draw the end-of-line fake cursor as an inverse-video space. Pi closes
+// it with a full SGR reset (\x1b[0m); forks that keep an editor background
+// surface alive, such as prime-agent, close it with \x1b[27m so the background
+// survives the cursor cell. Accept both, otherwise the suggestion lookup never
+// finds the cursor and inline suggestions silently never render.
+const CURSOR_INVERSE_SPACE = "\x1b[7m ";
+const CURSOR_TOKEN_PATTERN = /\x1b\[7m \x1b\[(0|27)m/;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 const SPINNER_INTERVAL_MS = 80;
 const SPINNER_LABEL = "Generating suggestion";
@@ -718,15 +724,26 @@ class PromptAutocompleteEditor extends CustomEditor {
       return lines;
     }
 
-    const cursorLineIndex = lines.findIndex((line) => line.includes(CURSOR_TOKEN));
-    if (cursorLineIndex === -1) return lines;
+    let cursorLineIndex = -1;
+    let cursorMatch: RegExpMatchArray | undefined;
+    for (let index = 0; index < lines.length; index++) {
+      if (!lines[index]!.includes(CURSOR_INVERSE_SPACE)) continue;
+      const match = lines[index]!.match(CURSOR_TOKEN_PATTERN);
+      if (match?.index !== undefined) {
+        cursorLineIndex = index;
+        cursorMatch = match;
+        break;
+      }
+    }
+    if (cursorLineIndex === -1 || !cursorMatch || cursorMatch.index === undefined) return lines;
 
     const cursorLine = lines[cursorLineIndex]!;
-    const cursorIndex = cursorLine.indexOf(CURSOR_TOKEN);
-    if (cursorIndex === -1) return lines;
+    const cursorIndex = cursorMatch.index;
+    const cursorToken = cursorMatch[0];
+    const cursorReset = cursorMatch[1] === "27" ? "\x1b[27m" : "\x1b[0m";
 
     const before = cursorLine.slice(0, cursorIndex);
-    const after = cursorLine.slice(cursorIndex + CURSOR_TOKEN.length);
+    const after = cursorLine.slice(cursorIndex + cursorToken.length);
     const availableWidth = visibleWidth(after);
     if (availableWidth <= 0) return lines;
 
@@ -735,7 +752,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     const firstPreviewChar = previewChars[0] ?? "";
     const absorbLeadingWhitespaceIntoCursor = /^[ \t]$/.test(firstPreviewChar);
 
-    const cursorCell = absorbLeadingWhitespaceIntoCursor ? `\x1b[7m${firstPreviewChar}\x1b[0m` : CURSOR_TOKEN;
+    const cursorCell = absorbLeadingWhitespaceIntoCursor ? `\x1b[7m${firstPreviewChar}${cursorReset}` : cursorToken;
     const renderedPreviewText = absorbLeadingWhitespaceIntoCursor ? previewChars.slice(1).join("") : previewText;
 
     const indicator = this.suggestions.length > 1 ? `  ‹${this.suggestionIndex + 1}/${this.suggestions.length}›` : "";

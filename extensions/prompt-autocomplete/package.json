@@ -1,6 +1,6 @@
 {
   "name": "@kliebhan/pi-prompt-autocomplete",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Privacy-conscious inline AI prompt completion for the Pi coding agent",
   "type": "module",
   "license": "MIT",

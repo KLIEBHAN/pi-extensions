@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-08-06
+
+### Fixed
+
+- Inline suggestions now render on hosts that keep an editor background surface alive. The renderer located the fake cursor by Pi's exact `\x1b[7m \x1b[0m` byte sequence, but forks such as prime-agent close the inverse-video cursor with `\x1b[27m` so the background survives the cursor cell. The lookup missed, so suggestions were generated and counted as showing yet never drawn. The cursor lookup now accepts both reset variants and rebuilds the line with the host's own reset.
+
 ## [0.2.2] - 2026-08-06
 
 ### Security

@@ -7,6 +7,7 @@ import type {
   ExtensionContext,
   KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import {
   type AutocompleteProvider,
   CURSOR_MARKER,
@@ -314,6 +315,37 @@ test("a forked host without ExtensionContext.mode still renders and accepts sugg
   assert.doesNotMatch(status, /requires interactive TUI mode/);
   assert.match(status, /enabled=yes/);
   assert.match(status, /editor=mounted/);
+});
+
+test("a forked host that closes the cursor with ESC[27m still renders and accepts suggestions", async () => {
+  // prime-agent keeps its editor background surface alive by closing the fake
+  // cursor with \x1b[27m instead of Pi's full reset \x1b[0m. Simulate that host
+  // by rewriting the cursor token the base editor emits.
+  const originalRender = CustomEditor.prototype.render;
+  CustomEditor.prototype.render = function (this: CustomEditor, width: number): string[] {
+    return originalRender
+      .call(this, width)
+      .map((line) => line.replaceAll("\x1b[7m \x1b[0m", "\x1b[7m \x1b[27m"));
+  };
+  try {
+    let calls = 0;
+    const harness = createEditorHarness({
+      completeSimple: (async () => {
+        calls += 1;
+        return calls === 1 ? makeCompletion([" the implementation carefully"]) : makeCompletion([]);
+      }) as CompleteSimple,
+    });
+
+    const editor = await harness.createEditor();
+    editor.setText("Review");
+    await flushAsyncWork();
+
+    assert.match(renderedText(editor), /the implementation carefully/);
+    editor.handleInput("\t");
+    assert.equal(editor.getText(), "Review the implementation carefully");
+  } finally {
+    CustomEditor.prototype.render = originalRender;
+  }
 });
 
 test("streaming renders monotonic first-suggestion progress before terminal alternatives", async () => {
