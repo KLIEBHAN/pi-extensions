@@ -1183,7 +1183,7 @@ test("model selection descriptions are terminal-safe and mark invalid values", (
 });
 
 test("string control sequences are removed in both C1 and escaped form", () => {
-  for (const opener of ["\u0090", "\u0098", "\u009E", "\u009F"]) {
+  for (const opener of ["\u0090", "\u0098", "\u009D", "\u009E", "\u009F"]) {
     assert.equal(sanitizeTerminalText(`before${opener}payload\u009Cafter`), "beforeafter");
   }
   for (const opener of ["\u001BP", "\u001BX", "\u001B^", "\u001B_"]) {
@@ -1213,6 +1213,16 @@ test("text that would misrepresent itself is removed", () => {
   // A bidi override could make a rejected model identifier display as another.
   assert.equal(sanitizeTerminalText("safe \u202Elaever ton"), "safe laever ton");
   assert.equal(sanitizeTerminalText("open\u202Eai/x"), "openai/x");
+  assert.equal(sanitizeTerminalText("open\u061Cai/x"), "openai/x");
   assert.equal(sanitizeTerminalText("a\u200Bb\u2066c\u2069d\uFEFFe"), "abcde");
-  assert.equal(sanitizeTerminalText("line\u2028split"), "linesplit");
+  assert.equal(sanitizeTerminalText("x\u2061y\u180Ez"), "xyz");
+  // Tag characters are invisible and the usual text-smuggling vector.
+  assert.equal(sanitizeTerminalText("safe\u{E0064}\u{E0065}/model"), "safe/model");
+
+  // Separators become line breaks so multi-line errors stay readable.
+  assert.equal(sanitizeTerminalText("first line\u2028second line"), "first line\nsecond line");
+
+  // Joiners carry meaning in several scripts and in emoji sequences.
+  assert.equal(sanitizeTerminalText("\u0645\u06CC\u200C\u062E"), "\u0645\u06CC\u200C\u062E");
+  assert.equal(sanitizeTerminalText("👨\u200D👩"), "👨\u200D👩");
 });

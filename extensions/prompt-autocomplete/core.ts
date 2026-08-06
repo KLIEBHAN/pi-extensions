@@ -6,18 +6,26 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
 const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
 const PROMPT_AUTOCOMPLETE_RESPONSE_KEY = "completions";
-/** DCS, SOS, PM, and APC introducers in their C1 form. */
-const C1_STRING_SEQUENCE_OPENERS = new Set(["\u0090", "\u0098", "\u009E", "\u009F"]);
+/** DCS, SOS, OSC, PM, and APC introducers in their C1 form. */
+const C1_STRING_SEQUENCE_OPENERS = new Set(["\u0090", "\u0098", "\u009D", "\u009E", "\u009F"]);
 /** The same introducers in their ESC-prefixed form. */
 const ESCAPED_STRING_SEQUENCE_OPENERS = new Set(["P", "X", "^", "_"]);
 /**
- * Bidirectional overrides, isolates, and invisible separators.
+ * Bidirectional controls and invisible characters.
  *
  * They cannot change terminal state, but they can make a diagnostic display
  * text that differs from its actual content, which defeats the purpose of
- * naming a rejected model or a failing provider.
+ * naming a rejected model or a failing provider. The Tags block is included
+ * because it is the usual text-smuggling vector.
+ *
+ * Zero-width joiner and non-joiner are deliberately absent: they carry meaning
+ * in Arabic, Persian, and Indic scripts and in emoji sequences, and they cannot
+ * reorder text.
  */
-const DECEPTIVE_FORMAT_CHARACTERS = /[\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060\u2066-\u2069\uFEFF]/g;
+const DECEPTIVE_FORMAT_CHARACTERS =
+  /[\u061C\u180E\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]|[\u{E0000}-\u{E007F}]/gu;
+/** Line and paragraph separators; a line break keeps the text readable. */
+const UNICODE_LINE_SEPARATORS = /[\u2028\u2029]/g;
 
 export function normalizeTemplateText(template: string): string {
   return template.replace(/\r\n/g, "\n").trim();
@@ -1360,6 +1368,9 @@ export function sanitizeTerminalText(text: string): string {
     // Everything except tab and newline goes, including carriage return, which a
     // terminal would otherwise use to overwrite the line that was already drawn.
     .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "")
+    // Separators become real line breaks instead of disappearing, so a
+    // multi-line provider error does not end up with its words glued together.
+    .replace(UNICODE_LINE_SEPARATORS, "\n")
     .replace(DECEPTIVE_FORMAT_CHARACTERS, "");
 }
 

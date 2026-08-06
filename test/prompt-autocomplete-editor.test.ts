@@ -1621,11 +1621,32 @@ test("provider errors reach the terminal without control sequences", async () =>
 });
 
 test("diagnostics stay well formed and bounded for hostile provider text", async () => {
+  // The visible cut lands inside an astral character, which slicing would split.
+  const astralBoundaryError = `${"e".repeat(88)}😀 trailing detail`;
   const harness = createEditorHarness({
     completeSimple: (async () => {
-      // An unbounded body with many unterminated introducers is the shape that
-      // used to make sanitization quadratic.
-      throw new Error(`${"\u001B_".repeat(50_000)}boom ${"😀".repeat(200)}`);
+      throw new Error(astralBoundaryError);
+    }) as CompleteSimple,
+  });
+
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  await flushAsyncWork();
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+  const errorField = /error=([^|]*)/.exec(status)?.[1]?.trim() ?? "";
+  assert.equal(errorField, `${"e".repeat(88)}…`, "the astral character is dropped, not split");
+  assert.equal(errorField.isWellFormed(), true, "a split surrogate must not reach the terminal");
+  assert.equal(status.isWellFormed(), true);
+});
+
+test("an unbounded provider error cannot stall the terminal", async () => {
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      // Unterminated introducers used to make sanitization quadratic, and a
+      // provider error body has no length limit.
+      throw new Error(`${"\u001B_".repeat(400_000)}boom`);
     }) as CompleteSimple,
   });
 
@@ -1633,10 +1654,10 @@ test("diagnostics stay well formed and bounded for hostile provider text", async
   editor.setText("Draft");
   const started = process.hrtime.bigint();
   await flushAsyncWork();
-  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
-  assert.ok(elapsedMs < 1_000, `handling a hostile error took ${elapsedMs.toFixed(1)}ms`);
-
   await harness.command("status");
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  assert.ok(elapsedMs < 1_000, `handling a 800KB error took ${elapsedMs.toFixed(1)}ms`);
   const status = harness.notifications.at(-1) ?? "";
   assert.doesNotMatch(status, /\u001B/);
   assert.equal(status.isWellFormed(), true);

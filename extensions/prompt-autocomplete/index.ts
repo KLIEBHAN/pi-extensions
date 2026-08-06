@@ -498,7 +498,9 @@ function truncateDebug(text: string, maxLength = 140): string {
   // terminal-control scrub happens here, before whitespace collapsing keeps a
   // sanitized fragment on one line. Provider error bodies are not length-bounded,
   // and only a short prefix is ever displayed, so the input is capped first.
-  const bounded = text.length > MAX_DIAGNOSTIC_INPUT_CHARS ? text.slice(0, MAX_DIAGNOSTIC_INPUT_CHARS) : text;
+  const bounded = text.length > MAX_DIAGNOSTIC_INPUT_CHARS
+    ? truncateAtSafeBoundary(text.slice(0, MAX_DIAGNOSTIC_INPUT_CHARS))
+    : text;
   const normalized = sanitizeTerminalText(bounded).replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
   // Slicing can split a surrogate pair that sanitization had just repaired.
@@ -531,7 +533,7 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     `editor=${editorState}`,
     shared.editorBlockedReason ? `editor-blocked=${truncateDebug(shared.editorBlockedReason, 90)}` : undefined,
     `model=${truncateDebug(formatModelLabel(resolvedModel), 90)}`,
-    `requested-model=${requestedModel}`,
+    `requested-model=${truncateDebug(requestedModel, 90)}`,
     `while-streaming=${shared.config.allowWhileStreaming ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.allowWhileStreaming)})`,
     `stream=${shared.config.streamResponses ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.streamResponses)})`,
     `request-path=${shared.config.streamResponses && shared.streamSimple ? "stream" : shared.config.streamResponses ? "complete-compat" : "complete"}`,
@@ -1764,6 +1766,17 @@ function notifyPromptAutocompleteEnabled(
   const resolvedModel = resolution.model;
   const privacyNotice = "Requests send the current draft and recent conversation context to the selected model and may incur provider usage.";
 
+  if (!resolvedModel && resolution.refusedRequest) {
+    // A refused explicit request must be reported on every enable path,
+    // including toggle: "configure auth" would point at the active model, which
+    // is deliberately not used.
+    ctx.ui.notify(
+      `Prompt autocomplete enabled, but no request can be issued. ${truncateDebug(resolution.refusedRequest, 240)}`,
+      "warning",
+    );
+    return;
+  }
+
   if (options.includeModel) {
     if (resolvedModel) {
       ctx.ui.notify(
@@ -1772,11 +1785,7 @@ function notifyPromptAutocompleteEnabled(
       );
     } else {
       ctx.ui.notify(
-        resolution.refusedRequest
-          // A refused explicit request needs its own reason: "configure auth"
-          // would point at the active model, which is deliberately not used.
-          ? `Prompt autocomplete enabled, but no request can be issued. ${truncateDebug(resolution.refusedRequest, 200)}`
-          : "Prompt autocomplete enabled, but no usable model/auth is configured yet. Select a model or configure auth first.",
+        "Prompt autocomplete enabled, but no usable model/auth is configured yet. Select a model or configure auth first.",
         "warning",
       );
     }
