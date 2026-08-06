@@ -26,7 +26,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "video": "https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.2/prompt-autocomplete-demo.mp4"
+    "video": "https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.3/prompt-autocomplete-demo.mp4"
   },
   "engines": {
     "node": ">=22.19.0"
