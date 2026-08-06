@@ -1174,6 +1174,20 @@ test("a long malformed model value keeps its rejection marker", () => {
 
   assert.ok(described.endsWith("… (invalid)"), described.slice(-20));
   assert.ok(described.length < 100, `description is ${described.length} chars`);
+
+  // The cut must not split an astral character.
+  const astral = describePromptAutocompleteModelSelection({
+    kind: "invalid",
+    raw: "😀".repeat(100),
+  });
+  assert.equal(astral.isWellFormed(), true);
+  assert.ok(astral.endsWith("… (invalid)"));
+
+  // A value made only of invisible characters still has to be recognizable.
+  assert.equal(
+    describePromptAutocompleteModelSelection({ kind: "invalid", raw: "\u200B\u202E" }),
+    "<unprintable> (invalid)",
+  );
 });
 
 test("model selection descriptions are terminal-safe and mark invalid values", () => {
@@ -1213,6 +1227,12 @@ test("string control sequences are removed in both C1 and escaped form", () => {
     sanitizeTerminalText("rate limit for \u009Dgpt-4\nretry in 30s"),
     "rate limit for \nretry in 30s",
   );
+  assert.equal(sanitizeTerminalText("keep\u001B_payload\ntail"), "keep\ntail");
+
+  // The text that becomes visible again is still scrubbed, and deleting a
+  // sequence must not let its neighbours re-form one.
+  assert.equal(sanitizeTerminalText("a\u001B_payload\ntail\u001B[2Jx"), "a\ntailx");
+  assert.equal(sanitizeTerminalText("\u001B\u009Dzap\u0007[2J"), "");
 });
 
 test("sanitization stays linear on hostile input", () => {

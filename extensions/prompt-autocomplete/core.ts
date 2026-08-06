@@ -6,6 +6,8 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
 const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
 const PROMPT_AUTOCOMPLETE_RESPONSE_KEY = "completions";
+/** Model references are short; a longer flag value is never displayed in full. */
+const MAX_RAW_MODEL_CHARS = 512;
 /** DCS, SOS, OSC, PM, and APC introducers in their C1 form. */
 const C1_STRING_SEQUENCE_OPENERS = new Set(["\u0090", "\u0098", "\u009D", "\u009E", "\u009F"]);
 /** The same introducers in their ESC-prefixed form. */
@@ -1458,7 +1460,15 @@ export function describePromptAutocompleteModelSelection(
   maxRawChars = 78,
 ): string {
   if (selection.kind === "active") return "current active model";
-  const raw = trimAndCollapse(sanitizeTerminalText(selection.raw));
+  // This runs on the request path, so the value is capped before sanitizing
+  // rather than only afterwards.
+  const capped = selection.raw.length > MAX_RAW_MODEL_CHARS
+    ? truncateAtFirstUnpairedSurrogate(selection.raw.slice(0, MAX_RAW_MODEL_CHARS))
+    : selection.raw;
+  const raw = trimAndCollapse(sanitizeTerminalText(capped));
+  // A value made only of invisible characters would otherwise be reported as an
+  // empty string, leaving nothing to recognize.
+  if (!raw) return selection.kind === "dedicated" ? "<unprintable>" : "<unprintable> (invalid)";
   // Truncate the raw value only, so a long malformed value cannot push the
   // rejection marker out of the message and read as a plausible model name.
   const bounded = raw.length > maxRawChars
