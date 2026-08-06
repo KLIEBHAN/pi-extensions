@@ -17,6 +17,7 @@ import {
   DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
   DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
+  describePromptAutocompleteModelSelection,
   describeSettingSource,
   ExpiringLruCache,
   formatPromptAutocompleteStats,
@@ -28,6 +29,7 @@ import {
   recordProviderLatency,
   recordProviderUsage,
   resolveOverride,
+  sanitizeTerminalText,
   reusePromptAutocompleteSuggestions,
   extractMessageText,
   extractNextSuggestionChunk,
@@ -37,6 +39,7 @@ import {
   parseBoundedIntFlag,
   parsePartialPromptSuggestion,
   parseModelRef,
+  parsePromptAutocompleteModelSelection,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES,
   renderMiniTemplate,
@@ -1112,4 +1115,159 @@ test("streamed responses require the host to expose streamSimple", () => {
   // the injected or lazily resolved implementation decides.
   assert.equal(hostSupportsStreamedResponses({}), true);
   assert.equal(hostSupportsStreamedResponses({ streamSimple: noop }), true);
+});
+
+test("terminal sanitization removes complete escape sequences and stray controls", () => {
+  // Complete sequences disappear with their payload.
+  assert.equal(sanitizeTerminalText("\u001B[31mred\u001B[0m"), "red");
+  assert.equal(sanitizeTerminalText("\u001B]8;;https://evil.example\u0007link\u001B]8;;\u0007"), "link");
+  assert.equal(sanitizeTerminalText("\u001B]52;c;cGF5bG9hZA==\u0007copy"), "copy");
+  assert.equal(sanitizeTerminalText("\u001BPq#0;2;0;0;0\u001B\\dcs"), "dcs");
+
+  // Bare introducers and other controls cannot survive either.
+  assert.equal(sanitizeTerminalText("a\u001Bb"), "ab");
+  assert.equal(sanitizeTerminalText("a\u009Bb"), "ab");
+  assert.equal(sanitizeTerminalText("a\u0007b\u0000c\u007Fd"), "abcd");
+  assert.equal(sanitizeTerminalText("first\rsecond"), "firstsecond");
+
+  // Structure that legitimate multiline output relies on stays intact.
+  assert.equal(sanitizeTerminalText("line\n\tindented"), "line\n\tindented");
+  assert.equal(sanitizeTerminalText("plain diagnostic"), "plain diagnostic");
+
+  // Malformed UTF-16 is repaired instead of being passed through.
+  const repaired = sanitizeTerminalText("ok\uD800");
+  assert.equal(repaired.includes("\uD800"), false);
+  assert.ok(repaired.startsWith("ok"));
+  assert.equal(sanitizeTerminalText("👍 done"), "👍 done");
+});
+
+test("an explicit autocomplete model stays distinguishable from the active model", () => {
+  assert.deepEqual(parsePromptAutocompleteModelSelection(undefined), { kind: "active" });
+  assert.deepEqual(parsePromptAutocompleteModelSelection(true), { kind: "active" });
+  assert.deepEqual(parsePromptAutocompleteModelSelection("   "), { kind: "active" });
+  // The flag ships this sentinel as its default.
+  assert.deepEqual(parsePromptAutocompleteModelSelection(DEFAULT_PREFERRED_MODEL), { kind: "active" });
+  assert.deepEqual(parsePromptAutocompleteModelSelection("Active"), { kind: "active" });
+
+  assert.deepEqual(parsePromptAutocompleteModelSelection(" openai/GPT-5.4-Mini "), {
+    kind: "dedicated",
+    ref: { provider: "openai", id: "GPT-5.4-Mini" },
+    raw: "openai/GPT-5.4-Mini",
+  });
+
+  // A malformed explicit value must not collapse into "no dedicated model".
+  assert.deepEqual(parsePromptAutocompleteModelSelection("malformed"), {
+    kind: "invalid",
+    raw: "malformed",
+  });
+  assert.deepEqual(parsePromptAutocompleteModelSelection("/missing-provider"), {
+    kind: "invalid",
+    raw: "/missing-provider",
+  });
+});
+
+test("a long malformed model value keeps its rejection marker", () => {
+  const described = describePromptAutocompleteModelSelection({
+    kind: "invalid",
+    raw: "z".repeat(200),
+  });
+
+  assert.ok(described.endsWith("… (invalid)"), described.slice(-20));
+  assert.ok(described.length < 100, `description is ${described.length} chars`);
+
+  // The cut must not split an astral character.
+  const astral = describePromptAutocompleteModelSelection({
+    kind: "invalid",
+    raw: "😀".repeat(100),
+  });
+  assert.equal(astral.isWellFormed(), true);
+  assert.ok(astral.endsWith("… (invalid)"));
+
+  // A value made only of invisible characters still has to be recognizable.
+  assert.equal(
+    describePromptAutocompleteModelSelection({ kind: "invalid", raw: "\u200B\u202E" }),
+    "<unprintable> (invalid)",
+  );
+});
+
+test("model selection descriptions are terminal-safe and mark invalid values", () => {
+  assert.equal(describePromptAutocompleteModelSelection({ kind: "active" }), "current active model");
+  assert.equal(
+    describePromptAutocompleteModelSelection({
+      kind: "dedicated",
+      ref: { provider: "openai", id: "GPT-5.4-Mini" },
+      raw: "openai/GPT-5.4-Mini",
+    }),
+    "openai/GPT-5.4-Mini",
+  );
+  assert.equal(
+    describePromptAutocompleteModelSelection({ kind: "invalid", raw: "\u001B[31mbad\u001B[0m" }),
+    "bad (invalid)",
+  );
+});
+
+test("string control sequences are removed in both C1 and escaped form", () => {
+  for (const opener of ["\u0090", "\u0098", "\u009D", "\u009E", "\u009F"]) {
+    assert.equal(sanitizeTerminalText(`before${opener}payload\u009Cafter`), "beforeafter");
+  }
+  for (const opener of ["\u001BP", "\u001BX", "\u001B^", "\u001B_"]) {
+    assert.equal(sanitizeTerminalText(`before${opener}payload\u001B\\after`), "beforeafter");
+    assert.equal(sanitizeTerminalText(`before${opener}payload\u0007after`), "beforeafter");
+  }
+
+  // A terminal consumes an unterminated introducer to the end of the stream, so
+  // the remainder is dropped here as well instead of becoming visible text.
+  assert.equal(sanitizeTerminalText("kept\u001B_dropped tail"), "kept");
+  assert.equal(sanitizeTerminalText("kept\u0090dropped tail"), "kept");
+
+  // The discard stops at a line break: a bare C1 introducer is also what a
+  // mis-decoded UTF-8 quote looks like, and the rest of a provider message must
+  // not disappear because of mojibake.
+  assert.equal(
+    sanitizeTerminalText("rate limit for \u009Dgpt-4\nretry in 30s"),
+    "rate limit for \nretry in 30s",
+  );
+  assert.equal(sanitizeTerminalText("keep\u001B_payload\ntail"), "keep\ntail");
+
+  // The text that becomes visible again is still scrubbed, and deleting a
+  // sequence must not let its neighbours re-form one.
+  assert.equal(sanitizeTerminalText("a\u001B_payload\ntail\u001B[2Jx"), "a\ntailx");
+  assert.equal(sanitizeTerminalText("\u001B\u009Dzap\u0007[2J"), "");
+});
+
+test("sanitization stays linear on hostile input", () => {
+  // A lazy regex body backtracks quadratically on repeated unterminated
+  // introducers; provider error text is not length-bounded.
+  const hostile = "\u001B_".repeat(100_000);
+  const started = process.hrtime.bigint();
+  const sanitized = sanitizeTerminalText(hostile);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  assert.equal(sanitized, "");
+  assert.ok(elapsedMs < 500, `sanitizing 200KB of introducers took ${elapsedMs.toFixed(1)}ms`);
+});
+
+test("text that would misrepresent itself is removed", () => {
+  // A bidi override could make a rejected model identifier display as another.
+  assert.equal(sanitizeTerminalText("safe \u202Elaever ton"), "safe laever ton");
+  assert.equal(sanitizeTerminalText("open\u202Eai/x"), "openai/x");
+  assert.equal(sanitizeTerminalText("open\u061Cai/x"), "openai/x");
+  assert.equal(sanitizeTerminalText("a\u200Bb\u2066c\u2069d\uFEFFe"), "abcde");
+  assert.equal(sanitizeTerminalText("x\u2061y\u180Ez"), "xyz");
+  // Tag characters are invisible and the usual text-smuggling vector.
+  assert.equal(sanitizeTerminalText("safe\u{E0064}\u{E0065}/model"), "safe/model");
+  // Matching the Unicode properties instead of a list also covers soft hyphens,
+  // Hangul fillers, annotation marks, and the rest of plane 14.
+  assert.equal(sanitizeTerminalText("open\u00ADai/x"), "openai/x");
+  assert.equal(
+    sanitizeTerminalText("a\u034Fb\u2065c\u206Ad\uFFF9e\u115Ff\u{E0080}g"),
+    "abcdefg",
+  );
+
+  // Separators become line breaks so multi-line errors stay readable.
+  assert.equal(sanitizeTerminalText("first line\u2028second line"), "first line\nsecond line");
+
+  // Joiners carry meaning in several scripts and in emoji sequences.
+  assert.equal(sanitizeTerminalText("\u0645\u06CC\u200C\u062E"), "\u0645\u06CC\u200C\u062E");
+  assert.equal(sanitizeTerminalText("👨\u200D👩"), "👨\u200D👩");
 });

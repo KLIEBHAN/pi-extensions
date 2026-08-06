@@ -210,7 +210,7 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 
 `extensions/prompt-autocomplete/` adds inline AI autocomplete while you type your next prompt. It is also packaged independently as [`@kliebhan/pi-prompt-autocomplete`](extensions/prompt-autocomplete/README.md), so users can install it without loading the rest of this collection.
 
-[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.1/prompt-autocomplete-demo.mp4)
+[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.2/prompt-autocomplete-demo.mp4)
 
 ```bash
 pi install npm:@kliebhan/pi-prompt-autocomplete

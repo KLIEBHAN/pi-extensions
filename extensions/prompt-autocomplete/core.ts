@@ -1,10 +1,33 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { stripVTControlCharacters } from "node:util";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
 const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
 const PROMPT_AUTOCOMPLETE_RESPONSE_KEY = "completions";
+/** Model references are short; a longer flag value is never displayed in full. */
+const MAX_RAW_MODEL_CHARS = 512;
+/** DCS, SOS, OSC, PM, and APC introducers in their C1 form. */
+const C1_STRING_SEQUENCE_OPENERS = new Set(["\u0090", "\u0098", "\u009D", "\u009E", "\u009F"]);
+/** The same introducers in their ESC-prefixed form. */
+const ESCAPED_STRING_SEQUENCE_OPENERS = new Set(["P", "X", "^", "_"]);
+/**
+ * Format and default-ignorable characters.
+ *
+ * They cannot change terminal state, but they can make a diagnostic display
+ * text that differs from its actual content, which defeats the purpose of
+ * naming a rejected model or a failing provider. Both Unicode properties are
+ * matched instead of an explicit list, because an enumeration misses soft
+ * hyphens, Hangul fillers, annotation marks, and most of plane 14.
+ *
+ * Zero-width joiner and non-joiner are deliberately kept: they carry meaning in
+ * Arabic, Persian, and Indic scripts and in emoji sequences, and they cannot
+ * reorder text.
+ */
+const DECEPTIVE_FORMAT_CHARACTERS = /[^\P{Cf}\u200C\u200D]|[^\P{Default_Ignorable_Code_Point}\u200C\u200D]/gu;
+/** Line and paragraph separators; a line break keeps the text readable. */
+const UNICODE_LINE_SEPARATORS = /[\u2028\u2029]/g;
 
 export function normalizeTemplateText(template: string): string {
   return template.replace(/\r\n/g, "\n").trim();
@@ -1323,6 +1346,135 @@ function parseSuggestionResponse(rawResponse: string): string[] {
   }
 
   return rawResponse.trim() ? [rawResponse] : [];
+}
+
+/**
+ * Make untrusted text safe to render in a terminal.
+ *
+ * Provider errors, raw responses, model identifiers taken from CLI flags, and
+ * host diagnostics all end up in notifications and widgets whose renderer keeps
+ * ANSI escapes intact. Sanitizing happens in three steps because no single one
+ * is sufficient: malformed UTF-16 is repaired first so later passes cannot split
+ * a surrogate pair, complete VT sequences (CSI, OSC, DCS) are removed next so
+ * their payload disappears with the introducer, and any remaining C0/C1 control
+ * is dropped so a bare ESC or C1 introducer cannot start a new sequence.
+ *
+ * Tabs and newlines survive; callers that need a single line collapse whitespace
+ * afterwards.
+ */
+export function sanitizeTerminalText(text: string): string {
+  const wellFormed = typeof (text as { toWellFormed?: () => string }).toWellFormed === "function"
+    ? text.toWellFormed()
+    : truncateAtFirstUnpairedSurrogate(text);
+  return stripVTControlCharacters(removeStringControlSequences(wellFormed))
+    // Everything except tab and newline goes, including carriage return, which a
+    // terminal would otherwise use to overwrite the line that was already drawn.
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "")
+    // Separators become real line breaks instead of disappearing, so a
+    // multi-line provider error does not end up with its words glued together.
+    .replace(UNICODE_LINE_SEPARATORS, "\n")
+    .replace(DECEPTIVE_FORMAT_CHARACTERS, "");
+}
+
+/**
+ * Drop DCS, SOS, PM, and APC sequences including their payload.
+ *
+ * `stripVTControlCharacters` leaves these string sequences behind, and a
+ * terminal consumes everything up to the string terminator, so an unterminated
+ * introducer discards the remainder here as well. The discard stops at a line
+ * break: a C1 introducer is also what a mis-decoded UTF-8 quote looks like, and
+ * losing the rest of a provider message to mojibake would hide the diagnostic
+ * this text exists for.
+ *
+ * This is a single forward scan rather than a regex: a pattern with a lazy body
+ * backtracks quadratically when an input carries many unterminated introducers,
+ * and provider error text is not length-bounded.
+ */
+function removeStringControlSequences(text: string): string {
+  let result = "";
+  let index = 0;
+
+  while (index < text.length) {
+    const char = text[index] as string;
+    const isC1Opener = C1_STRING_SEQUENCE_OPENERS.has(char);
+    const isEscapedOpener = char === "\u001B" && ESCAPED_STRING_SEQUENCE_OPENERS.has(text[index + 1] ?? "");
+    if (!isC1Opener && !isEscapedOpener) {
+      result += char;
+      index += 1;
+      continue;
+    }
+
+    index += isC1Opener ? 1 : 2;
+    while (index < text.length) {
+      const candidate = text[index] as string;
+      if (candidate === "\u0007" || candidate === "\u009C") {
+        index += 1;
+        break;
+      }
+      if (candidate === "\u001B" && text[index + 1] === "\\") {
+        index += 2;
+        break;
+      }
+      if (candidate === "\n") break;
+      index += 1;
+    }
+  }
+
+  return result;
+}
+
+/** Which model an autocomplete request may use. */
+export type PromptAutocompleteModelSelection =
+  | { kind: "active" }
+  | { kind: "dedicated"; ref: ModelRef; raw: string }
+  | { kind: "invalid"; raw: string };
+
+/**
+ * Classify the `--prompt-autocomplete-model` value.
+ *
+ * An explicit but unusable value must stay distinguishable from "no dedicated
+ * model requested". Collapsing both into `undefined` is what allows a malformed
+ * value to silently send the draft and conversation context to the active
+ * model, which may belong to a different provider than the user asked for.
+ */
+export function parsePromptAutocompleteModelSelection(
+  value: boolean | string | undefined,
+): PromptAutocompleteModelSelection {
+  if (typeof value !== "string") return { kind: "active" };
+  const trimmed = value.trim();
+  if (!trimmed) return { kind: "active" };
+  // The flag ships the sentinel default `DEFAULT_PREFERRED_MODEL`, and `active`
+  // is the explicit way to ask for the session model.
+  const normalized = trimmed.toLowerCase();
+  if (normalized === DEFAULT_PREFERRED_MODEL || normalized === "active") return { kind: "active" };
+
+  const ref = parseModelRef(trimmed);
+  // Preserve the raw value: model identifiers are case-sensitive and the user
+  // needs to recognize what was rejected.
+  return ref ? { kind: "dedicated", ref, raw: trimmed } : { kind: "invalid", raw: trimmed };
+}
+
+/** Human-readable, terminal-safe description of the requested model. */
+export function describePromptAutocompleteModelSelection(
+  selection: PromptAutocompleteModelSelection,
+  maxRawChars = 78,
+): string {
+  if (selection.kind === "active") return "current active model";
+  // This runs on the request path, so the value is capped before sanitizing
+  // rather than only afterwards.
+  const capped = selection.raw.length > MAX_RAW_MODEL_CHARS
+    ? truncateAtFirstUnpairedSurrogate(selection.raw.slice(0, MAX_RAW_MODEL_CHARS))
+    : selection.raw;
+  const raw = trimAndCollapse(sanitizeTerminalText(capped));
+  // A value made only of invisible characters would otherwise be reported as an
+  // empty string, leaving nothing to recognize.
+  if (!raw) return selection.kind === "dedicated" ? "<unprintable>" : "<unprintable> (invalid)";
+  // Truncate the raw value only, so a long malformed value cannot push the
+  // rejection marker out of the message and read as a plausible model name.
+  const bounded = raw.length > maxRawChars
+    ? `${truncateAtFirstUnpairedSurrogate(raw.slice(0, maxRawChars - 1))}…`
+    : raw;
+  return selection.kind === "dedicated" ? bounded : `${bounded} (invalid)`;
 }
 
 export function parseModelRef(value: boolean | string | undefined): ModelRef | undefined {
