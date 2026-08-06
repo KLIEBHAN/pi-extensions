@@ -17,6 +17,7 @@ import {
   DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
   DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
+  describePromptAutocompleteModelSelection,
   describeSettingSource,
   ExpiringLruCache,
   formatPromptAutocompleteStats,
@@ -28,6 +29,7 @@ import {
   recordProviderLatency,
   recordProviderUsage,
   resolveOverride,
+  sanitizeTerminalText,
   reusePromptAutocompleteSuggestions,
   extractMessageText,
   extractNextSuggestionChunk,
@@ -37,6 +39,7 @@ import {
   parseBoundedIntFlag,
   parsePartialPromptSuggestion,
   parseModelRef,
+  parsePromptAutocompleteModelSelection,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES,
   renderMiniTemplate,
@@ -1112,4 +1115,69 @@ test("streamed responses require the host to expose streamSimple", () => {
   // the injected or lazily resolved implementation decides.
   assert.equal(hostSupportsStreamedResponses({}), true);
   assert.equal(hostSupportsStreamedResponses({ streamSimple: noop }), true);
+});
+
+test("terminal sanitization removes complete escape sequences and stray controls", () => {
+  // Complete sequences disappear with their payload.
+  assert.equal(sanitizeTerminalText("\u001B[31mred\u001B[0m"), "red");
+  assert.equal(sanitizeTerminalText("\u001B]8;;https://evil.example\u0007link\u001B]8;;\u0007"), "link");
+  assert.equal(sanitizeTerminalText("\u001B]52;c;cGF5bG9hZA==\u0007copy"), "copy");
+  assert.equal(sanitizeTerminalText("\u001BPq#0;2;0;0;0\u001B\\dcs"), "dcs");
+
+  // Bare introducers and other controls cannot survive either.
+  assert.equal(sanitizeTerminalText("a\u001Bb"), "ab");
+  assert.equal(sanitizeTerminalText("a\u009Bb"), "ab");
+  assert.equal(sanitizeTerminalText("a\u0007b\u0000c\u007Fd"), "abcd");
+  assert.equal(sanitizeTerminalText("first\rsecond"), "firstsecond");
+
+  // Structure that legitimate multiline output relies on stays intact.
+  assert.equal(sanitizeTerminalText("line\n\tindented"), "line\n\tindented");
+  assert.equal(sanitizeTerminalText("plain diagnostic"), "plain diagnostic");
+
+  // Malformed UTF-16 is repaired instead of being passed through.
+  const repaired = sanitizeTerminalText("ok\uD800");
+  assert.equal(repaired.includes("\uD800"), false);
+  assert.ok(repaired.startsWith("ok"));
+  assert.equal(sanitizeTerminalText("👍 done"), "👍 done");
+});
+
+test("an explicit autocomplete model stays distinguishable from the active model", () => {
+  assert.deepEqual(parsePromptAutocompleteModelSelection(undefined), { kind: "active" });
+  assert.deepEqual(parsePromptAutocompleteModelSelection(true), { kind: "active" });
+  assert.deepEqual(parsePromptAutocompleteModelSelection("   "), { kind: "active" });
+  // The flag ships this sentinel as its default.
+  assert.deepEqual(parsePromptAutocompleteModelSelection(DEFAULT_PREFERRED_MODEL), { kind: "active" });
+  assert.deepEqual(parsePromptAutocompleteModelSelection("Active"), { kind: "active" });
+
+  assert.deepEqual(parsePromptAutocompleteModelSelection(" openai/GPT-5.4-Mini "), {
+    kind: "dedicated",
+    ref: { provider: "openai", id: "GPT-5.4-Mini" },
+    raw: "openai/GPT-5.4-Mini",
+  });
+
+  // A malformed explicit value must not collapse into "no dedicated model".
+  assert.deepEqual(parsePromptAutocompleteModelSelection("malformed"), {
+    kind: "invalid",
+    raw: "malformed",
+  });
+  assert.deepEqual(parsePromptAutocompleteModelSelection("/missing-provider"), {
+    kind: "invalid",
+    raw: "/missing-provider",
+  });
+});
+
+test("model selection descriptions are terminal-safe and mark invalid values", () => {
+  assert.equal(describePromptAutocompleteModelSelection({ kind: "active" }), "current active model");
+  assert.equal(
+    describePromptAutocompleteModelSelection({
+      kind: "dedicated",
+      ref: { provider: "openai", id: "GPT-5.4-Mini" },
+      raw: "openai/GPT-5.4-Mini",
+    }),
+    "openai/GPT-5.4-Mini",
+  );
+  assert.equal(
+    describePromptAutocompleteModelSelection({ kind: "invalid", raw: "\u001B[31mbad\u001B[0m" }),
+    "bad (invalid)",
+  );
 });

@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.1/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.2/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -60,7 +60,7 @@ pi \
   --prompt-autocomplete-max-alternatives 3
 ```
 
-- The active Pi model is used unless `--prompt-autocomplete-model provider/model` selects a dedicated authenticated model.
+- The active Pi model is used unless `--prompt-autocomplete-model provider/model` selects a dedicated authenticated model. An explicitly requested model is never substituted: if it is unknown, unauthenticated, or malformed, autocomplete stays inactive and reports why.
 - Automatic suggestions require at least one non-whitespace draft character by default. Set `--prompt-autocomplete-min-chars 0` to opt into empty-draft suggestions.
 - Provider responses stream into the first ghost-text suggestion by default. Use `--prompt-autocomplete-stream off` or `/prompt-autocomplete stream off` to wait for complete responses instead. This changes rendering only: each suggestion request still uses the same context and token budget.
 - Changing `/prompt-autocomplete stream` cancels active autocomplete work but does **not** start a replacement request; the selected path applies to the next edit or manual one-shot.
@@ -108,7 +108,9 @@ Enabling Prompt Autocomplete permits additional model requests. Streaming change
 
 The active conversation leaf identity is used only in the local in-memory cache key and is not sent to the provider.
 
-By default, requests use the active model. A dedicated `--prompt-autocomplete-model` may send this context to a different provider. Requests can incur token charges and consume provider rate limits.
+By default, requests use the active model. A dedicated `--prompt-autocomplete-model` may send this context to a different provider, so an explicitly requested model that cannot be used suppresses requests instead of falling back to the active one. Requests can incur token charges and consume provider rate limits.
+
+Provider errors, raw responses, requested model identifiers, and host diagnostics are stripped of terminal control sequences before they are displayed, so untrusted text cannot repaint the terminal, hide output, or drive OSC clipboard and hyperlink escapes.
 
 Successful results are cached only in memory for up to 60 seconds; a terminal entry retains its base draft in process memory for the prefix comparison. If the draft then grows by an exact prefix of a cached suggestion, Prompt Autocomplete removes the text you typed and shows the remaining suffix locally instead of issuing another provider request. Prefix reuse is forward-only, stays scoped to the same conversation leaf, model, bounded context and output configuration, and never uses partial streamed text. Divergence, expiry or any context change falls through to a fresh request. The caches are bounded and are cleared on session reset or when the extension is disabled. Provider failures are not cached.
 

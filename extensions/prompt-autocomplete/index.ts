@@ -19,6 +19,7 @@ import {
   computeRequestMaxTokens,
   createOwnerRefCounter,
   createPromptAutocompleteUsageStats,
+  describePromptAutocompleteModelSelection,
   describeSettingSource,
   DEFAULT_DEBOUNCE_MS,
   DEFAULT_MAX_ALTERNATIVES,
@@ -37,19 +38,20 @@ import {
   MAX_DRAFT_CONTEXT_CHARS,
   normalizePromptSuggestions,
   parseBoundedIntFlag,
-  parseModelRef,
   parsePartialPromptSuggestion,
+  parsePromptAutocompleteModelSelection,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   recordProviderLatency,
   recordProviderUsage,
   resolveOverride,
   reusePromptAutocompleteSuggestions,
+  sanitizeTerminalText,
   SequenceOwnedSlot,
   shouldSkipPromptAutocomplete,
   truncateDraftTail,
   type CoalescedRequestEntry,
   type CoalescedRequestSubscription,
-  type ModelRef,
+  type PromptAutocompleteModelSelection,
   type PromptAutocompleteRuntimeOverrides,
   type PromptAutocompleteUsageStats,
 } from "./core.ts";
@@ -120,7 +122,7 @@ interface PromptAutocompleteConfig {
   minPromptChars: number;
   maxSuggestionChars: number;
   maxAlternatives: number;
-  preferredModel?: ModelRef;
+  modelSelection: PromptAutocompleteModelSelection;
 }
 
 interface PromptAutocompleteCacheEntry {
@@ -220,6 +222,10 @@ interface PromptAutocompleteSharedState {
   debugState: string;
   editorMount?: EditorMountState;
   editorBlockedReason?: string;
+  /** Mount-bound notification channel; cleared together with the editor runtime. */
+  notify?: (message: string, type?: "info" | "warning" | "error") => void;
+  /** Last refused model request already reported, to avoid repeating it. */
+  reportedModelRefusal?: string;
   /**
    * Set once a mount attempt proved whether this host installs custom editors.
    *
@@ -347,22 +353,79 @@ function formatPrimaryKey(keys: readonly KeyId[]): string {
   return keys[0] ?? "";
 }
 
-function resolveSuggestionModel(shared: PromptAutocompleteSharedState): Model<Api> | undefined {
-  const registry = shared.modelRegistry;
-  if (!registry) return undefined;
+interface SuggestionModelResolution {
+  model?: Model<Api>;
+  /** Why no model is usable; also used as the suppression reason. */
+  reason?: string;
+  /** Set when an explicitly requested model was refused, for a one-time notice. */
+  refusedRequest?: string;
+}
 
-  if (shared.config.preferredModel) {
-    const preferred = registry.find(shared.config.preferredModel.provider, shared.config.preferredModel.id);
-    if (preferred && registry.hasConfiguredAuth(preferred)) {
-      return preferred as Model<Api>;
+/**
+ * Resolve the model an autocomplete request may use.
+ *
+ * An explicitly requested model is honoured or refused, never substituted: the
+ * request carries the draft and recent conversation context, so falling back to
+ * the active model would send that context to a provider the user did not
+ * choose and bill it there.
+ */
+function resolveSuggestionModelResolution(
+  shared: PromptAutocompleteSharedState,
+): SuggestionModelResolution {
+  const registry = shared.modelRegistry;
+  if (!registry) return { reason: "No model registry is available yet" };
+
+  const selection = shared.config.modelSelection;
+  const requested = describePromptAutocompleteModelSelection(selection);
+
+  if (selection.kind === "invalid") {
+    return {
+      reason: `Requested autocomplete model ${requested} is not a provider/model reference`,
+      refusedRequest: `Prompt autocomplete is inactive: ${requested} is not a provider/model reference. `
+        + "Requests are not sent to the active model instead.",
+    };
+  }
+
+  if (selection.kind === "dedicated") {
+    const preferred = registry.find(selection.ref.provider, selection.ref.id);
+    if (!preferred) {
+      return {
+        reason: `Requested autocomplete model ${requested} is unknown`,
+        refusedRequest: `Prompt autocomplete is inactive: model ${requested} is unknown. `
+          + "Requests are not sent to the active model instead.",
+      };
     }
+    if (!registry.hasConfiguredAuth(preferred)) {
+      return {
+        reason: `Requested autocomplete model ${requested} has no configured auth`,
+        refusedRequest: `Prompt autocomplete is inactive: model ${requested} has no configured auth. `
+          + "Requests are not sent to the active model instead.",
+      };
+    }
+    return { model: preferred as Model<Api> };
   }
 
   if (shared.currentModel && registry.hasConfiguredAuth(shared.currentModel)) {
-    return shared.currentModel as Model<Api>;
+    return { model: shared.currentModel as Model<Api> };
   }
 
-  return undefined;
+  return { reason: "No usable autocomplete model with configured auth was found" };
+}
+
+function resolveSuggestionModel(shared: PromptAutocompleteSharedState): Model<Api> | undefined {
+  return resolveSuggestionModelResolution(shared).model;
+}
+
+/**
+ * Report a refused model request once per distinct reason.
+ *
+ * The refusal repeats on every keystroke, so without deduplication a single
+ * misconfigured flag would flood the terminal.
+ */
+function notifyRefusedModelRequest(shared: PromptAutocompleteSharedState, message: string): void {
+  if (shared.reportedModelRefusal === message) return;
+  shared.reportedModelRefusal = message;
+  shared.notify?.(truncateDebug(message, 200), "warning");
 }
 
 function parseOnOffFlag(value: boolean | string | undefined, fallback: boolean): boolean {
@@ -393,7 +456,7 @@ function parseConfig(pi: ExtensionAPI): PromptAutocompleteConfig {
       1,
       5,
     ),
-    preferredModel: parseModelRef(pi.getFlag("prompt-autocomplete-model")),
+    modelSelection: parsePromptAutocompleteModelSelection(pi.getFlag("prompt-autocomplete-model")),
   };
 }
 
@@ -421,7 +484,10 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
 }
 
 function truncateDebug(text: string, maxLength = 140): string {
-  const normalized = text.replace(/\s+/g, " ").trim();
+  // Every diagnostic string can contain untrusted provider or host text, so the
+  // terminal-control scrub happens here, before whitespace collapsing keeps a
+  // sanitized fragment on one line.
+  const normalized = sanitizeTerminalText(text).replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, maxLength - 1)}…`;
 }
@@ -445,9 +511,7 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     : shared.editorBlockedReason
       ? "blocked"
       : "unmounted";
-  const requestedModel = shared.config.preferredModel
-    ? `${shared.config.preferredModel.provider}/${shared.config.preferredModel.id}`
-    : "current active model";
+  const requestedModel = describePromptAutocompleteModelSelection(shared.config.modelSelection);
 
   return [
     `enabled=${shared.enabled ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.enabled)})`,
@@ -911,8 +975,11 @@ class PromptAutocompleteEditor extends CustomEditor {
       if (this.shared.now() < this.suspendedUntil) return "In temporary cooldown after the last error";
     }
 
-    const model = resolveSuggestionModel(this.shared);
-    if (!model) return "No usable autocomplete model with configured auth was found";
+    const resolution = resolveSuggestionModelResolution(this.shared);
+    if (!resolution.model) {
+      if (resolution.refusedRequest) notifyRefusedModelRequest(this.shared, resolution.refusedRequest);
+      return resolution.reason ?? "No usable autocomplete model with configured auth was found";
+    }
 
     const draft = this.getText();
     if (!options.manual && draft.trim().length < this.shared.config.minPromptChars) {
@@ -1372,6 +1439,7 @@ function releaseEditorRuntime(shared: PromptAutocompleteSharedState): void {
   shared.setStatusText = undefined;
   shared.setSpinnerActive = undefined;
   shared.clearSpinner = undefined;
+  shared.notify = undefined;
   shared.ownsEditor = undefined;
 }
 
@@ -1417,6 +1485,10 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
   shared.editorBlockedReason = undefined;
   shared.activationId += 1;
   const activationId = shared.activationId;
+  shared.notify = (message, type) => {
+    if (activationId !== shared.activationId) return;
+    ctx.ui.notify(message, type ?? "info");
+  };
   shared.setStatusText = (text) => {
     ctx.ui.setWidget(
       "prompt-autocomplete-debug",
@@ -1503,7 +1575,8 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
     // Nothing can render or request here, so the extension must not stay marked
     // enabled, no matter which path attempted the mount.
     shared.enabled = false;
-    const reason = "This host does not install custom editors; prompt autocomplete stays inactive";
+    const reason = "Prompt autocomplete needs a host that installs custom editors in the terminal process. "
+      + "This host accepted the editor but runs extensions outside its terminal UI, so inline suggestions stay unavailable.";
     const shouldNotify = shared.editorBlockedReason !== reason;
     shared.editorBlockedReason = reason;
     updateDebugState(shared, "blocked-no-editor-slot", reason);

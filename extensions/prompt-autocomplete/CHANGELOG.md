@@ -2,6 +2,17 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-08-06
+
+### Security
+
+- Sanitize every untrusted string before it reaches the terminal. Provider errors, raw responses, requested model identifiers, and host diagnostics are stripped of complete escape sequences, including DCS, SOS, PM, and APC payloads that Node's own helper leaves behind, and of any remaining C0/C1 control such as a bare ESC or a carriage return. Tabs and newlines are preserved.
+- An explicitly requested `--prompt-autocomplete-model` is now honoured or refused, never substituted. An unknown, unauthenticated, or malformed value suppresses autocomplete requests and reports the reason once instead of silently sending the draft and recent conversation context to the active model, which may belong to a different provider.
+
+### Changed
+
+- The notice for hosts that accept a custom editor without installing it now explains the cause: such hosts run extensions outside their terminal UI, so inline suggestions are unavailable.
+
 ## [0.2.1] - 2026-08-06
 
 ### Fixed

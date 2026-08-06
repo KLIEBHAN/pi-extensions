@@ -189,7 +189,7 @@ test("a host whose editor slot silently drops the factory stays inactive", async
   assert.equal(noOpHost.editorSetCalls.length, 1, "the host is probed exactly once");
   assert.match(
     noOpHost.notifications.at(-1)?.message ?? "",
-    /does not install custom editors/,
+    /installs custom editors in the terminal process/,
   );
 
   // Once proven, such a host is treated like any other non-interactive host.
@@ -208,7 +208,7 @@ test("enabling on a host that never installs the editor stops after one attempt"
 
   await command(noOpHost, "on");
   assert.equal(noOpHost.editorSetCalls.length, 1);
-  assert.match(noOpHost.notifications.at(-1)?.message ?? "", /does not install custom editors/);
+  assert.match(noOpHost.notifications.at(-1)?.message ?? "", /installs custom editors in the terminal process/);
 
   await command(noOpHost, "on");
   assert.equal(noOpHost.editorSetCalls.length, 1, "the failed host is not retried");

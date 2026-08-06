@@ -1,10 +1,16 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { stripVTControlCharacters } from "node:util";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
 const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
 const PROMPT_AUTOCOMPLETE_RESPONSE_KEY = "completions";
+/** DCS, SOS, PM, and APC openers with their string terminator (ST or BEL). */
+const STRING_CONTROL_SEQUENCE_PATTERN =
+  /(?:\u001B[P^_X]|[\u0090\u0098\u009E\u009F])[\s\S]*?(?:\u001B\\|[\u009C\u0007])/g;
+/** The same openers without a terminator; a terminal keeps consuming to the end. */
+const UNTERMINATED_STRING_CONTROL_SEQUENCE_PATTERN = /(?:\u001B[P^_X]|[\u0090\u0098\u009E\u009F])[\s\S]*$/;
 
 export function normalizeTemplateText(template: string): string {
   return template.replace(/\r\n/g, "\n").trim();
@@ -1323,6 +1329,77 @@ function parseSuggestionResponse(rawResponse: string): string[] {
   }
 
   return rawResponse.trim() ? [rawResponse] : [];
+}
+
+/**
+ * Make untrusted text safe to render in a terminal.
+ *
+ * Provider errors, raw responses, model identifiers taken from CLI flags, and
+ * host diagnostics all end up in notifications and widgets whose renderer keeps
+ * ANSI escapes intact. Sanitizing happens in three steps because no single one
+ * is sufficient: malformed UTF-16 is repaired first so later passes cannot split
+ * a surrogate pair, complete VT sequences (CSI, OSC, DCS) are removed next so
+ * their payload disappears with the introducer, and any remaining C0/C1 control
+ * is dropped so a bare ESC or C1 introducer cannot start a new sequence.
+ *
+ * Tabs and newlines survive; callers that need a single line collapse whitespace
+ * afterwards.
+ */
+export function sanitizeTerminalText(text: string): string {
+  const wellFormed = typeof (text as { toWellFormed?: () => string }).toWellFormed === "function"
+    ? text.toWellFormed()
+    : truncateAtFirstUnpairedSurrogate(text);
+  // `stripVTControlCharacters` does not cover the string sequences DCS, SOS, PM,
+  // and APC, whose payload would otherwise survive as visible text. A terminal
+  // consumes everything up to the string terminator, so an unterminated opener
+  // discards the remainder here too.
+  const withoutStringSequences = wellFormed
+    .replace(STRING_CONTROL_SEQUENCE_PATTERN, "")
+    .replace(UNTERMINATED_STRING_CONTROL_SEQUENCE_PATTERN, "");
+  // Everything except tab and newline goes, including carriage return, which a
+  // terminal would otherwise use to overwrite the line that was already drawn.
+  return stripVTControlCharacters(withoutStringSequences)
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "");
+}
+
+/** Which model an autocomplete request may use. */
+export type PromptAutocompleteModelSelection =
+  | { kind: "active" }
+  | { kind: "dedicated"; ref: ModelRef; raw: string }
+  | { kind: "invalid"; raw: string };
+
+/**
+ * Classify the `--prompt-autocomplete-model` value.
+ *
+ * An explicit but unusable value must stay distinguishable from "no dedicated
+ * model requested". Collapsing both into `undefined` is what allows a malformed
+ * value to silently send the draft and conversation context to the active
+ * model, which may belong to a different provider than the user asked for.
+ */
+export function parsePromptAutocompleteModelSelection(
+  value: boolean | string | undefined,
+): PromptAutocompleteModelSelection {
+  if (typeof value !== "string") return { kind: "active" };
+  const trimmed = value.trim();
+  if (!trimmed) return { kind: "active" };
+  // The flag ships the sentinel default `DEFAULT_PREFERRED_MODEL`, and `active`
+  // is the explicit way to ask for the session model.
+  const normalized = trimmed.toLowerCase();
+  if (normalized === DEFAULT_PREFERRED_MODEL || normalized === "active") return { kind: "active" };
+
+  const ref = parseModelRef(trimmed);
+  // Preserve the raw value: model identifiers are case-sensitive and the user
+  // needs to recognize what was rejected.
+  return ref ? { kind: "dedicated", ref, raw: trimmed } : { kind: "invalid", raw: trimmed };
+}
+
+/** Human-readable, terminal-safe description of the requested model. */
+export function describePromptAutocompleteModelSelection(
+  selection: PromptAutocompleteModelSelection,
+): string {
+  if (selection.kind === "active") return "current active model";
+  const raw = trimAndCollapse(sanitizeTerminalText(selection.raw));
+  return selection.kind === "dedicated" ? raw : `${raw} (invalid)`;
 }
 
 export function parseModelRef(value: boolean | string | undefined): ModelRef | undefined {

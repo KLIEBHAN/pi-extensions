@@ -125,6 +125,10 @@ interface EditorHarnessOptions {
   maxAlternatives?: number;
   now?: () => number;
   preferredModel?: string;
+  /** Registry lookup; return undefined to emulate an unknown model. */
+  findModel?: (provider: string, id: string) => { provider: string; id: string } | undefined;
+  /** Per-model auth, for hosts where only some models are authenticated. */
+  hasConfiguredAuth?: (model: { provider: string; id: string }) => boolean;
   /** Emulate forked hosts (prime-agent) whose ExtensionContext predates `mode`. */
   omitHostMode?: boolean;
 }
@@ -156,8 +160,10 @@ function createEditorHarness(options: EditorHarnessOptions) {
     notify: (message: string) => notifications.push(message),
   };
   const modelRegistry = {
-    find: (provider: string, id: string) => ({ provider, id }),
-    hasConfiguredAuth: () => options.authConfigured ?? true,
+    find: (provider: string, id: string) =>
+      options.findModel ? options.findModel(provider, id) : { provider, id },
+    hasConfiguredAuth: (model: { provider: string; id: string }) =>
+      options.hasConfiguredAuth ? options.hasConfiguredAuth(model) : (options.authConfigured ?? true),
     getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "test-key", headers: {} }),
   };
   const sessionManager = {
@@ -1496,4 +1502,120 @@ test("accounting resets when a new session starts", async () => {
   assert.match(harness.notifications.at(-1) ?? "", /usage=0 req, 0 cached, 0 tok, ~\$0 est/);
   await harness.command("stats");
   assert.match(harness.notifications.at(-1) ?? "", /Requests: 0 issued.*Suggestions: 0 offered/s);
+});
+
+test("an explicitly requested model that is unusable never falls back to the active model", async () => {
+  const scenarios = [
+    {
+      name: "unknown model",
+      preferredModel: "missing/model-x",
+      findModel: (provider: string, id: string) =>
+        provider === "test-provider" ? { provider, id } : undefined,
+      expected: /unknown/,
+    },
+    {
+      name: "unauthenticated model",
+      preferredModel: "locked/model-y",
+      hasConfiguredAuth: (model: { provider: string }) => model.provider === "test-provider",
+      expected: /no configured auth/,
+    },
+    {
+      name: "malformed value",
+      preferredModel: "malformed-without-slash",
+      expected: /not a provider\/model reference/,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    let calls = 0;
+    const harness = createEditorHarness({
+      preferredModel: scenario.preferredModel,
+      findModel: scenario.findModel,
+      hasConfiguredAuth: scenario.hasConfiguredAuth,
+      completeSimple: (async () => {
+        calls += 1;
+        return makeCompletion([" leaked"]);
+      }) as CompleteSimple,
+    });
+
+    const editor = await harness.createEditor();
+    editor.setText("Draft that would be sent");
+    await flushAsyncWork();
+
+    // The active model is authenticated in every scenario, so a fallback would
+    // send the draft and conversation context to a provider the user did not pick.
+    assert.equal(calls, 0, `${scenario.name} must not issue a request`);
+    assert.doesNotMatch(renderedText(editor), /leaked/);
+
+    const warning = harness.notifications.at(-1) ?? "";
+    assert.match(warning, scenario.expected, scenario.name);
+    assert.match(warning, /not sent to the active model/, scenario.name);
+
+    // The refusal repeats on every keystroke; the notice must not.
+    const notificationCount = harness.notifications.length;
+    editor.setText("Draft that would be sent again");
+    await flushAsyncWork();
+    assert.equal(harness.notifications.length, notificationCount, `${scenario.name} must notify once`);
+    assert.equal(calls, 0);
+  }
+});
+
+test("an explicitly requested model is reported without terminal control sequences", async () => {
+  const harness = createEditorHarness({
+    preferredModel: "\u001B[31mmalformed\u001B[0m",
+    completeSimple: (async () => makeCompletion([" leaked"])) as CompleteSimple,
+  });
+
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  await flushAsyncWork();
+
+  const warning = harness.notifications.at(-1) ?? "";
+  assert.doesNotMatch(warning, /\u001B/);
+  assert.match(warning, /malformed \(invalid\)/);
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+  assert.doesNotMatch(status, /\u001B/);
+  assert.match(status, /requested-model=malformed \(invalid\)/);
+});
+
+test("provider diagnostics reach the terminal without control sequences", async () => {
+  const hostileRaw = "\u001B[2J\u001B]0;pwned\u0007not json\rrewritten";
+  const harness = createEditorHarness({
+    completeSimple: (async () => makeRawCompletion(hostileRaw)) as CompleteSimple,
+  });
+
+  const editor = await harness.createEditor();
+  await harness.command("debug-on");
+  editor.setText("Draft");
+  await flushAsyncWork();
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+  assert.doesNotMatch(status, /\u001B|\u0007|\r/);
+  assert.match(status, /raw=/);
+  assert.match(status, /not jsonrewritten/);
+
+  const widgetLines = harness.widgets
+    .flatMap((entry) => entry.content ?? [])
+    .join("\n");
+  assert.doesNotMatch(widgetLines.replace(/\u001B\[[0-9;]*m/g, ""), /\u001B|\u0007/);
+});
+
+test("provider errors reach the terminal without control sequences", async () => {
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("\u001B]52;c;cGF5bG9hZA==\u0007provider exploded");
+    }) as CompleteSimple,
+  });
+
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  await flushAsyncWork();
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+  assert.doesNotMatch(status, /\u001B|\u0007/);
+  assert.match(status, /provider exploded/);
 });
