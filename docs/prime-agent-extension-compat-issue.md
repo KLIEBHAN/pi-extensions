@@ -1,6 +1,6 @@
 # Extension API compatibility gaps in prime-agent 0.7.0
 
-Filed against: https://github.com/PrimeIntellect-ai/prime-agent
+Filed as https://github.com/PrimeIntellect-ai/prime-agent/issues/734 on 2026-08-06. Related: [#690](https://github.com/PrimeIntellect-ai/prime-agent/issues/690), the same root cause for `ctx.ui.setFooter()`.
 
 ## Summary
 
