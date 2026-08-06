@@ -186,15 +186,33 @@ test("a host whose editor slot silently drops the factory stays inactive", async
   });
 
   await emit(noOpHost, "session_start");
+  assert.equal(noOpHost.editorSetCalls.length, 1, "the host is probed exactly once");
   assert.match(
     noOpHost.notifications.at(-1)?.message ?? "",
     /does not install custom editors/,
   );
 
+  // Once proven, such a host is treated like any other non-interactive host.
   await command(noOpHost, "status");
-  const status = noOpHost.notifications.at(-1)?.message ?? "";
-  assert.match(status, /editor=blocked/);
-  assert.match(status, /does not install custom editors/);
+  assert.match(noOpHost.notifications.at(-1)?.message ?? "", /requires interactive TUI mode/);
+
+  await emit(noOpHost, "session_start");
+  assert.equal(noOpHost.editorSetCalls.length, 1, "a proven host is not probed again");
+});
+
+test("enabling on a host that never installs the editor stops after one attempt", async () => {
+  const noOpHost = createHarness({ omitMode: true, hasUI: true, noOpEditorSlot: true });
+
+  await emit(noOpHost, "session_start");
+  assert.equal(noOpHost.editorSetCalls.length, 0, "a disabled extension never touches the editor slot");
+
+  await command(noOpHost, "on");
+  assert.equal(noOpHost.editorSetCalls.length, 1);
+  assert.match(noOpHost.notifications.at(-1)?.message ?? "", /does not install custom editors/);
+
+  await command(noOpHost, "on");
+  assert.equal(noOpHost.editorSetCalls.length, 1, "the failed host is not retried");
+  assert.match(noOpHost.notifications.at(-1)?.message ?? "", /requires interactive TUI mode/);
 });
 
 test("commands refuse to mount a custom editor outside TUI mode", async () => {

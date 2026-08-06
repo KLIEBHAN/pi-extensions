@@ -16,7 +16,7 @@
       "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"],
       "effects": ["@earendil-works/pi-coding-agent"],
       "pinnedBy": "@earendil-works/pi-coding-agent",
-      "reason": "brace-expansion is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent. A dependency shrinkwrap is authoritative for its own subtree, so neither a root overrides entry nor `npm audit fix` can raise it to a patched release. Pi 0.82.0 and 0.83.0 both still ship 5.0.7. The package is a development dependency used by the local toolchain and CI on trusted repository inputs, and it is never shipped in the published npm package, which declares Pi as a peer dependency.",
+      "reason": "brace-expansion is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent. A dependency shrinkwrap is authoritative for its own subtree, so neither a root overrides entry nor `npm audit fix` can raise it to a patched release. Pi 0.82.0 still ships 5.0.7. The package is a development dependency used by the local toolchain and CI on trusted repository inputs, and it is never shipped in the published npm package, which declares Pi as a peer dependency.",
       "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump brace-expansion to >=5.0.9 in its shrinkwrap.",
       "acceptedOn": "2026-07-25",
       "reviewBy": "2026-09-05"
@@ -42,7 +42,7 @@
       "paths": ["node_modules/@earendil-works/pi-coding-agent/node_modules/undici"],
       "effects": ["@earendil-works/pi-coding-agent"],
       "pinnedBy": "@earendil-works/pi-coding-agent",
-      "reason": "undici 8.5.0 is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent, so no root override can raise it. Pi 0.83.0 still declares the same version. Downstream response desynchronization through the retry interceptor requires an attacker-controlled or intercepted HTTP peer; the audited installation is a development dependency used by the local toolchain and CI against trusted registry endpoints, and undici is never shipped in the published npm package, which declares Pi as a peer dependency.",
+      "reason": "undici 8.5.0 is pinned by the npm-shrinkwrap.json published inside @earendil-works/pi-coding-agent, so no root override can raise it. Downstream response desynchronization through the retry interceptor requires an attacker-controlled or intercepted HTTP peer; the audited installation is a development dependency used by the local toolchain and CI against trusted registry endpoints, and undici is never shipped in the published npm package, which declares Pi as a peer dependency.",
       "upstreamFix": "Requires @earendil-works/pi-coding-agent to bump undici to >=8.9.0 in its shrinkwrap.",
       "acceptedOn": "2026-08-06",
       "reviewBy": "2026-09-05"

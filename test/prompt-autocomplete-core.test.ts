@@ -1092,6 +1092,6 @@ test("forked hosts without a mode fall back to UI availability plus a real edito
 test("non-string mode values fail closed instead of falling back", () => {
   assert.equal(isInteractiveEditorHost({ mode: 1, hasUI: true, canInstallEditor: true }), false);
   assert.equal(isInteractiveEditorHost({ mode: {}, hasUI: true, canInstallEditor: true }), false);
-  // null is treated as "not reported", matching hosts that clear the field.
-  assert.equal(isInteractiveEditorHost({ mode: null, hasUI: true, canInstallEditor: true }), true);
+  // Only an omitted mode selects the fork fallback; a cleared field fails closed.
+  assert.equal(isInteractiveEditorHost({ mode: null, hasUI: true, canInstallEditor: true }), false);
 });

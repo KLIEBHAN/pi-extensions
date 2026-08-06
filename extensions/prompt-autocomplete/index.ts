@@ -214,6 +214,8 @@ interface PromptAutocompleteSharedState {
   debugState: string;
   editorMount?: EditorMountState;
   editorBlockedReason?: string;
+  /** Set once a mount attempt proved whether this host installs custom editors. */
+  hostInstallsEditors?: boolean;
   lastError?: string;
   lastRawResponse?: string;
   requestCache: ExpiringLruCache<PromptAutocompleteCacheEntry>;
@@ -1368,7 +1370,10 @@ function releaseEditorRuntime(shared: PromptAutocompleteSharedState): void {
  * editor). Hosts from older forks of the extension API omit `mode` entirely, so
  * UI availability plus a usable editor slot decides instead.
  */
-function hostOwnsInteractiveEditor(ctx: ExtensionContext): boolean {
+function hostOwnsInteractiveEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
+  // A host that already accepted an editor factory without installing it is not
+  // interactive, no matter what its capabilities claim.
+  if (shared.hostInstallsEditors === false) return false;
   const host = ctx as Partial<Pick<ExtensionContext, "mode" | "hasUI" | "ui">>;
   return isInteractiveEditorHost({
     mode: host.mode,
@@ -1379,7 +1384,7 @@ function hostOwnsInteractiveEditor(ctx: ExtensionContext): boolean {
 }
 
 function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
-  if (!hostOwnsInteractiveEditor(ctx)) return false;
+  if (!hostOwnsInteractiveEditor(ctx, shared)) return false;
 
   if (shared.editorMount) {
     if (shared.ownsEditor?.()) return true;
@@ -1482,6 +1487,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
   if (ctx.ui.getEditorComponent() !== installedFactory) {
     releaseEditorRuntime(shared);
     shared.editorMount = undefined;
+    shared.hostInstallsEditors = false;
     const reason = "This host does not install custom editors; prompt autocomplete stays inactive";
     const shouldNotify = shared.editorBlockedReason !== reason;
     shared.editorBlockedReason = reason;
@@ -1490,6 +1496,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
     return false;
   }
 
+  shared.hostInstallsEditors = true;
   updateDebugState(shared, "mounted", "Editor extension attached");
   return true;
 }
@@ -1497,7 +1504,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
 function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
   const mount = shared.editorMount;
   const shouldRestore =
-    hostOwnsInteractiveEditor(ctx) && !!mount && ctx.ui.getEditorComponent() === mount.installedFactory;
+    hostOwnsInteractiveEditor(ctx, shared) && !!mount && ctx.ui.getEditorComponent() === mount.installedFactory;
 
   releaseEditorRuntime(shared);
   shared.editorMount = undefined;
@@ -1611,9 +1618,20 @@ function setStreamResponses(
 }
 
 function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
+  const previousEnabled = shared.enabled;
+  const previousOverride = shared.runtimeOverrides.enabled;
   shared.enabled = true;
   shared.runtimeOverrides.enabled = true;
-  return mountEditor(ctx, shared);
+
+  if (!mountEditor(ctx, shared) && shared.hostInstallsEditors === false) {
+    // The host accepted the editor factory without installing it: nothing can
+    // ever render or request, so do not leave the extension marked enabled.
+    shared.enabled = previousEnabled;
+    shared.runtimeOverrides.enabled = previousOverride;
+    return false;
+  }
+
+  return shared.editorMount !== undefined;
 }
 
 function disablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
@@ -1726,9 +1744,17 @@ export function createPromptAutocompleteExtension(
   dependencies: PromptAutocompleteDependencies = {},
 ): (pi: ExtensionAPI) => void {
   const completeSimpleImpl = dependencies.completeSimple ?? hostCompleteSimple;
+  // A host that exposes the simple API without streaming must use the
+  // completion path instead of failing every request. When the module exposes
+  // neither function the extension is not running inside a host that maps them,
+  // so capability stays unknown and is reported only when a request runs.
+  const hostStreamingUnsupported =
+    typeof piAiSimpleApi.completeSimple === "function" && typeof piAiSimpleApi.streamSimple !== "function";
   // Existing deterministic harnesses inject only completeSimple. Never let such
   // a harness fall through to the real network-capable stream implementation.
-  const streamSimpleImpl = dependencies.streamSimple ?? (dependencies.completeSimple ? undefined : hostStreamSimple);
+  const streamSimpleImpl =
+    dependencies.streamSimple
+    ?? (dependencies.completeSimple || hostStreamingUnsupported ? undefined : hostStreamSimple);
   const now = dependencies.now ?? Date.now;
 
   return function promptAutocompleteExtension(pi: ExtensionAPI): void {
@@ -1803,7 +1829,7 @@ export function createPromptAutocompleteExtension(
     resetSharedForSession(pi, shared);
     bindRuntimeContext(ctx, shared);
 
-    if (!hostOwnsInteractiveEditor(ctx) || !shared.enabled) return;
+    if (!hostOwnsInteractiveEditor(ctx, shared) || !shared.enabled) return;
     mountEditor(ctx, shared);
   });
 
@@ -1845,7 +1871,7 @@ export function createPromptAutocompleteExtension(
   pi.registerCommand("prompt-autocomplete", {
     description: "Enable, disable, or inspect inline prompt autocomplete and session stats",
     handler: async (args, ctx) => {
-      if (!hostOwnsInteractiveEditor(ctx)) {
+      if (!hostOwnsInteractiveEditor(ctx, shared)) {
         ctx.ui.notify("prompt-autocomplete requires interactive TUI mode", "warning");
         return;
       }

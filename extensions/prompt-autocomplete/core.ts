@@ -1650,13 +1650,17 @@ export interface EditorHostCapabilities {
  * Decide whether the host runs an interactive terminal editor.
  *
  * A host that reports `mode` is authoritative: only `"tui"` may own the editor,
- * so `rpc`, `json`, and `print` stay excluded exactly as before. A host without
- * `mode` is a forked API revision; it is treated as interactive only when it
- * reports UI availability *and* exposes the custom-editor slot, which keeps
- * headless and daemon front-ends out.
+ * so `rpc`, `json`, and `print` stay excluded exactly as before. Only a host
+ * that omits `mode` entirely is treated as a forked API revision, and then only
+ * when it reports UI availability *and* exposes the custom-editor slot. Any
+ * other reported value, including `null`, fails closed.
+ *
+ * Capabilities alone cannot prove that a host really installs custom editors:
+ * some forks expose a no-op editor slot in headless front-ends. The caller must
+ * still verify the installation after mounting.
  */
 export function isInteractiveEditorHost(host: EditorHostCapabilities): boolean {
   if (typeof host.mode === "string") return host.mode === "tui";
-  if (host.mode !== undefined && host.mode !== null) return false;
+  if (host.mode !== undefined) return false;
   return host.hasUI === true && host.canInstallEditor === true;
 }

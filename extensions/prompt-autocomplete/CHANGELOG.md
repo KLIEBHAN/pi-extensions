@@ -7,7 +7,7 @@ All notable changes to this package are documented here. This project follows [S
 ### Fixed
 
 - Load the simple completion API from the `@earendil-works/pi-ai` root specifier, which Pi maps to its compat entrypoint and forked hosts export directly. Hosts that never mapped the `@earendil-works/pi-ai/compat` subpath, such as prime-agent, can now load the extension at all.
-- Detect the interactive editor host without requiring `ExtensionContext.mode`. Hosts that report a mode keep the previous behaviour, and hosts built on an older extension API are treated as interactive only when they report UI availability and expose a usable custom-editor slot. This restores `/prompt-autocomplete` commands and ghost text on prime-agent while keeping RPC, JSON, and print runs excluded.
+- Detect the interactive editor host without requiring `ExtensionContext.mode`. Hosts that report a mode keep the previous behaviour, so Pi's RPC, JSON, and print runs stay excluded unchanged. Hosts built on an older extension API are treated as candidates only when they report UI availability and expose a custom-editor slot, and the installation is then verified: a host that accepts an editor factory without installing it — such as a forked headless or daemon front-end — is detected on the first attempt, is never retried, is not left enabled, and can neither render ghost text nor issue a provider request. This restores `/prompt-autocomplete` commands and ghost text on prime-agent.
 
 ## [0.2.0] - 2026-07-31
 

@@ -118,8 +118,8 @@ The extension makes no autocomplete request while disabled. Automatic empty-draf
 
 - Supported baseline: Pi `0.80.6`, Node.js `22.19.0` or newer.
 - Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor.
-- Forks of Pi's extension API whose `ExtensionContext` predates `mode`, such as [prime-agent](https://www.npmjs.com/package/prime-agent), are supported: the extension then treats a host as interactive only when it reports UI availability and exposes a usable custom-editor slot, so headless front-ends stay excluded.
-- The simple completion API is imported from the `@earendil-works/pi-ai` root specifier, which Pi maps to its compat entrypoint and such forks export directly.
+- Forks of Pi's extension API whose `ExtensionContext` predates `mode`, such as [prime-agent](https://www.npmjs.com/package/prime-agent), are supported. For those hosts the extension first requires UI availability and a custom-editor slot, and then verifies that the host actually installed the editor. A front-end that accepts an editor factory without installing it, as forked RPC and daemon modes do, is detected on the first attempt and stays inactive: it is not retried, not left enabled, and can neither render ghost text nor issue a provider request.
+- The simple completion API is imported from the `@earendil-works/pi-ai` root specifier, which Pi maps to its compat entrypoint and such forks export directly. If a host exposes that module without `streamSimple`, the extension uses the completion path instead of failing requests.
 - Prompt Autocomplete requires exclusive ownership of Pi's custom-editor slot. It refuses to replace another custom editor and never removes a later replacement editor.
 
 ## Development
