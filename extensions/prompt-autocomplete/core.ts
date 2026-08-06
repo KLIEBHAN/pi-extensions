@@ -1659,6 +1659,12 @@ export interface EditorHostCapabilities {
  * some forks expose a no-op editor slot in headless front-ends. The caller must
  * still verify the installation after mounting.
  */
+export function isInteractiveEditorHost(host: EditorHostCapabilities): boolean {
+  if (typeof host.mode === "string") return host.mode === "tui";
+  if (host.mode !== undefined) return false;
+  return host.hasUI === true && host.canInstallEditor === true;
+}
+
 /**
  * Whether streamed responses can be requested from the host's pi-ai module.
  *
@@ -1673,10 +1679,4 @@ export function hostSupportsStreamedResponses(api: {
 }): boolean {
   if (typeof api.streamSimple === "function") return true;
   return typeof api.completeSimple !== "function";
-}
-
-export function isInteractiveEditorHost(host: EditorHostCapabilities): boolean {
-  if (typeof host.mode === "string") return host.mode === "tui";
-  if (host.mode !== undefined) return false;
-  return host.hasUI === true && host.canInstallEditor === true;
 }

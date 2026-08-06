@@ -1534,6 +1534,9 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.cancelActiveRequest?.();
   shared.cancelActiveRequest = undefined;
   applyEffectiveConfig(pi, shared);
+  // A host that never installs custom editors stays inactive for the rest of
+  // the process, so flags must not re-enable it in a later session either.
+  if (shared.hostInstallsEditors === false) shared.enabled = false;
   shared.usageStats = createPromptAutocompleteUsageStats();
   shared.editorMount = undefined;
   shared.editorBlockedReason = undefined;
@@ -1633,16 +1636,15 @@ function setStreamResponses(
 }
 
 function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
-  const previousEnabled = shared.enabled;
   const previousOverride = shared.runtimeOverrides.enabled;
   shared.enabled = true;
   shared.runtimeOverrides.enabled = true;
 
   if (!mountEditor(ctx, shared) && shared.hostInstallsEditors === false) {
     // The host accepted the editor factory without installing it. mountEditor
-    // already cleared `enabled`; also drop the session override so the refused
-    // activation is not replayed as a user decision in a later session.
-    shared.enabled = previousEnabled;
+    // already cleared `enabled`; keep it cleared and drop the session override
+    // so the refused activation is not replayed as a user decision later.
+    shared.enabled = false;
     shared.runtimeOverrides.enabled = previousOverride;
     return false;
   }
