@@ -533,7 +533,7 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     `editor=${editorState}`,
     shared.editorBlockedReason ? `editor-blocked=${truncateDebug(shared.editorBlockedReason, 90)}` : undefined,
     `model=${truncateDebug(formatModelLabel(resolvedModel), 90)}`,
-    `requested-model=${truncateDebug(requestedModel, 90)}`,
+    `requested-model=${requestedModel}`,
     `while-streaming=${shared.config.allowWhileStreaming ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.allowWhileStreaming)})`,
     `stream=${shared.config.streamResponses ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.streamResponses)})`,
     `request-path=${shared.config.streamResponses && shared.streamSimple ? "stream" : shared.config.streamResponses ? "complete-compat" : "complete"}`,
@@ -1770,6 +1770,8 @@ function notifyPromptAutocompleteEnabled(
     // A refused explicit request must be reported on every enable path,
     // including toggle: "configure auth" would point at the active model, which
     // is deliberately not used.
+    // Recorded as reported so the first keystroke does not repeat it verbatim.
+    shared.reportedModelRefusals.add(resolution.refusedRequest);
     ctx.ui.notify(
       `Prompt autocomplete enabled, but no request can be issued. ${truncateDebug(resolution.refusedRequest, 240)}`,
       "warning",

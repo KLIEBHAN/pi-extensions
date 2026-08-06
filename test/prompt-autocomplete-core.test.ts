@@ -1166,6 +1166,16 @@ test("an explicit autocomplete model stays distinguishable from the active model
   });
 });
 
+test("a long malformed model value keeps its rejection marker", () => {
+  const described = describePromptAutocompleteModelSelection({
+    kind: "invalid",
+    raw: "z".repeat(200),
+  });
+
+  assert.ok(described.endsWith("… (invalid)"), described.slice(-20));
+  assert.ok(described.length < 100, `description is ${described.length} chars`);
+});
+
 test("model selection descriptions are terminal-safe and mark invalid values", () => {
   assert.equal(describePromptAutocompleteModelSelection({ kind: "active" }), "current active model");
   assert.equal(
@@ -1195,6 +1205,14 @@ test("string control sequences are removed in both C1 and escaped form", () => {
   // the remainder is dropped here as well instead of becoming visible text.
   assert.equal(sanitizeTerminalText("kept\u001B_dropped tail"), "kept");
   assert.equal(sanitizeTerminalText("kept\u0090dropped tail"), "kept");
+
+  // The discard stops at a line break: a bare C1 introducer is also what a
+  // mis-decoded UTF-8 quote looks like, and the rest of a provider message must
+  // not disappear because of mojibake.
+  assert.equal(
+    sanitizeTerminalText("rate limit for \u009Dgpt-4\nretry in 30s"),
+    "rate limit for \nretry in 30s",
+  );
 });
 
 test("sanitization stays linear on hostile input", () => {
@@ -1218,6 +1236,13 @@ test("text that would misrepresent itself is removed", () => {
   assert.equal(sanitizeTerminalText("x\u2061y\u180Ez"), "xyz");
   // Tag characters are invisible and the usual text-smuggling vector.
   assert.equal(sanitizeTerminalText("safe\u{E0064}\u{E0065}/model"), "safe/model");
+  // Matching the Unicode properties instead of a list also covers soft hyphens,
+  // Hangul fillers, annotation marks, and the rest of plane 14.
+  assert.equal(sanitizeTerminalText("open\u00ADai/x"), "openai/x");
+  assert.equal(
+    sanitizeTerminalText("a\u034Fb\u2065c\u206Ad\uFFF9e\u115Ff\u{E0080}g"),
+    "abcdefg",
+  );
 
   // Separators become line breaks so multi-line errors stay readable.
   assert.equal(sanitizeTerminalText("first line\u2028second line"), "first line\nsecond line");

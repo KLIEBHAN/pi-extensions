@@ -11,19 +11,19 @@ const C1_STRING_SEQUENCE_OPENERS = new Set(["\u0090", "\u0098", "\u009D", "\u009
 /** The same introducers in their ESC-prefixed form. */
 const ESCAPED_STRING_SEQUENCE_OPENERS = new Set(["P", "X", "^", "_"]);
 /**
- * Bidirectional controls and invisible characters.
+ * Format and default-ignorable characters.
  *
  * They cannot change terminal state, but they can make a diagnostic display
  * text that differs from its actual content, which defeats the purpose of
- * naming a rejected model or a failing provider. The Tags block is included
- * because it is the usual text-smuggling vector.
+ * naming a rejected model or a failing provider. Both Unicode properties are
+ * matched instead of an explicit list, because an enumeration misses soft
+ * hyphens, Hangul fillers, annotation marks, and most of plane 14.
  *
- * Zero-width joiner and non-joiner are deliberately absent: they carry meaning
- * in Arabic, Persian, and Indic scripts and in emoji sequences, and they cannot
+ * Zero-width joiner and non-joiner are deliberately kept: they carry meaning in
+ * Arabic, Persian, and Indic scripts and in emoji sequences, and they cannot
  * reorder text.
  */
-const DECEPTIVE_FORMAT_CHARACTERS =
-  /[\u061C\u180E\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]|[\u{E0000}-\u{E007F}]/gu;
+const DECEPTIVE_FORMAT_CHARACTERS = /[^\P{Cf}\u200C\u200D]|[^\P{Default_Ignorable_Code_Point}\u200C\u200D]/gu;
 /** Line and paragraph separators; a line break keeps the text readable. */
 const UNICODE_LINE_SEPARATORS = /[\u2028\u2029]/g;
 
@@ -1379,10 +1379,14 @@ export function sanitizeTerminalText(text: string): string {
  *
  * `stripVTControlCharacters` leaves these string sequences behind, and a
  * terminal consumes everything up to the string terminator, so an unterminated
- * introducer discards the remainder here as well. This is a single forward scan
- * rather than a regex: a pattern with a lazy body backtracks quadratically when
- * an input carries many unterminated introducers, and provider error text is
- * not length-bounded.
+ * introducer discards the remainder here as well. The discard stops at a line
+ * break: a C1 introducer is also what a mis-decoded UTF-8 quote looks like, and
+ * losing the rest of a provider message to mojibake would hide the diagnostic
+ * this text exists for.
+ *
+ * This is a single forward scan rather than a regex: a pattern with a lazy body
+ * backtracks quadratically when an input carries many unterminated introducers,
+ * and provider error text is not length-bounded.
  */
 function removeStringControlSequences(text: string): string {
   let result = "";
@@ -1409,6 +1413,7 @@ function removeStringControlSequences(text: string): string {
         index += 2;
         break;
       }
+      if (candidate === "\n") break;
       index += 1;
     }
   }
@@ -1450,10 +1455,16 @@ export function parsePromptAutocompleteModelSelection(
 /** Human-readable, terminal-safe description of the requested model. */
 export function describePromptAutocompleteModelSelection(
   selection: PromptAutocompleteModelSelection,
+  maxRawChars = 78,
 ): string {
   if (selection.kind === "active") return "current active model";
   const raw = trimAndCollapse(sanitizeTerminalText(selection.raw));
-  return selection.kind === "dedicated" ? raw : `${raw} (invalid)`;
+  // Truncate the raw value only, so a long malformed value cannot push the
+  // rejection marker out of the message and read as a plausible model name.
+  const bounded = raw.length > maxRawChars
+    ? `${truncateAtFirstUnpairedSurrogate(raw.slice(0, maxRawChars - 1))}…`
+    : raw;
+  return selection.kind === "dedicated" ? bounded : `${bounded} (invalid)`;
 }
 
 export function parseModelRef(value: boolean | string | undefined): ModelRef | undefined {

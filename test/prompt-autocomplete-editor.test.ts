@@ -220,6 +220,12 @@ function createEditorHarness(options: EditorHarnessOptions) {
       const keybindings = { matches: () => false } as unknown as KeybindingsManager;
       return editorFactory(tui, editorTheme, keybindings);
     },
+    /** Instantiate the currently installed factory without starting a session. */
+    instantiateEditor: (): EditorComponent => {
+      assert.ok(editorFactory, "an editor factory must be installed");
+      const keybindings = { matches: () => false } as unknown as KeybindingsManager;
+      return editorFactory(tui, editorTheme, keybindings);
+    },
     emit: async (name: string, event: unknown = {}) => {
       await handlers.get(name)?.(event, ctx);
     },
@@ -1641,11 +1647,12 @@ test("diagnostics stay well formed and bounded for hostile provider text", async
   assert.equal(status.isWellFormed(), true);
 });
 
-test("an unbounded provider error cannot stall the terminal", async () => {
+test("an unbounded provider error is capped before it is displayed", async () => {
   const harness = createEditorHarness({
     completeSimple: (async () => {
-      // Unterminated introducers used to make sanitization quadratic, and a
-      // provider error body has no length limit.
+      // A provider error body has no length limit. Linearity of the scan itself
+      // is covered in the core suite; this pins the input cap in the diagnostic
+      // path that feeds it.
       throw new Error(`${"\u001B_".repeat(400_000)}boom`);
     }) as CompleteSimple,
   });
@@ -1674,6 +1681,7 @@ test("a refused model is reported again after disabling and re-enabling", async 
   editor.setText("Draft");
   await flushAsyncWork();
   assert.match(harness.notifications.at(-1) ?? "", /is unknown/);
+  const afterFirstReport = harness.notifications.length;
 
   await harness.command("off");
   await harness.command("on");
@@ -1683,8 +1691,18 @@ test("a refused model is reported again after disabling and re-enabling", async 
   assert.match(enableNotice, /is unknown/);
   assert.match(enableNotice, /not sent to the active model/);
 
-  const reEnabledEditor = await harness.createEditor();
+  const afterEnableNotice = harness.notifications.length;
+  assert.ok(afterEnableNotice > afterFirstReport);
+
+  // Enabling already stated the reason, so typing must not repeat it verbatim.
+  const reEnabledEditor = harness.instantiateEditor();
   reEnabledEditor.setText("Draft again");
+  await flushAsyncWork();
+  assert.equal(harness.notifications.length, afterEnableNotice);
+
+  // A new session starts fresh accounting and may state it again.
+  const nextSessionEditor = await harness.createEditor();
+  nextSessionEditor.setText("Draft in a new session");
   await flushAsyncWork();
   assert.match(harness.notifications.at(-1) ?? "", /is unknown/);
 });
