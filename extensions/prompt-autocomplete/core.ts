@@ -1629,3 +1629,34 @@ export function formatModelLabel(model: Model<Api> | undefined): string {
   if (!model) return "none";
   return `${model.provider}/${model.id}`;
 }
+
+/**
+ * Host capabilities needed to decide whether an interactive editor slot exists.
+ *
+ * Pi exposes `ExtensionContext.mode`. Forks of the Pi extension API (for
+ * example prime-agent, which is based on an older API revision) ship
+ * `hasUI` without `mode`.
+ */
+export interface EditorHostCapabilities {
+  /** `ExtensionContext.mode` when the host provides it. */
+  mode?: unknown;
+  /** `ExtensionContext.hasUI` when the host provides it. */
+  hasUI?: unknown;
+  /** Whether the host exposes a usable custom-editor slot. */
+  canInstallEditor?: unknown;
+}
+
+/**
+ * Decide whether the host runs an interactive terminal editor.
+ *
+ * A host that reports `mode` is authoritative: only `"tui"` may own the editor,
+ * so `rpc`, `json`, and `print` stay excluded exactly as before. A host without
+ * `mode` is a forked API revision; it is treated as interactive only when it
+ * reports UI availability *and* exposes the custom-editor slot, which keeps
+ * headless and daemon front-ends out.
+ */
+export function isInteractiveEditorHost(host: EditorHostCapabilities): boolean {
+  if (typeof host.mode === "string") return host.mode === "tui";
+  if (host.mode !== undefined && host.mode !== null) return false;
+  return host.hasUI === true && host.canInstallEditor === true;
+}

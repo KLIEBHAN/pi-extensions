@@ -21,6 +21,7 @@ import {
   ExpiringLruCache,
   formatPromptAutocompleteStats,
   formatUsageStats,
+  isInteractiveEditorHost,
   MAX_REQUEST_MAX_TOKENS,
   MIN_REQUEST_MAX_TOKENS,
   recordProviderLatency,
@@ -1059,4 +1060,38 @@ test("a side-effecting usage getter cannot report different values to totals and
   assert.equal(stats.tokenReports, 0);
   assert.equal(stats.costReports, 1);
   assert.equal(stats.estimatedCost, 1);
+});
+
+test("hosts that report a mode keep authoritative editor-ownership semantics", () => {
+  const slot = { hasUI: true, canInstallEditor: true };
+
+  assert.equal(isInteractiveEditorHost({ mode: "tui", ...slot }), true);
+  for (const mode of ["rpc", "json", "print"]) {
+    assert.equal(isInteractiveEditorHost({ mode, ...slot }), false, `${mode} must not own the editor`);
+  }
+
+  // A reported TUI mode stays authoritative even when hasUI is missing.
+  assert.equal(isInteractiveEditorHost({ mode: "tui" }), true);
+});
+
+test("forked hosts without a mode fall back to UI availability plus a real editor slot", () => {
+  // prime-agent and other forks of an older extension API omit `mode`.
+  assert.equal(isInteractiveEditorHost({ hasUI: true, canInstallEditor: true }), true);
+  assert.equal(isInteractiveEditorHost({ mode: undefined, hasUI: true, canInstallEditor: true }), true);
+
+  assert.equal(isInteractiveEditorHost({ hasUI: false, canInstallEditor: true }), false);
+  assert.equal(isInteractiveEditorHost({ hasUI: true, canInstallEditor: false }), false);
+  assert.equal(isInteractiveEditorHost({ canInstallEditor: true }), false);
+  assert.equal(isInteractiveEditorHost({}), false);
+
+  // Only an exact boolean true counts; truthy proxies must not unlock the editor.
+  assert.equal(isInteractiveEditorHost({ hasUI: 1, canInstallEditor: 1 }), false);
+  assert.equal(isInteractiveEditorHost({ hasUI: "yes", canInstallEditor: true }), false);
+});
+
+test("non-string mode values fail closed instead of falling back", () => {
+  assert.equal(isInteractiveEditorHost({ mode: 1, hasUI: true, canInstallEditor: true }), false);
+  assert.equal(isInteractiveEditorHost({ mode: {}, hasUI: true, canInstallEditor: true }), false);
+  // null is treated as "not reported", matching hosts that clear the field.
+  assert.equal(isInteractiveEditorHost({ mode: null, hasUI: true, canInstallEditor: true }), true);
 });

@@ -125,6 +125,8 @@ interface EditorHarnessOptions {
   maxAlternatives?: number;
   now?: () => number;
   preferredModel?: string;
+  /** Emulate forked hosts (prime-agent) whose ExtensionContext predates `mode`. */
+  omitHostMode?: boolean;
 }
 
 function createEditorHarness(options: EditorHarnessOptions) {
@@ -163,7 +165,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
     getLeafId: () => leafId,
   };
   const ctx = {
-    mode: "tui",
+    ...(options.omitHostMode ? {} : { mode: "tui" }),
     hasUI: true,
     get model() {
       return model;
@@ -275,6 +277,31 @@ test("editor renders and accepts full and word-level suggestions", async () => {
   editor.handleInput("\t");
   assert.equal(editor.getText(), "Review the implementation carefully");
   assert.ok(harness.getRenderRequests() > 0);
+});
+
+test("a forked host without ExtensionContext.mode still renders and accepts suggestions", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    omitHostMode: true,
+    completeSimple: (async () => {
+      calls += 1;
+      return calls === 1 ? makeCompletion([" the implementation carefully"]) : makeCompletion([]);
+    }) as CompleteSimple,
+  });
+
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.match(renderedText(editor), /the implementation carefully/);
+  editor.handleInput("\t");
+  assert.equal(editor.getText(), "Review the implementation carefully");
+
+  await harness.command("status");
+  const status = harness.notifications.at(-1) ?? "";
+  assert.doesNotMatch(status, /requires interactive TUI mode/);
+  assert.match(status, /enabled=yes/);
+  assert.match(status, /editor=mounted/);
 });
 
 test("streaming renders monotonic first-suggestion progress before terminal alternatives", async () => {

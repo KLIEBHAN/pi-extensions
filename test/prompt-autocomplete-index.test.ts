@@ -11,6 +11,14 @@ interface HarnessOptions {
   enabled?: boolean;
   existingEditorFactory?: EditorFactory;
   mode?: ExtensionContext["mode"];
+  /** Emulate forked hosts (prime-agent) whose ExtensionContext predates `mode`. */
+  omitMode?: boolean;
+  /** Override `hasUI` for forked hosts that report UI availability differently. */
+  hasUI?: boolean;
+  /** Emulate hosts without a usable custom-editor slot. */
+  omitEditorSlot?: boolean;
+  /** Emulate hosts whose editor slot accepts a factory without installing it. */
+  noOpEditorSlot?: boolean;
 }
 
 function createHarness(options: HarnessOptions = {}) {
@@ -46,13 +54,25 @@ function createHarness(options: HarnessOptions = {}) {
     getLeafId: () => "leaf-1",
   };
 
+  const hostUi = options.omitEditorSlot
+    ? { ...ui, getEditorComponent: undefined, setEditorComponent: undefined }
+    : options.noOpEditorSlot
+      ? {
+          ...ui,
+          getEditorComponent: () => undefined,
+          setEditorComponent: (factory: EditorFactory | undefined) => {
+            editorSetCalls.push(factory);
+          },
+        }
+      : ui;
+
   const ctx = {
-    mode,
-    hasUI: mode === "tui" || mode === "rpc",
+    ...(options.omitMode ? {} : { mode }),
+    hasUI: options.hasUI ?? (mode === "tui" || mode === "rpc"),
     model,
     modelRegistry,
     sessionManager,
-    ui,
+    ui: hostUi,
   } as unknown as ExtensionContext;
 
   const pi = {
@@ -124,6 +144,57 @@ test("session start mounts the editor only in TUI mode", async () => {
     await emit(nonTui, "session_start");
     assert.equal(nonTui.editorSetCalls.length, 0, `${mode} must not mount a custom editor`);
   }
+});
+
+test("forked hosts without ExtensionContext.mode mount the editor when a real editor slot exists", async () => {
+  const legacyTui = createHarness({ enabled: true, omitMode: true, hasUI: true });
+  await emit(legacyTui, "session_start");
+  assert.equal(legacyTui.editorSetCalls.length, 1);
+  assert.equal(typeof legacyTui.getEditorFactory(), "function");
+
+  await command(legacyTui, "status");
+  assert.doesNotMatch(legacyTui.notifications.at(-1)?.message ?? "", /requires interactive TUI mode/);
+});
+
+test("forked hosts without UI availability or an editor slot stay excluded", async () => {
+  const headless = createHarness({ enabled: true, omitMode: true, hasUI: false });
+  await emit(headless, "session_start");
+  assert.equal(headless.editorSetCalls.length, 0);
+
+  await command(headless, "on");
+  assert.equal(headless.editorSetCalls.length, 0);
+  assert.match(headless.notifications.at(-1)?.message ?? "", /interactive TUI mode/);
+
+  const withoutEditorSlot = createHarness({
+    enabled: true,
+    omitMode: true,
+    hasUI: true,
+    omitEditorSlot: true,
+  });
+  await emit(withoutEditorSlot, "session_start");
+  assert.equal(withoutEditorSlot.editorSetCalls.length, 0);
+  await command(withoutEditorSlot, "on");
+  assert.match(withoutEditorSlot.notifications.at(-1)?.message ?? "", /interactive TUI mode/);
+});
+
+test("a host whose editor slot silently drops the factory stays inactive", async () => {
+  const noOpHost = createHarness({
+    enabled: true,
+    omitMode: true,
+    hasUI: true,
+    noOpEditorSlot: true,
+  });
+
+  await emit(noOpHost, "session_start");
+  assert.match(
+    noOpHost.notifications.at(-1)?.message ?? "",
+    /does not install custom editors/,
+  );
+
+  await command(noOpHost, "status");
+  const status = noOpHost.notifications.at(-1)?.message ?? "";
+  assert.match(status, /editor=blocked/);
+  assert.match(status, /does not install custom editors/);
 });
 
 test("commands refuse to mount a custom editor outside TUI mode", async () => {

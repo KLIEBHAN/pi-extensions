@@ -1,12 +1,11 @@
-import {
-  completeSimple,
-  streamSimple,
-  type Api,
-  type AssistantMessage,
-  type AssistantMessageEventStream,
-  type Model,
-  type UserMessage,
-} from "@earendil-works/pi-ai/compat";
+import * as piAi from "@earendil-works/pi-ai";
+import type {
+  Api,
+  AssistantMessage,
+  AssistantMessageEventStream,
+  Model,
+  UserMessage,
+} from "@earendil-works/pi-ai";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import {
@@ -33,6 +32,7 @@ import {
   formatModelLabel,
   formatPromptAutocompleteStats,
   formatUsageStats,
+  isInteractiveEditorHost,
   MAX_DRAFT_CONTEXT_CHARS,
   normalizePromptSuggestions,
   parseBoundedIntFlag,
@@ -148,8 +148,47 @@ interface EditorMountState {
   installedFactory: EditorFactory;
 }
 
-type CompleteSimpleFunction = typeof completeSimple;
-type StreamSimpleFunction = typeof streamSimple;
+type CompleteSimpleFunction = typeof import("@earendil-works/pi-ai/compat").completeSimple;
+type StreamSimpleFunction = typeof import("@earendil-works/pi-ai/compat").streamSimple;
+
+/**
+ * Host-neutral access to the simple completion API.
+ *
+ * Pi aliases the pi-ai root specifier to its compat entrypoint for extensions,
+ * and forked hosts based on an older API revision (for example prime-agent)
+ * export the same functions from the pi-ai root module. Importing the root
+ * specifier therefore works on both, while importing `@earendil-works/pi-ai/compat`
+ * fails to resolve on hosts that never mapped that subpath.
+ */
+const piAiSimpleApi = piAi as unknown as {
+  completeSimple?: CompleteSimpleFunction;
+  streamSimple?: StreamSimpleFunction;
+};
+
+function requireSimpleApiFunction<T>(name: "completeSimple" | "streamSimple", impl: T | undefined): T {
+  if (typeof impl !== "function") {
+    throw new Error(
+      `prompt-autocomplete requires ${name}() from @earendil-works/pi-ai; this host does not provide it`,
+    );
+  }
+  return impl;
+}
+
+// Resolved on first use: plain Node test runs resolve the real pi-ai root,
+// which only exposes these functions when the host maps them for extensions.
+const hostCompleteSimple = ((model, context, options) =>
+  requireSimpleApiFunction("completeSimple", piAiSimpleApi.completeSimple)(
+    model,
+    context,
+    options,
+  )) as CompleteSimpleFunction;
+
+const hostStreamSimple = ((model, context, options) =>
+  requireSimpleApiFunction("streamSimple", piAiSimpleApi.streamSimple)(
+    model,
+    context,
+    options,
+  )) as StreamSimpleFunction;
 
 export interface PromptAutocompleteDependencies {
   completeSimple?: CompleteSimpleFunction;
@@ -1322,8 +1361,25 @@ function releaseEditorRuntime(shared: PromptAutocompleteSharedState): void {
   shared.ownsEditor = undefined;
 }
 
+/**
+ * Whether this host can hand the prompt editor to the extension.
+ *
+ * Hosts that report `ctx.mode` stay authoritative (only `"tui"` owns the
+ * editor). Hosts from older forks of the extension API omit `mode` entirely, so
+ * UI availability plus a usable editor slot decides instead.
+ */
+function hostOwnsInteractiveEditor(ctx: ExtensionContext): boolean {
+  const host = ctx as Partial<Pick<ExtensionContext, "mode" | "hasUI" | "ui">>;
+  return isInteractiveEditorHost({
+    mode: host.mode,
+    hasUI: host.hasUI,
+    canInstallEditor:
+      typeof host.ui?.setEditorComponent === "function" && typeof host.ui?.getEditorComponent === "function",
+  });
+}
+
 function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
-  if (ctx.mode !== "tui") return false;
+  if (!hostOwnsInteractiveEditor(ctx)) return false;
 
   if (shared.editorMount) {
     if (shared.ownsEditor?.()) return true;
@@ -1420,13 +1476,28 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
     throw error;
   }
 
+  // Some hosts accept the call without installing anything: forked front-ends
+  // (for example prime-agent's RPC mode) expose a no-op editor slot while still
+  // reporting UI availability. Verify the installation instead of trusting it.
+  if (ctx.ui.getEditorComponent() !== installedFactory) {
+    releaseEditorRuntime(shared);
+    shared.editorMount = undefined;
+    const reason = "This host does not install custom editors; prompt autocomplete stays inactive";
+    const shouldNotify = shared.editorBlockedReason !== reason;
+    shared.editorBlockedReason = reason;
+    updateDebugState(shared, "blocked-no-editor-slot", reason);
+    if (shouldNotify) ctx.ui.notify(reason, "warning");
+    return false;
+  }
+
   updateDebugState(shared, "mounted", "Editor extension attached");
   return true;
 }
 
 function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
   const mount = shared.editorMount;
-  const shouldRestore = ctx.mode === "tui" && !!mount && ctx.ui.getEditorComponent() === mount.installedFactory;
+  const shouldRestore =
+    hostOwnsInteractiveEditor(ctx) && !!mount && ctx.ui.getEditorComponent() === mount.installedFactory;
 
   releaseEditorRuntime(shared);
   shared.editorMount = undefined;
@@ -1654,10 +1725,10 @@ function createPromptAutocompleteCommandHandlers(
 export function createPromptAutocompleteExtension(
   dependencies: PromptAutocompleteDependencies = {},
 ): (pi: ExtensionAPI) => void {
-  const completeSimpleImpl = dependencies.completeSimple ?? completeSimple;
+  const completeSimpleImpl = dependencies.completeSimple ?? hostCompleteSimple;
   // Existing deterministic harnesses inject only completeSimple. Never let such
   // a harness fall through to the real network-capable stream implementation.
-  const streamSimpleImpl = dependencies.streamSimple ?? (dependencies.completeSimple ? undefined : streamSimple);
+  const streamSimpleImpl = dependencies.streamSimple ?? (dependencies.completeSimple ? undefined : hostStreamSimple);
   const now = dependencies.now ?? Date.now;
 
   return function promptAutocompleteExtension(pi: ExtensionAPI): void {
@@ -1732,7 +1803,7 @@ export function createPromptAutocompleteExtension(
     resetSharedForSession(pi, shared);
     bindRuntimeContext(ctx, shared);
 
-    if (ctx.mode !== "tui" || !shared.enabled) return;
+    if (!hostOwnsInteractiveEditor(ctx) || !shared.enabled) return;
     mountEditor(ctx, shared);
   });
 
@@ -1774,7 +1845,7 @@ export function createPromptAutocompleteExtension(
   pi.registerCommand("prompt-autocomplete", {
     description: "Enable, disable, or inspect inline prompt autocomplete and session stats",
     handler: async (args, ctx) => {
-      if (ctx.mode !== "tui") {
+      if (!hostOwnsInteractiveEditor(ctx)) {
         ctx.ui.notify("prompt-autocomplete requires interactive TUI mode", "warning");
         return;
       }

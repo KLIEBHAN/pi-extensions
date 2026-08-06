@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.0/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.1/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -118,6 +118,8 @@ The extension makes no autocomplete request while disabled. Automatic empty-draf
 
 - Supported baseline: Pi `0.80.6`, Node.js `22.19.0` or newer.
 - Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor.
+- Forks of Pi's extension API whose `ExtensionContext` predates `mode`, such as [prime-agent](https://www.npmjs.com/package/prime-agent), are supported: the extension then treats a host as interactive only when it reports UI availability and exposes a usable custom-editor slot, so headless front-ends stay excluded.
+- The simple completion API is imported from the `@earendil-works/pi-ai` root specifier, which Pi maps to its compat entrypoint and such forks export directly.
 - Prompt Autocomplete requires exclusive ownership of Pi's custom-editor slot. It refuses to replace another custom editor and never removes a later replacement editor.
 
 ## Development
