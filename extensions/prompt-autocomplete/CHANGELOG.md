@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-08-06
+
+### Added
+
+- `/prompt-autocomplete on` and `off` now persist across processes. The decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (`~/.config` fallback, `PI_PROMPT_AUTOCOMPLETE_SETTINGS` override) and enables autocomplete in later sessions without the CLI flag. An explicit `--prompt-autocomplete` flag still outranks a saved `off` for that invocation, a decision is only recorded when the host actually installs the editor, a failed save warns without losing the in-process decision, and a malformed file degrades to flag-only behaviour. `status` attributes the setting as `(flag)`, `(saved)`, or `(session)`.
+
 ## [0.2.3] - 2026-08-06
 
 ### Fixed

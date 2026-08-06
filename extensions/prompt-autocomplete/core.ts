@@ -610,7 +610,7 @@ export interface PromptAutocompleteRuntimeOverrides {
   debug?: boolean;
 }
 
-export type PromptAutocompleteSettingSource = "flag" | "session";
+export type PromptAutocompleteSettingSource = "flag" | "saved" | "session";
 
 export function resolveOverride<T>(override: T | undefined, flagValue: T): T {
   return override ?? flagValue;
@@ -618,6 +618,67 @@ export function resolveOverride<T>(override: T | undefined, flagValue: T): T {
 
 export function describeSettingSource(override: unknown): PromptAutocompleteSettingSource {
   return override === undefined ? "flag" : "session";
+}
+
+/**
+ * Settings persisted across processes.
+ *
+ * Only explicit `/prompt-autocomplete on|off` decisions are stored. An absent
+ * field defers to the CLI flag, so an empty or missing file behaves exactly
+ * like no persisted decision.
+ */
+export interface PromptAutocompletePersistedSettings {
+  enabled?: boolean;
+}
+
+/**
+ * Parse persisted settings text defensively.
+ *
+ * The file is user-editable, so anything malformed — invalid JSON, a non-object
+ * payload, or a non-boolean `enabled` — degrades to "no persisted decision"
+ * instead of failing extension activation.
+ */
+export function parsePromptAutocompletePersistedSettings(
+  text: string | undefined,
+): PromptAutocompletePersistedSettings {
+  if (!text) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+  const enabled = (parsed as Record<string, unknown>).enabled;
+  return typeof enabled === "boolean" ? { enabled } : {};
+}
+
+export function serializePromptAutocompletePersistedSettings(
+  settings: PromptAutocompletePersistedSettings,
+): string {
+  const payload: PromptAutocompletePersistedSettings = {};
+  if (typeof settings.enabled === "boolean") payload.enabled = settings.enabled;
+  return `${JSON.stringify(payload, null, 2)}\n`;
+}
+
+/**
+ * Resolve the effective enabled state and its attribution.
+ *
+ * Precedence: an in-session slash-command decision outranks everything; an
+ * explicit CLI flag outranks the persisted decision because it is scoped to
+ * this invocation; the persisted decision outranks the built-in default.
+ * pi's boolean extension flags can only be switched on, so `flagEnabled` is
+ * true exactly when the flag was passed explicitly.
+ */
+export function resolvePersistedEnabled(
+  override: boolean | undefined,
+  flagEnabled: boolean,
+  saved: boolean | undefined,
+): { enabled: boolean; source: PromptAutocompleteSettingSource } {
+  if (override !== undefined) return { enabled: override, source: "session" };
+  if (flagEnabled) return { enabled: true, source: "flag" };
+  if (saved !== undefined) return { enabled: saved, source: "saved" };
+  return { enabled: false, source: "flag" };
 }
 
 interface SuggestionPayload {

@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.3/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.4/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -70,7 +70,11 @@ pi \
 - `Ctrl+.` with no active suggestion is an explicit one-shot request and may bypass the main-agent-streaming, cooldown, and minimum-length gates. Model, authentication, slash-command, and path safety checks still apply.
 - Use `--prompt-autocomplete-debug` or `/prompt-autocomplete debug-on` for troubleshooting.
 
-Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) outrank the CLI flags for the rest of the process, including in sessions started later. `status` labels each toggle with its source, `(flag)` or `(session)`. Settings you never toggled keep following their flag.
+Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) outrank the CLI flags for the rest of the process, including in sessions started later. `status` labels each toggle with its source, `(flag)`, `(saved)`, or `(session)`. Settings you never toggled keep following their flag.
+
+#### Persistent enablement
+
+`/prompt-autocomplete on` and `off` are durable: the decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (falling back to `~/.config`; override the location with `PI_PROMPT_AUTOCOMPLETE_SETTINGS`) and applies to later processes without any CLI flag. An explicit `--prompt-autocomplete` flag still outranks a saved `off` for that invocation, and a saved decision is only recorded when the host actually installs the editor. The file stores nothing but the boolean decision; deleting it restores flag-only behaviour.
 
 ### Usage and cost accounting
 

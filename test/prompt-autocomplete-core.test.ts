@@ -40,6 +40,9 @@ import {
   parsePartialPromptSuggestion,
   parseModelRef,
   parsePromptAutocompleteModelSelection,
+  parsePromptAutocompletePersistedSettings,
+  resolvePersistedEnabled,
+  serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES,
   renderMiniTemplate,
@@ -1270,4 +1273,33 @@ test("text that would misrepresent itself is removed", () => {
   // Joiners carry meaning in several scripts and in emoji sequences.
   assert.equal(sanitizeTerminalText("\u0645\u06CC\u200C\u062E"), "\u0645\u06CC\u200C\u062E");
   assert.equal(sanitizeTerminalText("👨\u200D👩"), "👨\u200D👩");
+});
+
+test("persisted settings parsing degrades malformed input to no decision", () => {
+  assert.deepEqual(parsePromptAutocompletePersistedSettings(undefined), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings(""), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings("not json"), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings("[true]"), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings("null"), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"enabled":"yes"}'), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"enabled":true}'), { enabled: true });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"enabled":false,"extra":1}'), { enabled: false });
+});
+
+test("persisted settings serialization round-trips and drops unknown fields", () => {
+  const serialized = serializePromptAutocompletePersistedSettings({ enabled: true });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings(serialized), { enabled: true });
+  assert.ok(serialized.endsWith("\n"));
+
+  const empty = serializePromptAutocompletePersistedSettings({});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings(empty), {});
+});
+
+test("enabled resolution ranks session over flag over saved over default", () => {
+  assert.deepEqual(resolvePersistedEnabled(undefined, false, undefined), { enabled: false, source: "flag" });
+  assert.deepEqual(resolvePersistedEnabled(undefined, false, true), { enabled: true, source: "saved" });
+  assert.deepEqual(resolvePersistedEnabled(undefined, false, false), { enabled: false, source: "saved" });
+  assert.deepEqual(resolvePersistedEnabled(undefined, true, false), { enabled: true, source: "flag" });
+  assert.deepEqual(resolvePersistedEnabled(false, true, true), { enabled: false, source: "session" });
+  assert.deepEqual(resolvePersistedEnabled(true, false, false), { enabled: true, source: "session" });
 });

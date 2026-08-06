@@ -1,3 +1,6 @@
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
 import * as piAi from "@earendil-works/pi-ai";
 import type {
   Api,
@@ -40,6 +43,9 @@ import {
   parseBoundedIntFlag,
   parsePartialPromptSuggestion,
   parsePromptAutocompleteModelSelection,
+  parsePromptAutocompletePersistedSettings,
+  resolvePersistedEnabled,
+  serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   recordProviderLatency,
   recordProviderUsage,
@@ -52,6 +58,7 @@ import {
   type CoalescedRequestEntry,
   type CoalescedRequestSubscription,
   type PromptAutocompleteModelSelection,
+  type PromptAutocompletePersistedSettings,
   type PromptAutocompleteRuntimeOverrides,
   type PromptAutocompleteUsageStats,
 } from "./core.ts";
@@ -210,6 +217,59 @@ export interface PromptAutocompleteDependencies {
   completeSimple?: CompleteSimpleFunction;
   streamSimple?: StreamSimpleFunction;
   now?: () => number;
+  /** Store for decisions that survive the process; defaults to a JSON settings file. */
+  settingsStore?: PromptAutocompleteSettingsStore;
+}
+
+/**
+ * Persistence boundary for cross-process decisions.
+ *
+ * `load` runs once per activation and must not throw for a missing or
+ * malformed store; `save` may throw and the caller reports the failure.
+ */
+export interface PromptAutocompleteSettingsStore {
+  load(): PromptAutocompletePersistedSettings;
+  save(settings: PromptAutocompletePersistedSettings): void;
+}
+
+/**
+ * Resolve the persisted settings file path.
+ *
+ * `PI_PROMPT_AUTOCOMPLETE_SETTINGS` overrides the location outright; otherwise
+ * the file lives under `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json`,
+ * falling back to `~/.config` when XDG is unset or not absolute as the spec
+ * requires.
+ */
+export function resolvePromptAutocompleteSettingsPath(
+  env: Record<string, string | undefined> = process.env,
+  homeDir: string = homedir(),
+): string {
+  const explicit = env.PI_PROMPT_AUTOCOMPLETE_SETTINGS;
+  if (explicit) return explicit;
+  const xdgConfigHome = env.XDG_CONFIG_HOME;
+  const configHome = xdgConfigHome && isAbsolute(xdgConfigHome) ? xdgConfigHome : join(homeDir, ".config");
+  return join(configHome, "pi-prompt-autocomplete", "settings.json");
+}
+
+function createFileSettingsStore(path: string): PromptAutocompleteSettingsStore {
+  return {
+    load(): PromptAutocompletePersistedSettings {
+      let text: string;
+      try {
+        text = readFileSync(path, "utf8");
+      } catch {
+        return {};
+      }
+      return parsePromptAutocompletePersistedSettings(text);
+    },
+    save(settings: PromptAutocompletePersistedSettings): void {
+      // Atomic replace so a crash mid-write cannot corrupt the settings file.
+      const tempPath = `${path}.tmp`;
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(tempPath, serializePromptAutocompletePersistedSettings(settings), "utf8");
+      renameSync(tempPath, path);
+    },
+  };
 }
 
 interface PromptAutocompleteSharedState {
@@ -219,6 +279,11 @@ interface PromptAutocompleteSharedState {
   config: PromptAutocompleteConfig;
   /** Slash-command decisions that outrank flags for the lifetime of the process. */
   runtimeOverrides: PromptAutocompleteRuntimeOverrides;
+  /** Decisions persisted across processes; loaded once per activation. */
+  persistedSettings: PromptAutocompletePersistedSettings;
+  settingsStore?: PromptAutocompleteSettingsStore;
+  /** Last enabled-flag value seen by applyEffectiveConfig, for status attribution. */
+  enabledFlagValue: boolean;
   /** Session-scoped request accounting; reset together with the cache. */
   usageStats: PromptAutocompleteUsageStats;
   currentModel?: Model<Api>;
@@ -481,7 +546,12 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
   const flagEnabled = pi.getFlag("prompt-autocomplete") === true;
   const flagConfig = parseConfig(pi);
 
-  shared.enabled = resolveOverride(shared.runtimeOverrides.enabled, flagEnabled);
+  shared.enabledFlagValue = flagEnabled;
+  shared.enabled = resolvePersistedEnabled(
+    shared.runtimeOverrides.enabled,
+    flagEnabled,
+    shared.persistedSettings.enabled,
+  ).enabled;
   shared.config = {
     ...flagConfig,
     allowWhileStreaming: resolveOverride(
@@ -535,7 +605,13 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
   const requestedModel = describePromptAutocompleteModelSelection(shared.config.modelSelection);
 
   return [
-    `enabled=${shared.enabled ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.enabled)})`,
+    `enabled=${shared.enabled ? "yes" : "no"}(${
+      resolvePersistedEnabled(
+        shared.runtimeOverrides.enabled,
+        shared.enabledFlagValue,
+        shared.persistedSettings.enabled,
+      ).source
+    })`,
     `editor=${editorState}`,
     shared.editorBlockedReason ? `editor-blocked=${truncateDebug(shared.editorBlockedReason, 90)}` : undefined,
     `model=${truncateDebug(formatModelLabel(resolvedModel), 90)}`,
@@ -1741,6 +1817,31 @@ function setStreamResponses(
   }
 }
 
+/**
+ * Record an explicit enable/disable decision so later processes honour it.
+ *
+ * The in-memory copy is updated even when the store write fails, so the
+ * current process stays consistent with what the user asked for.
+ */
+function persistEnabledDecision(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  enabled: boolean,
+): void {
+  shared.persistedSettings = { ...shared.persistedSettings, enabled };
+  const store = shared.settingsStore;
+  if (!store) return;
+  try {
+    store.save(shared.persistedSettings);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(
+      `Prompt autocomplete could not save the enabled setting: ${truncateDebug(reason, 90)}`,
+      "warning",
+    );
+  }
+}
+
 function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
   const previousOverride = shared.runtimeOverrides.enabled;
   shared.enabled = true;
@@ -1846,34 +1947,40 @@ function createPromptAutocompleteCommandHandlers(
     on: () => {
       if (shared.enabled && shared.ownsEditor?.()) {
         // Already in the requested state, but the user still expressed intent:
-        // record it so a later session does not fall back to the flag.
+        // record it so later sessions and processes do not fall back to the flag.
         shared.runtimeOverrides.enabled = true;
+        persistEnabledDecision(ctx, shared, true);
         ctx.ui.notify(`Prompt autocomplete already enabled (${formatStatus(shared)})`, "info");
         return;
       }
 
       if (enablePromptAutocomplete(ctx, shared)) {
+        persistEnabledDecision(ctx, shared, true);
         notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: true });
       }
     },
     off: () => {
       if (!shared.enabled) {
         shared.runtimeOverrides.enabled = false;
+        persistEnabledDecision(ctx, shared, false);
         ctx.ui.notify("Prompt autocomplete is already disabled", "info");
         return;
       }
 
       disablePromptAutocomplete(ctx, shared);
+      persistEnabledDecision(ctx, shared, false);
       ctx.ui.notify("Prompt autocomplete disabled", "info");
     },
     toggle: () => {
       if (shared.enabled) {
         disablePromptAutocomplete(ctx, shared);
+        persistEnabledDecision(ctx, shared, false);
         ctx.ui.notify("Prompt autocomplete disabled", "info");
         return;
       }
 
       if (enablePromptAutocomplete(ctx, shared)) {
+        persistEnabledDecision(ctx, shared, true);
         notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: false });
       }
     },
@@ -1893,6 +2000,15 @@ export function createPromptAutocompleteExtension(
   const now = dependencies.now ?? Date.now;
 
   return function promptAutocompleteExtension(pi: ExtensionAPI): void {
+  const settingsStore = dependencies.settingsStore ?? createFileSettingsStore(resolvePromptAutocompleteSettingsPath());
+  let persistedSettings: PromptAutocompletePersistedSettings;
+  try {
+    persistedSettings = settingsStore.load();
+  } catch {
+    // A store that violates the load contract must not block activation.
+    persistedSettings = {};
+  }
+
   pi.registerFlag("prompt-autocomplete", {
     description: "Enable inline AI prompt autocomplete in the editor",
     type: "boolean",
@@ -1947,6 +2063,9 @@ export function createPromptAutocompleteExtension(
     agentStreaming: false,
     config: parseConfig(pi),
     runtimeOverrides: {},
+    persistedSettings,
+    settingsStore,
+    enabledFlagValue: false,
     usageStats: createPromptAutocompleteUsageStats(),
     completeSimple: completeSimpleImpl,
     streamSimple: streamSimpleImpl,

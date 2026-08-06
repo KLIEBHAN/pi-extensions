@@ -200,6 +200,12 @@ function createEditorHarness(options: EditorHarnessOptions) {
     completeSimple: options.completeSimple,
     streamSimple: options.streamSimple,
     now: options.now,
+    // In-memory store keeps editor tests hermetic: no real settings file is
+    // read on load and slash commands never write outside the test.
+    settingsStore: {
+      load: () => ({}),
+      save: () => undefined,
+    },
   })(pi);
 
   const tui = {

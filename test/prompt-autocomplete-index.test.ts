@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import promptAutocompleteExtension from "../extensions/prompt-autocomplete/index.ts";
+import type { PromptAutocompletePersistedSettings } from "../extensions/prompt-autocomplete/core.ts";
+import {
+  createPromptAutocompleteExtension,
+  resolvePromptAutocompleteSettingsPath,
+} from "../extensions/prompt-autocomplete/index.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown;
 type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown> | unknown;
@@ -9,6 +13,10 @@ type EditorFactory = Exclude<Parameters<ExtensionContext["ui"]["setEditorCompone
 
 interface HarnessOptions {
   enabled?: boolean;
+  /** Initial contents of the injected in-memory settings store. */
+  savedSettings?: PromptAutocompletePersistedSettings;
+  /** Simulate a store whose writes fail, e.g. a read-only config directory. */
+  failingSettingsSave?: boolean;
   existingEditorFactory?: EditorFactory;
   mode?: ExtensionContext["mode"];
   /** Emulate forked hosts (prime-agent) whose ExtensionContext predates `mode`. */
@@ -93,7 +101,18 @@ function createHarness(options: HarnessOptions = {}) {
     },
   } as unknown as ExtensionAPI;
 
-  promptAutocompleteExtension(pi);
+  let storedSettings: PromptAutocompletePersistedSettings = { ...(options.savedSettings ?? {}) };
+  const settingsSaves: PromptAutocompletePersistedSettings[] = [];
+  const settingsStore = {
+    load: () => ({ ...storedSettings }),
+    save: (settings: PromptAutocompletePersistedSettings) => {
+      if (options.failingSettingsSave) throw new Error("read-only config directory");
+      storedSettings = { ...settings };
+      settingsSaves.push({ ...settings });
+    },
+  };
+
+  createPromptAutocompleteExtension({ settingsStore })(pi);
 
   return {
     commands,
@@ -103,6 +122,8 @@ function createHarness(options: HarnessOptions = {}) {
     handlers,
     notifications,
     registeredFlags,
+    settingsSaves,
+    getStoredSettings: () => ({ ...storedSettings }),
     getEditorFactory: () => editorFactory,
     replaceEditorExternally: (factory: EditorFactory | undefined) => {
       editorFactory = factory;
@@ -476,4 +497,107 @@ test("a redundant on or off still records the user's intent", async () => {
   await command(disabled, "off");
   await command(disabled, "status");
   assert.match(lastStatus(disabled), /enabled=no\(session\)/);
+});
+
+test("a persisted enabled decision mounts the editor without the flag", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  await emit(harness, "session_start");
+  assert.equal(harness.editorSetCalls.length, 1);
+  assert.equal(typeof harness.getEditorFactory(), "function");
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /enabled=yes\(saved\)/);
+});
+
+test("a persisted disabled decision keeps the editor unmounted and is attributed", async () => {
+  const harness = createHarness({ savedSettings: { enabled: false } });
+  await emit(harness, "session_start");
+  assert.equal(harness.editorSetCalls.length, 0);
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /enabled=no\(saved\)/);
+});
+
+test("an explicit flag outranks a persisted disabled decision for this invocation", async () => {
+  const harness = createHarness({ enabled: true, savedSettings: { enabled: false } });
+  await emit(harness, "session_start");
+  assert.equal(harness.editorSetCalls.length, 1);
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /enabled=yes\(flag\)/);
+});
+
+test("slash-command enable and disable decisions persist across processes", async () => {
+  const harness = createHarness();
+  await emit(harness, "session_start");
+
+  await command(harness, "on");
+  assert.deepEqual(harness.settingsSaves.at(-1), { enabled: true });
+
+  await command(harness, "off");
+  assert.deepEqual(harness.settingsSaves.at(-1), { enabled: false });
+
+  await command(harness, "toggle");
+  assert.deepEqual(harness.settingsSaves.at(-1), { enabled: true });
+
+  // A fresh activation over the same store behaves like the saved decision.
+  const next = createHarness({ savedSettings: harness.getStoredSettings() });
+  await emit(next, "session_start");
+  assert.equal(next.editorSetCalls.length, 1);
+});
+
+test("a redundant on or off still persists the decision", async () => {
+  const enabled = createHarness({ enabled: true });
+  await emit(enabled, "session_start");
+  await command(enabled, "on");
+  assert.deepEqual(enabled.settingsSaves.at(-1), { enabled: true });
+
+  const disabled = createHarness();
+  await emit(disabled, "session_start");
+  await command(disabled, "off");
+  assert.deepEqual(disabled.settingsSaves.at(-1), { enabled: false });
+});
+
+test("a host that refuses custom editors does not persist an enable decision", async () => {
+  const harness = createHarness({ noOpEditorSlot: true });
+  await emit(harness, "session_start");
+
+  await command(harness, "on");
+  assert.equal(harness.settingsSaves.length, 0);
+});
+
+test("a failing settings store warns without losing the in-process decision", async () => {
+  const harness = createHarness({ failingSettingsSave: true });
+  await emit(harness, "session_start");
+
+  await command(harness, "on");
+  const warning = harness.notifications.find((entry) =>
+    entry.message.includes("could not save the enabled setting"),
+  );
+  assert.ok(warning);
+  assert.equal(warning?.type, "warning");
+  assert.equal(typeof harness.getEditorFactory(), "function");
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /enabled=yes\(session\)/);
+});
+
+test("the default settings path honours the override, XDG, and the home fallback", () => {
+  assert.equal(
+    resolvePromptAutocompleteSettingsPath({ PI_PROMPT_AUTOCOMPLETE_SETTINGS: "/tmp/pa.json" }, "/home/u"),
+    "/tmp/pa.json",
+  );
+  assert.equal(
+    resolvePromptAutocompleteSettingsPath({ XDG_CONFIG_HOME: "/xdg" }, "/home/u"),
+    "/xdg/pi-prompt-autocomplete/settings.json",
+  );
+  // A relative XDG_CONFIG_HOME is invalid per spec and must fall back to home.
+  assert.equal(
+    resolvePromptAutocompleteSettingsPath({ XDG_CONFIG_HOME: "relative/dir" }, "/home/u"),
+    "/home/u/.config/pi-prompt-autocomplete/settings.json",
+  );
+  assert.equal(
+    resolvePromptAutocompleteSettingsPath({}, "/home/u"),
+    "/home/u/.config/pi-prompt-autocomplete/settings.json",
+  );
 });
