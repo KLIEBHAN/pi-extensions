@@ -186,6 +186,10 @@ test("the below-baseline probe documents the current technical floor", { skip: s
   // completion API directly. When this test starts failing, the documented
   // baseline has become the technical floor: convert both smokes into
   // expected-failure assertions that pin the failure mode; do not delete them.
+  assert.ok(
+    BELOW_BASELINE_PI_PROBE.localeCompare(MINIMUM_SUPPORTED_PI, "en", { numeric: true }) < 0,
+    `the below-baseline probe ${BELOW_BASELINE_PI_PROBE} must be strictly lower than ${MINIMUM_SUPPORTED_PI}`,
+  );
   const tempRoot = mkdtempSync(join(tmpdir(), "pi-compat-probe-"));
 
   try {
