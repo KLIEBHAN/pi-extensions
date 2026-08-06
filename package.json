@@ -5,7 +5,9 @@
   "type": "module",
   "description": "Reusable extensions for pi",
   "license": "MIT",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "files": [
     "extensions",
     "themes"
@@ -23,8 +25,12 @@
     "typecheck:prompt-autocomplete": "tsc -p tsconfig.prompt-autocomplete.json"
   },
   "pi": {
-    "extensions": ["./extensions"],
-    "themes": ["./themes"]
+    "extensions": [
+      "./extensions"
+    ],
+    "themes": [
+      "./themes"
+    ]
   },
   "engines": {
     "node": ">=22.19.0"
@@ -36,9 +42,9 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.82.0",
-    "@earendil-works/pi-coding-agent": "0.82.0",
-    "@earendil-works/pi-tui": "0.82.0",
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "0.83.0",
     "@types/node": "24.12.4",
     "typebox": "1.1.38",
     "typescript": "5.9.3",
