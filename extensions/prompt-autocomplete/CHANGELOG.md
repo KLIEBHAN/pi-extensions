@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-08-07
+
+### Added
+
+- `/prompt-autocomplete min-chars <n>` sets the minimum draft length for automatic suggestions, applies it immediately, and persists it to the settings file for later processes. An explicit non-default `--prompt-autocomplete-min-chars` flag outranks the saved value for that invocation; the flag's default value defers to the saved setting. Out-of-range or malformed persisted values degrade to the default, and `status` attributes the value as `(flag)`, `(saved)`, or `(session)`.
+
 ## [0.2.4] - 2026-08-06
 
 ### Added

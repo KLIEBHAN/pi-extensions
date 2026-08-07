@@ -82,6 +82,8 @@ export const DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED = false;
 export const DEFAULT_STREAM_RESPONSES = true;
 export const DEFAULT_DEBOUNCE_MS = 350;
 export const DEFAULT_MIN_PROMPT_CHARS = 1;
+export const MIN_PROMPT_CHARS_MIN = 0;
+export const MIN_PROMPT_CHARS_MAX = 500;
 export const DEFAULT_MAX_SUGGESTION_CHARS = 160;
 export const DEFAULT_MAX_ALTERNATIVES = 3;
 export const MAX_DRAFT_CONTEXT_CHARS = 2_000;
@@ -608,6 +610,7 @@ export interface PromptAutocompleteRuntimeOverrides {
   allowWhileStreaming?: boolean;
   streamResponses?: boolean;
   debug?: boolean;
+  minPromptChars?: number;
 }
 
 export type PromptAutocompleteSettingSource = "flag" | "saved" | "session";
@@ -629,6 +632,7 @@ export function describeSettingSource(override: unknown): PromptAutocompleteSett
  */
 export interface PromptAutocompletePersistedSettings {
   enabled?: boolean;
+  minPromptChars?: number;
 }
 
 /**
@@ -649,8 +653,18 @@ export function parsePromptAutocompletePersistedSettings(
     return {};
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
-  const enabled = (parsed as Record<string, unknown>).enabled;
-  return typeof enabled === "boolean" ? { enabled } : {};
+  const record = parsed as Record<string, unknown>;
+  const settings: PromptAutocompletePersistedSettings = {};
+  if (typeof record.enabled === "boolean") settings.enabled = record.enabled;
+  if (
+    typeof record.minPromptChars === "number"
+    && Number.isInteger(record.minPromptChars)
+    && record.minPromptChars >= MIN_PROMPT_CHARS_MIN
+    && record.minPromptChars <= MIN_PROMPT_CHARS_MAX
+  ) {
+    settings.minPromptChars = record.minPromptChars;
+  }
+  return settings;
 }
 
 export function serializePromptAutocompletePersistedSettings(
@@ -658,6 +672,14 @@ export function serializePromptAutocompletePersistedSettings(
 ): string {
   const payload: PromptAutocompletePersistedSettings = {};
   if (typeof settings.enabled === "boolean") payload.enabled = settings.enabled;
+  if (
+    typeof settings.minPromptChars === "number"
+    && Number.isInteger(settings.minPromptChars)
+    && settings.minPromptChars >= MIN_PROMPT_CHARS_MIN
+    && settings.minPromptChars <= MIN_PROMPT_CHARS_MAX
+  ) {
+    payload.minPromptChars = settings.minPromptChars;
+  }
   return `${JSON.stringify(payload, null, 2)}\n`;
 }
 
@@ -679,6 +701,44 @@ export function resolvePersistedEnabled(
   if (flagEnabled) return { enabled: true, source: "flag" };
   if (saved !== undefined) return { enabled: saved, source: "saved" };
   return { enabled: false, source: "flag" };
+}
+
+/**
+ * Resolve a numeric setting with the same precedence as the enabled decision:
+ * an in-session slash-command value outranks an explicitly passed flag, which
+ * outranks the persisted value, which outranks the built-in default.
+ */
+export function resolvePersistedNumber(
+  override: number | undefined,
+  explicitFlag: number | undefined,
+  saved: number | undefined,
+  fallback: number,
+): { value: number; source: PromptAutocompleteSettingSource } {
+  if (override !== undefined) return { value: override, source: "session" };
+  if (explicitFlag !== undefined) return { value: explicitFlag, source: "flag" };
+  if (saved !== undefined) return { value: saved, source: "saved" };
+  return { value: fallback, source: "flag" };
+}
+
+/**
+ * Parse an integer flag as an explicit user decision.
+ *
+ * pi pre-fills string flags with their registered default, so a value equal to
+ * the default is indistinguishable from an unset flag and yields undefined,
+ * deferring to the persisted setting. Invalid input also yields undefined so a
+ * typo cannot silently outrank a saved value.
+ */
+export function parseExplicitBoundedIntFlag(
+  value: boolean | string | undefined,
+  defaultValue: number,
+  min: number,
+  max: number,
+): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const parsed = Number.parseInt(value.trim(), 10);
+  if (!Number.isFinite(parsed)) return undefined;
+  const bounded = Math.max(min, Math.min(max, parsed));
+  return bounded === defaultValue ? undefined : bounded;
 }
 
 interface SuggestionPayload {

@@ -40,8 +40,10 @@ import {
   parsePartialPromptSuggestion,
   parseModelRef,
   parsePromptAutocompleteModelSelection,
+  parseExplicitBoundedIntFlag,
   parsePromptAutocompletePersistedSettings,
   resolvePersistedEnabled,
+  resolvePersistedNumber,
   serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT_TEMPLATE_VARIABLES,
@@ -1302,4 +1304,34 @@ test("enabled resolution ranks session over flag over saved over default", () =>
   assert.deepEqual(resolvePersistedEnabled(undefined, true, false), { enabled: true, source: "flag" });
   assert.deepEqual(resolvePersistedEnabled(false, true, true), { enabled: false, source: "session" });
   assert.deepEqual(resolvePersistedEnabled(true, false, false), { enabled: true, source: "session" });
+});
+
+test("persisted min-chars parsing accepts only bounded integers", () => {
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"minPromptChars":0}'), { minPromptChars: 0 });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"minPromptChars":500}'), { minPromptChars: 500 });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"minPromptChars":501}'), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"minPromptChars":-1}'), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"minPromptChars":1.5}'), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"minPromptChars":"0"}'), {});
+  assert.deepEqual(
+    parsePromptAutocompletePersistedSettings('{"enabled":true,"minPromptChars":2}'),
+    { enabled: true, minPromptChars: 2 },
+  );
+  const roundTrip = serializePromptAutocompletePersistedSettings({ enabled: true, minPromptChars: 0 });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings(roundTrip), { enabled: true, minPromptChars: 0 });
+});
+
+test("numeric resolution ranks session over explicit flag over saved over default", () => {
+  assert.deepEqual(resolvePersistedNumber(undefined, undefined, undefined, 1), { value: 1, source: "flag" });
+  assert.deepEqual(resolvePersistedNumber(undefined, undefined, 0, 1), { value: 0, source: "saved" });
+  assert.deepEqual(resolvePersistedNumber(undefined, 3, 0, 1), { value: 3, source: "flag" });
+  assert.deepEqual(resolvePersistedNumber(2, 3, 0, 1), { value: 2, source: "session" });
+});
+
+test("explicit bounded int flag parsing treats default and invalid input as unset", () => {
+  assert.equal(parseExplicitBoundedIntFlag(undefined, 1, 0, 500), undefined);
+  assert.equal(parseExplicitBoundedIntFlag("1", 1, 0, 500), undefined);
+  assert.equal(parseExplicitBoundedIntFlag("abc", 1, 0, 500), undefined);
+  assert.equal(parseExplicitBoundedIntFlag("0", 1, 0, 500), 0);
+  assert.equal(parseExplicitBoundedIntFlag("750", 1, 0, 500), 500);
 });

@@ -29,6 +29,8 @@ import {
   DEFAULT_MAX_SUGGESTION_CHARS,
   DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
+  MIN_PROMPT_CHARS_MAX,
+  MIN_PROMPT_CHARS_MIN,
   DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
   DEFAULT_STREAM_RESPONSES,
   ExpiringLruCache,
@@ -41,10 +43,12 @@ import {
   MAX_DRAFT_CONTEXT_CHARS,
   normalizePromptSuggestions,
   parseBoundedIntFlag,
+  parseExplicitBoundedIntFlag,
   parsePartialPromptSuggestion,
   parsePromptAutocompleteModelSelection,
   parsePromptAutocompletePersistedSettings,
   resolvePersistedEnabled,
+  resolvePersistedNumber,
   serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   recordProviderLatency,
@@ -284,6 +288,8 @@ interface PromptAutocompleteSharedState {
   settingsStore?: PromptAutocompleteSettingsStore;
   /** Last enabled-flag value seen by applyEffectiveConfig, for status attribution. */
   enabledFlagValue: boolean;
+  /** Explicit min-chars flag value seen by applyEffectiveConfig, undefined when defaulted. */
+  minPromptCharsFlagExplicit?: number;
   /** Session-scoped request accounting; reset together with the cache. */
   usageStats: PromptAutocompleteUsageStats;
   currentModel?: Model<Api>;
@@ -552,6 +558,12 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
     flagEnabled,
     shared.persistedSettings.enabled,
   ).enabled;
+  shared.minPromptCharsFlagExplicit = parseExplicitBoundedIntFlag(
+    pi.getFlag("prompt-autocomplete-min-chars"),
+    DEFAULT_MIN_PROMPT_CHARS,
+    MIN_PROMPT_CHARS_MIN,
+    MIN_PROMPT_CHARS_MAX,
+  );
   shared.config = {
     ...flagConfig,
     allowWhileStreaming: resolveOverride(
@@ -560,6 +572,12 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
     ),
     streamResponses: resolveOverride(shared.runtimeOverrides.streamResponses, flagConfig.streamResponses),
     debug: resolveOverride(shared.runtimeOverrides.debug, flagConfig.debug),
+    minPromptChars: resolvePersistedNumber(
+      shared.runtimeOverrides.minPromptChars,
+      shared.minPromptCharsFlagExplicit,
+      shared.persistedSettings.minPromptChars,
+      flagConfig.minPromptChars,
+    ).value,
   };
 }
 
@@ -621,7 +639,14 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     `request-path=${shared.config.streamResponses && shared.streamSimple ? "stream" : shared.config.streamResponses ? "complete-compat" : "complete"}`,
     `debug=${shared.config.debug ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.debug)})`,
     `debounce=${shared.config.debounceMs}ms`,
-    `min-chars=${shared.config.minPromptChars}`,
+    `min-chars=${shared.config.minPromptChars}(${
+      resolvePersistedNumber(
+        shared.runtimeOverrides.minPromptChars,
+        shared.minPromptCharsFlagExplicit,
+        shared.persistedSettings.minPromptChars,
+        DEFAULT_MIN_PROMPT_CHARS,
+      ).source
+    })`,
     `max-suggestion-chars=${shared.config.maxSuggestionChars}`,
     `max-alternatives=${shared.config.maxAlternatives}`,
     `cache-size=${shared.requestCache.size}`,
@@ -1817,18 +1842,60 @@ function setStreamResponses(
   }
 }
 
+function setMinPromptChars(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  arg: string | undefined,
+): void {
+  if (arg === undefined) {
+    const resolution = resolvePersistedNumber(
+      shared.runtimeOverrides.minPromptChars,
+      shared.minPromptCharsFlagExplicit,
+      shared.persistedSettings.minPromptChars,
+      DEFAULT_MIN_PROMPT_CHARS,
+    );
+    ctx.ui.notify(
+      `Prompt autocomplete min-chars is ${shared.config.minPromptChars} (${resolution.source})`,
+      "info",
+    );
+    return;
+  }
+
+  const parsed = Number.parseInt(arg, 10);
+  if (!Number.isInteger(parsed) || String(parsed) !== arg || parsed < MIN_PROMPT_CHARS_MIN || parsed > MIN_PROMPT_CHARS_MAX) {
+    ctx.ui.notify(
+      `Usage: /prompt-autocomplete min-chars [${MIN_PROMPT_CHARS_MIN}-${MIN_PROMPT_CHARS_MAX}]`,
+      "warning",
+    );
+    return;
+  }
+
+  const changed = shared.config.minPromptChars !== parsed;
+  shared.config.minPromptChars = parsed;
+  shared.runtimeOverrides.minPromptChars = parsed;
+  persistSettingsDecision(ctx, shared, { minPromptChars: parsed });
+  ctx.ui.notify(
+    `Prompt autocomplete min-chars set to ${parsed} (saved for future sessions)`,
+    "info",
+  );
+
+  if (shared.enabled && changed) {
+    refreshEditorImmediately(shared, "ready", `Minimum prompt length set to ${parsed}`);
+  }
+}
+
 /**
- * Record an explicit enable/disable decision so later processes honour it.
+ * Record an explicit user decision so later processes honour it.
  *
  * The in-memory copy is updated even when the store write fails, so the
  * current process stays consistent with what the user asked for.
  */
-function persistEnabledDecision(
+function persistSettingsDecision(
   ctx: ExtensionContext,
   shared: PromptAutocompleteSharedState,
-  enabled: boolean,
+  patch: Partial<PromptAutocompletePersistedSettings>,
 ): void {
-  shared.persistedSettings = { ...shared.persistedSettings, enabled };
+  shared.persistedSettings = { ...shared.persistedSettings, ...patch };
   const store = shared.settingsStore;
   if (!store) return;
   try {
@@ -1836,10 +1903,18 @@ function persistEnabledDecision(
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(
-      `Prompt autocomplete could not save the enabled setting: ${truncateDebug(reason, 90)}`,
+      `Prompt autocomplete could not save the setting: ${truncateDebug(reason, 90)}`,
       "warning",
     );
   }
+}
+
+function persistEnabledDecision(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  enabled: boolean,
+): void {
+  persistSettingsDecision(ctx, shared, { enabled });
 }
 
 function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
@@ -2142,6 +2217,10 @@ export function createPromptAutocompleteExtension(
         setStreamResponses(ctx, shared, parts[1]);
         return;
       }
+      if (command === "min-chars") {
+        setMinPromptChars(ctx, shared, parts[1]);
+        return;
+      }
 
       const handlers = createPromptAutocompleteCommandHandlers(ctx, shared);
       const handler = handlers[command];
@@ -2152,7 +2231,7 @@ export function createPromptAutocompleteExtension(
       }
 
       ctx.ui.notify(
-        "Usage: /prompt-autocomplete [on|off|toggle|status|stats|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
+        "Usage: /prompt-autocomplete [on|off|toggle|status|stats|min-chars <n>|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
         "warning",
       );
     },

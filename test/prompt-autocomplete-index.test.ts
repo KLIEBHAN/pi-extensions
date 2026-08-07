@@ -572,7 +572,7 @@ test("a failing settings store warns without losing the in-process decision", as
 
   await command(harness, "on");
   const warning = harness.notifications.find((entry) =>
-    entry.message.includes("could not save the enabled setting"),
+    entry.message.includes("could not save the setting"),
   );
   assert.ok(warning);
   assert.equal(warning?.type, "warning");
@@ -600,4 +600,46 @@ test("the default settings path honours the override, XDG, and the home fallback
     resolvePromptAutocompleteSettingsPath({}, "/home/u"),
     "/home/u/.config/pi-prompt-autocomplete/settings.json",
   );
+});
+
+test("min-chars slash command applies, persists, and reports its value", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  await emit(harness, "session_start");
+
+  await command(harness, "min-chars 0");
+  assert.deepEqual(harness.settingsSaves.at(-1), { enabled: true, minPromptChars: 0 });
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /min-chars=0\(session\)/);
+
+  await command(harness, "min-chars");
+  assert.match(lastStatus(harness), /min-chars is 0 \(session\)/);
+
+  await command(harness, "min-chars nonsense");
+  assert.match(lastStatus(harness), /Usage: \/prompt-autocomplete min-chars \[0-500\]/);
+  await command(harness, "min-chars 501");
+  assert.match(lastStatus(harness), /Usage: \/prompt-autocomplete min-chars \[0-500\]/);
+  assert.deepEqual(harness.settingsSaves.at(-1), { enabled: true, minPromptChars: 0 });
+});
+
+test("a persisted min-chars value applies to later processes and is attributed", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true, minPromptChars: 0 } });
+  await emit(harness, "session_start");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /min-chars=0\(saved\)/);
+});
+
+test("an explicit non-default min-chars flag outranks the saved value", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true, minPromptChars: 0 } });
+  harness.flags.set("prompt-autocomplete-min-chars", "3");
+  await emit(harness, "session_start");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /min-chars=3\(flag\)/);
+});
+
+test("a defaulted min-chars flag defers to the saved value", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true, minPromptChars: 0 } });
+  harness.flags.set("prompt-autocomplete-min-chars", "1");
+  await emit(harness, "session_start");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /min-chars=0\(saved\)/);
 });

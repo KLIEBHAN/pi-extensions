@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.4/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.5/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -42,6 +42,7 @@ Or enable it for the current interactive session:
 | Enable, disable, or inspect configuration | `/prompt-autocomplete on\|off\|toggle\|status` |
 | Show current-session effectiveness and cost | `/prompt-autocomplete stats` |
 | Toggle streamed response previews | `/prompt-autocomplete stream on\|off\|toggle` |
+| Set and persist the minimum draft length | `/prompt-autocomplete min-chars <n>` |
 
 Legacy fallbacks are available for terminals that forward them: `Ctrl+Tab`, `Alt+[`, and `Alt+]`.
 
@@ -61,7 +62,7 @@ pi \
 ```
 
 - The active Pi model is used unless `--prompt-autocomplete-model provider/model` selects a dedicated authenticated model; `active` selects the session model explicitly. An explicitly requested model is never substituted: if it is unknown, unauthenticated, or malformed, autocomplete stays inactive and reports why.
-- Automatic suggestions require at least one non-whitespace draft character by default. Set `--prompt-autocomplete-min-chars 0` to opt into empty-draft suggestions.
+- Automatic suggestions require at least one non-whitespace draft character by default. Set `--prompt-autocomplete-min-chars 0` or `/prompt-autocomplete min-chars 0` (persisted) to opt into empty-draft suggestions.
 - Provider responses stream into the first ghost-text suggestion by default. Use `--prompt-autocomplete-stream off` or `/prompt-autocomplete stream off` to wait for complete responses instead. This changes rendering only: each suggestion request still uses the same context and token budget.
 - Changing `/prompt-autocomplete stream` cancels active autocomplete work but does **not** start a replacement request; the selected path applies to the next edit or manual one-shot.
 - Partial text advances monotonically: Latin text waits for complete word boundaries, while CJK and other no-space scripts remain grapheme-safe. Alternatives appear only after the response finishes.
@@ -72,9 +73,9 @@ pi \
 
 Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) outrank the CLI flags for the rest of the process, including in sessions started later. `status` labels each toggle with its source, `(flag)`, `(saved)`, or `(session)`. Settings you never toggled keep following their flag.
 
-#### Persistent enablement
+#### Persistent settings
 
-`/prompt-autocomplete on` and `off` are durable: the decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (falling back to `~/.config`; override the location with `PI_PROMPT_AUTOCOMPLETE_SETTINGS`) and applies to later processes without any CLI flag. An explicit `--prompt-autocomplete` flag still outranks a saved `off` for that invocation, and a saved decision is only recorded when the host actually installs the editor. The file stores nothing but the boolean decision; deleting it restores flag-only behaviour.
+`/prompt-autocomplete on`, `off`, and `min-chars <n>` are durable: the decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (falling back to `~/.config`; override the location with `PI_PROMPT_AUTOCOMPLETE_SETTINGS`) and applies to later processes without any CLI flag. An explicit CLI flag still outranks the saved value for that invocation — for `min-chars`, passing the default (`1`) is indistinguishable from not passing the flag and defers to the saved value. An enable decision is only recorded when the host actually installs the editor. The file stores nothing but these decisions; deleting it restores flag-only behaviour. `status` labels each value with its source.
 
 ### Usage and cost accounting
 
