@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PromptAutocompletePersistedSettings } from "../extensions/prompt-autocomplete/core.ts";
@@ -583,22 +584,24 @@ test("a failing settings store warns without losing the in-process decision", as
 });
 
 test("the default settings path honours the override, XDG, and the home fallback", () => {
+  // Composed paths use path.join so the assertion matches Windows separators.
+  // An explicit override is returned unchanged and stays a raw env string.
   assert.equal(
     resolvePromptAutocompleteSettingsPath({ PI_PROMPT_AUTOCOMPLETE_SETTINGS: "/tmp/pa.json" }, "/home/u"),
     "/tmp/pa.json",
   );
   assert.equal(
     resolvePromptAutocompleteSettingsPath({ XDG_CONFIG_HOME: "/xdg" }, "/home/u"),
-    "/xdg/pi-prompt-autocomplete/settings.json",
+    join("/xdg", "pi-prompt-autocomplete", "settings.json"),
   );
   // A relative XDG_CONFIG_HOME is invalid per spec and must fall back to home.
   assert.equal(
     resolvePromptAutocompleteSettingsPath({ XDG_CONFIG_HOME: "relative/dir" }, "/home/u"),
-    "/home/u/.config/pi-prompt-autocomplete/settings.json",
+    join("/home/u", ".config", "pi-prompt-autocomplete", "settings.json"),
   );
   assert.equal(
     resolvePromptAutocompleteSettingsPath({}, "/home/u"),
-    "/home/u/.config/pi-prompt-autocomplete/settings.json",
+    join("/home/u", ".config", "pi-prompt-autocomplete", "settings.json"),
   );
 });
 
