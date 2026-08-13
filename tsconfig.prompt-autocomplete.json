@@ -3,6 +3,7 @@
   "include": [
     "extensions/prompt-autocomplete/**/*.ts",
     "test/package-smoke.test.ts",
-    "test/prompt-autocomplete-*.test.ts"
+    "test/prompt-autocomplete-*.test.ts",
+    "test/pi-compat-matrix.test.ts"
   ]
 }

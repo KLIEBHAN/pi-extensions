@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MINIMUM_SUPPORTED_PI, SUPPORTED_PI_MATRIX } from "./prompt-autocomplete-support.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const packageRoot = resolve(root, "extensions", "prompt-autocomplete");
@@ -32,6 +33,11 @@ assert.equal(manifest.repository?.directory, "extensions/prompt-autocomplete");
 assert.match(changelog, new RegExp(`^## \\[${escapeRegex(manifest.version)}\\]`, "m"));
 assert.match(readme, /Privacy, providers, and cost/);
 assert.match(readme, /disabled by default/i);
+assert.equal(SUPPORTED_PI_MATRIX[0], MINIMUM_SUPPORTED_PI, "the compat matrix must start at the documented minimum");
+assert.ok(
+  readme.includes(`Supported baseline: Pi \`${MINIMUM_SUPPORTED_PI}\``),
+  `standalone README must state the tested baseline Pi ${MINIMUM_SUPPORTED_PI}`,
+);
 assert.equal(manifest.pi?.video, releaseVideoUrl);
 assert.ok(readme.includes(releaseVideoUrl), "standalone README must use the versioned Gallery video URL");
 assert.ok(rootReadme.includes(releaseVideoUrl), "root README must use the versioned Gallery video URL");
