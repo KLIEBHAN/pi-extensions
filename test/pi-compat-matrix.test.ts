@@ -33,8 +33,29 @@ const standalonePackageRoot = join(projectRoot, "extensions", "prompt-autocomple
 const fixturePath = join(projectRoot, "test", "fixtures", "pi-triplet-editor-smoke.ts");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const skipMatrix = process.env.PI_COMPAT_MATRIX === "0";
+const npmInstallTimeoutMs = process.platform === "win32" ? 600_000 : 300_000;
 
 const CORE_PACKAGES = ["pi-coding-agent", "pi-ai", "pi-tui"] as const;
+
+/**
+ * Windows CI timed out when the matrix and the below-baseline probe installed
+ * triplets in parallel against one shared npm cache. Keep one install at a
+ * time, and give each consumer its own cache directory.
+ */
+let npmInstallQueue = Promise.resolve();
+
+function enqueueNpmInstall<T>(fn: () => T): Promise<T> {
+  const run = npmInstallQueue.then(fn);
+  npmInstallQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+function removeTempTree(path: string): void {
+  rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
+}
 
 function packStandalone(packDir: string): string {
   mkdirSync(packDir, { recursive: true });
@@ -57,6 +78,8 @@ function createConsumer(consumerDir: string, tarball: string, piVersion: string)
     JSON.stringify({ name: "pi-compat-consumer", version: "0.0.0", private: true, type: "module" }),
     "utf8",
   );
+  const npmCache = join(consumerDir, ".npm-cache");
+  mkdirSync(npmCache, { recursive: true });
 
   const install = spawnSync(
     npmCommand,
@@ -72,11 +95,20 @@ function createConsumer(consumerDir: string, tarball: string, piVersion: string)
     {
       cwd: consumerDir,
       encoding: "utf8",
-      timeout: 300_000,
+      timeout: npmInstallTimeoutMs,
       shell: process.platform === "win32",
+      env: {
+        ...process.env,
+        npm_config_cache: npmCache,
+        npm_config_update_notifier: "false",
+      },
     },
   );
-  assert.equal(install.status, 0, `installing the ${piVersion} triplet failed: ${install.stderr}`);
+  assert.equal(
+    install.status,
+    0,
+    `installing the ${piVersion} triplet failed: status=${String(install.status)} signal=${String(install.signal)} error=${install.error?.message ?? ""} stderr=${install.stderr}`,
+  );
 
   for (const name of CORE_PACKAGES) {
     const manifest = JSON.parse(
@@ -165,22 +197,22 @@ test("supported Pi host triplets pass discovery and editor lifecycle smokes", { 
     const tarball = packStandalone(join(tempRoot, "pack"));
 
     for (const piVersion of SUPPORTED_PI_MATRIX) {
-      await t.test(`Pi ${piVersion}`, () => {
+      await t.test(`Pi ${piVersion}`, async () => {
         const consumerDir = join(tempRoot, `pi-${piVersion.replaceAll(".", "-")}`);
         const agentDir = join(consumerDir, "agent");
         mkdirSync(agentDir, { recursive: true });
 
-        const installedPackage = createConsumer(consumerDir, tarball, piVersion);
+        const installedPackage = await enqueueNpmInstall(() => createConsumer(consumerDir, tarball, piVersion));
         runDiscoverySmoke(consumerDir, installedPackage, agentDir);
         runEditorSmoke(consumerDir, installedPackage);
       });
     }
   } finally {
-    rmSync(tempRoot, { recursive: true, force: true });
+    removeTempTree(tempRoot);
   }
 });
 
-test("the below-baseline probe documents the current technical floor", { skip: skipMatrix }, () => {
+test("the below-baseline probe documents the current technical floor", { skip: skipMatrix }, async () => {
   // Pi 0.79 is below the supported baseline and carries no promise. It happens
   // to work today because the pre-split pi-ai root exported the simple
   // completion API directly. When this test starts failing, the documented
@@ -198,10 +230,12 @@ test("the below-baseline probe documents the current technical floor", { skip: s
     const agentDir = join(consumerDir, "agent");
     mkdirSync(agentDir, { recursive: true });
 
-    const installedPackage = createConsumer(consumerDir, tarball, BELOW_BASELINE_PI_PROBE);
+    const installedPackage = await enqueueNpmInstall(() =>
+      createConsumer(consumerDir, tarball, BELOW_BASELINE_PI_PROBE),
+    );
     runDiscoverySmoke(consumerDir, installedPackage, agentDir);
     runEditorSmoke(consumerDir, installedPackage);
   } finally {
-    rmSync(tempRoot, { recursive: true, force: true });
+    removeTempTree(tempRoot);
   }
 });
