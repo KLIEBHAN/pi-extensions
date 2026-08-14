@@ -43,6 +43,7 @@ Or enable it for the current interactive session:
 | Show current-session effectiveness and cost | `/prompt-autocomplete stats` |
 | Toggle streamed response previews | `/prompt-autocomplete stream on\|off\|toggle` |
 | Set and persist the minimum draft length | `/prompt-autocomplete min-chars <n>` |
+| Cap provider requests for this session | `/prompt-autocomplete budget <n\|off>` |
 | Persist remaining runtime knobs | `/prompt-autocomplete set debounce-ms\|max-chars\|max-alternatives\|model` |
 | Inspect effective runtime knobs | `/prompt-autocomplete set` |
 
@@ -60,7 +61,8 @@ pi \
   --prompt-autocomplete-min-chars 1 \
   --prompt-autocomplete-debounce-ms 250 \
   --prompt-autocomplete-max-chars 240 \
-  --prompt-autocomplete-max-alternatives 3
+  --prompt-autocomplete-max-alternatives 3 \
+  --prompt-autocomplete-max-requests off
 ```
 
 - The active Pi model is used unless `--prompt-autocomplete-model provider/model` selects a dedicated authenticated model; `active` selects the session model explicitly. An explicitly requested model is never substituted: if it is unknown, unauthenticated, or malformed, autocomplete stays inactive and reports why.
@@ -77,6 +79,17 @@ Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) and 
 
 Changing `max-chars`, `max-alternatives`, or `model` cancels in-flight autocomplete work and drops the request caches. It does **not** start a replacement request. Changing `debounce-ms` only drops a waiting timer; an already-started provider call continues. Debug toggles change neither.
 
+#### Session request budget
+
+`--prompt-autocomplete-max-requests <n|off>` and `/prompt-autocomplete budget <n|off>` cap how many provider requests one session may issue. The default `off` keeps the 0.2 behaviour.
+
+- Only real provider invocations count, including failed and aborted ones. Exact-cache hits, prefix reuse, and joining an in-flight request are free and keep working above the ceiling.
+- Auth failures consume nothing: the reservation happens after credentials resolve and immediately before the provider call, so two concurrent requests can never overshoot a ceiling of one.
+- An exhausted budget blocks automatic **and** manual (`Ctrl+.`) requests and reports itself once. Raise the ceiling with `/prompt-autocomplete budget <n>` or lift it with `/prompt-autocomplete budget off`; neither starts a replacement request.
+- The budget is **session-scoped**, not process-wide: it is snapshotted into the session's own non-LLM entries and never into `settings.json`. `/new` and `/fork` therefore start with a fresh budget, while a graceful `/reload` or `/resume` of the same session restores both the usage and the ceiling. A crash before the last snapshot, or a host without `pi.appendEntry`, can lose that durability — the in-process ceiling still applies.
+- Interactive values outside `1`–`100000` are rejected; the CLI flag clamps. `budget` without an argument, `status`, and `stats` all report `used/limit` with the source of the ceiling.
+- This is a request ceiling only: there is no token or dollar budget.
+
 #### Persistent settings
 
 `/prompt-autocomplete on`, `off`, `min-chars <n>`, and `/prompt-autocomplete set` (`debounce-ms`, `max-chars`, `max-alternatives`, `model`) are durable: the decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (falling back to `~/.config`; override the location with `PI_PROMPT_AUTOCOMPLETE_SETTINGS`) and applies to later processes without any CLI flag. `/prompt-autocomplete min-chars` remains the canonical command; `set min-chars` dispatches to it. An explicit CLI flag still outranks the saved value for that invocation — for numeric knobs and the model flag, passing the registered default is indistinguishable from not passing the flag and defers to the saved value. `set model` validates syntax, registry presence, and auth before saving: a dedicated model must resolve, and `active` commits while no active model is known yet but is rejected when the known active model is unusable. `active` is an explicit sentinel for the session model, mixed-case model ids are preserved, and a cross-provider change restates the privacy notice. An enable decision is only recorded when the host actually installs the editor. The file stores nothing but these decisions; deleting it restores flag-only behaviour. `status` labels each value with its source, and success notices only claim durability when the file was actually written.
@@ -92,6 +105,7 @@ Cache: 5 hits (2 exact, 3 prefix)
 Suggestions: 8 offered, 3 accepted (2 full, 1 word/chunk)
 Usage: 1832 tokens, estimated cost ~$0.00214
 Mean provider latency: 410 ms (4 samples)
+Budget: 4/25 (session)
 ```
 
 `/prompt-autocomplete status` keeps its existing compact `usage=4 req, 5 cached, …` field for configuration troubleshooting.

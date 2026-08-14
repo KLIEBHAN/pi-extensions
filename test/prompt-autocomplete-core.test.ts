@@ -10,6 +10,15 @@ import {
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
+  buildPromptAutocompleteBudgetSnapshot,
+  BUDGET_REQUESTS_MAX,
+  BUDGET_REQUESTS_MIN,
+  findPromptAutocompleteBudgetSnapshot,
+  parsePromptAutocompleteBudgetFlag,
+  parsePromptAutocompleteBudgetValue,
+  parsePromptAutocompleteBudgetSnapshot,
+  PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
+  resolvePromptAutocompleteBudgetLimit,
   createOwnerRefCounter,
   createPromptAutocompleteUsageStats,
   DEFAULT_DEBOUNCE_MS,
@@ -1477,4 +1486,86 @@ test("prompt-autocomplete set persists remaining knobs through the settings stor
   assert.match(source, /cancelScheduledRequest/);
   assert.match(source, /affectsRequestIdentity/);
   assert.doesNotMatch(source, /coalescedJoins/);
+});
+
+test("budget flags clamp while interactive budget values are rejected", () => {
+  assert.equal(parsePromptAutocompleteBudgetFlag(undefined), undefined);
+  assert.equal(parsePromptAutocompleteBudgetFlag("off"), undefined);
+  assert.equal(parsePromptAutocompleteBudgetFlag("OFF"), undefined);
+  assert.equal(parsePromptAutocompleteBudgetFlag(""), undefined);
+  assert.equal(parsePromptAutocompleteBudgetFlag("nonsense"), undefined);
+  assert.equal(parsePromptAutocompleteBudgetFlag("3"), 3);
+  assert.equal(parsePromptAutocompleteBudgetFlag("0"), BUDGET_REQUESTS_MIN);
+  assert.equal(parsePromptAutocompleteBudgetFlag("999999999"), BUDGET_REQUESTS_MAX);
+
+  assert.deepEqual(parsePromptAutocompleteBudgetValue(undefined), { kind: "unset" });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue("  "), { kind: "unset" });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue("off"), { kind: "off" });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue("Off"), { kind: "off" });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue("3"), { kind: "limit", value: 3 });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue("0"), { kind: "invalid" });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue("-1"), { kind: "invalid" });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue("1.5"), { kind: "invalid" });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue("1e3"), { kind: "invalid" });
+  assert.deepEqual(parsePromptAutocompleteBudgetValue(String(BUDGET_REQUESTS_MAX + 1)), { kind: "invalid" });
+});
+
+test("budget snapshots round-trip and reject foreign or malformed state", () => {
+  const snapshot = buildPromptAutocompleteBudgetSnapshot({ limit: 3, used: 2 }, "session-1");
+  assert.deepEqual(snapshot, {
+    schemaVersion: 1,
+    physicalSessionId: "session-1",
+    limit: 3,
+    used: 2,
+  });
+  assert.deepEqual(parsePromptAutocompleteBudgetSnapshot(snapshot, "session-1"), { limit: 3, used: 2 });
+  assert.equal(parsePromptAutocompleteBudgetSnapshot(snapshot, "session-2"), undefined);
+
+  // An off ceiling is a real decision and keeps its usage.
+  const offSnapshot = buildPromptAutocompleteBudgetSnapshot({ limit: undefined, used: 4 }, "session-1");
+  assert.equal(offSnapshot.limit, "off");
+  assert.deepEqual(parsePromptAutocompleteBudgetSnapshot(offSnapshot, "session-1"), {
+    limit: undefined,
+    used: 4,
+  });
+
+  assert.equal(parsePromptAutocompleteBudgetSnapshot(undefined, "session-1"), undefined);
+  assert.equal(parsePromptAutocompleteBudgetSnapshot({ ...snapshot, schemaVersion: 2 }, "session-1"), undefined);
+  assert.equal(parsePromptAutocompleteBudgetSnapshot({ ...snapshot, used: -1 }, "session-1"), undefined);
+  assert.equal(parsePromptAutocompleteBudgetSnapshot({ ...snapshot, used: 1.5 }, "session-1"), undefined);
+  assert.equal(parsePromptAutocompleteBudgetSnapshot({ ...snapshot, limit: 0 }, "session-1"), undefined);
+  assert.equal(parsePromptAutocompleteBudgetSnapshot({ ...snapshot, limit: "nope" }, "session-1"), undefined);
+});
+
+test("the newest own-session budget snapshot wins and foreign sessions are skipped", () => {
+  const entry = (physicalSessionId: string, used: number, limit: number | "off" = 3) => ({
+    type: "custom",
+    customType: PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
+    data: { schemaVersion: 1, physicalSessionId, limit, used },
+  });
+
+  const branch = [
+    { type: "message", id: "m1" },
+    entry("session-1", 1),
+    entry("session-1", 2),
+    { type: "custom", customType: "unrelated", data: { used: 99 } },
+    entry("session-2", 7),
+  ];
+
+  assert.deepEqual(findPromptAutocompleteBudgetSnapshot(branch, "session-1"), { limit: 3, used: 2 });
+  assert.deepEqual(findPromptAutocompleteBudgetSnapshot(branch, "session-2"), { limit: 3, used: 7 });
+  assert.equal(findPromptAutocompleteBudgetSnapshot(branch, "session-3"), undefined);
+  assert.equal(findPromptAutocompleteBudgetSnapshot([], "session-1"), undefined);
+});
+
+test("budget resolution ranks session over flag over restored value", () => {
+  assert.deepEqual(resolvePromptAutocompleteBudgetLimit(undefined, undefined, undefined), {
+    limit: undefined,
+    source: "flag",
+  });
+  assert.deepEqual(resolvePromptAutocompleteBudgetLimit(undefined, undefined, 4), { limit: 4, source: "saved" });
+  assert.deepEqual(resolvePromptAutocompleteBudgetLimit(undefined, 2, 4), { limit: 2, source: "flag" });
+  assert.deepEqual(resolvePromptAutocompleteBudgetLimit(9, 2, 4), { limit: 9, source: "session" });
+  // An explicit "off" is a decision, not an absent override.
+  assert.deepEqual(resolvePromptAutocompleteBudgetLimit("off", 2, 4), { limit: undefined, source: "session" });
 });
