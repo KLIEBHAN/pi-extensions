@@ -32,6 +32,10 @@ interface HarnessOptions {
   findModel?: (provider: string, id: string) => { provider: string; id: string } | undefined;
   /** Per-model auth, for hosts where only some models are authenticated. */
   hasConfiguredAuth?: (model: { provider: string; id: string }) => boolean;
+  /** Session entries visible to the extension, e.g. restored budget snapshots. */
+  branch?: unknown[];
+  /** Physical session id; a different id emulates a new or forked session. */
+  sessionId?: string;
 }
 
 function createHarness(options: HarnessOptions = {}) {
@@ -57,6 +61,7 @@ function createHarness(options: HarnessOptions = {}) {
   };
 
   const model = { provider: "test-provider", id: "test-model" };
+  let branch: unknown[] = [...(options.branch ?? [])];
   const modelRegistry = {
     find: (provider: string, id: string) =>
       options.findModel ? options.findModel(provider, id) : { provider, id },
@@ -65,9 +70,10 @@ function createHarness(options: HarnessOptions = {}) {
     getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "test-key", headers: {} }),
   };
   const sessionManager = {
-    getBranch: () => [],
+    getBranch: () => branch,
+    getEntries: () => branch,
     getLeafId: () => "leaf-1",
-    getSessionId: () => "session-1",
+    getSessionId: () => options.sessionId ?? "session-1",
   };
 
   const hostUi = options.omitEditorSlot
@@ -107,6 +113,9 @@ function createHarness(options: HarnessOptions = {}) {
     registerCommand(name: string, definition: { handler: CommandHandler }) {
       commands.set(name, definition.handler);
     },
+    appendEntry(customType: string, data: unknown) {
+      branch = [...branch, { type: "custom", customType, data, id: `custom-${branch.length + 1}` }];
+    },
   } as unknown as ExtensionAPI;
 
   let storedSettings: PromptAutocompletePersistedSettings = { ...(options.savedSettings ?? {}) };
@@ -132,6 +141,7 @@ function createHarness(options: HarnessOptions = {}) {
     registeredFlags,
     settingsSaves,
     getStoredSettings: () => ({ ...storedSettings }),
+    getBranch: () => branch,
     getEditorFactory: () => editorFactory,
     replaceEditorExternally: (factory: EditorFactory | undefined) => {
       editorFactory = factory;
@@ -485,6 +495,7 @@ test("status stays compatible while stats reports an empty current session", asy
       "Suggestions: 0 offered, 0 accepted (0 full, 0 word/chunk)",
       "Usage: 0 tokens, estimated cost ~$0",
       "Mean provider latency: n/a",
+      "Budget: off (flag)",
     ].join("\n"),
   );
 
@@ -850,4 +861,72 @@ test("a defaulted runtime flag defers to the saved set value", async () => {
   await command(harness, "status");
   assert.match(lastStatus(harness), /debounce=100ms\(saved\)/);
   assert.match(lastStatus(harness), /requested-model=openai\/saved\(saved\)/);
+});
+
+test("budget reports, validates, and stays out of the settings file", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  await emit(harness, "session_start");
+
+  await command(harness, "budget");
+  assert.match(lastStatus(harness), /budget is off \(flag\); 0 provider requests used this session/);
+
+  await command(harness, "budget 0");
+  assert.match(lastStatus(harness), /Usage: \/prompt-autocomplete budget <1-100000\|off>/);
+  await command(harness, "budget nonsense");
+  assert.match(lastStatus(harness), /Usage: \/prompt-autocomplete budget <1-100000\|off>/);
+
+  await command(harness, "budget 5");
+  assert.match(lastStatus(harness), /budget set to 5 provider requests per session/);
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /budget=0\/5\(session\)/);
+
+  await command(harness, "budget off");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /budget=off\(session\)/);
+
+  // The ceiling is session state: the process-wide settings file never sees it.
+  for (const saved of harness.settingsSaves) {
+    assert.deepEqual(Object.keys(saved).sort(), ["enabled"]);
+  }
+  assert.deepEqual(harness.getStoredSettings(), { enabled: true });
+});
+
+test("a restored budget snapshot defers to an explicit flag but outranks the default", async () => {
+  const snapshot = {
+    type: "custom",
+    customType: "prompt-autocomplete-stats",
+    data: { schemaVersion: 1, physicalSessionId: "session-1", limit: 4, used: 3 },
+  };
+
+  const restored = createHarness({ savedSettings: { enabled: true }, branch: [snapshot] });
+  await emit(restored, "session_start");
+  await command(restored, "status");
+  assert.match(lastStatus(restored), /budget=3\/4\(saved\)/);
+
+  const flagged = createHarness({ savedSettings: { enabled: true }, branch: [snapshot] });
+  flagged.flags.set("prompt-autocomplete-max-requests", "9");
+  await emit(flagged, "session_start");
+  await command(flagged, "status");
+  assert.match(lastStatus(flagged), /budget=3\/9\(flag\)/, "an explicit flag outranks the restored ceiling");
+
+  const defaulted = createHarness({ savedSettings: { enabled: true }, branch: [snapshot] });
+  defaulted.flags.set("prompt-autocomplete-max-requests", "off");
+  await emit(defaulted, "session_start");
+  await command(defaulted, "status");
+  assert.match(lastStatus(defaulted), /budget=3\/4\(saved\)/, "the registered default defers to the restored ceiling");
+
+  const forked = createHarness({ savedSettings: { enabled: true }, branch: [snapshot], sessionId: "session-2" });
+  await emit(forked, "session_start");
+  await command(forked, "status");
+  assert.match(lastStatus(forked), /budget=off\(flag\)/, "a forked session ignores another session's snapshot");
+});
+
+test("a session-scoped budget decision survives a new session as an override", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  await emit(harness, "session_start");
+  await command(harness, "budget 2");
+
+  await emit(harness, "session_start");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /budget=0\/2\(session\)/, "the ceiling persists in process while usage resets");
 });

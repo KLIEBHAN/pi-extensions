@@ -92,6 +92,13 @@ export const MAX_SUGGESTION_CHARS_MAX = 1_000;
 export const DEFAULT_MAX_ALTERNATIVES = 3;
 export const MAX_ALTERNATIVES_MIN = 1;
 export const MAX_ALTERNATIVES_MAX = 5;
+/** Provider-request ceiling bounds; `off` (no ceiling) is the default. */
+export const BUDGET_REQUESTS_MIN = 1;
+export const BUDGET_REQUESTS_MAX = 100_000;
+export const DEFAULT_BUDGET_REQUESTS_FLAG = "off";
+/** Custom-entry customType carrying versioned budget snapshots. */
+export const PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE = "prompt-autocomplete-stats";
+export const PROMPT_AUTOCOMPLETE_BUDGET_SCHEMA_VERSION = 1;
 export const MAX_DRAFT_CONTEXT_CHARS = 2_000;
 export const MAX_CONTEXT_MESSAGES = 6;
 export const MAX_CONTEXT_MESSAGE_CHARS = 600;
@@ -652,6 +659,8 @@ export interface PromptAutocompleteRuntimeOverrides {
   maxSuggestionChars?: number;
   maxAlternatives?: number;
   modelSelection?: PromptAutocompleteModelSelection;
+  /** Session request ceiling; `"off"` is an explicit decision, not unset. */
+  budgetLimit?: PromptAutocompleteBudgetSetting;
 }
 
 export type PromptAutocompleteSettingSource = "flag" | "saved" | "session";
@@ -896,6 +905,163 @@ export function resolvePersistedModelSelection(
   if (explicitFlag !== undefined) return { selection: explicitFlag, source: "flag" };
   if (saved !== undefined) return { selection: saved, source: "saved" };
   return { selection: { kind: "active" }, source: "flag" };
+}
+
+/**
+ * Session-scoped provider-request ceiling.
+ *
+ * The limit is the effective ceiling (`undefined` means off) and `used` counts
+ * every provider invocation reserved in the current physical session,
+ * including failed and aborted ones, and including invocations made while the
+ * ceiling was off. Cache hits and in-flight joins never reserve.
+ */
+export interface PromptAutocompleteBudgetState {
+  limit?: number;
+  used: number;
+}
+
+export type PromptAutocompleteBudgetSetting = number | "off";
+
+/** A restored snapshot always carries a real decision, including an explicit `off`. */
+export interface PromptAutocompleteBudgetSnapshotState {
+  limit: PromptAutocompleteBudgetSetting;
+  used: number;
+}
+
+/**
+ * Parse the `--prompt-autocomplete-max-requests` flag. Flags clamp: invalid
+ * input and the registered default (`off`) fall back to "no explicit flag",
+ * which defers to the session-restored value.
+ */
+export function parsePromptAutocompleteBudgetFlag(
+  value: boolean | string | undefined,
+): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.toLowerCase() === DEFAULT_BUDGET_REQUESTS_FLAG) return undefined;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || String(parsed) !== trimmed) return undefined;
+  return Math.min(BUDGET_REQUESTS_MAX, Math.max(BUDGET_REQUESTS_MIN, parsed));
+}
+
+/** Result of parsing an interactive `budget` argument. */
+export type ParsedPromptAutocompleteBudgetValue =
+  | { kind: "limit"; value: number }
+  | { kind: "off" }
+  | { kind: "unset" }
+  | { kind: "invalid" };
+
+/**
+ * Parse `/prompt-autocomplete budget <n|off>`. Interactive values are rejected
+ * rather than clamped so the user sees the valid range.
+ */
+export function parsePromptAutocompleteBudgetValue(value: string | undefined): ParsedPromptAutocompleteBudgetValue {
+  if (value === undefined || !value.trim()) return { kind: "unset" };
+  const trimmed = value.trim();
+  if (trimmed.toLowerCase() === DEFAULT_BUDGET_REQUESTS_FLAG) return { kind: "off" };
+  if (!/^\d+$/.test(trimmed)) return { kind: "invalid" };
+  const parsed = Number.parseInt(trimmed, 10);
+  if (parsed < BUDGET_REQUESTS_MIN || parsed > BUDGET_REQUESTS_MAX) return { kind: "invalid" };
+  return { kind: "limit", value: parsed };
+}
+
+/** Durable snapshot of the session budget, appended as a non-LLM custom entry. */
+export interface PromptAutocompleteBudgetSnapshot {
+  schemaVersion: number;
+  physicalSessionId: string;
+  limit: PromptAutocompleteBudgetSetting;
+  used: number;
+}
+
+export function buildPromptAutocompleteBudgetSnapshot(
+  limit: PromptAutocompleteBudgetSetting,
+  used: number,
+  physicalSessionId: string,
+): PromptAutocompleteBudgetSnapshot {
+  return {
+    schemaVersion: PROMPT_AUTOCOMPLETE_BUDGET_SCHEMA_VERSION,
+    physicalSessionId,
+    limit,
+    used,
+  };
+}
+
+/**
+ * Parse a persisted snapshot. Unknown schema versions, foreign physical
+ * sessions, and malformed fields degrade to `undefined` (fresh budget).
+ */
+export function parsePromptAutocompleteBudgetSnapshot(
+  data: unknown,
+  physicalSessionId: string,
+): PromptAutocompleteBudgetSnapshotState | undefined {
+  if (!isRecord(data)) return undefined;
+  if (data.schemaVersion !== PROMPT_AUTOCOMPLETE_BUDGET_SCHEMA_VERSION) return undefined;
+  if (data.physicalSessionId !== physicalSessionId) return undefined;
+  const limit: PromptAutocompleteBudgetSetting | undefined = data.limit === "off"
+    ? "off"
+    : typeof data.limit === "number" && Number.isInteger(data.limit)
+      && data.limit >= BUDGET_REQUESTS_MIN && data.limit <= BUDGET_REQUESTS_MAX
+      ? data.limit
+      : undefined;
+  if (limit === undefined) return undefined;
+  if (typeof data.used !== "number" || !Number.isInteger(data.used) || data.used < 0) return undefined;
+  return { limit, used: data.used };
+}
+
+/**
+ * Restore this physical session's budget from its own entries.
+ *
+ * Scans every entry of the session, not just the current leaf path: a request
+ * paid for on a branch the user later left was still paid for, so switching
+ * branches must not hand out a fresh allowance. Usage is therefore restored
+ * monotonically (the highest observed count), while the ceiling is the last
+ * recorded decision.
+ */
+export function findPromptAutocompleteBudgetSnapshot(
+  entries: unknown[],
+  physicalSessionId: string,
+): PromptAutocompleteBudgetSnapshotState | undefined {
+  let restored: PromptAutocompleteBudgetSnapshotState | undefined;
+  for (const entry of entries) {
+    if (!isRecord(entry) || entry.type !== "custom") continue;
+    if (entry.customType !== PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE) continue;
+    const snapshot = parsePromptAutocompleteBudgetSnapshot(entry.data, physicalSessionId);
+    if (!snapshot) continue;
+    restored = {
+      limit: snapshot.limit,
+      used: Math.max(restored?.used ?? 0, snapshot.used),
+    };
+  }
+  return restored;
+}
+
+/**
+ * Thrown by a request producer that cannot reserve budget. This is not a
+ * provider failure: it must not enter the failure cooldown or failure stats.
+ */
+export class PromptAutocompleteBudgetExhaustedError extends Error {
+  constructor(limit: number, used: number) {
+    super(`Session request budget exhausted (${used}/${limit} provider requests used)`);
+    this.name = "PromptAutocompleteBudgetExhaustedError";
+  }
+}
+
+/**
+ * Resolve the effective request ceiling and its attribution. An explicit
+ * `budget off` override outranks flag and saved values; the registered flag
+ * default is indistinguishable from not passing the flag.
+ */
+export function resolvePromptAutocompleteBudgetLimit(
+  override: PromptAutocompleteBudgetSetting | undefined,
+  explicitFlag: number | undefined,
+  saved: PromptAutocompleteBudgetSetting | undefined,
+): { limit?: number; source: PromptAutocompleteSettingSource } {
+  if (override !== undefined) {
+    return { limit: override === "off" ? undefined : override, source: "session" };
+  }
+  if (explicitFlag !== undefined) return { limit: explicitFlag, source: "flag" };
+  if (saved !== undefined) return { limit: saved === "off" ? undefined : saved, source: "saved" };
+  return { limit: undefined, source: "flag" };
 }
 
 interface SuggestionPayload {

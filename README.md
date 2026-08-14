@@ -233,6 +233,7 @@ pi install npm:@kliebhan/pi-prompt-autocomplete
 - configurable alternative count via `--prompt-autocomplete-max-alternatives <1-5>`
 - clean default UI: debug/status lines stay hidden unless you opt into debug mode
 - `/prompt-autocomplete stats` reports current-session requests, failures, exact/prefix cache hits, suggestions offered and accepted, tokens, estimated cost, and mean provider latency
+- optional session request ceiling via `--prompt-autocomplete-max-requests <n|off>` or `/prompt-autocomplete budget <n|off>`: only real provider calls count, cache hits and in-flight joins stay free, and the ceiling is session-scoped (`/new` and `/fork` start fresh, `/reload` and `/resume` restore it)
 - the internal autocomplete system prompt lives in `extensions/prompt-autocomplete/system-prompt.template.md` and is rendered through a tiny mini-template helper with `{{PLACEHOLDER}}`, `{{PLACEHOLDER|fallback}}`, and escaped literals via `\{{PLACEHOLDER}}`, so prompt tuning stays decoupled from TypeScript while still allowing reusable prompt fragments
 - can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle`, `/prompt-autocomplete set`, `/prompt-autocomplete stream on|off|toggle`, and `/prompt-autocomplete while-streaming on|off|toggle`
 
@@ -258,6 +259,8 @@ Or enable it for the current session from inside pi:
 /prompt-autocomplete stats
 /prompt-autocomplete set
 /prompt-autocomplete set debounce-ms 250
+/prompt-autocomplete budget 25
+/prompt-autocomplete budget off
 /prompt-autocomplete stream off
 /prompt-autocomplete stream on
 /prompt-autocomplete while-streaming on

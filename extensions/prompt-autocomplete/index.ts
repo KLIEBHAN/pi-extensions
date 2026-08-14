@@ -18,10 +18,14 @@ import {
   buildPromptAutocompleteCacheKey,
   buildPromptAutocompletePrefixContextKey,
   buildRecentConversationContext,
+  buildPromptAutocompleteBudgetSnapshot,
+  BUDGET_REQUESTS_MAX,
+  BUDGET_REQUESTS_MIN,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
   createOwnerRefCounter,
   createPromptAutocompleteUsageStats,
+  DEFAULT_BUDGET_REQUESTS_FLAG,
   describePromptAutocompleteModelSelection,
   describeSettingSource,
   DEFAULT_DEBOUNCE_MS,
@@ -52,15 +56,22 @@ import {
   parseExplicitBoundedIntFlag,
   parseExplicitModelFlag,
   parsePersistedModelRaw,
+  parsePromptAutocompleteBudgetFlag,
+  parsePromptAutocompleteBudgetValue,
   parseStrictBoundedInt,
   persistableModelRaw,
   parsePartialPromptSuggestion,
   parsePromptAutocompleteModelSelection,
   parsePromptAutocompletePersistedSettings,
+  findPromptAutocompleteBudgetSnapshot,
+  PromptAutocompleteBudgetExhaustedError,
+  type PromptAutocompleteBudgetSetting,
   resolvePersistedEnabled,
   resolvePersistedNumber,
+  resolvePromptAutocompleteBudgetLimit,
   serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+  PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
   recordProviderLatency,
   recordProviderUsage,
   resolveAutocompleteConversationId,
@@ -109,7 +120,7 @@ const FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_CACHE_TTL_MS = 60_000;
 const REQUEST_CACHE_MAX_ENTRIES = 128;
 const COMMAND_USAGE =
-  "Usage: /prompt-autocomplete [on|off|toggle|status|stats|min-chars <n>|set <key> [value]|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]";
+  "Usage: /prompt-autocomplete [on|off|toggle|status|stats|min-chars <n>|budget <n|off>|set <key> [value]|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]";
 const SET_USAGE =
   "Usage: /prompt-autocomplete set [debounce-ms <0-5000>|min-chars <0-500>|max-chars <16-1000>|max-alternatives <1-5>|model <provider/model|active>]";
 const PRIVACY_NOTICE =
@@ -160,6 +171,8 @@ interface PromptAutocompleteConfig {
   maxSuggestionChars: number;
   maxAlternatives: number;
   modelSelection: PromptAutocompleteModelSelection;
+  /** Effective provider-request ceiling; undefined means off. */
+  budgetLimit?: number;
 }
 
 interface PromptAutocompleteCacheEntry {
@@ -332,6 +345,24 @@ interface PromptAutocompleteSharedState {
   maxSuggestionCharsFlagExplicit?: number;
   maxAlternativesFlagExplicit?: number;
   modelFlagExplicit?: PromptAutocompleteModelSelection;
+  /** Explicit max-requests flag value seen by applyEffectiveConfig, undefined when defaulted. */
+  budgetFlagExplicit?: number;
+  /** Ceiling restored from this session's entries; `"off"` is a real restored decision. */
+  savedBudgetLimit?: PromptAutocompleteBudgetSetting;
+  /** Reserved provider invocations of the current physical session. */
+  budgetUsed: number;
+  /**
+   * Whether this physical session already carries durable budget state.
+   *
+   * Once a ceiling was set or restored, accounting stays durable even while the
+   * ceiling is off, so a later ceiling cannot ignore what the session spent in
+   * between. A session that never touched the budget writes no entries at all.
+   */
+  budgetSnapshotsActive?: boolean;
+  /** Exhaustion notices already delivered, keyed by `used/limit`. */
+  budgetBlockNotices: Set<string>;
+  /** Session-bound snapshot writer; appends a non-LLM custom entry. */
+  persistBudgetSnapshot?: (limit: PromptAutocompleteBudgetSetting, used: number) => void;
   /** Session-scoped request accounting; reset together with the cache. */
   usageStats: PromptAutocompleteUsageStats;
   currentModel?: Model<Api>;
@@ -592,6 +623,7 @@ function parseConfig(pi: ExtensionAPI): PromptAutocompleteConfig {
       MAX_ALTERNATIVES_MAX,
     ),
     modelSelection: parsePromptAutocompleteModelSelection(pi.getFlag("prompt-autocomplete-model")),
+    budgetLimit: parsePromptAutocompleteBudgetFlag(pi.getFlag("prompt-autocomplete-max-requests")),
   };
 }
 
@@ -637,6 +669,7 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
     MAX_ALTERNATIVES_MAX,
   );
   shared.modelFlagExplicit = parseExplicitModelFlag(pi.getFlag("prompt-autocomplete-model"));
+  shared.budgetFlagExplicit = parsePromptAutocompleteBudgetFlag(pi.getFlag("prompt-autocomplete-max-requests"));
   shared.config = {
     ...flagConfig,
     allowWhileStreaming: resolveOverride(
@@ -674,6 +707,11 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
       shared.modelFlagExplicit,
       parsePersistedModelRaw(shared.persistedSettings.model),
     ).selection,
+    budgetLimit: resolvePromptAutocompleteBudgetLimit(
+      shared.runtimeOverrides.budgetLimit,
+      shared.budgetFlagExplicit,
+      shared.savedBudgetLimit,
+    ).limit,
   };
 }
 
@@ -773,6 +811,7 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
       ).source
     })`,
     `cache-size=${shared.requestCache.size}`,
+    `budget=${formatBudget(shared)}`,
     `usage=${formatUsageStats(shared.usageStats)}`,
     `state=${shared.debugState || "idle"}`,
     shared.lastError ? `error=${truncateDebug(shared.lastError, 90)}` : undefined,
@@ -1342,6 +1381,22 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
 
     const shouldJoinInFlight = this.shared.inFlightRequests.has(request.cacheKey);
+
+    // Cache hits and joins of existing work stay free above the ceiling; only a
+    // request that would start new provider work is blocked here. The producer
+    // still re-checks and reserves, which is what makes concurrency safe.
+    if (!shouldJoinInFlight && isBudgetExhausted(this.shared)) {
+      this.cancelPendingRequest();
+      updateDebugState(
+        this.shared,
+        "budget-exhausted",
+        `Session request budget exhausted (${this.shared.budgetUsed}/${this.shared.config.budgetLimit})`,
+      );
+      notifyBudgetExhaustedOnce(this.shared);
+      this.setSuggestions([]);
+      return;
+    }
+
     this.cancelPendingRequest();
 
     const seq = ++this.requestSeq;
@@ -1452,7 +1507,18 @@ class PromptAutocompleteEditor extends CustomEditor {
         this.setSuggestions(entry.suggestions);
       }
     } catch (error) {
-      if (this.isRequestStillCurrent(request, seq)) {
+      if (error instanceof PromptAutocompleteBudgetExhaustedError) {
+        // Not a provider failure: no cooldown, no failure stat, no provider call.
+        if (this.isRequestStillCurrent(request, seq)) {
+          updateDebugState(
+            this.shared,
+            "budget-exhausted",
+            `Session request budget exhausted (${this.shared.budgetUsed}/${this.shared.config.budgetLimit})`,
+          );
+          notifyBudgetExhaustedOnce(this.shared);
+          this.setSuggestions([]);
+        }
+      } else if (this.isRequestStillCurrent(request, seq)) {
         this.suspendedUntil = this.shared.now() + FAILURE_COOLDOWN_MS;
         const message = error instanceof Error ? error.message : String(error);
         this.shared.lastError = message;
@@ -1502,6 +1568,14 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
     if (signal.aborted) {
       throw new Error("Request was aborted");
+    }
+    // Last await is done: reserving here and invoking below without another
+    // await is what keeps two concurrent producers from overshooting a ceiling.
+    if (!reserveBudgetRequest(this.shared)) {
+      throw new PromptAutocompleteBudgetExhaustedError(
+        this.shared.config.budgetLimit ?? this.shared.budgetUsed,
+        this.shared.budgetUsed,
+      );
     }
 
     const sections: string[] = [];
@@ -1884,6 +1958,15 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.cancelActiveRequest?.();
   shared.cancelActiveRequest = undefined;
   shared.cancelScheduledRequest = undefined;
+  // Budget accounting is physical-session scoped: a new session starts fresh.
+  // Clearing before applyEffectiveConfig keeps the effective ceiling from
+  // silently inheriting the previous session's restored value; session_start
+  // restores this session's own snapshot right afterwards.
+  shared.budgetUsed = 0;
+  shared.savedBudgetLimit = undefined;
+  shared.persistBudgetSnapshot = undefined;
+  shared.budgetSnapshotsActive = false;
+  shared.budgetBlockNotices.clear();
   applyEffectiveConfig(pi, shared);
   // A host that never installs custom editors stays inactive for the rest of
   // the process, so flags must not re-enable it in a later session either.
@@ -2012,6 +2095,68 @@ function setStreamResponses(
   }
 }
 
+function describeBudget(shared: PromptAutocompleteSharedState): { value: string; source: string } {
+  const resolution = resolvePromptAutocompleteBudgetLimit(
+    shared.runtimeOverrides.budgetLimit,
+    shared.budgetFlagExplicit,
+    shared.savedBudgetLimit,
+  );
+  return {
+    value: resolution.limit === undefined ? "off" : `${shared.budgetUsed}/${resolution.limit}`,
+    source: resolution.source,
+  };
+}
+
+function formatBudget(shared: PromptAutocompleteSharedState): string {
+  const { value, source } = describeBudget(shared);
+  return `${value}(${source})`;
+}
+
+/**
+ * Set the session request ceiling.
+ *
+ * The decision is session-scoped by design: it is snapshotted into the current
+ * session's entries, never into the process-wide settings file.
+ */
+function setBudgetLimit(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  arg: string | undefined,
+): void {
+  const parsed = parsePromptAutocompleteBudgetValue(arg);
+  if (parsed.kind === "unset") {
+    const { value, source } = describeBudget(shared);
+    ctx.ui.notify(
+      `Prompt autocomplete budget is ${value} (${source}); ${shared.budgetUsed} provider request${
+        shared.budgetUsed === 1 ? "" : "s"
+      } used this session`,
+      "info",
+    );
+    return;
+  }
+  if (parsed.kind === "invalid") {
+    ctx.ui.notify(
+      `Usage: /prompt-autocomplete budget <${BUDGET_REQUESTS_MIN}-${BUDGET_REQUESTS_MAX}|off>`,
+      "warning",
+    );
+    return;
+  }
+
+  shared.runtimeOverrides.budgetLimit = parsed.kind === "off" ? "off" : parsed.value;
+  const nextLimit = parsed.kind === "off" ? undefined : parsed.value;
+  // Only a real transition is a new exhaustion state worth reporting again.
+  if (nextLimit !== shared.config.budgetLimit) shared.budgetBlockNotices.clear();
+  shared.config.budgetLimit = nextLimit;
+  persistBudgetSnapshot(shared);
+  updateDebugState(shared, "configured", `Budget ${formatBudget(shared)}`);
+  ctx.ui.notify(
+    parsed.kind === "off"
+      ? `Prompt autocomplete budget off (${shared.budgetUsed} request${shared.budgetUsed === 1 ? "" : "s"} used this session)`
+      : `Prompt autocomplete budget set to ${parsed.value} provider request${parsed.value === 1 ? "" : "s"} per session (${shared.budgetUsed} used)`,
+    "info",
+  );
+}
+
 function setMinPromptChars(
   ctx: ExtensionContext,
   shared: PromptAutocompleteSharedState,
@@ -2081,6 +2226,110 @@ function persistSettingsDecision(
     );
     return false;
   }
+}
+
+function isBudgetExhausted(shared: PromptAutocompleteSharedState): boolean {
+  return shared.config.budgetLimit !== undefined && shared.budgetUsed >= shared.config.budgetLimit;
+}
+
+function notifyBudgetExhaustedOnce(shared: PromptAutocompleteSharedState): void {
+  const limit = shared.config.budgetLimit;
+  if (limit === undefined) return;
+  const key = `${shared.budgetUsed}/${limit}`;
+  if (shared.budgetBlockNotices.has(key)) return;
+  shared.budgetBlockNotices.add(key);
+  shared.notify?.(
+    `Prompt autocomplete session budget exhausted (${shared.budgetUsed}/${limit} provider requests). `
+      + "Raise it with /prompt-autocomplete budget <n> or disable it with /prompt-autocomplete budget off.",
+    "warning",
+  );
+}
+
+/**
+ * Authoritative budget admission inside a request producer.
+ *
+ * Called synchronously after the last await (successful auth) and before the
+ * provider invocation, so two concurrent producers can never both pass a
+ * limit of one. Failed and aborted calls keep their reservation; auth
+ * failures never reach this point and consume nothing.
+ *
+ * Every real invocation advances the physical-session count, including while
+ * the ceiling is off: enabling a ceiling later must not hand out an allowance
+ * that ignores what this session already spent. Snapshots are written while a
+ * ceiling exists and, once this session carries durable budget state, also for
+ * uncapped invocations — so a session that never touched the budget still adds
+ * no session entries.
+ */
+function reserveBudgetRequest(shared: PromptAutocompleteSharedState): boolean {
+  const limit = shared.config.budgetLimit;
+  if (limit !== undefined && shared.budgetUsed >= limit) return false;
+  shared.budgetUsed += 1;
+  if (limit !== undefined || shared.budgetSnapshotsActive) persistBudgetSnapshot(shared);
+  return true;
+}
+
+function persistBudgetSnapshot(shared: PromptAutocompleteSharedState): void {
+  if (!shared.physicalSessionId || !shared.persistBudgetSnapshot) return;
+  shared.budgetSnapshotsActive = true;
+  shared.persistBudgetSnapshot(
+    shared.config.budgetLimit === undefined ? "off" : shared.config.budgetLimit,
+    shared.budgetUsed,
+  );
+}
+
+/**
+ * Restore this physical session's budget from its own entries and bind the
+ * snapshot writer for the session.
+ *
+ * `/reload` and `/resume` re-run `session_start` on the same session file, so
+ * the session's own snapshots re-establish usage and the ceiling; `/new` and
+ * `/fork` start a session whose entries hold no (or foreign) snapshots and
+ * begin with a fresh budget. Hosts without `appendEntry` keep the in-process
+ * ceiling without durable snapshots.
+ */
+function restoreBudgetFromSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
+  const snapshot = findPromptAutocompleteBudgetSnapshot(
+    readSessionEntries(shared),
+    shared.physicalSessionId,
+  );
+  if (snapshot) {
+    shared.budgetUsed = snapshot.used;
+    shared.savedBudgetLimit = snapshot.limit;
+    // This session already accounts durably: keep it that way even if the
+    // restored decision is an explicit off.
+    shared.budgetSnapshotsActive = true;
+  }
+  // Always recompute: resetSharedForSession cleared the previous session's
+  // restored ceiling, so the effective config must follow even when this
+  // session has no snapshot of its own.
+  applyEffectiveConfig(pi, shared);
+  if (typeof pi.appendEntry !== "function") return;
+  shared.persistBudgetSnapshot = (limit, used) => {
+    try {
+      pi.appendEntry(
+        PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
+        buildPromptAutocompleteBudgetSnapshot(limit, used, shared.physicalSessionId),
+      );
+    } catch {
+      // Durability is best-effort: the in-process ceiling still applies.
+    }
+  };
+}
+
+/**
+ * Every entry of the current session, falling back to the current branch.
+ *
+ * The ceiling is a physical-session fact, so restoring it must not depend on
+ * the current leaf path: a request paid for on a branch the user later left
+ * was still paid for.
+ */
+function readSessionEntries(shared: PromptAutocompleteSharedState): unknown[] {
+  const manager = shared.sessionManager as
+    | { getEntries?: () => unknown[]; getBranch?: () => unknown[] }
+    | undefined;
+  const entries = manager?.getEntries?.();
+  if (Array.isArray(entries)) return entries;
+  return manager?.getBranch?.() ?? [];
 }
 
 function requestIdentityFingerprint(shared: PromptAutocompleteSharedState): string {
@@ -2376,7 +2625,11 @@ function createPromptAutocompleteCommandHandlers(
       ctx.ui.notify(formatStatus(shared), "info");
     },
     stats: () => {
-      ctx.ui.notify(formatPromptAutocompleteStats(shared.usageStats), "info");
+      const { value, source } = describeBudget(shared);
+      ctx.ui.notify(
+        `${formatPromptAutocompleteStats(shared.usageStats)}\nBudget: ${value} (${source})`,
+        "info",
+      );
     },
     "debug-on": () => {
       setDebugDisplay(shared, true);
@@ -2508,6 +2761,11 @@ export function createPromptAutocompleteExtension(
     type: "string",
     default: String(DEFAULT_MAX_ALTERNATIVES),
   });
+  pi.registerFlag("prompt-autocomplete-max-requests", {
+    description: `Maximum provider requests per session before autocomplete stops requesting (${BUDGET_REQUESTS_MIN}-${BUDGET_REQUESTS_MAX} or off)`,
+    type: "string",
+    default: DEFAULT_BUDGET_REQUESTS_FLAG,
+  });
 
   const shared: PromptAutocompleteSharedState = {
     enabled: false,
@@ -2520,6 +2778,8 @@ export function createPromptAutocompleteExtension(
     persistedSettings,
     settingsStore,
     enabledFlagValue: false,
+    budgetUsed: 0,
+    budgetBlockNotices: new Set(),
     usageStats: createPromptAutocompleteUsageStats(),
     completeSimple: completeSimpleImpl,
     streamSimple: streamSimpleImpl,
@@ -2537,6 +2797,7 @@ export function createPromptAutocompleteExtension(
     }
     resetSharedForSession(pi, shared);
     bindRuntimeContext(ctx, shared);
+    restoreBudgetFromSession(pi, shared);
 
     if (!hostOwnsInteractiveEditor(ctx, shared) || !shared.enabled) return;
     mountEditor(ctx, shared);
@@ -2608,6 +2869,10 @@ export function createPromptAutocompleteExtension(
       }
       if (command === "min-chars") {
         setMinPromptChars(ctx, shared, firstRestToken || undefined);
+        return;
+      }
+      if (command === "budget") {
+        setBudgetLimit(ctx, shared, firstRestToken || undefined);
         return;
       }
       if (command === "set") {
