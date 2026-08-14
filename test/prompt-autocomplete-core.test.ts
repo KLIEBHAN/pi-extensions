@@ -1511,7 +1511,7 @@ test("budget flags clamp while interactive budget values are rejected", () => {
 });
 
 test("budget snapshots round-trip and reject foreign or malformed state", () => {
-  const snapshot = buildPromptAutocompleteBudgetSnapshot({ limit: 3, used: 2 }, "session-1");
+  const snapshot = buildPromptAutocompleteBudgetSnapshot(3, 2, "session-1");
   assert.deepEqual(snapshot, {
     schemaVersion: 1,
     physicalSessionId: "session-1",
@@ -1521,11 +1521,11 @@ test("budget snapshots round-trip and reject foreign or malformed state", () => 
   assert.deepEqual(parsePromptAutocompleteBudgetSnapshot(snapshot, "session-1"), { limit: 3, used: 2 });
   assert.equal(parsePromptAutocompleteBudgetSnapshot(snapshot, "session-2"), undefined);
 
-  // An off ceiling is a real decision and keeps its usage.
-  const offSnapshot = buildPromptAutocompleteBudgetSnapshot({ limit: undefined, used: 4 }, "session-1");
+  // An explicit off stays a real restored decision, not an absent one.
+  const offSnapshot = buildPromptAutocompleteBudgetSnapshot("off", 4, "session-1");
   assert.equal(offSnapshot.limit, "off");
   assert.deepEqual(parsePromptAutocompleteBudgetSnapshot(offSnapshot, "session-1"), {
-    limit: undefined,
+    limit: "off",
     used: 4,
   });
 
@@ -1537,7 +1537,7 @@ test("budget snapshots round-trip and reject foreign or malformed state", () => 
   assert.equal(parsePromptAutocompleteBudgetSnapshot({ ...snapshot, limit: "nope" }, "session-1"), undefined);
 });
 
-test("the newest own-session budget snapshot wins and foreign sessions are skipped", () => {
+test("budget restoration scans the whole session and never lets usage go backwards", () => {
   const entry = (physicalSessionId: string, used: number, limit: number | "off" = 3) => ({
     type: "custom",
     customType: PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
@@ -1556,6 +1556,24 @@ test("the newest own-session budget snapshot wins and foreign sessions are skipp
   assert.deepEqual(findPromptAutocompleteBudgetSnapshot(branch, "session-2"), { limit: 3, used: 7 });
   assert.equal(findPromptAutocompleteBudgetSnapshot(branch, "session-3"), undefined);
   assert.equal(findPromptAutocompleteBudgetSnapshot([], "session-1"), undefined);
+
+  // A snapshot from an abandoned branch still counts: the request was paid for.
+  assert.deepEqual(
+    findPromptAutocompleteBudgetSnapshot(
+      [entry("session-1", 5), entry("session-1", 2)],
+      "session-1",
+    ),
+    { limit: 3, used: 5 },
+  );
+
+  // The ceiling follows the last recorded decision, including an explicit off.
+  assert.deepEqual(
+    findPromptAutocompleteBudgetSnapshot(
+      [entry("session-1", 2, 3), entry("session-1", 2, "off")],
+      "session-1",
+    ),
+    { limit: "off", used: 2 },
+  );
 });
 
 test("budget resolution ranks session over flag over restored value", () => {
@@ -1568,4 +1586,9 @@ test("budget resolution ranks session over flag over restored value", () => {
   assert.deepEqual(resolvePromptAutocompleteBudgetLimit(9, 2, 4), { limit: 9, source: "session" });
   // An explicit "off" is a decision, not an absent override.
   assert.deepEqual(resolvePromptAutocompleteBudgetLimit("off", 2, 4), { limit: undefined, source: "session" });
+  // A restored "off" keeps its attribution instead of looking like no decision.
+  assert.deepEqual(resolvePromptAutocompleteBudgetLimit(undefined, undefined, "off"), {
+    limit: undefined,
+    source: "saved",
+  });
 });

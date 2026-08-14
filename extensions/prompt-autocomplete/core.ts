@@ -911,8 +911,9 @@ export function resolvePersistedModelSelection(
  * Session-scoped provider-request ceiling.
  *
  * The limit is the effective ceiling (`undefined` means off) and `used` counts
- * reserved provider invocations of the current physical session, including
- * failed and aborted ones. Cache hits and in-flight joins never reserve.
+ * every provider invocation reserved in the current physical session,
+ * including failed and aborted ones, and including invocations made while the
+ * ceiling was off. Cache hits and in-flight joins never reserve.
  */
 export interface PromptAutocompleteBudgetState {
   limit?: number;
@@ -920,6 +921,12 @@ export interface PromptAutocompleteBudgetState {
 }
 
 export type PromptAutocompleteBudgetSetting = number | "off";
+
+/** A restored snapshot always carries a real decision, including an explicit `off`. */
+export interface PromptAutocompleteBudgetSnapshotState {
+  limit: PromptAutocompleteBudgetSetting;
+  used: number;
+}
 
 /**
  * Parse the `--prompt-autocomplete-max-requests` flag. Flags clamp: invalid
@@ -967,14 +974,15 @@ export interface PromptAutocompleteBudgetSnapshot {
 }
 
 export function buildPromptAutocompleteBudgetSnapshot(
-  state: PromptAutocompleteBudgetState,
+  limit: PromptAutocompleteBudgetSetting,
+  used: number,
   physicalSessionId: string,
 ): PromptAutocompleteBudgetSnapshot {
   return {
     schemaVersion: PROMPT_AUTOCOMPLETE_BUDGET_SCHEMA_VERSION,
     physicalSessionId,
-    limit: state.limit === undefined ? "off" : state.limit,
-    used: state.used,
+    limit,
+    used,
   };
 }
 
@@ -985,39 +993,46 @@ export function buildPromptAutocompleteBudgetSnapshot(
 export function parsePromptAutocompleteBudgetSnapshot(
   data: unknown,
   physicalSessionId: string,
-): PromptAutocompleteBudgetState | undefined {
+): PromptAutocompleteBudgetSnapshotState | undefined {
   if (!isRecord(data)) return undefined;
   if (data.schemaVersion !== PROMPT_AUTOCOMPLETE_BUDGET_SCHEMA_VERSION) return undefined;
   if (data.physicalSessionId !== physicalSessionId) return undefined;
-  const limit = data.limit === "off"
-    ? undefined
+  const limit: PromptAutocompleteBudgetSetting | undefined = data.limit === "off"
+    ? "off"
     : typeof data.limit === "number" && Number.isInteger(data.limit)
       && data.limit >= BUDGET_REQUESTS_MIN && data.limit <= BUDGET_REQUESTS_MAX
       ? data.limit
       : undefined;
-  if (data.limit !== "off" && limit === undefined) return undefined;
+  if (limit === undefined) return undefined;
   if (typeof data.used !== "number" || !Number.isInteger(data.used) || data.used < 0) return undefined;
   return { limit, used: data.used };
 }
 
 /**
- * Newest budget snapshot of the current physical session on the branch.
+ * Restore this physical session's budget from its own entries.
  *
- * Entries from other physical sessions (a forked session file) are skipped so
- * only this session's own accounting counts.
+ * Scans every entry of the session, not just the current leaf path: a request
+ * paid for on a branch the user later left was still paid for, so switching
+ * branches must not hand out a fresh allowance. Usage is therefore restored
+ * monotonically (the highest observed count), while the ceiling is the last
+ * recorded decision.
  */
 export function findPromptAutocompleteBudgetSnapshot(
-  branch: unknown[],
+  entries: unknown[],
   physicalSessionId: string,
-): PromptAutocompleteBudgetState | undefined {
-  for (let index = branch.length - 1; index >= 0; index -= 1) {
-    const entry = branch[index];
+): PromptAutocompleteBudgetSnapshotState | undefined {
+  let restored: PromptAutocompleteBudgetSnapshotState | undefined;
+  for (const entry of entries) {
     if (!isRecord(entry) || entry.type !== "custom") continue;
     if (entry.customType !== PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE) continue;
     const snapshot = parsePromptAutocompleteBudgetSnapshot(entry.data, physicalSessionId);
-    if (snapshot !== undefined) return snapshot;
+    if (!snapshot) continue;
+    restored = {
+      limit: snapshot.limit,
+      used: Math.max(restored?.used ?? 0, snapshot.used),
+    };
   }
-  return undefined;
+  return restored;
 }
 
 /**
@@ -1039,13 +1054,13 @@ export class PromptAutocompleteBudgetExhaustedError extends Error {
 export function resolvePromptAutocompleteBudgetLimit(
   override: PromptAutocompleteBudgetSetting | undefined,
   explicitFlag: number | undefined,
-  saved: number | undefined,
+  saved: PromptAutocompleteBudgetSetting | undefined,
 ): { limit?: number; source: PromptAutocompleteSettingSource } {
   if (override !== undefined) {
     return { limit: override === "off" ? undefined : override, source: "session" };
   }
   if (explicitFlag !== undefined) return { limit: explicitFlag, source: "flag" };
-  if (saved !== undefined) return { limit: saved, source: "saved" };
+  if (saved !== undefined) return { limit: saved === "off" ? undefined : saved, source: "saved" };
   return { limit: undefined, source: "flag" };
 }
 

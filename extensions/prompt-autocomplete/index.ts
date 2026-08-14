@@ -347,8 +347,8 @@ interface PromptAutocompleteSharedState {
   modelFlagExplicit?: PromptAutocompleteModelSelection;
   /** Explicit max-requests flag value seen by applyEffectiveConfig, undefined when defaulted. */
   budgetFlagExplicit?: number;
-  /** Request ceiling restored from this session's entries; undefined when absent. */
-  savedBudgetLimit?: number;
+  /** Ceiling restored from this session's entries; `"off"` is a real restored decision. */
+  savedBudgetLimit?: PromptAutocompleteBudgetSetting;
   /** Reserved provider invocations of the current physical session. */
   budgetUsed: number;
   /** Exhaustion notices already delivered, keyed by `used/limit`. */
@@ -1950,18 +1950,19 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.cancelActiveRequest?.();
   shared.cancelActiveRequest = undefined;
   shared.cancelScheduledRequest = undefined;
+  // Budget accounting is physical-session scoped: a new session starts fresh.
+  // Clearing before applyEffectiveConfig keeps the effective ceiling from
+  // silently inheriting the previous session's restored value; session_start
+  // restores this session's own snapshot right afterwards.
+  shared.budgetUsed = 0;
+  shared.savedBudgetLimit = undefined;
+  shared.persistBudgetSnapshot = undefined;
+  shared.budgetBlockNotices.clear();
   applyEffectiveConfig(pi, shared);
   // A host that never installs custom editors stays inactive for the rest of
   // the process, so flags must not re-enable it in a later session either.
   if (shared.hostInstallsEditors === false) shared.enabled = false;
   shared.usageStats = createPromptAutocompleteUsageStats();
-  // Budget accounting is physical-session scoped: a new session starts fresh.
-  // session_start restores it from this session's own entries right after
-  // bindRuntimeContext captures the new physical id.
-  shared.budgetUsed = 0;
-  shared.savedBudgetLimit = undefined;
-  shared.persistBudgetSnapshot = undefined;
-  shared.budgetBlockNotices.clear();
   shared.editorMount = undefined;
   shared.editorBlockedReason = undefined;
   shared.ownsEditor = undefined;
@@ -2133,9 +2134,10 @@ function setBudgetLimit(
   }
 
   shared.runtimeOverrides.budgetLimit = parsed.kind === "off" ? "off" : parsed.value;
-  shared.config.budgetLimit = parsed.kind === "off" ? undefined : parsed.value;
-  // A changed ceiling is a new exhaustion state worth reporting again.
-  shared.budgetBlockNotices.clear();
+  const nextLimit = parsed.kind === "off" ? undefined : parsed.value;
+  // Only a real transition is a new exhaustion state worth reporting again.
+  if (nextLimit !== shared.config.budgetLimit) shared.budgetBlockNotices.clear();
+  shared.config.budgetLimit = nextLimit;
   persistBudgetSnapshot(shared);
   updateDebugState(shared, "configured", `Budget ${formatBudget(shared)}`);
   ctx.ui.notify(
@@ -2241,13 +2243,17 @@ function notifyBudgetExhaustedOnce(shared: PromptAutocompleteSharedState): void 
  * provider invocation, so two concurrent producers can never both pass a
  * limit of one. Failed and aborted calls keep their reservation; auth
  * failures never reach this point and consume nothing.
+ *
+ * Every real invocation advances the physical-session count, including while
+ * the ceiling is off: enabling a ceiling later must not hand out an allowance
+ * that ignores what this session already spent. Snapshots are only written
+ * while a ceiling exists, so the default-off path adds no session entries.
  */
 function reserveBudgetRequest(shared: PromptAutocompleteSharedState): boolean {
   const limit = shared.config.budgetLimit;
-  if (limit === undefined) return true;
-  if (shared.budgetUsed >= limit) return false;
+  if (limit !== undefined && shared.budgetUsed >= limit) return false;
   shared.budgetUsed += 1;
-  persistBudgetSnapshot(shared);
+  if (limit !== undefined) persistBudgetSnapshot(shared);
   return true;
 }
 
@@ -2264,33 +2270,51 @@ function persistBudgetSnapshot(shared: PromptAutocompleteSharedState): void {
  * snapshot writer for the session.
  *
  * `/reload` and `/resume` re-run `session_start` on the same session file, so
- * the newest own snapshot re-establishes usage and the ceiling; `/new` and
+ * the session's own snapshots re-establish usage and the ceiling; `/new` and
  * `/fork` start a session whose entries hold no (or foreign) snapshots and
  * begin with a fresh budget. Hosts without `appendEntry` keep the in-process
  * ceiling without durable snapshots.
  */
 function restoreBudgetFromSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
-  const branch = shared.sessionManager?.getBranch?.() ?? [];
-  const snapshot = findPromptAutocompleteBudgetSnapshot(branch, shared.physicalSessionId);
+  const snapshot = findPromptAutocompleteBudgetSnapshot(
+    readSessionEntries(shared),
+    shared.physicalSessionId,
+  );
   if (snapshot) {
     shared.budgetUsed = snapshot.used;
     shared.savedBudgetLimit = snapshot.limit;
-    applyEffectiveConfig(pi, shared);
   }
+  // Always recompute: resetSharedForSession cleared the previous session's
+  // restored ceiling, so the effective config must follow even when this
+  // session has no snapshot of its own.
+  applyEffectiveConfig(pi, shared);
   if (typeof pi.appendEntry !== "function") return;
   shared.persistBudgetSnapshot = (limit, used) => {
     try {
       pi.appendEntry(
         PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
-        buildPromptAutocompleteBudgetSnapshot(
-          { limit: limit === "off" ? undefined : limit, used },
-          shared.physicalSessionId,
-        ),
+        buildPromptAutocompleteBudgetSnapshot(limit, used, shared.physicalSessionId),
       );
     } catch {
       // Durability is best-effort: the in-process ceiling still applies.
     }
   };
+}
+
+/**
+ * Every entry of the current session, falling back to the current branch.
+ *
+ * The ceiling is a physical-session fact, so restoring it must not depend on
+ * the current leaf path: a request paid for on a branch the user later left
+ * was still paid for.
+ */
+function readSessionEntries(shared: PromptAutocompleteSharedState): unknown[] {
+  const manager = shared.sessionManager as
+    | { getEntries?: () => unknown[]; getBranch?: () => unknown[] }
+    | undefined;
+  const entries = manager?.getEntries?.();
+  if (Array.isArray(entries)) return entries;
+  return manager?.getBranch?.() ?? [];
 }
 
 function requestIdentityFingerprint(shared: PromptAutocompleteSharedState): string {

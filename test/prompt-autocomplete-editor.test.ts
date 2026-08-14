@@ -161,6 +161,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
   let editorFactory: EditorFactory | undefined;
   let renderRequests = 0;
   let branch: unknown[] = [];
+  let entries: unknown[] = [];
   const appendedEntries: Array<{ customType: string; data: unknown }> = [];
   let leafId = "leaf-1";
   let sessionId = "session-1";
@@ -186,6 +187,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
   };
   const sessionManager = {
     getBranch: () => branch,
+    getEntries: () => entries,
     getLeafId: () => leafId,
     getSessionId: () => sessionId,
   };
@@ -218,7 +220,9 @@ function createEditorHarness(options: EditorHarnessOptions) {
       : {
           appendEntry(customType: string, data: unknown) {
             appendedEntries.push({ customType, data });
-            branch = [...branch, { type: "custom", customType, data, id: `custom-${appendedEntries.length}` }];
+            const entry = { type: "custom", customType, data, id: `custom-${appendedEntries.length}` };
+            branch = [...branch, entry];
+            entries = [...entries, entry];
           },
         }),
   } as unknown as ExtensionAPI;
@@ -275,6 +279,11 @@ function createEditorHarness(options: EditorHarnessOptions) {
       branch = nextBranch;
     },
     getBranch: () => branch,
+    /** All entries of the session file, which outlive a branch switch. */
+    setEntries: (nextEntries: unknown[]) => {
+      entries = nextEntries;
+    },
+    getEntries: () => entries,
     getAppendedEntries: () => appendedEntries.map((entry) => ({ ...entry })),
     setLeafId: (nextLeafId: string) => {
       leafId = nextLeafId;
@@ -2234,6 +2243,7 @@ test("a reload restores the session ceiling while a new session starts fresh", a
 
   // A graceful reload replaces the extension runtime but keeps the session file.
   const reloaded = createEditorHarness({ completeSimple });
+  reloaded.setEntries(harness.getEntries());
   reloaded.setBranch(harness.getBranch());
   const reloadedEditor = await reloaded.createEditor();
   await reloaded.command("status");
@@ -2246,6 +2256,7 @@ test("a reload restores the session ceiling while a new session starts fresh", a
   // A new or forked session carries no snapshot of its own physical session.
   const fresh = createEditorHarness({ completeSimple });
   fresh.setSessionId("session-2");
+  fresh.setEntries(harness.getEntries());
   fresh.setBranch(harness.getBranch());
   const freshEditor = await fresh.createEditor();
   await fresh.command("status");
@@ -2310,4 +2321,168 @@ test("an exhausted budget stops work before auth instead of resolving credential
     (widget) => widget.key === "prompt-autocomplete-spinner" && widget.content !== undefined,
   );
   assert.equal(spinnerWidgets.length, 1, "blocked drafts must not spin a request indicator");
+});
+
+test("switching branches cannot hand out a fresh budget after a reload", async () => {
+  let calls = 0;
+  const completeSimple = (async () => {
+    calls += 1;
+    return makeCompletion([" completion"]);
+  }) as CompleteSimple;
+  const harness = createEditorHarness({ completeSimple });
+  const editor = await harness.createEditor();
+  await harness.command("budget 1");
+
+  editor.setText("Review");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+
+  // The user leaves the branch that carries the snapshot; the session file keeps it.
+  const sessionEntries = harness.getEntries();
+  const reloaded = createEditorHarness({ completeSimple });
+  reloaded.setBranch([{ type: "message", id: "m1" }]);
+  reloaded.setEntries(sessionEntries);
+  const reloadedEditor = await reloaded.createEditor();
+
+  await reloaded.command("status");
+  assert.match(
+    reloaded.notifications.at(-1) ?? "",
+    /budget=1\/1\(saved\)/,
+    "a branch switch must not reset the physical-session ceiling",
+  );
+
+  reloadedEditor.setText("Draft after branch switch and reload");
+  await flushAsyncWork();
+  assert.equal(calls, 1, "the ceiling still holds after switching branches");
+});
+
+test("requests made while the ceiling is off still count against a ceiling enabled later", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([` completion ${calls}`]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+
+  editor.setText("Draft one");
+  await flushAsyncWork();
+  editor.setText("Draft two");
+  await flushAsyncWork();
+  assert.equal(calls, 2, "the default off ceiling admits every request");
+
+  await harness.command("budget 3");
+  await harness.command("status");
+  assert.match(
+    harness.notifications.at(-1) ?? "",
+    /budget=2\/3\(session\)/,
+    "enabling a ceiling must not forget what this session already spent",
+  );
+
+  editor.setText("Draft three");
+  await flushAsyncWork();
+  assert.equal(calls, 3);
+  editor.setText("Draft four");
+  await flushAsyncWork();
+  assert.equal(calls, 3, "the ceiling counts the earlier uncapped requests");
+});
+
+test("a restored off decision keeps its attribution and a new session drops the old ceiling", async () => {
+  let calls = 0;
+  const completeSimple = (async () => {
+    calls += 1;
+    return makeCompletion([" completion"]);
+  }) as CompleteSimple;
+  const harness = createEditorHarness({ completeSimple });
+  const editor = await harness.createEditor();
+  await harness.command("budget 1");
+  editor.setText("Review");
+  await flushAsyncWork();
+  await harness.command("budget off");
+
+  const reloaded = createEditorHarness({ completeSimple });
+  reloaded.setEntries(harness.getEntries());
+  reloaded.setBranch(harness.getBranch());
+  const reloadedEditor = await reloaded.createEditor();
+  await reloaded.command("status");
+  assert.match(reloaded.notifications.at(-1) ?? "", /budget=off\(saved\)/, "an explicit off is a restored decision");
+
+  reloadedEditor.setText("Draft after reload");
+  await flushAsyncWork();
+  assert.equal(calls, 2, "a restored off ceiling admits requests");
+
+  // A different physical session must not inherit the previous session's ceiling.
+  reloaded.setSessionId("session-9");
+  await reloaded.emit("session_start");
+  await reloaded.command("status");
+  assert.match(reloaded.notifications.at(-1) ?? "", /budget=off\(flag\)/);
+  const freshEditor = reloaded.instantiateEditor();
+  freshEditor.setText("Draft in a brand new session");
+  await flushAsyncWork();
+  assert.equal(calls, 3, "a new session enforces its own (absent) ceiling");
+});
+
+test("repeating the same ceiling does not repeat the exhaustion notice", async () => {
+  const harness = createEditorHarness({
+    completeSimple: (async () => makeCompletion([" completion"])) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  await harness.command("budget 1");
+
+  editor.setText("Review");
+  await flushAsyncWork();
+  editor.setText("Draft two");
+  await flushAsyncWork();
+  const notices = () =>
+    harness.notifications.filter((message) => message.includes("session budget exhausted")).length;
+  assert.equal(notices(), 1);
+
+  await harness.command("budget 1");
+  editor.setText("Draft three");
+  await flushAsyncWork();
+  assert.equal(notices(), 1, "an unchanged ceiling is not a new exhaustion state");
+
+  await harness.command("budget 2");
+  editor.setText("Draft four");
+  await flushAsyncWork();
+  editor.setText("Draft five");
+  await flushAsyncWork();
+  assert.equal(notices(), 2, "a real transition reports the new exhaustion state");
+});
+
+test("a new physical session does not inherit the previous session's restored ceiling", async () => {
+  let calls = 0;
+  const completeSimple = (async () => {
+    calls += 1;
+    return makeCompletion([" completion"]);
+  }) as CompleteSimple;
+  const harness = createEditorHarness({ completeSimple });
+  const editor = await harness.createEditor();
+  await harness.command("budget 1");
+  editor.setText("Review");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+
+  // Reload into the exhausted session, then move on to a brand new session.
+  const reloaded = createEditorHarness({ completeSimple });
+  reloaded.setEntries(harness.getEntries());
+  reloaded.setBranch(harness.getBranch());
+  await reloaded.createEditor();
+  await reloaded.command("status");
+  assert.match(reloaded.notifications.at(-1) ?? "", /budget=1\/1\(saved\)/);
+
+  reloaded.setSessionId("session-3");
+  reloaded.setEntries([]);
+  reloaded.setBranch([]);
+  await reloaded.emit("session_start");
+  await reloaded.command("status");
+  assert.match(reloaded.notifications.at(-1) ?? "", /budget=off\(flag\)/);
+
+  const freshEditor = reloaded.instantiateEditor();
+  freshEditor.setText("Draft in the new session");
+  await flushAsyncWork();
+  freshEditor.setText("Second draft in the new session");
+  await flushAsyncWork();
+  assert.equal(calls, 3, "a stale restored ceiling must not keep capping a new session");
 });

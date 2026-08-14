@@ -71,6 +71,7 @@ function createHarness(options: HarnessOptions = {}) {
   };
   const sessionManager = {
     getBranch: () => branch,
+    getEntries: () => branch,
     getLeafId: () => "leaf-1",
     getSessionId: () => options.sessionId ?? "session-1",
   };
