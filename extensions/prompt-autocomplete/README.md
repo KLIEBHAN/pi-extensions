@@ -43,6 +43,8 @@ Or enable it for the current interactive session:
 | Show current-session effectiveness and cost | `/prompt-autocomplete stats` |
 | Toggle streamed response previews | `/prompt-autocomplete stream on\|off\|toggle` |
 | Set and persist the minimum draft length | `/prompt-autocomplete min-chars <n>` |
+| Persist remaining runtime knobs | `/prompt-autocomplete set debounce-ms\|max-chars\|max-alternatives\|model` |
+| Inspect effective runtime knobs | `/prompt-autocomplete set` |
 
 Legacy fallbacks are available for terminals that forward them: `Ctrl+Tab`, `Alt+[`, and `Alt+]`.
 
@@ -71,11 +73,13 @@ pi \
 - `Ctrl+.` with no active suggestion is an explicit one-shot request and may bypass the main-agent-streaming, cooldown, and minimum-length gates. Model, authentication, slash-command, and path safety checks still apply.
 - Use `--prompt-autocomplete-debug` or `/prompt-autocomplete debug-on` for troubleshooting.
 
-Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) outrank the CLI flags for the rest of the process, including in sessions started later. `status` labels each toggle with its source, `(flag)`, `(saved)`, or `(session)`. Settings you never toggled keep following their flag.
+Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) and `/prompt-autocomplete set` outrank the CLI flags for the rest of the process, including in sessions started later. `status` labels each value with its source, `(flag)`, `(saved)`, or `(session)`. Settings you never toggled keep following their flag. Interactive `set` values outside the documented range are rejected rather than clamped; CLI flags still clamp.
+
+Changing `max-chars`, `max-alternatives`, or `model` cancels in-flight autocomplete work and drops the request caches. It does **not** start a replacement request. Changing `debounce-ms` only drops a waiting timer; an already-started provider call continues. Debug toggles change neither.
 
 #### Persistent settings
 
-`/prompt-autocomplete on`, `off`, and `min-chars <n>` are durable: the decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (falling back to `~/.config`; override the location with `PI_PROMPT_AUTOCOMPLETE_SETTINGS`) and applies to later processes without any CLI flag. An explicit CLI flag still outranks the saved value for that invocation — for `min-chars`, passing the default (`1`) is indistinguishable from not passing the flag and defers to the saved value. An enable decision is only recorded when the host actually installs the editor. The file stores nothing but these decisions; deleting it restores flag-only behaviour. `status` labels each value with its source.
+`/prompt-autocomplete on`, `off`, `min-chars <n>`, and `/prompt-autocomplete set` (`debounce-ms`, `max-chars`, `max-alternatives`, `model`) are durable: the decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (falling back to `~/.config`; override the location with `PI_PROMPT_AUTOCOMPLETE_SETTINGS`) and applies to later processes without any CLI flag. `/prompt-autocomplete min-chars` remains the canonical command; `set min-chars` dispatches to it. An explicit CLI flag still outranks the saved value for that invocation — for numeric knobs and the model flag, passing the registered default is indistinguishable from not passing the flag and defers to the saved value. `set model` validates syntax, registry presence, and auth before saving: a dedicated model must resolve, and `active` commits while no active model is known yet but is rejected when the known active model is unusable. `active` is an explicit sentinel for the session model, mixed-case model ids are preserved, and a cross-provider change restates the privacy notice. An enable decision is only recorded when the host actually installs the editor. The file stores nothing but these decisions; deleting it restores flag-only behaviour. `status` labels each value with its source, and success notices only claim durability when the file was actually written.
 
 ### Usage and cost accounting
 

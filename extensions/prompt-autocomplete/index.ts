@@ -25,9 +25,15 @@ import {
   describePromptAutocompleteModelSelection,
   describeSettingSource,
   DEFAULT_DEBOUNCE_MS,
+  DEBOUNCE_MS_MAX,
+  DEBOUNCE_MS_MIN,
   DEFAULT_MAX_ALTERNATIVES,
   DEFAULT_MAX_SUGGESTION_CHARS,
   DEFAULT_MIN_PROMPT_CHARS,
+  MAX_ALTERNATIVES_MAX,
+  MAX_ALTERNATIVES_MIN,
+  MAX_SUGGESTION_CHARS_MAX,
+  MAX_SUGGESTION_CHARS_MIN,
   DEFAULT_PREFERRED_MODEL,
   MIN_PROMPT_CHARS_MAX,
   MIN_PROMPT_CHARS_MIN,
@@ -44,6 +50,10 @@ import {
   normalizePromptSuggestions,
   parseBoundedIntFlag,
   parseExplicitBoundedIntFlag,
+  parseExplicitModelFlag,
+  parsePersistedModelRaw,
+  parseStrictBoundedInt,
+  persistableModelRaw,
   parsePartialPromptSuggestion,
   parsePromptAutocompleteModelSelection,
   parsePromptAutocompletePersistedSettings,
@@ -55,6 +65,7 @@ import {
   recordProviderUsage,
   resolveAutocompleteConversationId,
   resolveOverride,
+  resolvePersistedModelSelection,
   reusePromptAutocompleteSuggestions,
   sanitizeTerminalText,
   SequenceOwnedSlot,
@@ -97,6 +108,12 @@ const REQUEST_MAX_RETRY_DELAY_MS = 2_000;
 const FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_CACHE_TTL_MS = 60_000;
 const REQUEST_CACHE_MAX_ENTRIES = 128;
+const COMMAND_USAGE =
+  "Usage: /prompt-autocomplete [on|off|toggle|status|stats|min-chars <n>|set <key> [value]|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]";
+const SET_USAGE =
+  "Usage: /prompt-autocomplete set [debounce-ms <0-5000>|min-chars <0-500>|max-chars <16-1000>|max-alternatives <1-5>|model <provider/model|active>]";
+const PRIVACY_NOTICE =
+  "Requests send the current draft and recent conversation context to the selected model and may incur provider usage.";
 // Keymap audit vs. pi defaults (packages/tui/src/keybindings.ts +
 // packages/coding-agent/src/core/keybindings.ts): none of the keys below are bound
 // by pi's default keymap, so the editor can safely own them — including the
@@ -311,6 +328,10 @@ interface PromptAutocompleteSharedState {
   enabledFlagValue: boolean;
   /** Explicit min-chars flag value seen by applyEffectiveConfig, undefined when defaulted. */
   minPromptCharsFlagExplicit?: number;
+  debounceMsFlagExplicit?: number;
+  maxSuggestionCharsFlagExplicit?: number;
+  maxAlternativesFlagExplicit?: number;
+  modelFlagExplicit?: PromptAutocompleteModelSelection;
   /** Session-scoped request accounting; reset together with the cache. */
   usageStats: PromptAutocompleteUsageStats;
   currentModel?: Model<Api>;
@@ -342,6 +363,8 @@ interface PromptAutocompleteSharedState {
   ownsEditor?: () => boolean;
   refreshEditor?: (options?: SuggestionRefreshOptions) => void;
   cancelActiveRequest?: () => void;
+  /** Cancel a pending debounce timer without aborting an in-flight provider call. */
+  cancelScheduledRequest?: () => void;
   setStatusText?: (text: string | undefined) => void;
   setSpinnerActive?: (owner: string, active: boolean) => void;
   clearSpinner?: () => void;
@@ -471,11 +494,11 @@ interface SuggestionModelResolution {
  */
 function resolveSuggestionModelResolution(
   shared: PromptAutocompleteSharedState,
+  selection: PromptAutocompleteModelSelection = shared.config.modelSelection,
 ): SuggestionModelResolution {
   const registry = shared.modelRegistry;
   if (!registry) return { reason: "No model registry is available yet" };
 
-  const selection = shared.config.modelSelection;
   const requested = describePromptAutocompleteModelSelection(selection);
 
   if (selection.kind === "invalid") {
@@ -544,19 +567,29 @@ function parseConfig(pi: ExtensionAPI): PromptAutocompleteConfig {
     allowWhileStreaming: pi.getFlag("prompt-autocomplete-while-streaming") === true,
     streamResponses: parseOnOffFlag(pi.getFlag("prompt-autocomplete-stream"), DEFAULT_STREAM_RESPONSES),
     debug: pi.getFlag("prompt-autocomplete-debug") === true,
-    debounceMs: parseBoundedIntFlag(pi.getFlag("prompt-autocomplete-debounce-ms"), DEFAULT_DEBOUNCE_MS, 0, 5_000),
-    minPromptChars: parseBoundedIntFlag(pi.getFlag("prompt-autocomplete-min-chars"), DEFAULT_MIN_PROMPT_CHARS, 0, 500),
+    debounceMs: parseBoundedIntFlag(
+      pi.getFlag("prompt-autocomplete-debounce-ms"),
+      DEFAULT_DEBOUNCE_MS,
+      DEBOUNCE_MS_MIN,
+      DEBOUNCE_MS_MAX,
+    ),
+    minPromptChars: parseBoundedIntFlag(
+      pi.getFlag("prompt-autocomplete-min-chars"),
+      DEFAULT_MIN_PROMPT_CHARS,
+      MIN_PROMPT_CHARS_MIN,
+      MIN_PROMPT_CHARS_MAX,
+    ),
     maxSuggestionChars: parseBoundedIntFlag(
       pi.getFlag("prompt-autocomplete-max-chars"),
       DEFAULT_MAX_SUGGESTION_CHARS,
-      16,
-      1_000,
+      MAX_SUGGESTION_CHARS_MIN,
+      MAX_SUGGESTION_CHARS_MAX,
     ),
     maxAlternatives: parseBoundedIntFlag(
       pi.getFlag("prompt-autocomplete-max-alternatives"),
       DEFAULT_MAX_ALTERNATIVES,
-      1,
-      5,
+      MAX_ALTERNATIVES_MIN,
+      MAX_ALTERNATIVES_MAX,
     ),
     modelSelection: parsePromptAutocompleteModelSelection(pi.getFlag("prompt-autocomplete-model")),
   };
@@ -585,6 +618,25 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
     MIN_PROMPT_CHARS_MIN,
     MIN_PROMPT_CHARS_MAX,
   );
+  shared.debounceMsFlagExplicit = parseExplicitBoundedIntFlag(
+    pi.getFlag("prompt-autocomplete-debounce-ms"),
+    DEFAULT_DEBOUNCE_MS,
+    DEBOUNCE_MS_MIN,
+    DEBOUNCE_MS_MAX,
+  );
+  shared.maxSuggestionCharsFlagExplicit = parseExplicitBoundedIntFlag(
+    pi.getFlag("prompt-autocomplete-max-chars"),
+    DEFAULT_MAX_SUGGESTION_CHARS,
+    MAX_SUGGESTION_CHARS_MIN,
+    MAX_SUGGESTION_CHARS_MAX,
+  );
+  shared.maxAlternativesFlagExplicit = parseExplicitBoundedIntFlag(
+    pi.getFlag("prompt-autocomplete-max-alternatives"),
+    DEFAULT_MAX_ALTERNATIVES,
+    MAX_ALTERNATIVES_MIN,
+    MAX_ALTERNATIVES_MAX,
+  );
+  shared.modelFlagExplicit = parseExplicitModelFlag(pi.getFlag("prompt-autocomplete-model"));
   shared.config = {
     ...flagConfig,
     allowWhileStreaming: resolveOverride(
@@ -597,8 +649,31 @@ function applyEffectiveConfig(pi: ExtensionAPI, shared: PromptAutocompleteShared
       shared.runtimeOverrides.minPromptChars,
       shared.minPromptCharsFlagExplicit,
       shared.persistedSettings.minPromptChars,
-      flagConfig.minPromptChars,
+      DEFAULT_MIN_PROMPT_CHARS,
     ).value,
+    debounceMs: resolvePersistedNumber(
+      shared.runtimeOverrides.debounceMs,
+      shared.debounceMsFlagExplicit,
+      shared.persistedSettings.debounceMs,
+      DEFAULT_DEBOUNCE_MS,
+    ).value,
+    maxSuggestionChars: resolvePersistedNumber(
+      shared.runtimeOverrides.maxSuggestionChars,
+      shared.maxSuggestionCharsFlagExplicit,
+      shared.persistedSettings.maxSuggestionChars,
+      DEFAULT_MAX_SUGGESTION_CHARS,
+    ).value,
+    maxAlternatives: resolvePersistedNumber(
+      shared.runtimeOverrides.maxAlternatives,
+      shared.maxAlternativesFlagExplicit,
+      shared.persistedSettings.maxAlternatives,
+      DEFAULT_MAX_ALTERNATIVES,
+    ).value,
+    modelSelection: resolvePersistedModelSelection(
+      shared.runtimeOverrides.modelSelection,
+      shared.modelFlagExplicit,
+      parsePersistedModelRaw(shared.persistedSettings.model),
+    ).selection,
   };
 }
 
@@ -654,12 +729,25 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     `editor=${editorState}`,
     shared.editorBlockedReason ? `editor-blocked=${truncateDebug(shared.editorBlockedReason, 90)}` : undefined,
     `model=${truncateDebug(formatModelLabel(resolvedModel), 90)}`,
-    `requested-model=${requestedModel}`,
+    `requested-model=${requestedModel}(${
+      resolvePersistedModelSelection(
+        shared.runtimeOverrides.modelSelection,
+        shared.modelFlagExplicit,
+        parsePersistedModelRaw(shared.persistedSettings.model),
+      ).source
+    })`,
     `while-streaming=${shared.config.allowWhileStreaming ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.allowWhileStreaming)})`,
     `stream=${shared.config.streamResponses ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.streamResponses)})`,
     `request-path=${shared.config.streamResponses && shared.streamSimple ? "stream" : shared.config.streamResponses ? "complete-compat" : "complete"}`,
     `debug=${shared.config.debug ? "yes" : "no"}(${describeSettingSource(shared.runtimeOverrides.debug)})`,
-    `debounce=${shared.config.debounceMs}ms`,
+    `debounce=${shared.config.debounceMs}ms(${
+      resolvePersistedNumber(
+        shared.runtimeOverrides.debounceMs,
+        shared.debounceMsFlagExplicit,
+        shared.persistedSettings.debounceMs,
+        DEFAULT_DEBOUNCE_MS,
+      ).source
+    })`,
     `min-chars=${shared.config.minPromptChars}(${
       resolvePersistedNumber(
         shared.runtimeOverrides.minPromptChars,
@@ -668,8 +756,22 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
         DEFAULT_MIN_PROMPT_CHARS,
       ).source
     })`,
-    `max-suggestion-chars=${shared.config.maxSuggestionChars}`,
-    `max-alternatives=${shared.config.maxAlternatives}`,
+    `max-suggestion-chars=${shared.config.maxSuggestionChars}(${
+      resolvePersistedNumber(
+        shared.runtimeOverrides.maxSuggestionChars,
+        shared.maxSuggestionCharsFlagExplicit,
+        shared.persistedSettings.maxSuggestionChars,
+        DEFAULT_MAX_SUGGESTION_CHARS,
+      ).source
+    })`,
+    `max-alternatives=${shared.config.maxAlternatives}(${
+      resolvePersistedNumber(
+        shared.runtimeOverrides.maxAlternatives,
+        shared.maxAlternativesFlagExplicit,
+        shared.persistedSettings.maxAlternatives,
+        DEFAULT_MAX_ALTERNATIVES,
+      ).source
+    })`,
     `cache-size=${shared.requestCache.size}`,
     `usage=${formatUsageStats(shared.usageStats)}`,
     `state=${shared.debugState || "idle"}`,
@@ -1564,6 +1666,20 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.setSuggestions([]);
   }
 
+  /**
+   * Drop a waiting debounce without aborting an in-flight provider call.
+   *
+   * A debounce-only config change must not increment the request sequence or
+   * release the active subscription: those belong to work that already started.
+   */
+  cancelScheduledRequest(): void {
+    if (!this.debounceTimer) return;
+    clearTimeout(this.debounceTimer);
+    this.debounceTimer = undefined;
+    const pending = this.pendingRequests.take();
+    this.deactivateSpinner(pending?.spinnerOwner);
+  }
+
   private clearPendingRequestIfOwned(seq: number): void {
     this.pendingRequests.clearIfOwned(seq);
   }
@@ -1592,6 +1708,7 @@ function releaseEditorRuntime(shared: PromptAutocompleteSharedState): void {
   clearDebugUi(shared);
   shared.refreshEditor = undefined;
   shared.cancelActiveRequest = undefined;
+  shared.cancelScheduledRequest = undefined;
   shared.setStatusText = undefined;
   shared.setSpinnerActive = undefined;
   shared.clearSpinner = undefined;
@@ -1707,6 +1824,10 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
       if (activationId !== shared.activationId) return;
       editor.cancelActiveRequest();
     };
+    shared.cancelScheduledRequest = () => {
+      if (activationId !== shared.activationId) return;
+      editor.cancelScheduledRequest();
+    };
     return editor;
   };
 
@@ -1762,6 +1883,7 @@ function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedSt
 function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
   shared.cancelActiveRequest?.();
   shared.cancelActiveRequest = undefined;
+  shared.cancelScheduledRequest = undefined;
   applyEffectiveConfig(pi, shared);
   // A host that never installs custom editors stays inactive for the rest of
   // the process, so flags must not re-enable it in a later session either.
@@ -1921,9 +2043,11 @@ function setMinPromptChars(
   const changed = shared.config.minPromptChars !== parsed;
   shared.config.minPromptChars = parsed;
   shared.runtimeOverrides.minPromptChars = parsed;
-  persistSettingsDecision(ctx, shared, { minPromptChars: parsed });
+  const persisted = persistSettingsDecision(ctx, shared, { minPromptChars: parsed });
   ctx.ui.notify(
-    `Prompt autocomplete min-chars set to ${parsed} (saved for future sessions)`,
+    `Prompt autocomplete min-chars set to ${parsed}${
+      persisted ? " (saved for future sessions)" : " (session only — could not save for future sessions)"
+    }`,
     "info",
   );
 
@@ -1942,19 +2066,224 @@ function persistSettingsDecision(
   ctx: ExtensionContext,
   shared: PromptAutocompleteSharedState,
   patch: Partial<PromptAutocompletePersistedSettings>,
-): void {
+): boolean {
   shared.persistedSettings = { ...shared.persistedSettings, ...patch };
   const store = shared.settingsStore;
-  if (!store) return;
+  if (!store) return false;
   try {
     store.save(shared.persistedSettings);
+    return true;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(
       `Prompt autocomplete could not save the setting: ${truncateDebug(reason, 90)}`,
       "warning",
     );
+    return false;
   }
+}
+
+function requestIdentityFingerprint(shared: PromptAutocompleteSharedState): string {
+  return JSON.stringify({
+    model: formatModelLabel(resolveSuggestionModel(shared)),
+    maxAlternatives: shared.config.maxAlternatives,
+    maxSuggestionChars: shared.config.maxSuggestionChars,
+  });
+}
+
+function invalidateRequestCaches(shared: PromptAutocompleteSharedState): void {
+  shared.requestCache.clear();
+  shared.prefixReuseCache.clear();
+  cancelAllCoalescedRequests(shared.inFlightRequests);
+}
+
+interface ConfigTransaction {
+  apply(): void;
+  persist?: Partial<PromptAutocompletePersistedSettings>;
+  /** When true, abort in-flight work and drop caches. Debounce-only changes stay false. */
+  affectsRequestIdentity: boolean;
+  notify: string;
+}
+
+function applyConfigTransaction(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  transaction: ConfigTransaction,
+): void {
+  const previousIdentity = requestIdentityFingerprint(shared);
+  transaction.apply();
+  const persisted = transaction.persist
+    ? persistSettingsDecision(ctx, shared, transaction.persist)
+    : false;
+  const identityChanged = transaction.affectsRequestIdentity
+    && requestIdentityFingerprint(shared) !== previousIdentity;
+  if (identityChanged) {
+    shared.cancelActiveRequest?.();
+    invalidateRequestCaches(shared);
+    updateDebugState(shared, "configured", transaction.notify);
+  } else if (!transaction.affectsRequestIdentity) {
+    shared.cancelScheduledRequest?.();
+    updateDebugState(shared, "configured", transaction.notify);
+  }
+  // A failed store write already warned above; the success notice must not
+  // contradict it by claiming the decision is durable.
+  ctx.ui.notify(
+    transaction.persist
+      ? `${transaction.notify}${persisted ? " (saved for future sessions)" : " (session only — could not save for future sessions)"}`
+      : transaction.notify,
+    "info",
+  );
+}
+
+function setBoundedConfigField(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  options: {
+    key: string;
+    field: "debounceMs" | "maxSuggestionChars" | "maxAlternatives";
+    min: number;
+    max: number;
+    value: string;
+    affectsRequestIdentity: boolean;
+  },
+): void {
+  const parsed = parseStrictBoundedInt(options.value, options.min, options.max);
+  if (parsed === undefined) {
+    ctx.ui.notify(
+      `Usage: /prompt-autocomplete set ${options.key} <${options.min}-${options.max}>`,
+      "warning",
+    );
+    return;
+  }
+  applyConfigTransaction(ctx, shared, {
+    apply: () => {
+      shared.config[options.field] = parsed;
+      shared.runtimeOverrides[options.field] = parsed;
+    },
+    persist: { [options.field]: parsed },
+    affectsRequestIdentity: options.affectsRequestIdentity,
+    notify: `Prompt autocomplete ${options.key} set to ${parsed}`,
+  });
+}
+
+function setModelSetting(ctx: ExtensionContext, shared: PromptAutocompleteSharedState, raw: string): void {
+  const selection = parsePromptAutocompleteModelSelection(raw);
+  if (selection.kind === "invalid") {
+    ctx.ui.notify(
+      `Prompt autocomplete model ${describePromptAutocompleteModelSelection(selection)} is not a provider/model reference.`,
+      "warning",
+    );
+    return;
+  }
+
+  if (selection.kind === "dedicated") {
+    const resolution = resolveSuggestionModelResolution(shared, selection);
+    if (!resolution.model) {
+      ctx.ui.notify(
+        resolution.refusedRequest ?? resolution.reason ?? SET_USAGE,
+        "warning",
+      );
+      return;
+    }
+  } else if (shared.currentModel) {
+    // `active` is a selector that follows the session model, so it stays
+    // committable while no model is known yet. Once the target is known it
+    // must be usable: silently switching a working dedicated model to an
+    // unusable active model would cancel live work and deaden autocomplete.
+    const resolution = resolveSuggestionModelResolution(shared, selection);
+    if (!resolution.model) {
+      ctx.ui.notify(
+        `Prompt autocomplete could not set the model to active: ${
+          resolution.reason ?? "the current active model is not usable"
+        }.`,
+        "warning",
+      );
+      return;
+    }
+  }
+
+  // Compare the configured destinations, not the currently usable models: an
+  // unusable old model still defines where requests were meant to go, and the
+  // provider change must restate the privacy notice either way.
+  const configured = shared.config.modelSelection;
+  const currentProvider = configured.kind === "dedicated" ? configured.ref.provider : shared.currentModel?.provider;
+  const nextProvider = selection.kind === "dedicated"
+    ? selection.ref.provider
+    : shared.currentModel?.provider;
+  if (nextProvider && currentProvider && nextProvider !== currentProvider) {
+    ctx.ui.notify(PRIVACY_NOTICE, "info");
+  }
+
+  const persisted = persistableModelRaw(selection);
+  applyConfigTransaction(ctx, shared, {
+    apply: () => {
+      shared.config.modelSelection = selection;
+      shared.runtimeOverrides.modelSelection = selection;
+      shared.reportedModelRefusals.clear();
+    },
+    persist: persisted === undefined ? undefined : { model: persisted },
+    affectsRequestIdentity: true,
+    notify: selection.kind === "active"
+      ? "Prompt autocomplete model set to current active model"
+      : `Prompt autocomplete model set to ${describePromptAutocompleteModelSelection(selection)}`,
+  });
+}
+
+function handleSetCommand(ctx: ExtensionContext, shared: PromptAutocompleteSharedState, rest: string): void {
+  if (!rest) {
+    ctx.ui.notify(formatStatus(shared), "info");
+    return;
+  }
+  const space = rest.search(/\s/);
+  const key = (space < 0 ? rest : rest.slice(0, space)).toLowerCase();
+  const value = space < 0 ? "" : rest.slice(space + 1).trim();
+
+  if (key === "min-chars") {
+    setMinPromptChars(ctx, shared, value || undefined);
+    return;
+  }
+  if (key === "debounce-ms") {
+    setBoundedConfigField(ctx, shared, {
+      key: "debounce-ms",
+      field: "debounceMs",
+      min: DEBOUNCE_MS_MIN,
+      max: DEBOUNCE_MS_MAX,
+      value,
+      affectsRequestIdentity: false,
+    });
+    return;
+  }
+  if (key === "max-chars") {
+    setBoundedConfigField(ctx, shared, {
+      key: "max-chars",
+      field: "maxSuggestionChars",
+      min: MAX_SUGGESTION_CHARS_MIN,
+      max: MAX_SUGGESTION_CHARS_MAX,
+      value,
+      affectsRequestIdentity: true,
+    });
+    return;
+  }
+  if (key === "max-alternatives") {
+    setBoundedConfigField(ctx, shared, {
+      key: "max-alternatives",
+      field: "maxAlternatives",
+      min: MAX_ALTERNATIVES_MIN,
+      max: MAX_ALTERNATIVES_MAX,
+      value,
+      affectsRequestIdentity: true,
+    });
+    return;
+  }
+  if (key === "model") {
+    if (!value) {
+      ctx.ui.notify("Usage: /prompt-autocomplete set model <provider/model|active>", "warning");
+      return;
+    }
+    setModelSetting(ctx, shared, value);
+    return;
+  }
+  ctx.ui.notify(SET_USAGE, "warning");
 }
 
 function persistEnabledDecision(
@@ -2005,7 +2334,7 @@ function notifyPromptAutocompleteEnabled(
     `${formatPrimaryKey(CYCLE_NEXT_KEYS)} also forces a one-shot suggestion when none is shown (even while the agent works).`;
   const resolution = resolveSuggestionModelResolution(shared);
   const resolvedModel = resolution.model;
-  const privacyNotice = "Requests send the current draft and recent conversation context to the selected model and may incur provider usage.";
+  const privacyNotice = PRIVACY_NOTICE;
 
   if (!resolvedModel && resolution.refusedRequest) {
     // A refused explicit request must be reported on every enable path,
@@ -2263,19 +2592,26 @@ export function createPromptAutocompleteExtension(
         return;
       }
 
-      const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
-      const command = parts[0] || "status";
+      const trimmed = args.trim();
+      const space = trimmed.search(/\s/);
+      const command = (space < 0 ? trimmed : trimmed.slice(0, space)).toLowerCase() || "status";
+      const rest = space < 0 ? "" : trimmed.slice(space + 1).trim();
+      const firstRestToken = rest.split(/\s+/, 1)[0];
 
       if (command === "while-streaming") {
-        setWhileStreaming(ctx, shared, parts[1]);
+        setWhileStreaming(ctx, shared, firstRestToken || undefined);
         return;
       }
       if (command === "stream") {
-        setStreamResponses(ctx, shared, parts[1]);
+        setStreamResponses(ctx, shared, firstRestToken || undefined);
         return;
       }
       if (command === "min-chars") {
-        setMinPromptChars(ctx, shared, parts[1]);
+        setMinPromptChars(ctx, shared, firstRestToken || undefined);
+        return;
+      }
+      if (command === "set") {
+        handleSetCommand(ctx, shared, rest);
         return;
       }
 
@@ -2287,10 +2623,7 @@ export function createPromptAutocompleteExtension(
         return;
       }
 
-      ctx.ui.notify(
-        "Usage: /prompt-autocomplete [on|off|toggle|status|stats|min-chars <n>|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
-        "warning",
-      );
+      ctx.ui.notify(COMMAND_USAGE, "warning");
     },
   });
   };

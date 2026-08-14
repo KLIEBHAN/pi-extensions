@@ -12,11 +12,18 @@ import {
   computeRequestMaxTokens,
   createOwnerRefCounter,
   createPromptAutocompleteUsageStats,
+  DEFAULT_DEBOUNCE_MS,
   DEFAULT_MAX_ALTERNATIVES,
   DEFAULT_MAX_SUGGESTION_CHARS,
   DEFAULT_MIN_PROMPT_CHARS,
   DEFAULT_PREFERRED_MODEL,
   DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED,
+  DEBOUNCE_MS_MAX,
+  DEBOUNCE_MS_MIN,
+  MAX_ALTERNATIVES_MAX,
+  MAX_ALTERNATIVES_MIN,
+  MAX_SUGGESTION_CHARS_MAX,
+  MAX_SUGGESTION_CHARS_MIN,
   describePromptAutocompleteModelSelection,
   describeSettingSource,
   ExpiringLruCache,
@@ -41,9 +48,14 @@ import {
   parseModelRef,
   parsePromptAutocompleteModelSelection,
   parseExplicitBoundedIntFlag,
+  parseExplicitModelFlag,
+  parsePersistedModelRaw,
   parsePromptAutocompletePersistedSettings,
+  parseStrictBoundedInt,
+  persistableModelRaw,
   resolveAutocompleteConversationId,
   resolvePersistedEnabled,
+  resolvePersistedModelSelection,
   resolvePersistedNumber,
   serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
@@ -1366,4 +1378,103 @@ test("explicit bounded int flag parsing treats default and invalid input as unse
   assert.equal(parseExplicitBoundedIntFlag("abc", 1, 0, 500), undefined);
   assert.equal(parseExplicitBoundedIntFlag("0", 1, 0, 500), 0);
   assert.equal(parseExplicitBoundedIntFlag("750", 1, 0, 500), 500);
+});
+
+test("slash-command integers reject malformed and out-of-range values instead of clamping", () => {
+  assert.equal(parseStrictBoundedInt("0", DEBOUNCE_MS_MIN, DEBOUNCE_MS_MAX), 0);
+  assert.equal(parseStrictBoundedInt("5000", DEBOUNCE_MS_MIN, DEBOUNCE_MS_MAX), 5_000);
+  assert.equal(parseStrictBoundedInt("16", MAX_SUGGESTION_CHARS_MIN, MAX_SUGGESTION_CHARS_MAX), 16);
+  assert.equal(parseStrictBoundedInt("5", MAX_ALTERNATIVES_MIN, MAX_ALTERNATIVES_MAX), 5);
+  assert.equal(parseStrictBoundedInt(undefined, 0, 5), undefined);
+  assert.equal(parseStrictBoundedInt("", 0, 5), undefined);
+  assert.equal(parseStrictBoundedInt("abc", 0, 5), undefined);
+  assert.equal(parseStrictBoundedInt("1.5", 0, 5), undefined);
+  assert.equal(parseStrictBoundedInt("08", 0, 5000), undefined);
+  assert.equal(parseStrictBoundedInt("5001", DEBOUNCE_MS_MIN, DEBOUNCE_MS_MAX), undefined);
+  assert.equal(parseStrictBoundedInt("15", MAX_SUGGESTION_CHARS_MIN, MAX_SUGGESTION_CHARS_MAX), undefined);
+  assert.equal(parseStrictBoundedInt("6", MAX_ALTERNATIVES_MIN, MAX_ALTERNATIVES_MAX), undefined);
+});
+
+test("persisted runtime knobs accept only bounded integers and valid model sentinels", () => {
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"debounceMs":0}'), { debounceMs: 0 });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"debounceMs":5000}'), { debounceMs: 5_000 });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"debounceMs":5001}'), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"maxSuggestionChars":16}'), { maxSuggestionChars: 16 });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"maxSuggestionChars":15}'), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"maxAlternatives":5}'), { maxAlternatives: 5 });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"maxAlternatives":6}'), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"model":"active"}'), { model: "active" });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"model":" openai/GPT-5.4-Mini "}'), {
+    model: "openai/GPT-5.4-Mini",
+  });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"model":"malformed"}'), {});
+  assert.deepEqual(parsePromptAutocompletePersistedSettings('{"model":""}'), {});
+
+  const roundTrip = serializePromptAutocompletePersistedSettings({
+    enabled: true,
+    debounceMs: DEFAULT_DEBOUNCE_MS,
+    maxSuggestionChars: DEFAULT_MAX_SUGGESTION_CHARS,
+    maxAlternatives: DEFAULT_MAX_ALTERNATIVES,
+    model: "openai/GPT-5.4-Mini",
+  });
+  assert.deepEqual(parsePromptAutocompletePersistedSettings(roundTrip), {
+    enabled: true,
+    debounceMs: DEFAULT_DEBOUNCE_MS,
+    maxSuggestionChars: DEFAULT_MAX_SUGGESTION_CHARS,
+    maxAlternatives: DEFAULT_MAX_ALTERNATIVES,
+    model: "openai/GPT-5.4-Mini",
+  });
+});
+
+test("explicit model flags keep active as a sentinel and preserve mixed-case dedicated ids", () => {
+  assert.equal(parseExplicitModelFlag(undefined), undefined);
+  assert.equal(parseExplicitModelFlag(DEFAULT_PREFERRED_MODEL), undefined);
+  assert.deepEqual(parseExplicitModelFlag("active"), { kind: "active" });
+  assert.deepEqual(parseExplicitModelFlag("Active"), { kind: "active" });
+  assert.deepEqual(parseExplicitModelFlag(" openai/GPT-5.4-Mini "), {
+    kind: "dedicated",
+    ref: { provider: "openai", id: "GPT-5.4-Mini" },
+    raw: "openai/GPT-5.4-Mini",
+  });
+  assert.deepEqual(parseExplicitModelFlag("malformed"), { kind: "invalid", raw: "malformed" });
+
+  assert.equal(persistableModelRaw({ kind: "active" }), "active");
+  assert.equal(
+    persistableModelRaw({ kind: "dedicated", ref: { provider: "openai", id: "GPT-5.4-Mini" }, raw: "openai/GPT-5.4-Mini" }),
+    "openai/GPT-5.4-Mini",
+  );
+  assert.equal(persistableModelRaw({ kind: "invalid", raw: "nope" }), undefined);
+  assert.deepEqual(parsePersistedModelRaw("active"), { kind: "active" });
+  assert.equal(parsePersistedModelRaw(""), undefined);
+  assert.equal(parsePersistedModelRaw("   "), undefined);
+  assert.equal(parsePersistedModelRaw("malformed"), undefined);
+});
+
+test("model selection resolution ranks session over explicit flag over saved over default", () => {
+  const dedicated = parsePromptAutocompleteModelSelection("openai/GPT-5.4-Mini");
+  const saved = parsePromptAutocompleteModelSelection("anthropic/claude");
+  assert.deepEqual(resolvePersistedModelSelection(undefined, undefined, undefined), {
+    selection: { kind: "active" },
+    source: "flag",
+  });
+  assert.deepEqual(resolvePersistedModelSelection(undefined, undefined, saved), {
+    selection: saved,
+    source: "saved",
+  });
+  assert.deepEqual(resolvePersistedModelSelection(undefined, dedicated, saved), {
+    selection: dedicated,
+    source: "flag",
+  });
+  assert.deepEqual(resolvePersistedModelSelection({ kind: "active" }, dedicated, saved), {
+    selection: { kind: "active" },
+    source: "session",
+  });
+});
+
+test("prompt-autocomplete set persists remaining knobs through the settings store", () => {
+  const source = readFileSync(new URL("../extensions/prompt-autocomplete/index.ts", import.meta.url), "utf8");
+  assert.match(source, /handleSetCommand/);
+  assert.match(source, /cancelScheduledRequest/);
+  assert.match(source, /affectsRequestIdentity/);
+  assert.doesNotMatch(source, /coalescedJoins/);
 });
