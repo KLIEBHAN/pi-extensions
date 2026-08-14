@@ -2043,9 +2043,11 @@ function setMinPromptChars(
   const changed = shared.config.minPromptChars !== parsed;
   shared.config.minPromptChars = parsed;
   shared.runtimeOverrides.minPromptChars = parsed;
-  persistSettingsDecision(ctx, shared, { minPromptChars: parsed });
+  const persisted = persistSettingsDecision(ctx, shared, { minPromptChars: parsed });
   ctx.ui.notify(
-    `Prompt autocomplete min-chars set to ${parsed} (saved for future sessions)`,
+    `Prompt autocomplete min-chars set to ${parsed}${
+      persisted ? " (saved for future sessions)" : " (session only — could not save for future sessions)"
+    }`,
     "info",
   );
 
@@ -2064,18 +2066,20 @@ function persistSettingsDecision(
   ctx: ExtensionContext,
   shared: PromptAutocompleteSharedState,
   patch: Partial<PromptAutocompletePersistedSettings>,
-): void {
+): boolean {
   shared.persistedSettings = { ...shared.persistedSettings, ...patch };
   const store = shared.settingsStore;
-  if (!store) return;
+  if (!store) return false;
   try {
     store.save(shared.persistedSettings);
+    return true;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(
       `Prompt autocomplete could not save the setting: ${truncateDebug(reason, 90)}`,
       "warning",
     );
+    return false;
   }
 }
 
@@ -2108,7 +2112,9 @@ function applyConfigTransaction(
 ): void {
   const previousIdentity = requestIdentityFingerprint(shared);
   transaction.apply();
-  if (transaction.persist) persistSettingsDecision(ctx, shared, transaction.persist);
+  const persisted = transaction.persist
+    ? persistSettingsDecision(ctx, shared, transaction.persist)
+    : false;
   const identityChanged = transaction.affectsRequestIdentity
     && requestIdentityFingerprint(shared) !== previousIdentity;
   if (identityChanged) {
@@ -2119,7 +2125,14 @@ function applyConfigTransaction(
     shared.cancelScheduledRequest?.();
     updateDebugState(shared, "configured", transaction.notify);
   }
-  ctx.ui.notify(transaction.notify, "info");
+  // A failed store write already warned above; the success notice must not
+  // contradict it by claiming the decision is durable.
+  ctx.ui.notify(
+    transaction.persist
+      ? `${transaction.notify}${persisted ? " (saved for future sessions)" : " (session only — could not save for future sessions)"}`
+      : transaction.notify,
+    "info",
+  );
 }
 
 function setBoundedConfigField(
@@ -2149,7 +2162,7 @@ function setBoundedConfigField(
     },
     persist: { [options.field]: parsed },
     affectsRequestIdentity: options.affectsRequestIdentity,
-    notify: `Prompt autocomplete ${options.key} set to ${parsed} (saved for future sessions)`,
+    notify: `Prompt autocomplete ${options.key} set to ${parsed}`,
   });
 }
 
@@ -2172,12 +2185,31 @@ function setModelSetting(ctx: ExtensionContext, shared: PromptAutocompleteShared
       );
       return;
     }
+  } else if (shared.currentModel) {
+    // `active` is a selector that follows the session model, so it stays
+    // committable while no model is known yet. Once the target is known it
+    // must be usable: silently switching a working dedicated model to an
+    // unusable active model would cancel live work and deaden autocomplete.
+    const resolution = resolveSuggestionModelResolution(shared, selection);
+    if (!resolution.model) {
+      ctx.ui.notify(
+        `Prompt autocomplete could not set the model to active: ${
+          resolution.reason ?? "the current active model is not usable"
+        }.`,
+        "warning",
+      );
+      return;
+    }
   }
 
+  // Compare the configured destinations, not the currently usable models: an
+  // unusable old model still defines where requests were meant to go, and the
+  // provider change must restate the privacy notice either way.
+  const configured = shared.config.modelSelection;
+  const currentProvider = configured.kind === "dedicated" ? configured.ref.provider : shared.currentModel?.provider;
   const nextProvider = selection.kind === "dedicated"
     ? selection.ref.provider
     : shared.currentModel?.provider;
-  const currentProvider = resolveSuggestionModel(shared)?.provider;
   if (nextProvider && currentProvider && nextProvider !== currentProvider) {
     ctx.ui.notify(PRIVACY_NOTICE, "info");
   }
@@ -2192,8 +2224,8 @@ function setModelSetting(ctx: ExtensionContext, shared: PromptAutocompleteShared
     persist: persisted === undefined ? undefined : { model: persisted },
     affectsRequestIdentity: true,
     notify: selection.kind === "active"
-      ? "Prompt autocomplete model set to current active model (saved for future sessions)"
-      : `Prompt autocomplete model set to ${describePromptAutocompleteModelSelection(selection)} (saved for future sessions)`,
+      ? "Prompt autocomplete model set to current active model"
+      : `Prompt autocomplete model set to ${describePromptAutocompleteModelSelection(selection)}`,
   });
 }
 

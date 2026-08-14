@@ -763,6 +763,67 @@ test("an invalid or unusable set model leaves the previous config and does not p
   assert.match(lastStatus(harness), /debounce=100ms\(saved\)/);
 });
 
+test("set model active is rejected while the known active model is unusable", async () => {
+  const harness = createHarness({
+    savedSettings: { enabled: true, model: "openai/gpt-mini" },
+    hasConfiguredAuth: (model) => model.provider === "openai",
+  });
+  await emit(harness, "session_start");
+
+  await command(harness, "set model active");
+  assert.match(lastStatus(harness), /could not set the model to active/);
+  assert.equal(harness.settingsSaves.length, 0);
+  assert.equal(harness.getStoredSettings().model, "openai/gpt-mini");
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /requested-model=openai\/gpt-mini\(saved\)/);
+});
+
+test("set model active stays committable when no active model is known yet", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  await emit(harness, "session_start");
+  // A model event without a model clears the known active model, as on sparse
+  // hosts that never forward one.
+  await emit(harness, "model_select");
+
+  await command(harness, "set model active");
+  assert.equal(harness.getStoredSettings().model, "active");
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /requested-model=current active model\(session\)/);
+});
+
+test("a cross-provider change restates the privacy notice even when the old model is unusable", async () => {
+  const harness = createHarness({
+    savedSettings: { enabled: true, model: "openai/gpt-mini" },
+    findModel: (provider) => (provider === "openai" ? undefined : { provider, id: "model" }),
+  });
+  await emit(harness, "session_start");
+
+  await command(harness, "set model active");
+  assert.ok(
+    harness.notifications.some((entry) =>
+      entry.message.includes("current draft and recent conversation context")
+    ),
+    "a provider change from an unusable dedicated model still restates the privacy notice",
+  );
+  assert.equal(harness.getStoredSettings().model, "active");
+});
+
+test("a failed settings save does not claim durability in the success notice", async () => {
+  const harness = createHarness({ enabled: true, failingSettingsSave: true });
+  await emit(harness, "session_start");
+
+  await command(harness, "set max-chars 240");
+  const messages = harness.notifications.map((entry) => entry.message);
+  assert.ok(messages.some((message) => message.includes("could not save the setting")));
+  assert.ok(messages.some((message) => message.includes("session only")));
+  assert.ok(!messages.some((message) => message.includes("saved for future sessions")));
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /max-suggestion-chars=240\(session\)/);
+});
+
 test("an explicit non-default runtime flag outranks the saved set value", async () => {
   const harness = createHarness({
     savedSettings: { enabled: true, debounceMs: 100, maxSuggestionChars: 240, maxAlternatives: 5, model: "openai/saved" },
