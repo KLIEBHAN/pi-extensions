@@ -61,6 +61,7 @@ function createHarness(options: HarnessOptions = {}) {
   const sessionManager = {
     getBranch: () => [],
     getLeafId: () => "leaf-1",
+    getSessionId: () => "session-1",
   };
 
   const hostUi = options.omitEditorSlot

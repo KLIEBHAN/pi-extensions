@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.5/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.3.0/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -67,7 +67,7 @@ pi \
 - Changing `/prompt-autocomplete stream` cancels active autocomplete work but does **not** start a replacement request; the selected path applies to the next edit or manual one-shot.
 - Partial text advances monotonically: Latin text waits for complete word boundaries, while CJK and other no-space scripts remain grapheme-safe. Alternatives appear only after the response finishes.
 - `Tab` accepts all partial text currently visible. `Ctrl+Space` accepts only its next visible word/chunk. Both cancel that stream, and unlike accepting a completed suggestion, neither automatically starts another paid request.
-- Suggestions pause while the **main agent** is streaming by default. This is separate from streamed autocomplete responses. Use `--prompt-autocomplete-while-streaming` or `/prompt-autocomplete while-streaming on` to change that behavior.
+- Suggestions pause while the **main agent** is working by default, and stay paused until `agent_settled` on hosts that emit it. This is separate from streamed autocomplete responses. Use `--prompt-autocomplete-while-streaming` or `/prompt-autocomplete while-streaming on` to change that behavior.
 - `Ctrl+.` with no active suggestion is an explicit one-shot request and may bypass the main-agent-streaming, cooldown, and minimum-length gates. Model, authentication, slash-command, and path safety checks still apply.
 - Use `--prompt-autocomplete-debug` or `/prompt-autocomplete debug-on` for troubleshooting.
 
@@ -111,13 +111,13 @@ Enabling Prompt Autocomplete permits additional model requests. Streaming change
 - the latest user and assistant messages,
 - a bounded recent-conversation summary.
 
-The active conversation leaf identity is used only in the local in-memory cache key and is not sent to the provider.
+The newest conversation entry that affects autocomplete context is used only in the local in-memory cache key and is not sent to the provider. Custom, label, and session-info entries can move Pi's raw leaf without invalidating that key.
 
 By default, requests use the active model. A dedicated `--prompt-autocomplete-model` may send this context to a different provider, so an explicitly requested model that cannot be used suppresses requests instead of falling back to the active one. Requests can incur token charges and consume provider rate limits.
 
 Provider errors, raw responses, model identifiers, and host diagnostics are stripped of terminal control sequences and of bidirectional or invisible formatting characters before they are displayed, so untrusted text cannot repaint the terminal, hide output, drive OSC clipboard and hyperlink escapes, or misrepresent what it names.
 
-Successful results are cached only in memory for up to 60 seconds; a terminal entry retains its base draft in process memory for the prefix comparison. If the draft then grows by an exact prefix of a cached suggestion, Prompt Autocomplete removes the text you typed and shows the remaining suffix locally instead of issuing another provider request. Prefix reuse is forward-only, stays scoped to the same conversation leaf, model, bounded context and output configuration, and never uses partial streamed text. Divergence, expiry or any context change falls through to a fresh request. The caches are bounded and are cleared on session reset or when the extension is disabled. Provider failures are not cached.
+Successful results are cached only in memory for up to 60 seconds; a terminal entry retains its base draft in process memory for the prefix comparison. If the draft then grows by an exact prefix of a cached suggestion, Prompt Autocomplete removes the text you typed and shows the remaining suffix locally instead of issuing another provider request. Prefix reuse is forward-only, stays scoped to the same context-relevant conversation, model, bounded context and output configuration, and never uses partial streamed text. Divergence, expiry or any context change falls through to a fresh request. The caches are bounded and are cleared on session reset or when the extension is disabled. Provider failures are not cached.
 
 The extension makes no autocomplete request while disabled. Automatic empty-draft requests are also disabled by default.
 

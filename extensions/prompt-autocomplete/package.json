@@ -1,6 +1,6 @@
 {
   "name": "@kliebhan/pi-prompt-autocomplete",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "Privacy-conscious inline AI prompt completion for the Pi coding agent",
   "type": "module",
   "license": "MIT",
@@ -26,7 +26,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "video": "https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.5/prompt-autocomplete-demo.mp4"
+    "video": "https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.3.0/prompt-autocomplete-demo.mp4"
   },
   "engines": {
     "node": ">=22.19.0"

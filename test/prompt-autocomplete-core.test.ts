@@ -42,6 +42,7 @@ import {
   parsePromptAutocompleteModelSelection,
   parseExplicitBoundedIntFlag,
   parsePromptAutocompletePersistedSettings,
+  resolveAutocompleteConversationId,
   resolvePersistedEnabled,
   resolvePersistedNumber,
   serializePromptAutocompletePersistedSettings,
@@ -97,7 +98,7 @@ test("prompt-autocomplete index no longer hardcodes a provider/model default", (
 
 test("prompt autocomplete cache identity includes draft, context, and output configuration", () => {
   const base = {
-    leafId: "leaf-1",
+    conversationId: "leaf-1",
     modelLabel: "openai/gpt-test",
     maxAlternatives: 3,
     maxSuggestionChars: 160,
@@ -122,13 +123,44 @@ test("prompt autocomplete cache identity includes draft, context, and output con
   assert.equal(prefixKey, buildPromptAutocompletePrefixContextKey({ ...prefixIdentity }));
   assert.notEqual(
     prefixKey,
-    buildPromptAutocompletePrefixContextKey({ ...prefixIdentity, leafId: "leaf-2" }),
+    buildPromptAutocompletePrefixContextKey({ ...prefixIdentity, conversationId: "leaf-2" }),
   );
   assert.notEqual(
     prefixKey,
     buildPromptAutocompletePrefixContextKey({ ...prefixIdentity, recentContext: "changed" }),
   );
   assert.doesNotMatch(prefixKey, /Implementation finished|Please implement it/);
+});
+
+test("conversation identity skips metadata entries and unnamed entries", () => {
+  const user = { type: "message", id: "msg-user", message: { role: "user", content: "Hi" } };
+  const assistant = { type: "message", id: "msg-asst", message: { role: "assistant", content: "Hello" } };
+  const custom = { type: "custom", id: "custom-1", customType: "prompt-autocomplete-stats" };
+  const label = { type: "label", id: "label-1", targetId: "msg-asst", label: "keep" };
+  const sessionInfo = { type: "session_info", id: "info-1", name: "Session" };
+  const customMessage = { type: "custom_message", id: "ext-1", customType: "other", content: "Injected" };
+
+  assert.equal(resolveAutocompleteConversationId([user, assistant, custom, label, sessionInfo], "fallback"), "msg-asst");
+  assert.equal(resolveAutocompleteConversationId([user, assistant, customMessage], "fallback"), "ext-1");
+  assert.equal(resolveAutocompleteConversationId([custom, label, sessionInfo], "session-1"), "session-1");
+  assert.equal(
+    resolveAutocompleteConversationId([{ type: "message", message: { role: "user", content: "no id" } }], "leaf-1"),
+    "leaf-1",
+  );
+  assert.equal(resolveAutocompleteConversationId([], "session-1"), "session-1");
+  assert.notEqual(
+    resolveAutocompleteConversationId([user, { ...assistant, id: "msg-asst-2" }], "fallback"),
+    resolveAutocompleteConversationId([user, assistant], "fallback"),
+  );
+});
+
+test("prompt-autocomplete waits for agent_settled and uses conversation identity", () => {
+  const source = readFileSync(new URL("../extensions/prompt-autocomplete/index.ts", import.meta.url), "utf8");
+  assert.match(source, /physicalSessionId/);
+  assert.match(source, /getSessionId/);
+  assert.match(source, /pi\.on\("agent_settled"/);
+  assert.match(source, /hostEmitsAgentSettled/);
+  assert.match(source, /resolveAutocompleteConversationId/);
 });
 
 test("expiring LRU cache enforces TTL, manual bypass, and the entry bound", () => {

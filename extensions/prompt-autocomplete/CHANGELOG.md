@@ -2,6 +2,17 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - Unreleased
+
+### Changed
+
+- Cache and stream currency now follow the newest conversation entry that affects autocomplete context, not Pi's raw leaf. Custom, label, and session-info entries can move the leaf without discarding an otherwise identical cached suggestion.
+- Automatic suggestions wait for `agent_settled` on hosts that emit it, so a retry or queued continuation cannot use unfinished conversation context. Hosts without that event still settle on `agent_end`. Manual `Ctrl+.` remains an explicit one-shot.
+
+### Added
+
+- Capture the physical session id at `session_start` as the identity later session-scoped accounting will use. Enable and `min-chars` continue to persist through the existing settings file, not through custom entries.
+
 ## [0.2.5] - 2026-08-07
 
 ### Added

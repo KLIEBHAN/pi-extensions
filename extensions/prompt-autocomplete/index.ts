@@ -53,6 +53,7 @@ import {
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   recordProviderLatency,
   recordProviderUsage,
+  resolveAutocompleteConversationId,
   resolveOverride,
   reusePromptAutocompleteSuggestions,
   sanitizeTerminalText,
@@ -280,6 +281,26 @@ interface PromptAutocompleteSharedState {
   enabled: boolean;
   activationId: number;
   agentStreaming: boolean;
+  /**
+   * Immutable for the current extension runtime's session. Captured at
+   * `session_start` from `sessionManager.getSessionId()`. Fork/new replace the
+   * runtime, so a later session cannot inherit this id from an old closure.
+   */
+  physicalSessionId: string;
+  /**
+   * Last context-relevant conversation id observed on this runtime. Used to
+   * ignore `session_tree` events that only moved the raw leaf.
+   */
+  lastConversationId: string;
+  /**
+   * Set once we know whether this host emits `agent_settled`.
+   *
+   * `pi.on("agent_settled")` never throws — Pi stores any event name — so the
+   * probe is `typeof ctx.isIdle === "function"`. That method shipped together
+   * with `agent_settled` in Pi 0.80.5. A process cannot change its front-end,
+   * so this is never reset.
+   */
+  hostEmitsAgentSettled?: boolean;
   config: PromptAutocompleteConfig;
   /** Slash-command decisions that outrank flags for the lifetime of the process. */
   runtimeOverrides: PromptAutocompleteRuntimeOverrides;
@@ -328,7 +349,7 @@ interface PromptAutocompleteSharedState {
 
 interface SuggestionRequest {
   activationId: number;
-  leafId: string;
+  conversationId: string;
   draft: string;
   draftTail: string;
   model: Model<Api>;
@@ -1257,10 +1278,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     const recentContext = buildRecentConversationContext(branch);
     const draftTail = truncateDraftTail(draft, MAX_DRAFT_CONTEXT_CHARS);
     const modelLabel = formatModelLabel(model);
-    const leafId = this.shared.sessionManager?.getLeafId?.() ?? "";
+    const conversationId = resolveCurrentConversationId(this.shared);
+    this.shared.lastConversationId = conversationId;
 
     const prefixContextIdentity = {
-      leafId,
+      conversationId,
       modelLabel,
       maxAlternatives: this.shared.config.maxAlternatives,
       maxSuggestionChars: this.shared.config.maxSuggestionChars,
@@ -1271,7 +1293,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     return {
       activationId: this.activationId,
-      leafId,
+      conversationId,
       draft,
       draftTail,
       model,
@@ -1530,10 +1552,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     const currentModel = resolveSuggestionModel(this.shared);
     if (formatModelLabel(currentModel) !== request.modelLabel) return false;
 
-    // Session entries are immutable and the leaf identifies the exact branch
-    // from which all bounded context sections were derived. Checking it avoids
-    // rebuilding/scanning and hashing that context for every streamed token.
-    return (this.shared.sessionManager?.getLeafId?.() ?? "") === request.leafId;
+    // Session entries are immutable. The context-relevant conversation id
+    // identifies the branch from which all bounded context sections were
+    // derived, without treating custom/label/session-info leaf movement as a
+    // new conversation. Checking it avoids rebuilding that context per token.
+    return resolveCurrentConversationId(this.shared) === request.conversationId;
   }
 
   cancelActiveRequest(): void {
@@ -1760,7 +1783,32 @@ function bindRuntimeContext(ctx: ExtensionContext, shared: PromptAutocompleteSha
   shared.currentModel = ctx.model as Model<Api> | undefined;
   shared.modelRegistry = ctx.modelRegistry;
   shared.sessionManager = ctx.sessionManager;
+  shared.physicalSessionId = readPhysicalSessionId(ctx);
+  shared.lastConversationId = resolveCurrentConversationId(shared);
+  rememberAgentSettledSupport(ctx, shared);
   shared.agentStreaming = false;
+}
+
+function readPhysicalSessionId(ctx: ExtensionContext): string {
+  const sessionId = ctx.sessionManager?.getSessionId?.();
+  return typeof sessionId === "string" ? sessionId : "";
+}
+
+function resolveCurrentConversationId(shared: PromptAutocompleteSharedState): string {
+  const branch = shared.sessionManager?.getBranch?.() ?? [];
+  const leafId = shared.sessionManager?.getLeafId?.() ?? "";
+  return resolveAutocompleteConversationId(branch, leafId || shared.physicalSessionId);
+}
+
+function rememberAgentSettledSupport(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
+  if (shared.hostEmitsAgentSettled !== undefined) return;
+  shared.hostEmitsAgentSettled = typeof ctx.isIdle === "function";
+}
+
+function settleAgentTurn(shared: PromptAutocompleteSharedState, details: string): void {
+  shared.agentStreaming = false;
+  if (!shared.enabled) return;
+  refreshEditorImmediately(shared, "ready", details);
 }
 
 function refreshEditorImmediately(shared: PromptAutocompleteSharedState, state: string, details: string): void {
@@ -2136,6 +2184,8 @@ export function createPromptAutocompleteExtension(
     enabled: false,
     activationId: 0,
     agentStreaming: false,
+    physicalSessionId: "",
+    lastConversationId: "",
     config: parseConfig(pi),
     runtimeOverrides: {},
     persistedSettings,
@@ -2183,6 +2233,9 @@ export function createPromptAutocompleteExtension(
   pi.on("session_tree", async (_event, ctx) => {
     shared.sessionManager = ctx.sessionManager;
     if (!shared.enabled) return;
+    const nextConversationId = resolveCurrentConversationId(shared);
+    if (nextConversationId === shared.lastConversationId) return;
+    shared.lastConversationId = nextConversationId;
     refreshEditorImmediately(shared, "context-changed", "Conversation branch changed");
   });
 
@@ -2192,10 +2245,14 @@ export function createPromptAutocompleteExtension(
     refreshEditorImmediately(shared, "waiting", "Main agent is still working");
   });
 
-  pi.on("agent_end", async () => {
-    shared.agentStreaming = false;
-    if (!shared.enabled) return;
-    refreshEditorImmediately(shared, "ready", "Agent finished; autocomplete can request suggestions again");
+  pi.on("agent_end", async (_event, ctx) => {
+    rememberAgentSettledSupport(ctx, shared);
+    if (shared.hostEmitsAgentSettled) return;
+    settleAgentTurn(shared, "Agent finished; autocomplete can request suggestions again");
+  });
+
+  pi.on("agent_settled", async () => {
+    settleAgentTurn(shared, "Agent settled; autocomplete can request suggestions again");
   });
 
   pi.registerCommand("prompt-autocomplete", {

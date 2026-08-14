@@ -20,6 +20,7 @@ import {
   createPromptAutocompleteExtension,
   type PromptAutocompleteDependencies,
 } from "../extensions/prompt-autocomplete/index.ts";
+import type { PromptAutocompletePersistedSettings } from "../extensions/prompt-autocomplete/core.ts";
 
 type Handler = (event: any, ctx: ExtensionContext) => Promise<unknown> | unknown;
 type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown> | unknown;
@@ -132,6 +133,13 @@ interface EditorHarnessOptions {
   hasConfiguredAuth?: (model: { provider: string; id: string }) => boolean;
   /** Emulate forked hosts (prime-agent) whose ExtensionContext predates `mode`. */
   omitHostMode?: boolean;
+  /** When true, `ctx.isIdle` exists so automatic requests wait for `agent_settled`. */
+  emitsAgentSettled?: boolean;
+  /** Injected settings store so two factories can share persisted decisions. */
+  settingsStore?: {
+    load(): PromptAutocompletePersistedSettings;
+    save(settings: PromptAutocompletePersistedSettings): void;
+  };
 }
 
 function createEditorHarness(options: EditorHarnessOptions) {
@@ -150,6 +158,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
   let renderRequests = 0;
   let branch: unknown[] = [];
   let leafId = "leaf-1";
+  let sessionId = "session-1";
   let model = { provider: "test-provider", id: "model-a" };
 
   const ui = {
@@ -170,10 +179,12 @@ function createEditorHarness(options: EditorHarnessOptions) {
   const sessionManager = {
     getBranch: () => branch,
     getLeafId: () => leafId,
+    getSessionId: () => sessionId,
   };
   const ctx = {
     ...(options.omitHostMode ? {} : { mode: "tui" }),
     hasUI: true,
+    ...(options.emitsAgentSettled ? { isIdle: () => true } : {}),
     get model() {
       return model;
     },
@@ -202,7 +213,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
     now: options.now,
     // In-memory store keeps editor tests hermetic: no real settings file is
     // read on load and slash commands never write outside the test.
-    settingsStore: {
+    settingsStore: options.settingsStore ?? {
       load: () => ({}),
       save: () => undefined,
     },
@@ -249,6 +260,9 @@ function createEditorHarness(options: EditorHarnessOptions) {
     },
     setLeafId: (nextLeafId: string) => {
       leafId = nextLeafId;
+    },
+    setSessionId: (nextSessionId: string) => {
+      sessionId = nextSessionId;
     },
     setModel: (nextModel: { provider: string; id: string }) => {
       model = nextModel;
@@ -563,6 +577,45 @@ test("newer drafts and conversation branches reject stale streamed progress", as
   await flushAsyncWork();
 });
 
+test("session_tree metadata movement does not cancel an in-flight stream", async () => {
+  const provider = controlledStream();
+  let streamSignal: AbortSignal | undefined;
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    streamSimple: ((_model, _context, options) => {
+      calls += 1;
+      streamSignal = options?.signal as AbortSignal;
+      return provider.stream;
+    }) as StreamSimple,
+  });
+  const messages = [
+    { type: "message", id: "msg-user", message: { role: "user", content: "Keep this context" } },
+    { type: "message", id: "msg-asst", message: makeRawCompletion("Keep this answer") },
+  ];
+  harness.setBranch(messages);
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+  provider.delta('{"completions":[" the same context', " the same context");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /the same/);
+
+  harness.setBranch([...messages, { type: "custom", id: "custom-1", customType: "prompt-autocomplete-stats" }]);
+  harness.setLeafId("leaf-2");
+  await harness.emit("session_tree", { oldLeafId: "leaf-1", newLeafId: "leaf-2" });
+  await flushAsyncWork();
+  assert.equal(streamSignal?.aborted, false, "metadata leaf movement must not abort the current stream");
+  assert.equal(calls, 1);
+
+  provider.done([" the same context"]);
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /the same context/);
+});
+
 test("turning response streaming off cancels active work and applies on the next edit", async () => {
   const provider = controlledStream();
   let streamSignal: AbortSignal | undefined;
@@ -791,6 +844,83 @@ test("automatic suppression and manual intent follow the configured gates", asyn
   editor.insertTextAtCursor?.("x");
   await flushAsyncWork();
   assert.equal(calls, 1, "editing away from the draft end must not issue another request");
+});
+
+test("automatic requests wait for agent_settled when the host emits it", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    emitsAgentSettled: true,
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" settled"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+
+  await harness.emit("agent_start");
+  editor.setText("Draft during turn");
+  await flushAsyncWork();
+  assert.equal(calls, 1, "automatic requests must stay paused through agent_end");
+
+  editor.handleInput(CTRL_DOT);
+  await flushAsyncWork();
+  assert.equal(calls, 2, "manual one-shot must still run during the agent turn");
+
+  await harness.emit("agent_end");
+  editor.setText("Draft after end");
+  await flushAsyncWork();
+  assert.equal(calls, 2, "agent_end must not resume automatic requests on a settled-aware host");
+
+  await harness.emit("agent_settled");
+  await flushAsyncWork();
+  assert.equal(calls, 3, "agent_settled must resume automatic requests");
+});
+
+test("a replacement factory keeps saved settings and starts stats at zero", async () => {
+  let stored: PromptAutocompletePersistedSettings = {};
+  const settingsStore = {
+    load: () => ({ ...stored }),
+    save: (settings: PromptAutocompletePersistedSettings) => {
+      stored = { ...settings };
+    },
+  };
+  let firstCalls = 0;
+  const first = createEditorHarness({
+    settingsStore,
+    completeSimple: (async () => {
+      firstCalls += 1;
+      return makeCompletion([" first"]);
+    }) as CompleteSimple,
+  });
+  const firstEditor = await first.createEditor();
+  await first.command("min-chars 3");
+  firstEditor.setText("Hello");
+  await flushAsyncWork();
+  assert.equal(firstCalls, 1);
+  await first.command("stats");
+  assert.match(first.notifications.at(-1) ?? "", /Requests: 1 issued/);
+
+  let secondCalls = 0;
+  const second = createEditorHarness({
+    settingsStore,
+    completeSimple: (async () => {
+      secondCalls += 1;
+      return makeCompletion([" second"]);
+    }) as CompleteSimple,
+  });
+  second.setSessionId("session-2");
+  const secondEditor = await second.createEditor();
+  await second.command("stats");
+  assert.match(second.notifications.at(-1) ?? "", /Requests: 0 issued/);
+  await second.command("status");
+  assert.match(second.notifications.at(-1) ?? "", /min-chars=3\(saved\)/);
+
+  secondEditor.setText("Hello");
+  await flushAsyncWork();
+  assert.equal(secondCalls, 1, "the replacement factory must be able to issue its own requests");
 });
 
 test("provider failures enter cooldown while manual one-shot can retry", async () => {
@@ -1255,8 +1385,8 @@ test("prefix reuse filters alternatives and preserves the selected surviving ori
   assert.match(renderedText(editor), /‹2\/2›/);
 });
 
-test("prefix reuse misses on divergence, changed context, changed leaf, and expiry", async () => {
-  const scenarios = ["diverged", "context", "leaf", "expired"] as const;
+test("prefix reuse misses on divergence, changed context, changed conversation, and expiry", async () => {
+  const scenarios = ["diverged", "context", "conversation", "expired"] as const;
 
   for (const scenario of scenarios) {
     let calls = 0;
@@ -1269,8 +1399,8 @@ test("prefix reuse misses on divergence, changed context, changed leaf, and expi
       }) as CompleteSimple,
     });
     harness.setBranch([
-      { type: "message", message: { role: "user", content: "Initial context" } },
-      { type: "message", message: makeRawCompletion("Initial answer") },
+      { type: "message", id: "msg-user", message: { role: "user", content: "Initial context" } },
+      { type: "message", id: "msg-asst", message: makeRawCompletion("Initial answer") },
     ]);
     const editor = await harness.createEditor();
     editor.setText("Review");
@@ -1279,11 +1409,14 @@ test("prefix reuse misses on divergence, changed context, changed leaf, and expi
 
     if (scenario === "context") {
       harness.setBranch([
-        { type: "message", message: { role: "user", content: "Changed context" } },
-        { type: "message", message: makeRawCompletion("Changed answer") },
+        { type: "message", id: "msg-user", message: { role: "user", content: "Changed context" } },
+        { type: "message", id: "msg-asst", message: makeRawCompletion("Changed answer") },
       ]);
-    } else if (scenario === "leaf") {
-      harness.setLeafId("leaf-2");
+    } else if (scenario === "conversation") {
+      harness.setBranch([
+        { type: "message", id: "msg-user-2", message: { role: "user", content: "Initial context" } },
+        { type: "message", id: "msg-asst-2", message: makeRawCompletion("Initial answer") },
+      ]);
     } else if (scenario === "expired") {
       now += 60_001;
     }
@@ -1291,6 +1424,47 @@ test("prefix reuse misses on divergence, changed context, changed leaf, and expi
     insertAtCursor(editor, scenario === "diverged" ? " x" : " the");
     await flushAsyncWork();
     assert.equal(calls, 2, `${scenario} must issue a fresh request`);
+  }
+});
+
+test("prefix reuse survives raw leaf movement and metadata entries", async () => {
+  const scenarios = ["leaf", "custom", "label", "session_info"] as const;
+
+  for (const scenario of scenarios) {
+    let calls = 0;
+    const harness = createEditorHarness({
+      completeSimple: (async () => {
+        calls += 1;
+        return makeCompletion([" the implementation"]);
+      }) as CompleteSimple,
+    });
+    const messages = [
+      { type: "message", id: "msg-user", message: { role: "user", content: "Initial context" } },
+      { type: "message", id: "msg-asst", message: makeRawCompletion("Initial answer") },
+    ];
+    harness.setBranch(messages);
+    const editor = await harness.createEditor();
+    editor.setText("Review");
+    await flushAsyncWork();
+    assert.equal(calls, 1);
+
+    if (scenario === "leaf") {
+      harness.setLeafId("leaf-2");
+    } else if (scenario === "custom") {
+      harness.setBranch([...messages, { type: "custom", id: "custom-1", customType: "prompt-autocomplete-stats" }]);
+      harness.setLeafId("leaf-2");
+    } else if (scenario === "label") {
+      harness.setBranch([...messages, { type: "label", id: "label-1", targetId: "msg-asst", label: "keep" }]);
+      harness.setLeafId("leaf-2");
+    } else {
+      harness.setBranch([...messages, { type: "session_info", id: "info-1", name: "Renamed" }]);
+      harness.setLeafId("leaf-2");
+    }
+
+    insertAtCursor(editor, " the");
+    await flushAsyncWork();
+    assert.equal(calls, 1, `${scenario} must reuse the cached suffix`);
+    assert.match(renderedText(editor), /implementation/);
   }
 });
 
