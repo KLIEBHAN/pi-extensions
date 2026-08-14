@@ -2486,3 +2486,55 @@ test("a new physical session does not inherit the previous session's restored ce
   await flushAsyncWork();
   assert.equal(calls, 3, "a stale restored ceiling must not keep capping a new session");
 });
+
+test("uncapped requests after an explicit off survive a reload once the session accounts durably", async () => {
+  let calls = 0;
+  const completeSimple = (async () => {
+    calls += 1;
+    return makeCompletion([` completion ${calls}`]);
+  }) as CompleteSimple;
+  const harness = createEditorHarness({ completeSimple });
+  const editor = await harness.createEditor();
+
+  await harness.command("budget 3");
+  editor.setText("Draft one");
+  await flushAsyncWork();
+  await harness.command("budget off");
+
+  editor.setText("Draft two");
+  await flushAsyncWork();
+  editor.setText("Draft three");
+  await flushAsyncWork();
+  assert.equal(calls, 3, "an off ceiling admits every request");
+
+  const reloaded = createEditorHarness({ completeSimple });
+  reloaded.setEntries(harness.getEntries());
+  reloaded.setBranch(harness.getBranch());
+  await reloaded.createEditor();
+  await reloaded.command("budget 3");
+  await reloaded.command("status");
+  assert.match(
+    reloaded.notifications.at(-1) ?? "",
+    /budget=3\/3\(session\)/,
+    "requests made while the ceiling was off must survive the reload",
+  );
+
+  const reloadedEditor = reloaded.instantiateEditor();
+  reloadedEditor.setText("Draft after reload");
+  await flushAsyncWork();
+  assert.equal(calls, 3, "re-enabling a ceiling must not hand out a fresh allowance");
+});
+
+test("a session that never touches the budget writes no session entries", async () => {
+  const harness = createEditorHarness({
+    completeSimple: (async () => makeCompletion([" completion"])) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+
+  editor.setText("Draft one");
+  await flushAsyncWork();
+  editor.setText("Draft two");
+  await flushAsyncWork();
+
+  assert.equal(harness.getAppendedEntries().length, 0, "the default off path must stay write-free");
+});

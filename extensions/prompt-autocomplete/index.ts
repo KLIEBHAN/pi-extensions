@@ -351,6 +351,14 @@ interface PromptAutocompleteSharedState {
   savedBudgetLimit?: PromptAutocompleteBudgetSetting;
   /** Reserved provider invocations of the current physical session. */
   budgetUsed: number;
+  /**
+   * Whether this physical session already carries durable budget state.
+   *
+   * Once a ceiling was set or restored, accounting stays durable even while the
+   * ceiling is off, so a later ceiling cannot ignore what the session spent in
+   * between. A session that never touched the budget writes no entries at all.
+   */
+  budgetSnapshotsActive?: boolean;
   /** Exhaustion notices already delivered, keyed by `used/limit`. */
   budgetBlockNotices: Set<string>;
   /** Session-bound snapshot writer; appends a non-LLM custom entry. */
@@ -1957,6 +1965,7 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.budgetUsed = 0;
   shared.savedBudgetLimit = undefined;
   shared.persistBudgetSnapshot = undefined;
+  shared.budgetSnapshotsActive = false;
   shared.budgetBlockNotices.clear();
   applyEffectiveConfig(pi, shared);
   // A host that never installs custom editors stays inactive for the rest of
@@ -2246,20 +2255,23 @@ function notifyBudgetExhaustedOnce(shared: PromptAutocompleteSharedState): void 
  *
  * Every real invocation advances the physical-session count, including while
  * the ceiling is off: enabling a ceiling later must not hand out an allowance
- * that ignores what this session already spent. Snapshots are only written
- * while a ceiling exists, so the default-off path adds no session entries.
+ * that ignores what this session already spent. Snapshots are written while a
+ * ceiling exists and, once this session carries durable budget state, also for
+ * uncapped invocations — so a session that never touched the budget still adds
+ * no session entries.
  */
 function reserveBudgetRequest(shared: PromptAutocompleteSharedState): boolean {
   const limit = shared.config.budgetLimit;
   if (limit !== undefined && shared.budgetUsed >= limit) return false;
   shared.budgetUsed += 1;
-  if (limit !== undefined) persistBudgetSnapshot(shared);
+  if (limit !== undefined || shared.budgetSnapshotsActive) persistBudgetSnapshot(shared);
   return true;
 }
 
 function persistBudgetSnapshot(shared: PromptAutocompleteSharedState): void {
-  if (!shared.physicalSessionId) return;
-  shared.persistBudgetSnapshot?.(
+  if (!shared.physicalSessionId || !shared.persistBudgetSnapshot) return;
+  shared.budgetSnapshotsActive = true;
+  shared.persistBudgetSnapshot(
     shared.config.budgetLimit === undefined ? "off" : shared.config.budgetLimit,
     shared.budgetUsed,
   );
@@ -2283,6 +2295,9 @@ function restoreBudgetFromSession(pi: ExtensionAPI, shared: PromptAutocompleteSh
   if (snapshot) {
     shared.budgetUsed = snapshot.used;
     shared.savedBudgetLimit = snapshot.limit;
+    // This session already accounts durably: keep it that way even if the
+    // restored decision is an explicit off.
+    shared.budgetSnapshotsActive = true;
   }
   // Always recompute: resetSharedForSession cleared the previous session's
   // restored ceiling, so the effective config must follow even when this
