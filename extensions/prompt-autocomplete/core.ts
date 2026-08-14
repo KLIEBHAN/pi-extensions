@@ -102,7 +102,7 @@ export interface ModelRef {
 }
 
 export interface PromptAutocompleteCacheIdentity {
-  leafId: string;
+  conversationId: string;
   modelLabel: string;
   maxAlternatives: number;
   maxSuggestionChars: number;
@@ -110,6 +110,37 @@ export interface PromptAutocompleteCacheIdentity {
   latestAssistantContext: string;
   latestUserContext: string;
   recentContext: string;
+}
+
+/** Session entries that advance the raw leaf without changing autocomplete context. */
+const AUTOCOMPLETE_METADATA_ENTRY_TYPES = new Set(["custom", "label", "session_info"]);
+
+export function isAutocompleteMetadataEntry(entry: unknown): boolean {
+  return isRecord(entry)
+    && typeof entry.type === "string"
+    && AUTOCOMPLETE_METADATA_ENTRY_TYPES.has(entry.type);
+}
+
+/**
+ * Newest branch entry that affects transmitted autocomplete context.
+ *
+ * Custom, label, and session-info entries are skipped because they are excluded
+ * from model context. Entries without an id are skipped so a host that omits
+ * ids can still fall back to the raw leaf. `custom_message` is kept: it is
+ * included in LLM context even though today's context builders only read
+ * `type === "message"`.
+ */
+export function resolveAutocompleteConversationId(
+  branch: unknown[],
+  fallbackId = "",
+): string {
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index];
+    if (isAutocompleteMetadataEntry(entry)) continue;
+    if (!isRecord(entry) || typeof entry.id !== "string" || entry.id.length === 0) continue;
+    return entry.id;
+  }
+  return fallbackId;
 }
 
 export type PromptAutocompletePrefixContextIdentity = Omit<PromptAutocompleteCacheIdentity, "draft">;

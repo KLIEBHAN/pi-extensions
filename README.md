@@ -210,7 +210,7 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 
 `extensions/prompt-autocomplete/` adds inline AI autocomplete while you type your next prompt. It is also packaged independently as [`@kliebhan/pi-prompt-autocomplete`](extensions/prompt-autocomplete/README.md), so users can install it without loading the rest of this collection.
 
-[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.2.5/prompt-autocomplete-demo.mp4)
+[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.3.0/prompt-autocomplete-demo.mp4)
 
 ```bash
 pi install npm:@kliebhan/pi-prompt-autocomplete
@@ -277,7 +277,7 @@ pi -e ./extensions/prompt-autocomplete \
 
 ### Privacy and provider usage
 
-Prompt autocomplete makes additional model requests. Streaming changes when the first suggestion becomes visible, not what one request sends. Toggling response streaming cancels active autocomplete work but does not start a replacement request; the selected path applies to the next edit or manual one-shot. Each request can include the current draft, the latest user and assistant messages, and a bounded recent-conversation summary. By default it uses the active model; `--prompt-autocomplete-model provider/model` may send that context to a different provider. Requests may incur token costs and consume provider rate limits. Successful results are cached in memory for up to 60 seconds. Typing an exact prefix of a still-valid terminal suggestion can reuse its remaining suffix locally; any change to context, model, branch, output configuration, or expiry—or divergent text—forces a fresh request. The bounded caches are cleared when the session resets or the extension is disabled.
+Prompt autocomplete makes additional model requests. Streaming changes when the first suggestion becomes visible, not what one request sends. Toggling response streaming cancels active autocomplete work but does not start a replacement request; the selected path applies to the next edit or manual one-shot. Each request can include the current draft, the latest user and assistant messages, and a bounded recent-conversation summary. By default it uses the active model; `--prompt-autocomplete-model provider/model` may send that context to a different provider. Requests may incur token costs and consume provider rate limits. Successful results are cached in memory for up to 60 seconds. Typing an exact prefix of a still-valid terminal suggestion can reuse its remaining suffix locally; any change to context, model, context-relevant conversation, output configuration, or expiry—or divergent text—forces a fresh request. Custom, label, and session-info entries that only move the raw leaf do not. The bounded caches are cleared when the session resets or the extension is disabled.
 
 The extension is disabled by default. Enabling it with the CLI flag or slash command is explicit consent to these autocomplete requests. Automatic empty-draft requests remain disabled by the default `--prompt-autocomplete-min-chars 1`; set the value to `0` to opt into them. A manual `Ctrl+.` one-shot is treated as explicit intent and can bypass the minimum-character gate.
 
@@ -287,7 +287,7 @@ The extension is disabled by default. Enabling it with the CLI flag or slash com
 - Built-in slash-command and file/path autocomplete keep working.
 - Autocomplete responses stream into ghost text by default. Disable this at startup with `--prompt-autocomplete-stream off`, or toggle it for the process with `/prompt-autocomplete stream on|off|toggle`. Partial Latin text advances only at complete word boundaries; CJK, combining characters, flags, and emoji remain grapheme-safe. Alternatives appear only after the terminal response.
 - `Tab` accepts all visible partial text; `Ctrl+Space` accepts only its next visible word/chunk. Both cancel that stream without automatically starting a second paid request.
-- By default suggestions pause while the **main agent** is streaming so they can use the finished conversation context. This is separate from response streaming. Override it at startup with `--prompt-autocomplete-while-streaming`, or toggle it per session with `/prompt-autocomplete while-streaming on|off|toggle`.
+- By default suggestions pause while the **main agent** is working so they can use the finished conversation context, and they stay paused until `agent_settled` when the host emits it. This is separate from response streaming. Override it at startup with `--prompt-autocomplete-while-streaming`, or toggle it per session with `/prompt-autocomplete while-streaming on|off|toggle`.
 - Even while-streaming is off, press `Ctrl+.` with no active suggestion to force a single one-shot completion during an agent turn; it ignores the streaming gate, the post-error cooldown, and the min-chars threshold for that one request (model/auth and slash/path checks still apply).
 - Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling (and `Ctrl+.` doubles as the one-shot trigger).
 - The default suggestion count is 3. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.

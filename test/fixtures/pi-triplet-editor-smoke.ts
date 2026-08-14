@@ -45,7 +45,7 @@ const ctx = {
     hasConfiguredAuth: () => true,
     getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "smoke-key", headers: {} }),
   },
-  sessionManager: { getBranch: () => [], getLeafId: () => "leaf-1" },
+  sessionManager: { getBranch: () => [], getLeafId: () => "leaf-1", getSessionId: () => "session-1" },
   ui,
 } as unknown as ExtensionContext;
 
