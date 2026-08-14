@@ -234,7 +234,7 @@ pi install npm:@kliebhan/pi-prompt-autocomplete
 - clean default UI: debug/status lines stay hidden unless you opt into debug mode
 - `/prompt-autocomplete stats` reports current-session requests, failures, exact/prefix cache hits, suggestions offered and accepted, tokens, estimated cost, and mean provider latency
 - the internal autocomplete system prompt lives in `extensions/prompt-autocomplete/system-prompt.template.md` and is rendered through a tiny mini-template helper with `{{PLACEHOLDER}}`, `{{PLACEHOLDER|fallback}}`, and escaped literals via `\{{PLACEHOLDER}}`, so prompt tuning stays decoupled from TypeScript while still allowing reusable prompt fragments
-- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle`, `/prompt-autocomplete stream on|off|toggle`, and `/prompt-autocomplete while-streaming on|off|toggle`
+- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle`, `/prompt-autocomplete set`, `/prompt-autocomplete stream on|off|toggle`, and `/prompt-autocomplete while-streaming on|off|toggle`
 
 ### Usage
 
@@ -256,6 +256,8 @@ Or enable it for the current session from inside pi:
 /prompt-autocomplete on
 /prompt-autocomplete status
 /prompt-autocomplete stats
+/prompt-autocomplete set
+/prompt-autocomplete set debounce-ms 250
 /prompt-autocomplete stream off
 /prompt-autocomplete stream on
 /prompt-autocomplete while-streaming on

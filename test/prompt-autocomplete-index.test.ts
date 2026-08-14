@@ -28,6 +28,10 @@ interface HarnessOptions {
   omitEditorSlot?: boolean;
   /** Emulate hosts whose editor slot accepts a factory without installing it. */
   noOpEditorSlot?: boolean;
+  /** Registry lookup; return undefined to emulate an unknown model. */
+  findModel?: (provider: string, id: string) => { provider: string; id: string } | undefined;
+  /** Per-model auth, for hosts where only some models are authenticated. */
+  hasConfiguredAuth?: (model: { provider: string; id: string }) => boolean;
 }
 
 function createHarness(options: HarnessOptions = {}) {
@@ -54,8 +58,10 @@ function createHarness(options: HarnessOptions = {}) {
 
   const model = { provider: "test-provider", id: "test-model" };
   const modelRegistry = {
-    find: () => undefined,
-    hasConfiguredAuth: () => true,
+    find: (provider: string, id: string) =>
+      options.findModel ? options.findModel(provider, id) : { provider, id },
+    hasConfiguredAuth: (model: { provider: string; id: string }) =>
+      options.hasConfiguredAuth ? options.hasConfiguredAuth(model) : true,
     getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "test-key", headers: {} }),
   };
   const sessionManager = {
@@ -646,4 +652,141 @@ test("a defaulted min-chars flag defers to the saved value", async () => {
   await emit(harness, "session_start");
   await command(harness, "status");
   assert.match(lastStatus(harness), /min-chars=0\(saved\)/);
+});
+
+test("bare set dumps status and set min-chars dispatches to the canonical command", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  await emit(harness, "session_start");
+
+  await command(harness, "set");
+  assert.match(lastStatus(harness), /enabled=yes\(saved\)/);
+  assert.match(lastStatus(harness), /debounce=350ms\(flag\)/);
+  assert.match(lastStatus(harness), /requested-model=current active model\(flag\)/);
+  assert.match(lastStatus(harness), /max-suggestion-chars=160\(flag\)/);
+  assert.match(lastStatus(harness), /max-alternatives=3\(flag\)/);
+
+  await command(harness, "set min-chars 0");
+  assert.deepEqual(harness.settingsSaves.at(-1), { enabled: true, minPromptChars: 0 });
+  await command(harness, "set min-chars");
+  assert.match(lastStatus(harness), /min-chars is 0 \(session\)/);
+});
+
+test("set persists remaining runtime knobs and reports their sources", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  await emit(harness, "session_start");
+
+  await command(harness, "set Debounce-MS 100");
+  assert.deepEqual(harness.settingsSaves.at(-1), { enabled: true, debounceMs: 100 });
+  await command(harness, "set max-chars 240");
+  assert.deepEqual(harness.settingsSaves.at(-1), { enabled: true, debounceMs: 100, maxSuggestionChars: 240 });
+  await command(harness, "set max-alternatives 5");
+  assert.deepEqual(harness.settingsSaves.at(-1), {
+    enabled: true,
+    debounceMs: 100,
+    maxSuggestionChars: 240,
+    maxAlternatives: 5,
+  });
+  await command(harness, "set model openai/GPT-5.4-Mini");
+  assert.deepEqual(harness.settingsSaves.at(-1), {
+    enabled: true,
+    debounceMs: 100,
+    maxSuggestionChars: 240,
+    maxAlternatives: 5,
+    model: "openai/GPT-5.4-Mini",
+  });
+  assert.ok(
+    harness.notifications.some((entry) =>
+      entry.message.includes("current draft and recent conversation context")
+    ),
+    "a cross-provider model change must restate the privacy notice",
+  );
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /debounce=100ms\(session\)/);
+  assert.match(lastStatus(harness), /max-suggestion-chars=240\(session\)/);
+  assert.match(lastStatus(harness), /max-alternatives=5\(session\)/);
+  assert.match(lastStatus(harness), /requested-model=openai\/GPT-5.4-Mini\(session\)/);
+
+  await emit(harness, "session_start");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /debounce=100ms\(session\)/);
+
+  const next = createHarness({ savedSettings: harness.getStoredSettings() });
+  await emit(next, "session_start");
+  await command(next, "status");
+  assert.match(lastStatus(next), /debounce=100ms\(saved\)/);
+  assert.match(lastStatus(next), /max-suggestion-chars=240\(saved\)/);
+  assert.match(lastStatus(next), /max-alternatives=5\(saved\)/);
+  assert.match(lastStatus(next), /requested-model=openai\/GPT-5.4-Mini\(saved\)/);
+});
+
+test("set model active persists the sentinel and out-of-range values are rejected", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true, model: "openai/gpt-mini" } });
+  await emit(harness, "session_start");
+
+  await command(harness, "set model active");
+  assert.equal(harness.getStoredSettings().model, "active");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /requested-model=current active model\(session\)/);
+
+  const before = harness.getStoredSettings();
+  await command(harness, "set debounce-ms 5001");
+  assert.match(lastStatus(harness), /Usage: \/prompt-autocomplete set debounce-ms <0-5000>/);
+  await command(harness, "set max-chars 15");
+  assert.match(lastStatus(harness), /Usage: \/prompt-autocomplete set max-chars <16-1000>/);
+  await command(harness, "set max-alternatives 0");
+  assert.match(lastStatus(harness), /Usage: \/prompt-autocomplete set max-alternatives <1-5>/);
+  await command(harness, "set timeout 1");
+  assert.match(lastStatus(harness), /set \[debounce-ms/);
+  assert.deepEqual(harness.getStoredSettings(), before);
+});
+
+test("an invalid or unusable set model leaves the previous config and does not persist", async () => {
+  const harness = createHarness({
+    savedSettings: { enabled: true, debounceMs: 100 },
+    findModel: (provider, id) => (provider === "missing" ? undefined : { provider, id }),
+    hasConfiguredAuth: (model) => model.provider === "test-provider",
+  });
+  await emit(harness, "session_start");
+  const before = harness.getStoredSettings();
+
+  await command(harness, "set model not-a-model");
+  assert.match(lastStatus(harness), /not a provider\/model reference/);
+  await command(harness, "set model missing/model-x");
+  assert.match(lastStatus(harness), /is unknown/);
+  await command(harness, "set model locked/model-y");
+  assert.match(lastStatus(harness), /has no configured auth/);
+  assert.deepEqual(harness.getStoredSettings(), before);
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /requested-model=current active model\(flag\)/);
+  assert.match(lastStatus(harness), /debounce=100ms\(saved\)/);
+});
+
+test("an explicit non-default runtime flag outranks the saved set value", async () => {
+  const harness = createHarness({
+    savedSettings: { enabled: true, debounceMs: 100, maxSuggestionChars: 240, maxAlternatives: 5, model: "openai/saved" },
+  });
+  harness.flags.set("prompt-autocomplete-debounce-ms", "250");
+  harness.flags.set("prompt-autocomplete-max-chars", "320");
+  harness.flags.set("prompt-autocomplete-max-alternatives", "2");
+  harness.flags.set("prompt-autocomplete-model", "anthropic/flag");
+  await emit(harness, "session_start");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /debounce=250ms\(flag\)/);
+  assert.match(lastStatus(harness), /max-suggestion-chars=320\(flag\)/);
+  assert.match(lastStatus(harness), /max-alternatives=2\(flag\)/);
+  assert.match(lastStatus(harness), /requested-model=anthropic\/flag\(flag\)/);
+});
+
+test("a defaulted runtime flag defers to the saved set value", async () => {
+  const harness = createHarness({
+    savedSettings: { enabled: true, debounceMs: 100, model: "openai/saved" },
+  });
+  harness.flags.set("prompt-autocomplete-debounce-ms", "350");
+  harness.flags.set("prompt-autocomplete-model", "current active model");
+  await emit(harness, "session_start");
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /debounce=100ms\(saved\)/);
+  assert.match(lastStatus(harness), /requested-model=openai\/saved\(saved\)/);
 });

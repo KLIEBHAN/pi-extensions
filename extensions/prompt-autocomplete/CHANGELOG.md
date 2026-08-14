@@ -12,6 +12,7 @@ All notable changes to this package are documented here. This project follows [S
 ### Added
 
 - Capture the physical session id at `session_start` as the identity later session-scoped accounting will use. Enable and `min-chars` continue to persist through the existing settings file, not through custom entries.
+- `/prompt-autocomplete set` persists the remaining runtime knobs (`debounce-ms`, `max-chars`, `max-alternatives`, and `model`) through that same settings file. Bare `set` prints `status`. Interactive out-of-range values are rejected rather than clamped. A dedicated model is validated against the registry and auth before commit; `active` is an explicit sentinel; mixed-case model identifiers are preserved; a cross-provider change restates the privacy notice. Request-identity changes cancel in-flight work without starting a replacement; debounce-only changes drop a waiting timer without aborting an in-flight call. `/prompt-autocomplete min-chars` remains the canonical command.
 
 ## [0.2.5] - 2026-08-07
 

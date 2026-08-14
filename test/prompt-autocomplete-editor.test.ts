@@ -1069,6 +1069,118 @@ test("stale request results are discarded after a newer draft wins", async () =>
   );
 });
 
+test("set debounce-ms cancels a waiting timer without starting a replacement request", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    debounceMs: 80,
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" too late"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Debounce set");
+  await flushAsyncWork();
+  assert.equal(calls, 0);
+
+  await harness.command("set debounce-ms 0");
+  await new Promise<void>((resolve) => setTimeout(resolve, 120));
+  assert.equal(calls, 0, "a debounce-only change must not start a replacement request");
+  assert.doesNotMatch(renderedText(editor), /too late/);
+});
+
+test("request-identity set commands cancel in-flight work without a replacement request", async () => {
+  for (const scenario of ["max-chars", "max-alternatives", "model"] as const) {
+    const pending = deferred<CompletionResult>();
+    let calls = 0;
+    let signal: AbortSignal | undefined;
+    const harness = createEditorHarness({
+      completeSimple: (async (_model, _context, requestOptions) => {
+        calls += 1;
+        signal = requestOptions?.signal;
+        return pending.promise;
+      }) as CompleteSimple,
+    });
+    const editor = await harness.createEditor();
+    editor.setText(`Pending ${scenario}`);
+    await flushAsyncWork();
+    assert.equal(calls, 1);
+    assert.equal(signal?.aborted, false);
+
+    if (scenario === "max-chars") await harness.command("set max-chars 240");
+    else if (scenario === "max-alternatives") await harness.command("set max-alternatives 5");
+    else await harness.command("set model other-provider/fast-mini");
+
+    assert.equal(signal?.aborted, true, `${scenario} should abort the active provider request`);
+    assert.equal(calls, 1, `${scenario} must not buy a replacement request`);
+    pending.resolve(makeCompletion([" must not render"]));
+    await flushAsyncWork();
+    assert.doesNotMatch(renderedText(editor), /must not render/);
+  }
+});
+
+test("debug display does not cancel in-flight work or churn the request cache", async () => {
+  const pending = deferred<CompletionResult>();
+  let calls = 0;
+  let signal: AbortSignal | undefined;
+  const harness = createEditorHarness({
+    completeSimple: (async (_model, _context, requestOptions) => {
+      calls += 1;
+      signal = requestOptions?.signal;
+      return pending.promise;
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Keep this request");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+
+  await harness.command("debug-on");
+  assert.equal(signal?.aborted, false, "debug-only changes must not abort in-flight work");
+
+  pending.resolve(makeCompletion([" cached later"]));
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /cached later/);
+
+  editor.setText("Keep this request");
+  await flushAsyncWork();
+  assert.equal(calls, 1, "debug-only changes must not drop a still-valid cache entry");
+});
+
+test("an invalid set model leaves the previous config active and makes no provider call", async () => {
+  let stored: PromptAutocompletePersistedSettings = {};
+  let calls = 0;
+  const harness = createEditorHarness({
+    findModel: (provider, id) => (provider === "missing" ? undefined : { provider, id }),
+    settingsStore: {
+      load: () => ({ ...stored }),
+      save: (settings) => {
+        stored = { ...settings };
+      },
+    },
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" previous model"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Draft");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+  assert.match(renderedText(editor), /previous model/);
+
+  await harness.command("set model not-a-model");
+  await harness.command("set model missing/model-x");
+  await flushAsyncWork();
+  assert.equal(calls, 1, "refusing a model must not issue a provider request");
+  assert.equal(stored.model, undefined);
+  assert.match(renderedText(editor), /previous model/);
+
+  editor.setText("Draft again");
+  await flushAsyncWork();
+  assert.equal(calls, 2, "the previous model must remain usable after a refused set");
+});
+
 test("disabling or shutting down clears a scheduled debounce before it can call the provider", async () => {
   for (const scenario of ["off", "shutdown"] as const) {
     let calls = 0;

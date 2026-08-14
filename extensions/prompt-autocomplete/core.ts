@@ -81,11 +81,17 @@ export const DEFAULT_PREFERRED_MODEL = "current active model";
 export const DEFAULT_PROMPT_AUTOCOMPLETE_ENABLED = false;
 export const DEFAULT_STREAM_RESPONSES = true;
 export const DEFAULT_DEBOUNCE_MS = 350;
+export const DEBOUNCE_MS_MIN = 0;
+export const DEBOUNCE_MS_MAX = 5_000;
 export const DEFAULT_MIN_PROMPT_CHARS = 1;
 export const MIN_PROMPT_CHARS_MIN = 0;
 export const MIN_PROMPT_CHARS_MAX = 500;
 export const DEFAULT_MAX_SUGGESTION_CHARS = 160;
+export const MAX_SUGGESTION_CHARS_MIN = 16;
+export const MAX_SUGGESTION_CHARS_MAX = 1_000;
 export const DEFAULT_MAX_ALTERNATIVES = 3;
+export const MAX_ALTERNATIVES_MIN = 1;
+export const MAX_ALTERNATIVES_MAX = 5;
 export const MAX_DRAFT_CONTEXT_CHARS = 2_000;
 export const MAX_CONTEXT_MESSAGES = 6;
 export const MAX_CONTEXT_MESSAGE_CHARS = 600;
@@ -642,6 +648,10 @@ export interface PromptAutocompleteRuntimeOverrides {
   streamResponses?: boolean;
   debug?: boolean;
   minPromptChars?: number;
+  debounceMs?: number;
+  maxSuggestionChars?: number;
+  maxAlternatives?: number;
+  modelSelection?: PromptAutocompleteModelSelection;
 }
 
 export type PromptAutocompleteSettingSource = "flag" | "saved" | "session";
@@ -657,13 +667,19 @@ export function describeSettingSource(override: unknown): PromptAutocompleteSett
 /**
  * Settings persisted across processes.
  *
- * Only explicit `/prompt-autocomplete on|off` decisions are stored. An absent
- * field defers to the CLI flag, so an empty or missing file behaves exactly
- * like no persisted decision.
+ * Explicit `/prompt-autocomplete on|off`, `min-chars`, and `set` decisions are
+ * stored. An absent field defers to the CLI flag, so an empty or missing file
+ * behaves exactly like no persisted decision. The file stores nothing but these
+ * decisions: no conversation, cache, or stats.
  */
 export interface PromptAutocompletePersistedSettings {
   enabled?: boolean;
   minPromptChars?: number;
+  debounceMs?: number;
+  maxSuggestionChars?: number;
+  maxAlternatives?: number;
+  /** Raw dedicated model, or `active` for the session model. Invalid values are dropped on load. */
+  model?: string;
 }
 
 /**
@@ -687,13 +703,27 @@ export function parsePromptAutocompletePersistedSettings(
   const record = parsed as Record<string, unknown>;
   const settings: PromptAutocompletePersistedSettings = {};
   if (typeof record.enabled === "boolean") settings.enabled = record.enabled;
-  if (
-    typeof record.minPromptChars === "number"
-    && Number.isInteger(record.minPromptChars)
-    && record.minPromptChars >= MIN_PROMPT_CHARS_MIN
-    && record.minPromptChars <= MIN_PROMPT_CHARS_MAX
-  ) {
-    settings.minPromptChars = record.minPromptChars;
+  const minPromptChars = readPersistedBoundedInt(record, "minPromptChars", MIN_PROMPT_CHARS_MIN, MIN_PROMPT_CHARS_MAX);
+  if (minPromptChars !== undefined) settings.minPromptChars = minPromptChars;
+  const debounceMs = readPersistedBoundedInt(record, "debounceMs", DEBOUNCE_MS_MIN, DEBOUNCE_MS_MAX);
+  if (debounceMs !== undefined) settings.debounceMs = debounceMs;
+  const maxSuggestionChars = readPersistedBoundedInt(
+    record,
+    "maxSuggestionChars",
+    MAX_SUGGESTION_CHARS_MIN,
+    MAX_SUGGESTION_CHARS_MAX,
+  );
+  if (maxSuggestionChars !== undefined) settings.maxSuggestionChars = maxSuggestionChars;
+  const maxAlternatives = readPersistedBoundedInt(
+    record,
+    "maxAlternatives",
+    MAX_ALTERNATIVES_MIN,
+    MAX_ALTERNATIVES_MAX,
+  );
+  if (maxAlternatives !== undefined) settings.maxAlternatives = maxAlternatives;
+  if (typeof record.model === "string") {
+    const model = parsePersistedModelRaw(record.model);
+    if (model !== undefined) settings.model = persistableModelRaw(model);
   }
   return settings;
 }
@@ -711,7 +741,44 @@ export function serializePromptAutocompletePersistedSettings(
   ) {
     payload.minPromptChars = settings.minPromptChars;
   }
+  if (
+    typeof settings.debounceMs === "number"
+    && Number.isInteger(settings.debounceMs)
+    && settings.debounceMs >= DEBOUNCE_MS_MIN
+    && settings.debounceMs <= DEBOUNCE_MS_MAX
+  ) {
+    payload.debounceMs = settings.debounceMs;
+  }
+  if (
+    typeof settings.maxSuggestionChars === "number"
+    && Number.isInteger(settings.maxSuggestionChars)
+    && settings.maxSuggestionChars >= MAX_SUGGESTION_CHARS_MIN
+    && settings.maxSuggestionChars <= MAX_SUGGESTION_CHARS_MAX
+  ) {
+    payload.maxSuggestionChars = settings.maxSuggestionChars;
+  }
+  if (
+    typeof settings.maxAlternatives === "number"
+    && Number.isInteger(settings.maxAlternatives)
+    && settings.maxAlternatives >= MAX_ALTERNATIVES_MIN
+    && settings.maxAlternatives <= MAX_ALTERNATIVES_MAX
+  ) {
+    payload.maxAlternatives = settings.maxAlternatives;
+  }
+  const model = parsePersistedModelRaw(settings.model);
+  if (model !== undefined) payload.model = persistableModelRaw(model);
   return `${JSON.stringify(payload, null, 2)}\n`;
+}
+
+function readPersistedBoundedInt(
+  record: Record<string, unknown>,
+  key: string,
+  min: number,
+  max: number,
+): number | undefined {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) return undefined;
+  return value;
 }
 
 /**
@@ -770,6 +837,65 @@ export function parseExplicitBoundedIntFlag(
   if (!Number.isFinite(parsed)) return undefined;
   const bounded = Math.max(min, Math.min(max, parsed));
   return bounded === defaultValue ? undefined : bounded;
+}
+
+/**
+ * Parse a slash-command integer. Out-of-range and malformed values are rejected
+ * rather than clamped, so the user sees the valid range instead of a silent
+ * substitution.
+ */
+export function parseStrictBoundedInt(
+  value: string | undefined,
+  min: number,
+  max: number,
+): number | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || String(parsed) !== trimmed) return undefined;
+  if (parsed < min || parsed > max) return undefined;
+  return parsed;
+}
+
+/**
+ * An explicit `--prompt-autocomplete-model` value, or undefined when the flag
+ * still holds its registered default. `active` is an explicit sentinel and is
+ * not treated as unset.
+ */
+export function parseExplicitModelFlag(
+  value: boolean | string | undefined,
+): PromptAutocompleteModelSelection | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.toLowerCase() === DEFAULT_PREFERRED_MODEL) return undefined;
+  return parsePromptAutocompleteModelSelection(trimmed);
+}
+
+export function persistableModelRaw(selection: PromptAutocompleteModelSelection): string | undefined {
+  if (selection.kind === "active") return "active";
+  if (selection.kind === "dedicated") return selection.raw;
+  return undefined;
+}
+
+export function parsePersistedModelRaw(value: string | undefined): PromptAutocompleteModelSelection | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  // An empty field is "no decision", not an explicit request for the session model.
+  if (!trimmed) return undefined;
+  const selection = parsePromptAutocompleteModelSelection(trimmed);
+  return selection.kind === "invalid" ? undefined : selection;
+}
+
+export function resolvePersistedModelSelection(
+  override: PromptAutocompleteModelSelection | undefined,
+  explicitFlag: PromptAutocompleteModelSelection | undefined,
+  saved: PromptAutocompleteModelSelection | undefined,
+): { selection: PromptAutocompleteModelSelection; source: PromptAutocompleteSettingSource } {
+  if (override !== undefined) return { selection: override, source: "session" };
+  if (explicitFlag !== undefined) return { selection: explicitFlag, source: "flag" };
+  if (saved !== undefined) return { selection: saved, source: "saved" };
+  return { selection: { kind: "active" }, source: "flag" };
 }
 
 interface SuggestionPayload {
