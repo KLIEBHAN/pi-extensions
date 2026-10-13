@@ -2091,6 +2091,91 @@ export function truncateDraftTail(draft: string, maxChars = MAX_DRAFT_CONTEXT_CH
   return draft.slice(-maxChars);
 }
 
+/**
+ * Everything one autocomplete request transmits, derived from the draft and
+ * the conversation branch.
+ *
+ * The provider request and `/prompt-autocomplete inspect` consume the same
+ * snapshot and render it with the same function, so the local preview cannot
+ * drift from what is sent. Credentials and headers are never part of it.
+ */
+export interface PromptAutocompleteRequestSnapshot {
+  draft: string;
+  /** The transmitted part of the draft: its last MAX_DRAFT_CONTEXT_CHARS characters. */
+  draftTail: string;
+  latestAssistantContext: string;
+  latestUserContext: string;
+  recentContext: string;
+  maxAlternatives: number;
+  maxSuggestionChars: number;
+}
+
+export function buildPromptAutocompleteRequestSnapshot(input: {
+  draft: string;
+  branch: unknown[];
+  maxAlternatives: number;
+  maxSuggestionChars: number;
+}): PromptAutocompleteRequestSnapshot {
+  return {
+    draft: input.draft,
+    draftTail: truncateDraftTail(input.draft, MAX_DRAFT_CONTEXT_CHARS),
+    latestAssistantContext: buildLatestAssistantMessageContext(input.branch),
+    latestUserContext: buildLatestUserMessageContext(input.branch),
+    recentContext: buildRecentConversationContext(input.branch),
+    maxAlternatives: input.maxAlternatives,
+    maxSuggestionChars: input.maxSuggestionChars,
+  };
+}
+
+/**
+ * Render the single user message a request sends.
+ *
+ * Kept separate from the snapshot so the keystroke path only gathers context;
+ * the message text is produced when a provider request is actually created,
+ * or when inspection asks for it.
+ */
+export function renderPromptAutocompleteUserText(snapshot: PromptAutocompleteRequestSnapshot): string {
+  const sections: string[] = [];
+  if (snapshot.latestAssistantContext) {
+    sections.push(`Latest assistant message (primary context):\n${snapshot.latestAssistantContext}`);
+  }
+  if (snapshot.latestUserContext) {
+    sections.push(`Latest user message:\n${snapshot.latestUserContext}`);
+  }
+  if (snapshot.recentContext) {
+    sections.push(`Recent conversation summary:\n${snapshot.recentContext}`);
+  }
+
+  if (snapshot.draft.length === 0) {
+    sections.push("Current draft is empty.");
+    sections.push(
+      [
+        `Task: propose up to ${snapshot.maxAlternatives} ranked full next prompts the user could send now.`,
+        "Each item must be a complete next prompt, not a continuation fragment.",
+        "Suggest the prompt most likely to move the overall project forward.",
+        "Prefer 3-10 words when possible.",
+      ].join("\n"),
+    );
+  } else {
+    if (snapshot.draftTail.length < snapshot.draft.length) {
+      sections.push(
+        `Current draft tail (the real draft is longer; the cursor is at the end of the full draft):\n${snapshot.draftTail}`,
+      );
+    } else {
+      sections.push(`Current draft (cursor at end):\n${snapshot.draft}`);
+    }
+
+    sections.push(
+      [
+        `Task: propose up to ${snapshot.maxAlternatives} ranked continuations to insert at the cursor.`,
+        "Each item must be only the text after the cursor; never restate text the user already typed.",
+        "If the draft ends inside a partially typed word, complete that word directly without a leading space.",
+      ].join("\n"),
+    );
+  }
+  return sections.join("\n\n");
+}
+
 export function shouldSkipPromptAutocomplete(text: string): boolean {
   const trimmedStart = text.trimStart();
   if (trimmedStart.startsWith("/") || trimmedStart.startsWith("!")) return true;

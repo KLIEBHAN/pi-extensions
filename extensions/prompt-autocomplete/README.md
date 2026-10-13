@@ -24,7 +24,7 @@ Prompt Autocomplete is **disabled by default**. Enable it explicitly for a proce
 pi --prompt-autocomplete
 ```
 
-Or enable it for the current interactive session:
+Or enable it from inside an interactive session; the decision is saved for later sessions:
 
 ```text
 /prompt-autocomplete on
@@ -40,7 +40,8 @@ Or enable it for the current interactive session:
 | Previous alternative | `Ctrl+,` |
 | Dismiss the suggestion for this draft | `Escape` |
 | Enable, disable, or inspect configuration | `/prompt-autocomplete on\|off\|toggle\|status` |
-| Show current-session effectiveness and cost | `/prompt-autocomplete stats` |
+| Show in-memory effectiveness and cost counters | `/prompt-autocomplete stats` |
+| Preview what a request would send, locally | `/prompt-autocomplete inspect [draft text]` |
 | Toggle streamed response previews | `/prompt-autocomplete stream on\|off\|toggle` |
 | Set and persist the minimum draft length | `/prompt-autocomplete min-chars <n>` |
 | Cap provider requests for this session | `/prompt-autocomplete budget <n\|off>` |
@@ -75,7 +76,7 @@ pi \
 - `Ctrl+.` with no active suggestion is an explicit one-shot request and may bypass the main-agent-streaming, cooldown, and minimum-length gates. Model, authentication, slash-command, and path safety checks still apply.
 - Use `--prompt-autocomplete-debug` or `/prompt-autocomplete debug-on` for troubleshooting.
 
-Slash-command toggles (`on`, `off`, `stream`, `while-streaming`, `debug-*`) and `/prompt-autocomplete set` outrank the CLI flags for the rest of the process, including in sessions started later. `status` labels each value with its source, `(flag)`, `(saved)`, or `(session)`. Settings you never toggled keep following their flag. Interactive `set` values outside the documented range are rejected rather than clamped; CLI flags still clamp.
+Slash-command decisions outrank the CLI flags. `on`, `off`, `min-chars`, and `set` are also saved for later sessions and processes (see [Persistent settings](#persistent-settings)). `stream`, `while-streaming`, and `debug-*` live only in the current extension runtime: Pi replaces that runtime on `/new`, `/resume`, `/fork`, and `/reload`, after which their flags apply again. `status` labels each value with its source, `(flag)`, `(saved)`, or `(session)`. Settings you never toggled keep following their flag. Interactive `set` values outside the documented range are rejected rather than clamped; CLI flags still clamp.
 
 Changing `max-chars`, `max-alternatives`, or `model` cancels in-flight autocomplete work and drops the request caches. It does **not** start a replacement request. Changing `debounce-ms` only drops a waiting timer; an already-started provider call continues. Debug toggles change neither.
 
@@ -87,7 +88,7 @@ Changing `max-chars`, `max-alternatives`, or `model` cancels in-flight autocompl
 - Auth failures consume nothing: the reservation happens after credentials resolve and immediately before the provider call, so two concurrent requests can never overshoot a ceiling of one.
 - An exhausted budget blocks automatic **and** manual (`Ctrl+.`) requests and reports itself once per exhaustion state. Raise the ceiling with `/prompt-autocomplete budget <n>` or lift it with `/prompt-autocomplete budget off`; neither starts a replacement request.
 - The budget is **session-scoped**, not process-wide: usage and ceiling are snapshotted into the session's own non-LLM entries and never into `settings.json`. `/new` and `/fork` therefore start with a fresh usage count, while a graceful `/reload` or `/resume` of the same session restores usage and ceiling. Restoration scans the whole session rather than the current branch and never lets usage go backwards, so switching branches cannot buy extra requests. A session that never touched the budget writes no entries at all; once a ceiling has been set or restored, accounting stays durable even while the ceiling is off. A crash before the last snapshot, or a host without `pi.appendEntry`, can lose that durability — the in-process ceiling still applies.
-- Like the other slash-command decisions, a ceiling set with `/prompt-autocomplete budget` keeps applying for the rest of the process, including in later sessions; only the usage counter is per session. A CLI flag applies to its invocation, and `status` labels the ceiling `(flag)`, `(saved)`, or `(session)`.
+- A ceiling set with `/prompt-autocomplete budget` belongs to the session as well: `/reload` and `/resume` restore it, while `/new` and `/fork` start from the CLI flag or `off`. A CLI flag applies to its invocation, and `status` labels the ceiling `(flag)`, `(saved)`, or `(session)`.
 - Interactive values outside `1`–`100000` are rejected; the CLI flag clamps. `budget` without an argument, `status`, and `stats` all report `used/limit` with the source of the ceiling. The budget counter and the `stats` block have different scopes: `stats` covers the current extension runtime and restarts after a reload, while the budget counter covers the physical session and survives one.
 - This is a request ceiling only: there is no token or dollar budget.
 
@@ -97,7 +98,7 @@ Changing `max-chars`, `max-alternatives`, or `model` cancels in-flight autocompl
 
 ### Usage and cost accounting
 
-`/prompt-autocomplete stats` gives the current session a dedicated, readable report:
+`/prompt-autocomplete stats` gives the in-memory counters a dedicated, readable report:
 
 ```text
 Prompt Autocomplete — current session
@@ -120,7 +121,15 @@ Budget: 4/25 (session)
 - Token counts come from the provider.
 - **The cost is an estimate, not an invoice.** Pi derives it locally by multiplying the reported tokens with its own model price table, so it can disagree with what your provider actually bills.
 - A trailing `+` (`1832 tokens+`, `estimated cost ~$0.00214+`; compact `status`: `1832 tok+`, `~$0.00214 est+`) means at least one request did not report that metric, so the true total may be higher than shown. Tokens and cost are marked independently, because a response can report tokens without a cost figure.
-- Counters live only in memory, are scoped to the current session, and reset when a new session starts.
+- Counters live only in memory and belong to the current extension runtime: they restart whenever Pi replaces it — a new session, `/resume`, `/fork`, or `/reload`. The session request budget is the exception and survives `/reload` and `/resume` (see [Session request budget](#session-request-budget)).
+
+### Inspecting a request
+
+`/prompt-autocomplete inspect [draft text]` shows locally what an autocomplete request would send. It makes no provider request, persists nothing, and never shows credentials or headers; at most it warms the in-memory context cache that the next request in the same conversation reuses.
+
+- The report renders the same request snapshot the provider path uses: the resolved and requested model, the latest assistant and user messages, the recent-conversation summary, the transmitted draft tail, the exact request size, and the output and token ceilings. Long sections appear as character counts with short sanitized excerpts.
+- Without draft text the report covers the conversation sections only. The slash command replaced the editor text when you submitted it, so the draft a real request would carry cannot be recovered and is not invented; pass one explicitly to preview a complete request. Pi trims trailing whitespace from submitted commands.
+- `Shared policy` evaluates only the gates every editor shares — enabled state, editor ownership, the main-agent gate, model and auth, `min-chars` and slash/path detection for the given draft, and the session budget — separately for automatic requests and the manual `Ctrl+.` one-shot. Cursor position, the built-in autocomplete menu, Escape dismissal, the per-editor error cooldown, and cached responses belong to the live editor and are not evaluated.
 
 ## Privacy, providers, and cost
 
@@ -145,10 +154,12 @@ The extension makes no autocomplete request while disabled. Automatic empty-draf
 - Supported baseline: Pi `0.80.6`, Node.js `22.19.0` or newer.
 - Every release is verified against Pi `0.80.6`, `0.83.0`, and `1.2.0`. Pi 1.x draws the editor cursor through fake-cursor markers instead of inverse video; ghost text supports both forms.
 - On hosts that expose Pi's model-visible session projection (Pi 1.x), autocomplete context follows it: a message that `context_edit` omitted or replaced, for example to redact it, is omitted or replaced in autocomplete requests too. If that projection fails, requests carry no conversation context rather than the raw history. Autocomplete context remains user and assistant message text only: compaction summaries, custom messages, and tool results are not sent, so after a compaction autocomplete uses only the messages the compaction retained.
-- Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor.
+- Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor and never reach a provider.
+- The read-only commands `status`, `stats`, and `inspect` also work on hosts that can show notifications, such as RPC; there `status` reports `host=non-interactive` and `editor=unavailable`. Every command that changes state or touches the editor stays TUI-only. If the extension is enabled on such a host, it says once per process that no autocomplete request will be issued.
 - Forks of Pi's extension API whose `ExtensionContext` predates `mode`, such as [prime-agent](https://www.npmjs.com/package/prime-agent), are supported. For those hosts the extension first requires UI availability and a custom-editor slot, and then verifies that the host actually installed the editor. A front-end that accepts an editor factory without installing it, as forked RPC and daemon modes do, is detected on the first attempt and stays inactive: it is not retried, not left enabled, and can neither render ghost text nor issue a provider request.
 - The simple completion API is imported from the `@earendil-works/pi-ai` root specifier, which Pi maps to its compat entrypoint and such forks export directly. If a host exposes that module without `streamSimple`, the extension uses the completion path instead of failing requests.
 - Prompt Autocomplete requires exclusive ownership of Pi's custom-editor slot. It refuses to replace another custom editor and never removes a later replacement editor.
+- If another extension replaces the editor while a request runs, the request is released at the next boundary the old editor observes — an edit, streamed progress, or the terminal response — and its result is never painted. Pi exposes no editor-change event, so a provider that never yields cannot be interrupted earlier.
 
 ## Development
 

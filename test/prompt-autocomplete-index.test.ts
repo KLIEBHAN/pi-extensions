@@ -5,6 +5,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { PromptAutocompletePersistedSettings } from "../extensions/prompt-autocomplete/core.ts";
 import {
   createPromptAutocompleteExtension,
+  type PromptAutocompleteDependencies,
+  type PromptAutocompleteProcessState,
   resolvePromptAutocompleteSettingsPath,
 } from "../extensions/prompt-autocomplete/index.ts";
 
@@ -36,6 +38,10 @@ interface HarnessOptions {
   branch?: unknown[];
   /** Physical session id; a different id emulates a new or forked session. */
   sessionId?: string;
+  /** Process-lifetime state; share one object between harnesses to emulate runtimes of one process. */
+  processState?: PromptAutocompleteProcessState;
+  /** Use the real process-wide default instead of an isolated state object. */
+  useProcessGlobal?: boolean;
 }
 
 function createHarness(options: HarnessOptions = {}) {
@@ -129,7 +135,20 @@ function createHarness(options: HarnessOptions = {}) {
     },
   };
 
-  createPromptAutocompleteExtension({ settingsStore })(pi);
+  // Counting seams prove that no command or lifecycle path reaches a provider.
+  let providerCalls = 0;
+  createPromptAutocompleteExtension({
+    settingsStore,
+    processState: options.useProcessGlobal ? undefined : (options.processState ?? {}),
+    completeSimple: (async () => {
+      providerCalls += 1;
+      throw new Error("index tests must not reach the provider");
+    }) as unknown as NonNullable<PromptAutocompleteDependencies["completeSimple"]>,
+    streamSimple: (() => {
+      providerCalls += 1;
+      throw new Error("index tests must not reach the provider");
+    }) as unknown as NonNullable<PromptAutocompleteDependencies["streamSimple"]>,
+  })(pi);
 
   return {
     commands,
@@ -142,6 +161,7 @@ function createHarness(options: HarnessOptions = {}) {
     settingsSaves,
     getStoredSettings: () => ({ ...storedSettings }),
     getBranch: () => branch,
+    getProviderCalls: () => providerCalls,
     getEditorFactory: () => editorFactory,
     replaceEditorExternally: (factory: EditorFactory | undefined) => {
       editorFactory = factory;
@@ -231,8 +251,11 @@ test("a host whose editor slot silently drops the factory stays inactive", async
     /installs custom editors in the terminal process/,
   );
 
-  // Once proven, such a host is treated like any other non-interactive host.
+  // Once proven, such a host is treated like any other non-interactive host:
+  // reporting stays available and honest, while changes are still refused.
   await command(noOpHost, "status");
+  assert.match(noOpHost.notifications.at(-1)?.message ?? "", /host=non-interactive \| enabled=no\(flag\) \| editor=unavailable/);
+  await command(noOpHost, "on");
   assert.match(noOpHost.notifications.at(-1)?.message ?? "", /requires interactive TUI mode/);
 
   await emit(noOpHost, "session_start");
@@ -921,7 +944,7 @@ test("a restored budget snapshot defers to an explicit flag but outranks the def
   assert.match(lastStatus(forked), /budget=off\(flag\)/, "a forked session ignores another session's snapshot");
 });
 
-test("a session-scoped budget decision survives a new session as an override", async () => {
+test("a budget decision outlives a repeated session_start on the same runtime", async () => {
   const harness = createHarness({ savedSettings: { enabled: true } });
   await emit(harness, "session_start");
   await command(harness, "budget 2");
@@ -929,4 +952,215 @@ test("a session-scoped budget decision survives a new session as an override", a
   await emit(harness, "session_start");
   await command(harness, "status");
   assert.match(lastStatus(harness), /budget=0\/2\(session\)/, "the ceiling persists in process while usage resets");
+});
+
+const conversationBranch = [
+  { type: "message", message: { role: "user", content: "Please harden the parser" } },
+  { type: "message", message: { role: "assistant", content: "The implementation is ready for review" } },
+];
+
+test("read-only commands report on a non-interactive host while changes stay TUI-only", async () => {
+  const harness = createHarness({ enabled: true, mode: "rpc", branch: conversationBranch });
+  await emit(harness, "session_start");
+  for (const event of ["agent_start", "agent_end", "agent_settled", "model_select", "session_tree"]) {
+    await emit(harness, event);
+  }
+
+  await command(harness, "status");
+  assert.match(lastStatus(harness), /^host=non-interactive \| enabled=yes\(flag\) \| editor=unavailable/);
+  assert.doesNotMatch(lastStatus(harness), /keys=/, "keys cannot be used without an interactive editor");
+  await command(harness, "stats");
+  assert.match(lastStatus(harness), /^Prompt Autocomplete — current session/);
+  await command(harness, "inspect Review the parser");
+  assert.match(lastStatus(harness), /automatic blocked \(this host has no interactive editor\)/);
+
+  for (const mutating of [
+    "on",
+    "off",
+    "toggle",
+    "min-chars 3",
+    "budget 2",
+    "set debounce-ms 100",
+    "stream off",
+    "while-streaming on",
+    "debug-on",
+  ]) {
+    await command(harness, mutating);
+    assert.match(lastStatus(harness), /requires interactive TUI mode/, `${mutating} must stay TUI-only`);
+  }
+  assert.equal(harness.settingsSaves.length, 0);
+  assert.equal(harness.editorSetCalls.length, 0);
+  assert.equal(harness.getProviderCalls(), 0, "no provider seam is reachable outside the TUI");
+});
+
+test("hosts without a notification channel refuse every command and stay silent", async () => {
+  for (const mode of ["print", "json"] as const) {
+    const harness = createHarness({ enabled: true, mode });
+    await emit(harness, "session_start");
+    assert.ok(!harness.notifications.some((entry) => entry.message.includes("no autocomplete requests")));
+    await command(harness, "status");
+    assert.match(lastStatus(harness), /requires interactive TUI mode/);
+    assert.equal(harness.editorSetCalls.length, 0);
+    assert.equal(harness.getProviderCalls(), 0);
+  }
+});
+
+test("an enabled extension on a non-interactive host says once per process that it cannot issue requests", async () => {
+  const notice = "no autocomplete requests will be issued";
+  const count = (harness: ReturnType<typeof createHarness>) =>
+    harness.notifications.filter((entry) => entry.message.includes(notice)).length;
+
+  // Pi re-imports the extension for every runtime (/new, /resume, /fork,
+  // /reload); a fresh factory sharing the process state emulates that.
+  const processState: PromptAutocompleteProcessState = {};
+  const first = createHarness({ enabled: true, mode: "rpc", processState });
+  await emit(first, "session_start");
+  await emit(first, "session_start");
+  assert.equal(count(first), 1);
+  const reloaded = createHarness({ enabled: true, mode: "rpc", processState });
+  await emit(reloaded, "session_start");
+  assert.equal(count(reloaded), 0, "a replaced runtime in the same process stays quiet");
+
+  const nextProcess = createHarness({ enabled: true, mode: "rpc", processState: {} });
+  await emit(nextProcess, "session_start");
+  assert.equal(count(nextProcess), 1, "a new process says it again");
+
+  const disabled = createHarness({ enabled: false, mode: "rpc" });
+  await emit(disabled, "session_start");
+  assert.ok(!disabled.notifications.some((entry) => entry.message.includes(notice)));
+
+  const tui = createHarness({ enabled: true, mode: "tui" });
+  await emit(tui, "session_start");
+  assert.ok(!tui.notifications.some((entry) => entry.message.includes(notice)));
+});
+
+test("inspection without a draft reports conversation sections and never invents a draft", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true }, branch: conversationBranch });
+  await emit(harness, "session_start");
+  await command(harness, "inspect");
+
+  const report = lastStatus(harness);
+  assert.match(report, /^Prompt Autocomplete — request inspection \(local only; no provider request was made\)/);
+  assert.match(report, /Draft: not available — the slash command replaced the editor text/);
+  assert.match(report, /one user message whose size depends on the draft/);
+  assert.match(report, /Latest user message: 24 chars sent/);
+  assert.match(report, /Recent conversation: \d+ chars sent \(up to 6 messages × 600 chars\)/);
+  assert.match(report, /Output: up to 3 alternatives × 160 chars, at most \d+ output tokens/);
+  assert.match(report, /Not evaluated here \(live editor state\)/);
+  assert.match(report, /never sent; credentials and headers are never shown/);
+  assert.doesNotMatch(report, /test-key|apiKey|Authorization/);
+  assert.equal(harness.getProviderCalls(), 0);
+});
+
+test("inspection applies the shared draft policy and reports the budget", async () => {
+  const exhausted = {
+    type: "custom",
+    customType: "prompt-autocomplete-stats",
+    data: { schemaVersion: 1, physicalSessionId: "session-1", limit: 1, used: 1 },
+  };
+  const harness = createHarness({ savedSettings: { enabled: true, minPromptChars: 5 }, branch: [exhausted] });
+  await emit(harness, "session_start");
+
+  await command(harness, "inspect hi");
+  assert.match(
+    lastStatus(harness),
+    /automatic blocked \(the draft is shorter than min-chars \(5\)\) · manual blocked \(the session budget is exhausted \(1\/1\)\)/,
+  );
+  assert.match(lastStatus(harness), /budget=1\/1\(saved\)/);
+
+  await command(harness, "inspect /help");
+  assert.match(lastStatus(harness), /automatic blocked \(the draft looks like a slash command or path\)/);
+  assert.equal(harness.getProviderCalls(), 0);
+});
+
+test("inspection output is sanitized and bounded", async () => {
+  const hostile = `\x1b]0;pwned\x07\x1b[31mred\x1b[0m ${"x".repeat(10_000)}\u202e`;
+  const harness = createHarness({
+    savedSettings: { enabled: true },
+    branch: [{ type: "message", message: { role: "assistant", content: hostile } }],
+  });
+  await emit(harness, "session_start");
+  await command(harness, `inspect \x1b[2Jdraft ${"y".repeat(5_000)}`);
+
+  const report = lastStatus(harness);
+  assert.doesNotMatch(report, /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u202E]/, "no terminal controls or bidi overrides");
+  assert.doesNotMatch(report, /pwned/);
+  assert.match(report, /Latest assistant message: \d+ chars sent \(cap 3000\)/);
+  assert.match(report, /Draft: 5010 chars, 2000 sent \(only the last 2000 are sent\)/);
+  for (const line of report.split("\n")) {
+    assert.ok(line.length <= 400, `every report line stays bounded: ${line.length}`);
+  }
+});
+
+test("a proven no-op editor host stays inactive in a later runtime of the same process", async () => {
+  const processState: PromptAutocompleteProcessState = {};
+  const host = { enabled: true, omitMode: true, hasUI: true, noOpEditorSlot: true, processState } as const;
+  const first = createHarness(host);
+  await emit(first, "session_start");
+  assert.equal(first.editorSetCalls.length, 1, "the first runtime probes the host once");
+
+  const reloaded = createHarness(host);
+  await emit(reloaded, "session_start");
+  assert.equal(reloaded.editorSetCalls.length, 0, "a replaced runtime does not probe the proven host again");
+  assert.ok(
+    !reloaded.notifications.some((entry) => /installs custom editors in the terminal process/.test(entry.message)),
+    "the proven limitation is not reported again",
+  );
+  await command(reloaded, "on");
+  assert.equal(reloaded.editorSetCalls.length, 0);
+  assert.match(lastStatus(reloaded), /requires interactive TUI mode/);
+});
+
+test("a corrupt or frozen process-state occupant is replaced instead of trusted", async () => {
+  const key = Symbol.for("@kliebhan/pi-prompt-autocomplete/process-state");
+  const original = Reflect.getOwnPropertyDescriptor(globalThis, key);
+  const notice = "no autocomplete requests will be issued";
+  const occupy = (descriptor: PropertyDescriptor) => {
+    Reflect.deleteProperty(globalThis, key);
+    assert.ok(Reflect.defineProperty(globalThis, key, { configurable: true, ...descriptor }));
+  };
+  try {
+    const throwingProxy = new Proxy({}, {
+      getPrototypeOf() {
+        throw new Error("hostile trap");
+      },
+    });
+    const accessor = {};
+    Object.defineProperty(accessor, "hostInstallsEditors", { get: () => false, enumerable: true });
+    for (const occupant of [
+      { nonInteractiveNoticeShown: "false" },
+      Object.freeze({}),
+      "not-an-object",
+      Object.create({ nonInteractiveNoticeShown: true }),
+      accessor,
+      throwingProxy,
+    ]) {
+      occupy({ value: occupant, writable: true });
+      const harness = createHarness({ enabled: true, mode: "rpc", useProcessGlobal: true });
+      await emit(harness, "session_start");
+      assert.equal(
+        harness.notifications.filter((entry) => entry.message.includes(notice)).length,
+        1,
+        "an invalid occupant must neither suppress the notice nor throw",
+      );
+    }
+
+    // An inherited negative probe result must not block a real interactive host.
+    occupy({ value: Object.create({ hostInstallsEditors: false }), writable: true });
+    const tui = createHarness({ enabled: true, mode: "tui", useProcessGlobal: true });
+    await emit(tui, "session_start");
+    assert.equal(tui.editorSetCalls.length, 1);
+
+    // A non-writable but configurable slot is still claimed, so later runtimes share it.
+    occupy({ value: "corrupt", writable: false });
+    const first = createHarness({ enabled: true, mode: "rpc", useProcessGlobal: true });
+    await emit(first, "session_start");
+    const reloaded = createHarness({ enabled: true, mode: "rpc", useProcessGlobal: true });
+    await emit(reloaded, "session_start");
+    assert.equal(first.notifications.filter((entry) => entry.message.includes(notice)).length, 1);
+    assert.equal(reloaded.notifications.filter((entry) => entry.message.includes(notice)).length, 0);
+  } finally {
+    Reflect.deleteProperty(globalThis, key);
+    if (original) Reflect.defineProperty(globalThis, key, original);
+  }
 });
