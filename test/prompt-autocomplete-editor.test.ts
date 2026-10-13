@@ -10,6 +10,8 @@ import type {
 import { CustomEditor, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   type AutocompleteProvider,
+  CombinedAutocompleteProvider,
+  type SlashCommand,
   CURSOR_MARKER,
   type EditorComponent,
   type EditorTheme,
@@ -29,6 +31,11 @@ import {
 
 type Handler = (event: any, ctx: ExtensionContext) => Promise<unknown> | unknown;
 type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown> | unknown;
+interface CommandDefinition {
+  description?: string;
+  handler: CommandHandler;
+  getArgumentCompletions?: SlashCommand["getArgumentCompletions"];
+}
 type EditorFactory = Exclude<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0], undefined>;
 type CompleteSimple = NonNullable<PromptAutocompleteDependencies["completeSimple"]>;
 type StreamSimple = NonNullable<PromptAutocompleteDependencies["streamSimple"]>;
@@ -165,6 +172,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
   if (options.preferredModel) flags.set("prompt-autocomplete-model", options.preferredModel);
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, CommandHandler>();
+  const commandDefinitions = new Map<string, CommandDefinition>();
   const widgets: Array<{ key: string; content: string[] | undefined }> = [];
   const notifications: string[] = [];
   let editorFactory: EditorFactory | undefined;
@@ -222,8 +230,9 @@ function createEditorHarness(options: EditorHarnessOptions) {
     on(name: string, handler: Handler) {
       handlers.set(name, handler);
     },
-    registerCommand(name: string, definition: { handler: CommandHandler }) {
+    registerCommand(name: string, definition: CommandDefinition) {
       commands.set(name, definition.handler);
+      commandDefinitions.set(name, definition);
     },
     ...(options.omitAppendEntry
       ? {}
@@ -260,6 +269,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
 
   return {
     commands,
+    commandDefinitions,
     ctx,
     handlers,
     notifications,
@@ -2852,4 +2862,63 @@ test("a host without a session projection sends no compaction summary", async ()
   const sentText: string = capturedContext.messages[0].content[0].text;
   assert.doesNotMatch(sentText, /Earlier conversation summary/);
   assert.match(sentText, /Earlier request/, "older hosts keep the raw messages instead");
+});
+
+test("Pi's command menu completes arguments over the full span in the real editor", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" ghost"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  const definition = harness.commandDefinitions.get("prompt-autocomplete");
+  assert.ok(definition?.getArgumentCompletions && editor.setAutocompleteProvider);
+  // Pi's own provider, fed with the command exactly as the extension registered it.
+  editor.setAutocompleteProvider(
+    new CombinedAutocompleteProvider(
+      [{ name: "prompt-autocomplete", description: definition.description, getArgumentCompletions: definition.getArgumentCompletions }],
+      process.cwd(),
+      null,
+    ),
+  );
+  const submitted: string[] = [];
+  editor.onSubmit = (text) => submitted.push(text);
+  const type = async (text: string) => {
+    for (const character of text) {
+      editor.handleInput(character);
+      await flushAsyncWork();
+    }
+  };
+
+  await type("/prompt-autocomplete stre");
+  editor.handleInput("\t");
+  assert.equal(editor.getText(), "/prompt-autocomplete stream on", "Tab inserts the first full value");
+
+  editor.setText("");
+  await type("/prompt-autocomplete set   debou");
+  editor.handleInput("\t");
+  assert.equal(editor.getText(), "/prompt-autocomplete set debounce-ms ", "the whole argument span is replaced");
+
+  editor.setText("");
+  await type("/prompt-autocomplete set mo");
+  editor.handleInput("\r");
+  assert.equal(editor.getText(), "/prompt-autocomplete set model active", "Enter applies a nested value");
+  assert.deepEqual(submitted, [], "applying a completion does not submit");
+
+  // `stream` alone is complete (it toggles) although longer forms exist: the
+  // menu must stay closed so one Enter still submits it.
+  editor.setText("");
+  await type("/prompt-autocomplete stream");
+  editor.handleInput("\r");
+  assert.deepEqual(submitted, ["/prompt-autocomplete stream"], "a complete command submits with one Enter");
+
+  // `set min-chars` alone reports the value, so it submits with one Enter too.
+  editor.setText("");
+  await type("/prompt-autocomplete set min-chars");
+  editor.handleInput("\r");
+  assert.deepEqual(submitted, ["/prompt-autocomplete stream", "/prompt-autocomplete set min-chars"]);
+
+  assert.equal(calls, 0, "command completion never asks the model for ghost text");
 });

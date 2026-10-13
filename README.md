@@ -233,6 +233,7 @@ pi install npm:@kliebhan/pi-prompt-autocomplete
 - configurable alternative count via `--prompt-autocomplete-max-alternatives <1-5>`
 - clean default UI: debug/status lines stay hidden unless you opt into debug mode
 - `/prompt-autocomplete stats` reports in-memory counters for the current extension runtime (they restart on a new session, `/resume`, `/fork`, or `/reload`): requests, failures, exact/prefix cache hits, suggestions offered and accepted, tokens, estimated cost, and mean provider latency
+- `/prompt-autocomplete` arguments complete in Pi's command menu, including nested forms such as `set model active`
 - `/prompt-autocomplete inspect [draft text]` previews locally what a request would send, with sizes, sanitized excerpts, and the shared request policy, and makes no provider request
 - optional session request ceiling via `--prompt-autocomplete-max-requests <n|off>` or `/prompt-autocomplete budget <n|off>`: only real provider calls count, cache hits and in-flight joins stay free, and the ceiling is session-scoped (`/new` and `/fork` start fresh, `/reload` and `/resume` restore it)
 - the internal autocomplete system prompt lives in `extensions/prompt-autocomplete/system-prompt.template.md` and is rendered through a tiny mini-template helper with `{{PLACEHOLDER}}`, `{{PLACEHOLDER|fallback}}`, and escaped literals via `\{{PLACEHOLDER}}`, so prompt tuning stays decoupled from TypeScript while still allowing reusable prompt fragments

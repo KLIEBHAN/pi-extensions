@@ -12,6 +12,12 @@ import {
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
+  completePromptAutocompleteArguments,
+  findPromptAutocompleteCommand,
+  PROMPT_AUTOCOMPLETE_COMMANDS,
+  PROMPT_AUTOCOMPLETE_SET_KEYS,
+  PROMPT_AUTOCOMPLETE_SET_USAGE,
+  PROMPT_AUTOCOMPLETE_USAGE,
   MAX_DRAFT_CONTEXT_CHARS,
   buildPromptAutocompleteRequestSnapshot,
   renderPromptAutocompleteUserText,
@@ -1734,4 +1740,95 @@ test("a compaction summary is bounded with goal and next steps kept, and its che
     "the compaction's system checkpoint never reaches autocomplete context",
   );
   assert.equal(buildCompactionSummaryContext([{ type: "compaction_summary", summary: "   " }]), "");
+});
+
+test("the command grammar reproduces the published usage text exactly", () => {
+  assert.equal(
+    PROMPT_AUTOCOMPLETE_USAGE,
+    "Usage: /prompt-autocomplete [on|off|toggle|status|stats|inspect [draft]|min-chars <n>|budget <n|off>|set <key> [value]|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
+  );
+  assert.equal(
+    PROMPT_AUTOCOMPLETE_SET_USAGE,
+    "Usage: /prompt-autocomplete set [debounce-ms <0-5000>|min-chars <0-500>|max-chars <16-1000>|max-alternatives <1-5>|model <provider/model|active>]",
+  );
+});
+
+test("the command grammar is consistent", () => {
+  const names = PROMPT_AUTOCOMPLETE_COMMANDS.map((spec) => spec.name);
+  assert.equal(new Set(names).size, names.length, "command names are unique");
+  assert.deepEqual(
+    PROMPT_AUTOCOMPLETE_COMMANDS.filter((spec) => spec.readOnly).map((spec) => spec.name),
+    ["status", "stats", "inspect"],
+    "only reporting commands are read-only",
+  );
+  for (const spec of PROMPT_AUTOCOMPLETE_COMMANDS) {
+    assert.ok(spec.completions.length > 0, `${spec.name} offers at least one completion`);
+    for (const completion of spec.completions) {
+      // Pi replaces the whole argument span, so every value starts with its command.
+      assert.ok(
+        completion.value === spec.name || completion.value.startsWith(`${spec.name} `),
+        `${completion.value} must be a full value for ${spec.name}`,
+      );
+      assert.ok(completion.label.startsWith(spec.name));
+      // pi-tui's command menu gives labels a 32-column primary column with a
+      // 2-column gap; longer labels are cut off mid-word.
+      assert.ok(completion.label.length <= 30, `${completion.label} fits the menu label column`);
+      assert.ok(completion.description.length > 0);
+    }
+  }
+  const setValues = findPromptAutocompleteCommand("set")!.completions.map((completion) => completion.value);
+  for (const { key } of PROMPT_AUTOCOMPLETE_SET_KEYS) {
+    assert.ok(setValues.includes(`set ${key} `), `set ${key} is offered`);
+  }
+  assert.equal(findPromptAutocompleteCommand("unknown"), undefined);
+});
+
+test("argument completion covers empty, single-token, nested, and unmatched prefixes", () => {
+  const values = (prefix: string) => completePromptAutocompleteArguments(prefix)?.map((item) => item.value) ?? null;
+
+  const all = values("");
+  assert.ok(all);
+  assert.deepEqual(all.slice(0, 6), ["on", "off", "toggle", "status", "stats", "inspect"], "grammar order");
+  assert.equal(all.length, PROMPT_AUTOCOMPLETE_COMMANDS.flatMap((spec) => spec.completions).length);
+
+  assert.deepEqual(values("st"), ["status", "stats", "stream on", "stream off", "stream toggle"]);
+  assert.deepEqual(values("stream o"), ["stream on", "stream off"]);
+  assert.deepEqual(values("while-streaming of"), ["while-streaming off"]);
+  assert.deepEqual(values("set d"), ["set debounce-ms "]);
+  assert.deepEqual(values("set model a"), ["set model active"]);
+  assert.deepEqual(values("bu"), ["budget off", "budget "]);
+  assert.equal(values("zzz"), null);
+  assert.equal(values("set model openai/"), null, "free values are never guessed");
+  assert.equal(values("inspect Review the parser"), null, "an inspected draft is not completed");
+});
+
+test("argument completion stays out of the way of complete submissions", () => {
+  // While the menu is open, Enter applies a completion instead of submitting,
+  // so a complete command must close the menu to keep a single Enter working.
+  for (const complete of ["on", "off", "stats", "status", "inspect", "set", "set min-chars", "budget", "min-chars", "stream", "stream on", "budget off", "set model active", "debug-toggle"]) {
+    assert.equal(completePromptAutocompleteArguments(complete), null, `${complete} submits directly`);
+  }
+  // A form that still needs a value keeps offering it.
+  assert.deepEqual(completePromptAutocompleteArguments("set debounce-ms")?.map((item) => item.value), ["set debounce-ms "]);
+});
+
+test("argument completion is case-insensitive and normalizes whitespace", () => {
+  const values = (prefix: string) => completePromptAutocompleteArguments(prefix)?.map((item) => item.value) ?? null;
+  assert.deepEqual(values("STREAM O"), ["stream on", "stream off"]);
+  assert.deepEqual(values("  set   mo"), ["set model active", "set model "]);
+  assert.equal(values("  Stats"), null);
+
+  const first = completePromptAutocompleteArguments("st")!;
+  first[0]!.value = "mutated";
+  assert.equal(completePromptAutocompleteArguments("st")![0]!.value, "status", "callers get copies");
+});
+
+test("the package README documents every command and set key", () => {
+  const readme = readFileSync(new URL("../extensions/prompt-autocomplete/README.md", import.meta.url), "utf8");
+  for (const spec of PROMPT_AUTOCOMPLETE_COMMANDS) {
+    assert.match(readme, new RegExp(`/prompt-autocomplete[^\\n]*\\b${spec.name}\\b`), `README mentions ${spec.name}`);
+  }
+  for (const { key } of PROMPT_AUTOCOMPLETE_SET_KEYS) {
+    assert.ok(readme.includes(key), `README mentions set ${key}`);
+  }
 });

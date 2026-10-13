@@ -2424,3 +2424,194 @@ export function hostSupportsStreamedResponses(api: {
   if (typeof api.streamSimple === "function") return true;
   return typeof api.completeSimple !== "function";
 }
+
+/** One argument completion, in the shape Pi's slash-command autocomplete expects. */
+export interface PromptAutocompleteCommandCompletion {
+  /**
+   * The full argument text after `/prompt-autocomplete `. Pi replaces the whole
+   * argument span with it, so nested forms carry every token. A trailing space
+   * leaves the cursor where the user types a value.
+   */
+  value: string;
+  label: string;
+  description: string;
+}
+
+interface PromptAutocompleteCommandSpec<Name extends string> {
+  name: Name;
+  /** Placeholder after the name in the usage text, if the command takes an argument. */
+  usage?: string;
+  /** Reports state only, so it may run on hosts without an interactive editor. */
+  readOnly: boolean;
+  /** The name alone is a complete submission: it reports, toggles, or previews. */
+  bareComplete: boolean;
+  completions: readonly PromptAutocompleteCommandCompletion[];
+}
+
+function commandSpec<Name extends string>(
+  name: Name,
+  description: string,
+  options: {
+    usage?: string;
+    readOnly?: boolean;
+    /** Fixed argument choices, each offered as a complete form. */
+    choices?: readonly (readonly [choice: string, description: string])[];
+    /** A free value: offered as the name and a space, labeled with this placeholder. */
+    valuePlaceholder?: string;
+    /** Arguments are optional; without choices or a value the name alone is the only form. */
+    bareComplete?: boolean;
+  } = {},
+): PromptAutocompleteCommandSpec<Name> {
+  const completions: PromptAutocompleteCommandCompletion[] = [];
+  const takesArgument = !!options.choices || !!options.valuePlaceholder;
+  if (!takesArgument) completions.push({ value: name, label: name, description });
+  for (const [choice, choiceDescription] of options.choices ?? []) {
+    completions.push({ value: `${name} ${choice}`, label: `${name} ${choice}`, description: choiceDescription });
+  }
+  if (options.valuePlaceholder) {
+    completions.push({ value: `${name} `, label: `${name} ${options.valuePlaceholder}`, description });
+  }
+  return {
+    name,
+    usage: options.usage,
+    readOnly: options.readOnly ?? false,
+    bareComplete: !takesArgument || (options.bareComplete ?? false),
+    completions,
+  };
+}
+
+/**
+ * Keys accepted by `/prompt-autocomplete set`. Numeric keys carry their bounds,
+ * which both validation and the usage text use. `bareReports` marks a key that
+ * reports its value when submitted without one, so it is a complete command.
+ */
+export const PROMPT_AUTOCOMPLETE_SET_KEYS = [
+  { key: "debounce-ms", min: DEBOUNCE_MS_MIN, max: DEBOUNCE_MS_MAX, description: "Delay before an automatic request, in milliseconds" },
+  { key: "min-chars", min: MIN_PROMPT_CHARS_MIN, max: MIN_PROMPT_CHARS_MAX, bareReports: true, description: "Minimum draft length for automatic suggestions" },
+  { key: "max-chars", min: MAX_SUGGESTION_CHARS_MIN, max: MAX_SUGGESTION_CHARS_MAX, description: "Maximum characters per suggestion" },
+  { key: "max-alternatives", min: MAX_ALTERNATIVES_MIN, max: MAX_ALTERNATIVES_MAX, description: "Maximum alternatives per request" },
+  { key: "model", description: "Model for autocomplete requests" },
+] as const;
+
+export type PromptAutocompleteSetKey = (typeof PROMPT_AUTOCOMPLETE_SET_KEYS)[number]["key"];
+
+/** Usage placeholder of one set key, e.g. `<0-5000>`. */
+export function formatSetKeyPlaceholder(spec: (typeof PROMPT_AUTOCOMPLETE_SET_KEYS)[number]): string {
+  return "min" in spec ? `<${spec.min}-${spec.max}>` : "<provider/model|active>";
+}
+
+const SET_COMPLETIONS: readonly PromptAutocompleteCommandCompletion[] = PROMPT_AUTOCOMPLETE_SET_KEYS.flatMap((spec) => [
+  ...(spec.key === "model"
+    ? [{ value: "set model active", label: "set model active", description: "Follow the session model" }]
+    : []),
+  {
+    value: `set ${spec.key} `,
+    // `active` has its own entry above, so the model label leaves it out and
+    // fits Pi's 30-column label space.
+    label: `set ${spec.key} ${"min" in spec ? formatSetKeyPlaceholder(spec) : "<provider/model>"}`,
+    description: spec.description,
+  },
+]);
+
+const ON_OFF_TOGGLE = (subject: string) => [
+  ["on", `Turn ${subject} on`],
+  ["off", `Turn ${subject} off`],
+  ["toggle", `Switch ${subject}`],
+] as const;
+
+/**
+ * The `/prompt-autocomplete` grammar: the single source for dispatch, usage
+ * text, and argument completion. Order is the order of the usage text.
+ */
+export const PROMPT_AUTOCOMPLETE_COMMANDS = [
+  commandSpec("on", "Enable inline suggestions and save the decision"),
+  commandSpec("off", "Disable inline suggestions and save the decision"),
+  commandSpec("toggle", "Switch inline suggestions on or off"),
+  commandSpec("status", "Show configuration and request state", { readOnly: true }),
+  commandSpec("stats", "Show session requests, cache hits, tokens, and cost", { readOnly: true }),
+  commandSpec("inspect", "Preview locally what a request would send", { usage: "[draft]", readOnly: true }),
+  commandSpec("min-chars", "Set and save the minimum draft length", {
+    usage: "<n>",
+    valuePlaceholder: `<${MIN_PROMPT_CHARS_MIN}-${MIN_PROMPT_CHARS_MAX}>`,
+    bareComplete: true,
+  }),
+  commandSpec("budget", "Cap provider requests for this session", {
+    usage: "<n|off>",
+    choices: [["off", "Remove the session request ceiling"]],
+    valuePlaceholder: `<${BUDGET_REQUESTS_MIN}-${BUDGET_REQUESTS_MAX}>`,
+    bareComplete: true,
+  }),
+  {
+    ...commandSpec("set", "Show runtime knobs", { usage: "<key> [value]", bareComplete: true }),
+    completions: SET_COMPLETIONS,
+  },
+  commandSpec("stream", "Toggle streamed response previews", {
+    usage: "on|off|toggle",
+    choices: ON_OFF_TOGGLE("streamed previews"),
+    bareComplete: true,
+  }),
+  commandSpec("while-streaming", "Toggle suggestions while the agent works", {
+    usage: "on|off|toggle",
+    choices: ON_OFF_TOGGLE("suggestions while the agent works"),
+    bareComplete: true,
+  }),
+  commandSpec("debug-on", "Show the debug status line"),
+  commandSpec("debug-off", "Hide the debug status line"),
+  commandSpec("debug-toggle", "Switch the debug status line"),
+] as const;
+
+export type PromptAutocompleteCommandName = (typeof PROMPT_AUTOCOMPLETE_COMMANDS)[number]["name"];
+
+export function findPromptAutocompleteCommand(
+  name: string,
+): (typeof PROMPT_AUTOCOMPLETE_COMMANDS)[number] | undefined {
+  return PROMPT_AUTOCOMPLETE_COMMANDS.find((spec) => spec.name === name);
+}
+
+export function findPromptAutocompleteSetKey(
+  key: string,
+): (typeof PROMPT_AUTOCOMPLETE_SET_KEYS)[number] | undefined {
+  return PROMPT_AUTOCOMPLETE_SET_KEYS.find((spec) => spec.key === key);
+}
+
+export const PROMPT_AUTOCOMPLETE_USAGE = `Usage: /prompt-autocomplete [${PROMPT_AUTOCOMPLETE_COMMANDS.map((spec) =>
+  spec.usage ? `${spec.name} ${spec.usage}` : spec.name
+).join("|")}]`;
+
+export const PROMPT_AUTOCOMPLETE_SET_USAGE = `Usage: /prompt-autocomplete set [${PROMPT_AUTOCOMPLETE_SET_KEYS.map((spec) =>
+  `${spec.key} ${formatSetKeyPlaceholder(spec)}`
+).join("|")}]`;
+
+const ALL_COMMAND_COMPLETIONS: readonly PromptAutocompleteCommandCompletion[] = PROMPT_AUTOCOMPLETE_COMMANDS.flatMap(
+  (spec) => spec.completions,
+);
+
+/**
+ * Argument texts that are complete submissions on their own. Typing one of
+ * these exactly must not open the menu: while it is open, Enter applies a
+ * completion instead of submitting, so `stats` would need Enter twice.
+ */
+const COMPLETE_ARGUMENTS: ReadonlySet<string> = new Set([
+  ...PROMPT_AUTOCOMPLETE_COMMANDS.filter((spec) => spec.bareComplete).map((spec) => spec.name),
+  ...PROMPT_AUTOCOMPLETE_SET_KEYS.filter((spec) => "bareReports" in spec).map((spec) => `set ${spec.key}`),
+  ...ALL_COMMAND_COMPLETIONS.map((completion) => completion.value).filter((value) => !value.endsWith(" ")),
+]);
+
+/**
+ * Complete the argument span of `/prompt-autocomplete`.
+ *
+ * Purely local and synchronous: forms that strictly extend the typed text,
+ * matched case-insensitively with whitespace collapsed, in grammar order.
+ * Returns null when nothing matches or when the typed text is already a
+ * complete submission, so Enter keeps submitting it.
+ */
+export function completePromptAutocompleteArguments(
+  argumentPrefix: string,
+): PromptAutocompleteCommandCompletion[] | null {
+  const typed = argumentPrefix.trimStart().replace(/\s+/g, " ").toLowerCase();
+  if (COMPLETE_ARGUMENTS.has(typed)) return null;
+  const matches = ALL_COMMAND_COMPLETIONS
+    .filter((completion) => completion.value.length > typed.length && completion.value.startsWith(typed))
+    .map((completion) => ({ ...completion }));
+  return matches.length > 0 ? matches : null;
+}
