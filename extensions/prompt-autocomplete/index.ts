@@ -259,6 +259,27 @@ const hostStreamSimple = ((model, context, options) =>
     options,
   )) as StreamSimpleFunction;
 
+/** The model registry's own request entry point, which Pi 1.x provides. */
+type RegistryStreamSimple = (...args: Parameters<StreamSimpleFunction>) => ReturnType<StreamSimpleFunction>;
+
+/**
+ * Where a request goes when no seam was injected.
+ *
+ * Pi 1.x serves every chat model, including those that extensions register
+ * with their own streaming implementation, through the session's model
+ * registry; the global `pi-ai` compat functions only know Pi's built-in APIs
+ * there and fail for extension providers. The registry also applies the
+ * provider's request-time base URL and environment. Hosts without it (Pi 0.x
+ * and forks of that API) keep the compat functions, which serve every model
+ * there.
+ */
+function registryStreamSimple(registry: unknown): RegistryStreamSimple | undefined {
+  if (typeof registry !== "object" || registry === null) return undefined;
+  const streamSimple: unknown = Reflect.get(registry, "streamSimple");
+  if (typeof streamSimple !== "function") return undefined;
+  return (model, context, options) => Reflect.apply(streamSimple, registry, [model, context, options]);
+}
+
 export interface PromptAutocompleteDependencies {
   completeSimple?: CompleteSimpleFunction;
   streamSimple?: StreamSimpleFunction;
@@ -2972,16 +2993,28 @@ const COMMAND_RUNNERS: { [Name in PromptAutocompleteCommandName]: CommandRunner 
 export function createPromptAutocompleteExtension(
   dependencies: PromptAutocompleteDependencies = {},
 ): (pi: ExtensionAPI) => void {
-  const completeSimpleImpl = dependencies.completeSimple ?? hostCompleteSimple;
   const hostStreaming = hostSupportsStreamedResponses(piAiSimpleApi);
+  const now = dependencies.now ?? Date.now;
+
+  return function promptAutocompleteExtension(pi: ExtensionAPI): void {
+  // Injected seams win; otherwise each request routes through the session's
+  // model registry when it has one, and through the compat functions if not.
+  // The registry is read per request because a new session may bring another.
+  const routedCompleteSimple: CompleteSimpleFunction = (model, context, options) => {
+    const viaRegistry = registryStreamSimple(shared.modelRegistry);
+    return viaRegistry ? viaRegistry(model, context, options).result() : hostCompleteSimple(model, context, options);
+  };
+  const routedStreamSimple: StreamSimpleFunction = (model, context, options) => {
+    const viaRegistry = registryStreamSimple(shared.modelRegistry);
+    return viaRegistry ? viaRegistry(model, context, options) : hostStreamSimple(model, context, options);
+  };
+  const completeSimpleImpl = dependencies.completeSimple ?? routedCompleteSimple;
   // Existing deterministic harnesses inject only completeSimple. Never let such
   // a harness fall through to the real network-capable stream implementation.
   const streamSimpleImpl =
     dependencies.streamSimple
-    ?? (dependencies.completeSimple || !hostStreaming ? undefined : hostStreamSimple);
-  const now = dependencies.now ?? Date.now;
+    ?? (dependencies.completeSimple || !hostStreaming ? undefined : routedStreamSimple);
 
-  return function promptAutocompleteExtension(pi: ExtensionAPI): void {
   const settingsStore = dependencies.settingsStore ?? createFileSettingsStore(resolvePromptAutocompleteSettingsPath());
   let persistedSettings: PromptAutocompletePersistedSettings;
   try {

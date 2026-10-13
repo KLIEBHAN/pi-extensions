@@ -132,8 +132,11 @@ async function flushAsyncWork(): Promise<void> {
 
 interface EditorHarnessOptions {
   authConfigured?: boolean;
-  completeSimple: CompleteSimple;
+  /** Omit both seams to exercise the extension's own request routing. */
+  completeSimple?: CompleteSimple;
   streamSimple?: StreamSimple;
+  /** The session model registry's own request entry point (Pi 1.x). */
+  registryStreamSimple?: StreamSimple;
   streamSetting?: "on" | "off";
   debounceMs?: number;
   maxAlternatives?: number;
@@ -201,6 +204,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
       options.getApiKeyAndHeaders
         ? await options.getApiKeyAndHeaders()
         : ({ ok: true as const, apiKey: "test-key", headers: {} }),
+    ...(options.registryStreamSimple ? { streamSimple: options.registryStreamSimple } : {}),
   };
   const sessionManager = options.sessionManager ?? {
     getBranch: () => branch,
@@ -2921,4 +2925,67 @@ test("Pi's command menu completes arguments over the full span in the real edito
   assert.deepEqual(submitted, ["/prompt-autocomplete stream", "/prompt-autocomplete set min-chars"]);
 
   assert.equal(calls, 0, "command completion never asks the model for ghost text");
+});
+
+function registryStream(completions: string[]) {
+  const provider = controlledStream();
+  queueMicrotask(() => provider.done(completions, makeUsage(10, 5, 0.0001)));
+  return provider.stream;
+}
+
+test("without injected seams, requests route through the session model registry", async () => {
+  // A registry-only provider: the compat functions cannot serve it (and in
+  // plain Node they do not exist), so a suggestion proves the registry path.
+  const calls: Array<{ model: unknown; context: any; options: any }> = [];
+  const harness = createEditorHarness({
+    registryStreamSimple: ((model, context, options) => {
+      calls.push({ model, context, options });
+      return registryStream([" the patch for edge cases"]);
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.equal(calls.length, 1);
+  assert.match(renderedText(editor), /the patch for edge cases/);
+  assert.deepEqual(calls[0]!.model, { provider: "test-provider", id: "model-a" });
+  assert.match(calls[0]!.context.systemPrompt, /inline prompt suggestions/);
+  assert.match(calls[0]!.context.messages[0].content[0].text, /Current draft \(cursor at end\):\nReview/);
+  assert.equal(calls[0]!.options.apiKey, "test-key", "the resolved credentials are passed along");
+  assert.ok(calls[0]!.options.signal instanceof AbortSignal);
+  assert.equal(calls[0]!.options.timeoutMs, 8_000);
+  assert.equal(calls[0]!.options.maxRetries, 0);
+
+  editor.handleInput("\t");
+  assert.equal(editor.getText(), "Review the patch for edge cases");
+});
+
+test("the completion path also routes through the session model registry", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    streamSetting: "off",
+    registryStreamSimple: (() => {
+      calls += 1;
+      return registryStream([" the failing tests first"]);
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.equal(calls, 1);
+  assert.match(renderedText(editor), /the failing tests first/);
+});
+
+test("without a registry entry point, requests fall back to the compat functions", async () => {
+  const harness = createEditorHarness({});
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  // Plain Node has no Pi alias, so the compat fallback reports the missing API
+  // instead of reaching a provider.
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /requires streamSimple\(\) from @earendil-works\/pi-ai/);
 });
