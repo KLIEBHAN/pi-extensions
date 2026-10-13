@@ -30,11 +30,23 @@ ffmpeg -v error \
   -f null -
 ```
 
+The video must stay H.264, 1200×676, `yuv420p`, and short.
+
+### Re-recording the Gallery video
+
+`scripts/demo/record-prompt-autocomplete-demo.py` records the video from a real Pi TUI session at the repository's development Pi version and writes it to the shipped path. It needs macOS (Menlo and Apple Symbols fonts), `tmux`, `ffmpeg`, Python 3 with Pillow, and `npm ci`:
+
+```bash
+python3 scripts/demo/record-prompt-autocomplete-demo.py
+```
+
+Pi runs in a private tmux server (`tmux -L pa-gallery-demo`, no user configuration) from a clean environment (`env -i` with an explicit allowlist, so no API key or Pi directory of the maintainer leaks in), with a temporary `HOME`, agent and session directory, and settings file, offline, with only this extension and `scripts/demo/demo-provider.ts` loaded. The demo provider answers from the draft locally, so the recording needs no credentials and makes no network request. The script fails if a scene does not show its expected text, then renders each captured frame with Pillow and encodes the result with ffmpeg. Pass `--frames <dir>` to keep the rendered frames for review; everything else is removed, also when a scene fails. Neither file is part of the published package.
+
 ## Versioning
 
-1. Update `extensions/prompt-autocomplete/package.json`.
-2. Add the matching heading to `extensions/prompt-autocomplete/CHANGELOG.md`.
-3. Update the version-pinned `pi.video` release URL in the package manifest and package README.
+1. Update `extensions/prompt-autocomplete/package.json` and start an `## [<version>] - Unreleased` heading in `extensions/prompt-autocomplete/CHANGELOG.md`; never leave changed source under an already-published version.
+2. Update the version-pinned `pi.video` release URL in the package manifest, the package README, and the root README.
+3. Before tagging, replace `Unreleased` with the release date (`## [<version>] - YYYY-MM-DD`). A tagged release refuses an undated heading.
 4. Run the release gate from a clean commit.
 
 Tags are package-qualified because this repository contains several extensions:
