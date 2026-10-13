@@ -127,7 +127,7 @@ Budget: 4/25 (session)
 
 `/prompt-autocomplete inspect [draft text]` shows locally what an autocomplete request would send. It makes no provider request, persists nothing, and never shows credentials or headers; at most it warms the in-memory context cache that the next request in the same conversation reuses.
 
-- The report renders the same request snapshot the provider path uses: the resolved and requested model, the latest assistant and user messages, the recent-conversation summary, the transmitted draft tail, the exact request size, and the output and token ceilings. Long sections appear as character counts with short sanitized excerpts.
+- The report renders the same request snapshot the provider path uses: the resolved and requested model, the latest assistant and user messages, the recent-conversation summary, the compaction summary, the transmitted draft tail, the exact request size, and the output and token ceilings. Long sections appear as character counts with short sanitized excerpts.
 - Without draft text the report covers the conversation sections only. The slash command replaced the editor text when you submitted it, so the draft a real request would carry cannot be recovered and is not invented; pass one explicitly to preview a complete request. Pi trims trailing whitespace from submitted commands.
 - `Shared policy` evaluates only the gates every editor shares — enabled state, editor ownership, the main-agent gate, model and auth, `min-chars` and slash/path detection for the given draft, and the session budget — separately for automatic requests and the manual `Ctrl+.` one-shot. Cursor position, the built-in autocomplete menu, Escape dismissal, the per-editor error cooldown, and cached responses belong to the live editor and are not evaluated.
 
@@ -137,7 +137,8 @@ Enabling Prompt Autocomplete permits additional model requests. Streaming change
 
 - the current prompt draft or its bounded tail,
 - the latest user and assistant messages,
-- a bounded recent-conversation summary.
+- a bounded recent-conversation summary,
+- on hosts with Pi's model-visible session projection (Pi 1.x), the newest compaction summary, bounded to 1,500 characters with the middle elided.
 
 The newest conversation entry that affects autocomplete context is used only in the local in-memory cache key and is not sent to the provider. Custom, label, and session-info entries can move Pi's raw leaf without invalidating that key.
 
@@ -153,7 +154,7 @@ The extension makes no autocomplete request while disabled. Automatic empty-draf
 
 - Supported baseline: Pi `0.80.6`, Node.js `22.19.0` or newer.
 - Every release is verified against Pi `0.80.6`, `0.83.0`, and `1.2.0`. Pi 1.x draws the editor cursor through fake-cursor markers instead of inverse video; ghost text supports both forms.
-- On hosts that expose Pi's model-visible session projection (Pi 1.x), autocomplete context follows it: a message that `context_edit` omitted or replaced, for example to redact it, is omitted or replaced in autocomplete requests too. If that projection fails, requests carry no conversation context rather than the raw history. Autocomplete context remains user and assistant message text only: compaction summaries, custom messages, and tool results are not sent, so after a compaction autocomplete uses only the messages the compaction retained.
+- On hosts that expose Pi's model-visible session projection (Pi 1.x), autocomplete context follows it: a message that `context_edit` omitted or replaced, for example to redact it, is omitted or replaced in autocomplete requests too. If that projection fails, requests carry no conversation context rather than the raw history. Besides user and assistant message text, autocomplete sends only the newest compaction summary, so suggestions keep the summarized background after a compaction; custom messages, tool results, and the compaction's system checkpoint are not sent.
 - Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor and never reach a provider.
 - The read-only commands `status`, `stats`, and `inspect` also work on hosts that can show notifications, such as RPC; there `status` reports `host=non-interactive` and `editor=unavailable`. Every command that changes state or touches the editor stays TUI-only. If the extension is enabled on such a host, it says once per process that no autocomplete request will be issued.
 - Forks of Pi's extension API whose `ExtensionContext` predates `mode`, such as [prime-agent](https://www.npmjs.com/package/prime-agent), are supported. For those hosts the extension first requires UI availability and a custom-editor slot, and then verifies that the host actually installed the editor. A front-end that accepts an editor factory without installing it, as forked RPC and daemon modes do, is detected on the first attempt and stays inactive: it is not retried, not left enabled, and can neither render ghost text nor issue a provider request.

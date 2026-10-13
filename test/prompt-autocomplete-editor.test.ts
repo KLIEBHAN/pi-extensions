@@ -2800,3 +2800,56 @@ test("inspection previews the model-visible context, never content a context edi
   assert.match(report, /Latest user message: 23 chars sent \(cap 1200\): "Now refactor the parser"/);
   assert.match(report, new RegExp(`user message ${sentText.length} chars`), "inspection and provider share one source");
 });
+
+test("after a compaction, requests carry its summary and inspection shows it", async () => {
+  let capturedContext: any;
+  const session = SessionManager.inMemory(process.cwd());
+  session.appendMessage({ role: "user", content: "Old request about schema v1", timestamp: Date.now() });
+  const keptId = session.appendMessage({ role: "user", content: "Kept recent request", timestamp: Date.now() });
+  const summary = "## Goal\nMigrate the database to schema v2";
+  session.appendCompaction(summary, keptId, 12_000);
+
+  const harness = createEditorHarness({
+    sessionManager: session,
+    completeSimple: (async (_model, context) => {
+      capturedContext = context;
+      return makeCompletion([" next"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Update");
+  await flushAsyncWork();
+
+  const sentText: string = capturedContext.messages[0].content[0].text;
+  assert.match(sentText, /Earlier conversation summary \(compacted background\):\n## Goal\nMigrate the database to schema v2/);
+  assert.doesNotMatch(sentText, /schema v1/);
+
+  await harness.command("inspect Update");
+  const report = harness.notifications.at(-1) ?? "";
+  assert.match(
+    report,
+    new RegExp(`Compaction summary: ${summary.length} chars sent \\(cap 1500, middle elided\\): "## Goal Migrate the database to schema v2"`),
+  );
+  assert.match(report, new RegExp(`user message ${sentText.length} chars`), "inspection and provider share one source");
+});
+
+test("a host without a session projection sends no compaction summary", async () => {
+  let capturedContext: any;
+  const harness = createEditorHarness({
+    completeSimple: (async (_model, context) => {
+      capturedContext = context;
+      return makeCompletion([" next"]);
+    }) as CompleteSimple,
+  });
+  harness.setBranch([
+    { type: "message", message: { role: "user", content: "Earlier request" } },
+    { type: "compaction", id: "c1", summary: "## Goal\nRaw-branch summary", firstKeptEntryId: "m1", tokensBefore: 1 },
+  ]);
+  const editor = await harness.createEditor();
+  editor.setText("Update");
+  await flushAsyncWork();
+
+  const sentText: string = capturedContext.messages[0].content[0].text;
+  assert.doesNotMatch(sentText, /Earlier conversation summary/);
+  assert.match(sentText, /Earlier request/, "older hosts keep the raw messages instead");
+});
