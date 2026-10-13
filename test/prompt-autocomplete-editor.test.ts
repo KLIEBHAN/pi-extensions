@@ -2999,59 +2999,77 @@ test("without a registry entry point, requests fall back to the compat functions
 /**
  * A real Pi 1.x model registry with one provider that, like GitHub Copilot
  * Enterprise, derives a credential-specific endpoint from its stored OAuth
- * credential, and records what each request reached.
+ * credential, and records what each request reached. No network is used: the
+ * provider streams locally and the catalog refresh is offline.
  */
 async function createRealRegistry(toAuth: (access: string) => { apiKey?: string; headers?: Record<string, string>; baseUrl?: string }) {
   const directory = mkdtempSync(join(tmpdir(), "pa-registry-"));
-  writeFileSync(
-    join(directory, "auth.json"),
-    JSON.stringify({ enterprise: { type: "oauth", access: "oauth-token", refresh: "refresh", expires: Date.now() + 3_600_000 } }),
-  );
-  const runtime = await ModelRuntime.create({ authPath: join(directory, "auth.json"), modelsPath: null, refreshOnCreate: false });
-  const registry = new ModelRegistry(runtime);
-  const requests: Array<{ baseUrl: string; apiKey?: string; headers?: unknown }> = [];
-  const streamSimple: StreamSimple = (model, _context, options) => {
-    requests.push({ baseUrl: model.baseUrl, apiKey: options?.apiKey, headers: options?.headers });
-    return registryStream([" the patch for edge cases"]);
-  };
-  registry.registerProvider(createProvider({
-    id: "enterprise",
-    baseUrl: "https://individual.example/api",
-    auth: {
-      apiKey: {
-        name: "API key",
-        resolve: async ({ credential }) => (credential ? { auth: { apiKey: credential.key } } : undefined),
-      },
-      oauth: {
-        name: "OAuth",
-        login: async () => {
-          throw new Error("not used");
-        },
-        refresh: async (credential) => credential,
-        toAuth: async (credential) => toAuth(credential.access),
-      },
-    },
-    models: [{
-      id: "chat",
-      name: "Chat",
-      api: "enterprise-chat",
-      provider: "enterprise",
+  const cleanup = () => rmSync(directory, { recursive: true, force: true });
+  try {
+    writeFileSync(
+      join(directory, "auth.json"),
+      JSON.stringify({ enterprise: { type: "oauth", access: "oauth-token", refresh: "refresh", expires: Date.now() + 3_600_000 } }),
+    );
+    const runtime = await ModelRuntime.create({ authPath: join(directory, "auth.json"), modelsPath: null, refreshOnCreate: false });
+    const registry = new ModelRegistry(runtime);
+    const requests: Array<{ baseUrl: string; apiKey?: string; headers?: unknown }> = [];
+    let resolveFirstRequest!: () => void;
+    const firstRequest = new Promise<void>((resolve) => {
+      resolveFirstRequest = resolve;
+    });
+    const streamSimple: StreamSimple = (model, _context, options) => {
+      requests.push({ baseUrl: model.baseUrl, apiKey: options?.apiKey, headers: options?.headers });
+      resolveFirstRequest();
+      return registryStream([" the patch for edge cases"]);
+    };
+    registry.registerProvider(createProvider({
+      id: "enterprise",
       baseUrl: "https://individual.example/api",
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 8_000,
-      maxTokens: 1_000,
-    }],
-    api: { stream: streamSimple, streamSimple },
-  }));
-  // Availability of a newly registered provider settles asynchronously.
-  await registry.refresh();
-  return { registry, requests, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
+      auth: {
+        apiKey: {
+          name: "API key",
+          resolve: async ({ credential }) => (credential ? { auth: { apiKey: credential.key } } : undefined),
+        },
+        oauth: {
+          name: "OAuth",
+          login: async () => {
+            throw new Error("not used");
+          },
+          refresh: async (credential) => credential,
+          toAuth: async (credential) => toAuth(credential.access),
+        },
+      },
+      models: [{
+        id: "chat",
+        name: "Chat",
+        api: "enterprise-chat",
+        provider: "enterprise",
+        baseUrl: "https://individual.example/api",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 8_000,
+        maxTokens: 1_000,
+      }],
+      api: { stream: streamSimple, streamSimple },
+    }));
+    // Availability of a newly registered provider settles asynchronously.
+    await registry.refresh({ allowNetwork: false, providers: ["enterprise"] });
+    /** Resolves once the provider received its first request, or fails after a bound. */
+    const waitForFirstRequest = () =>
+      Promise.race([
+        firstRequest,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no request reached the provider")), 5_000)),
+      ]);
+    return { registry, requests, waitForFirstRequest, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 }
 
 test("requests through the real registry keep the OAuth-derived endpoint of the stored credential", async () => {
-  const { registry, requests, cleanup } = await createRealRegistry((access) => ({
+  const { registry, requests, waitForFirstRequest, cleanup } = await createRealRegistry((access) => ({
     apiKey: access,
     baseUrl: "https://enterprise.example/api",
   }));
@@ -3059,8 +3077,8 @@ test("requests through the real registry keep the OAuth-derived endpoint of the 
     const harness = createEditorHarness({ modelRegistry: registry, preferredModel: "enterprise/chat" });
     const editor = await harness.createEditor();
     editor.setText("Review");
+    await waitForFirstRequest();
     await flushAsyncWork();
-    await new Promise((resolve) => setTimeout(resolve, 20));
 
     assert.deepEqual(requests, [{ baseUrl: "https://enterprise.example/api", apiKey: "oauth-token", headers: undefined }]);
     assert.match(renderedText(editor), /the patch for edge cases/);
@@ -3070,15 +3088,15 @@ test("requests through the real registry keep the OAuth-derived endpoint of the 
 });
 
 test("header-only credentials work through the registry while the compat path still needs a key", async () => {
-  const { registry, requests, cleanup } = await createRealRegistry((access) => ({
+  const { registry, requests, waitForFirstRequest, cleanup } = await createRealRegistry((access) => ({
     headers: { Authorization: `Bearer ${access}` },
   }));
   try {
     const harness = createEditorHarness({ modelRegistry: registry, preferredModel: "enterprise/chat" });
     const editor = await harness.createEditor();
     editor.setText("Review");
+    await waitForFirstRequest();
     await flushAsyncWork();
-    await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(requests.length, 1, "a key-less credential reaches the provider through the registry");
     assert.match(renderedText(editor), /the patch for edge cases/);
   } finally {
@@ -3097,4 +3115,25 @@ test("header-only credentials work through the registry while the compat path st
   compatEditor.setText("Review");
   await flushAsyncWork();
   assert.equal(calls, 0, "without the registry a request still needs an API key");
+});
+
+test("any injected seam keeps the registry out of both request paths", async () => {
+  let registryCalls = 0;
+  const harness = createEditorHarness({
+    // Only the streaming seam is injected, but streaming is off: the completion
+    // path must not quietly fall back to the registry with credentials attached.
+    streamSimple: (() => controlledStream().stream) as StreamSimple,
+    streamSetting: "off",
+    registryStreamSimple: (() => {
+      registryCalls += 1;
+      return registryStream([" never"]);
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.equal(registryCalls, 0);
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /requires completeSimple\(\) from @earendil-works\/pi-ai/);
 });

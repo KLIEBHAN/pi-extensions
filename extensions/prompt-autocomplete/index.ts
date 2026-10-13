@@ -3006,12 +3006,18 @@ export function createPromptAutocompleteExtension(
   // Injected seams win; otherwise each request routes through the session's
   // model registry when it has one, and through the compat functions if not.
   // The registry is read per request because a new session may bring another.
+  // This one function decides routing for both paths and for the credential
+  // handling in the producer, so they cannot disagree. Any injected seam keeps
+  // the registry out entirely, including for the path that was not injected.
+  const injectedSeams = !!(dependencies.completeSimple || dependencies.streamSimple);
+  const hostRegistryStream = (): RegistryStreamSimple | undefined =>
+    injectedSeams ? undefined : registryStreamSimple(shared.modelRegistry);
   const routedCompleteSimple: CompleteSimpleFunction = (model, context, options) => {
-    const viaRegistry = registryStreamSimple(shared.modelRegistry);
+    const viaRegistry = hostRegistryStream();
     return viaRegistry ? viaRegistry(model, context, options).result() : hostCompleteSimple(model, context, options);
   };
   const routedStreamSimple: StreamSimpleFunction = (model, context, options) => {
-    const viaRegistry = registryStreamSimple(shared.modelRegistry);
+    const viaRegistry = hostRegistryStream();
     return viaRegistry ? viaRegistry(model, context, options) : hostStreamSimple(model, context, options);
   };
   const completeSimpleImpl = dependencies.completeSimple ?? routedCompleteSimple;
@@ -3099,8 +3105,7 @@ export function createPromptAutocompleteExtension(
     usageStats: createPromptAutocompleteUsageStats(),
     completeSimple: completeSimpleImpl,
     streamSimple: streamSimpleImpl,
-    routesThroughHostRegistry: () =>
-      !dependencies.completeSimple && !dependencies.streamSimple && registryStreamSimple(shared.modelRegistry) !== undefined,
+    routesThroughHostRegistry: () => hostRegistryStream() !== undefined,
     now,
     debugState: "idle",
     requestCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
