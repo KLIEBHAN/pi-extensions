@@ -6,6 +6,7 @@ import type { PromptAutocompletePersistedSettings } from "../extensions/prompt-a
 import {
   createPromptAutocompleteExtension,
   type PromptAutocompleteDependencies,
+  type PromptAutocompleteProcessState,
   resolvePromptAutocompleteSettingsPath,
 } from "../extensions/prompt-autocomplete/index.ts";
 
@@ -37,6 +38,8 @@ interface HarnessOptions {
   branch?: unknown[];
   /** Physical session id; a different id emulates a new or forked session. */
   sessionId?: string;
+  /** Process-lifetime state; share one object between harnesses to emulate runtimes of one process. */
+  processState?: PromptAutocompleteProcessState;
 }
 
 function createHarness(options: HarnessOptions = {}) {
@@ -134,6 +137,7 @@ function createHarness(options: HarnessOptions = {}) {
   let providerCalls = 0;
   createPromptAutocompleteExtension({
     settingsStore,
+    processState: options.processState ?? {},
     completeSimple: (async () => {
       providerCalls += 1;
       throw new Error("index tests must not reach the provider");
@@ -938,7 +942,7 @@ test("a restored budget snapshot defers to an explicit flag but outranks the def
   assert.match(lastStatus(forked), /budget=off\(flag\)/, "a forked session ignores another session's snapshot");
 });
 
-test("a session-scoped budget decision survives a new session as an override", async () => {
+test("a budget decision outlives a repeated session_start on the same runtime", async () => {
   const harness = createHarness({ savedSettings: { enabled: true } });
   await emit(harness, "session_start");
   await command(harness, "budget 2");
@@ -999,12 +1003,25 @@ test("hosts without a notification channel refuse every command and stay silent"
   }
 });
 
-test("an enabled extension on a non-interactive host says once that it cannot issue requests", async () => {
+test("an enabled extension on a non-interactive host says once per process that it cannot issue requests", async () => {
   const notice = "no autocomplete requests will be issued";
-  const rpc = createHarness({ enabled: true, mode: "rpc" });
-  await emit(rpc, "session_start");
-  await emit(rpc, "session_start");
-  assert.equal(rpc.notifications.filter((entry) => entry.message.includes(notice)).length, 1);
+  const count = (harness: ReturnType<typeof createHarness>) =>
+    harness.notifications.filter((entry) => entry.message.includes(notice)).length;
+
+  // Pi re-imports the extension for every runtime (/new, /resume, /fork,
+  // /reload); a fresh factory sharing the process state emulates that.
+  const processState: PromptAutocompleteProcessState = {};
+  const first = createHarness({ enabled: true, mode: "rpc", processState });
+  await emit(first, "session_start");
+  await emit(first, "session_start");
+  assert.equal(count(first), 1);
+  const reloaded = createHarness({ enabled: true, mode: "rpc", processState });
+  await emit(reloaded, "session_start");
+  assert.equal(count(reloaded), 0, "a replaced runtime in the same process stays quiet");
+
+  const nextProcess = createHarness({ enabled: true, mode: "rpc", processState: {} });
+  await emit(nextProcess, "session_start");
+  assert.equal(count(nextProcess), 1, "a new process says it again");
 
   const disabled = createHarness({ enabled: false, mode: "rpc" });
   await emit(disabled, "session_start");

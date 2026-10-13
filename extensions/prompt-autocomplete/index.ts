@@ -257,6 +257,35 @@ export interface PromptAutocompleteDependencies {
   now?: () => number;
   /** Store for decisions that survive the process; defaults to a JSON settings file. */
   settingsStore?: PromptAutocompleteSettingsStore;
+  /** Process-lifetime state; defaults to one object shared by every runtime of this process. */
+  processState?: PromptAutocompleteProcessState;
+}
+
+/**
+ * State that must outlive extension runtimes within one process.
+ *
+ * Pi re-imports the extension module for every runtime (`/new`, `/resume`,
+ * `/fork`, `/reload`), so neither runtime state nor module scope lasts for the
+ * process. Only what is genuinely process-wide belongs here.
+ */
+export interface PromptAutocompleteProcessState {
+  /** The enabled-but-non-interactive notice was already shown. */
+  nonInteractiveNoticeShown?: boolean;
+}
+
+const PROCESS_STATE_KEY = Symbol.for("@kliebhan/pi-prompt-autocomplete/process-state");
+
+function isProcessState(value: unknown): value is PromptAutocompleteProcessState {
+  return typeof value === "object" && value !== null;
+}
+
+/** The process-wide state object, created on first use and found again after a re-import. */
+function sharedProcessState(): PromptAutocompleteProcessState {
+  const existing: unknown = Reflect.get(globalThis, PROCESS_STATE_KEY);
+  if (isProcessState(existing)) return existing;
+  const created: PromptAutocompleteProcessState = {};
+  Reflect.set(globalThis, PROCESS_STATE_KEY, created);
+  return created;
 }
 
 /**
@@ -381,11 +410,8 @@ interface PromptAutocompleteSharedState {
   notify?: (message: string, type?: "info" | "warning" | "error") => void;
   /** Refused model requests already reported, to avoid repeating them. */
   reportedModelRefusals: Set<string>;
-  /**
-   * Set once the enabled-but-non-interactive notice was shown. A process cannot
-   * change its front-end, so this is never reset.
-   */
-  nonInteractiveNoticeShown?: boolean;
+  /** Process-lifetime state shared with later runtimes of this process. */
+  processState: PromptAutocompleteProcessState;
   /**
    * Set once a mount attempt proved whether this host installs custom editors.
    *
@@ -2750,7 +2776,7 @@ function runReadOnlyCommand(
   ctx: ExtensionContext,
   shared: PromptAutocompleteSharedState,
   command: string,
-  rest: string,
+  payload: string,
   interactiveHost: boolean,
 ): void {
   if (command === "status") {
@@ -2765,7 +2791,7 @@ function runReadOnlyCommand(
     );
     return;
   }
-  ctx.ui.notify(formatPromptAutocompleteInspection(shared, interactiveHost, rest || undefined), "info");
+  ctx.ui.notify(formatPromptAutocompleteInspection(shared, interactiveHost, payload || undefined), "info");
 }
 
 /**
@@ -2773,9 +2799,9 @@ function runReadOnlyCommand(
  * cannot issue requests there, instead of staying silently inert.
  */
 function notifyEnabledWithoutEditorOnce(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
-  if (!shared.enabled || shared.nonInteractiveNoticeShown) return;
+  if (!shared.enabled || shared.processState.nonInteractiveNoticeShown) return;
   if (hostOwnsInteractiveEditor(ctx, shared) || !hasNotificationChannel(ctx)) return;
-  shared.nonInteractiveNoticeShown = true;
+  shared.processState.nonInteractiveNoticeShown = true;
   ctx.ui.notify(
     "Prompt autocomplete is enabled, but this host has no interactive editor: no autocomplete requests will be issued.",
     "info",
@@ -2945,6 +2971,7 @@ export function createPromptAutocompleteExtension(
     prefixReuseCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
     inFlightRequests: new Map(),
     reportedModelRefusals: new Set(),
+    processState: dependencies.processState ?? sharedProcessState(),
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -3007,17 +3034,20 @@ export function createPromptAutocompleteExtension(
   pi.registerCommand("prompt-autocomplete", {
     description: "Enable, disable, or inspect inline prompt autocomplete and session stats",
     handler: async (args, ctx) => {
-      const trimmed = args.trim();
-      const space = trimmed.search(/\s/);
-      const command = (space < 0 ? trimmed : trimmed.slice(0, space)).toLowerCase() || "status";
-      const rest = space < 0 ? "" : trimmed.slice(space + 1).trim();
+      const commandStart = args.trimStart();
+      const space = commandStart.search(/\s/);
+      const command = (space < 0 ? commandStart : commandStart.slice(0, space)).toLowerCase() || "status";
+      // Everything after exactly one separator, verbatim: an inspected draft
+      // must keep its leading and trailing whitespace to match production.
+      const payload = space < 0 ? "" : commandStart.slice(space + 1);
+      const rest = payload.trim();
       const firstRestToken = rest.split(/\s+/, 1)[0];
 
       // Reporting works wherever a notification can be shown; anything that
       // changes state or touches the editor stays TUI-only.
       const interactiveHost = hostOwnsInteractiveEditor(ctx, shared);
       if (READ_ONLY_COMMANDS.has(command) && (interactiveHost || hasNotificationChannel(ctx))) {
-        runReadOnlyCommand(ctx, shared, command, rest, interactiveHost);
+        runReadOnlyCommand(ctx, shared, command, payload, interactiveHost);
         return;
       }
       if (!interactiveHost) {

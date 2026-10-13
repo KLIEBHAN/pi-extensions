@@ -233,6 +233,8 @@ function createEditorHarness(options: EditorHarnessOptions) {
   } as unknown as ExtensionAPI;
 
   createPromptAutocompleteExtension({
+    // Hermetic: never share process-lifetime state with other tests.
+    processState: {},
     completeSimple: options.completeSimple,
     streamSimple: options.streamSimple,
     now: options.now,
@@ -2640,4 +2642,26 @@ test("ownership loss before a complete response never paints it or touches the f
   assert.equal(harness.getEditorFactory(), foreignFactory);
   await harness.command("status");
   assert.match(harness.notifications.at(-1) ?? "", /editor=ownership-lost \| editor-blocked=Another extension replaced/);
+});
+
+test("inspection keeps the explicit draft verbatim, including leading and trailing whitespace", async () => {
+  let capturedContext: any;
+  const harness = createEditorHarness({
+    completeSimple: (async (_model, context) => {
+      capturedContext = context;
+      return makeCompletion([" next"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  const draft = "  Review it ";
+  editor.setText(draft);
+  await flushAsyncWork();
+  const sentText: string = capturedContext.messages[0].content[0].text;
+  assert.match(sentText, /Current draft \(cursor at end\):\n {2}Review it \n/);
+
+  // Exactly one separator follows the command; everything after it is the draft.
+  await harness.command(`inspect ${draft}`);
+  const report = harness.notifications.at(-1) ?? "";
+  assert.match(report, new RegExp(`Draft: ${draft.length} chars, ${draft.length} sent`));
+  assert.match(report, new RegExp(`user message ${sentText.length} chars`), "whitespace changes the transmitted size");
 });
