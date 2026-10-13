@@ -40,26 +40,42 @@ function lockedVersions(packageName: string): Array<[path: string, version: stri
 }
 
 /**
- * The full-tree audit command. `--include` outranks `--omit`, so an ambient
- * `NODE_ENV=production` or `npm_config_omit` cannot shrink the audited tree.
+ * The full-tree audit command. Command-line flags outrank `.npmrc` files and
+ * `npm_config_*` environment variables, so each flag pins one way the audit
+ * could otherwise be narrowed silently:
+ * - `--audit-level=info`: npm defaults to `low`, so an `info` advisory or an
+ *   ambient `audit-level` would otherwise exit 0;
+ * - `--offline=false`: an ambient `offline` skips the registry request and
+ *   reports a clean tree;
+ * - `--include=...`: npm drops included types from any ambient `omit`, such as
+ *   the one `NODE_ENV=production` implies.
  */
-const FULL_AUDIT_COMMAND = "npm audit --include=prod --include=dev --include=optional --include=peer";
+const FULL_AUDIT_COMMAND =
+  "npm audit --audit-level=info --offline=false --include=prod --include=dev --include=optional --include=peer";
 
-test("CI audits the complete development and production dependency tree", () => {
-  const workflow = parse(ciWorkflowSource) as {
-    jobs?: Record<string, { steps?: Array<{ run?: unknown }> }>;
-  };
+type WorkflowStep = { run?: unknown; if?: unknown; env?: unknown; "continue-on-error"?: unknown };
+type WorkflowJob = { steps?: WorkflowStep[]; if?: unknown; env?: unknown; "continue-on-error"?: unknown };
+
+test("CI audits the complete dependency tree in a step nothing can disable", () => {
+  const workflow = parse(ciWorkflowSource) as { env?: unknown; jobs?: Record<string, WorkflowJob> };
   const releaseAudit = workflow.jobs?.["release-audit"];
   assert.ok(releaseAudit, "CI must define the release-audit job");
   assert.ok(Array.isArray(releaseAudit.steps), "release-audit must define steps");
 
-  const commands = releaseAudit.steps
-    .map((step) => step.run)
-    .filter((command): command is string => typeof command === "string");
-  const auditCommands = commands.filter(
-    (command) => command.startsWith("npm audit") || command.includes("audit:dependencies"),
+  const auditSteps = releaseAudit.steps.filter(
+    (step) => typeof step.run === "string" && (step.run.startsWith("npm audit") || step.run.includes("audit:dependencies")),
   );
-  assert.deepEqual(auditCommands, ["npm run audit:dependencies"], "release-audit must run the full audit");
+  assert.deepEqual(auditSteps.map((step) => step.run), ["npm run audit:dependencies"], "release-audit must run the full audit");
+
+  // A condition, a tolerated failure, or injected npm configuration would turn
+  // the audit into a step that can pass without auditing anything.
+  for (const [label, holder] of [["workflow", workflow], ["release-audit job", releaseAudit], ["audit step", auditSteps[0]!]] as const) {
+    assert.equal(holder.env, undefined, `the ${label} must not set environment variables for the audit`);
+  }
+  for (const [label, holder] of [["release-audit job", releaseAudit], ["audit step", auditSteps[0]!]] as const) {
+    assert.equal(holder.if, undefined, `the ${label} must not be conditional`);
+    assert.equal(holder["continue-on-error"], undefined, `the ${label} must not tolerate failure`);
+  }
 });
 
 test("the audit script runs a full npm audit that cannot be narrowed", () => {
@@ -67,12 +83,9 @@ test("the audit script runs a full npm audit that cannot be narrowed", () => {
     scripts: Record<string, string>;
   }).scripts;
 
-  // Without this the workflow assertion above could be satisfied by an npm
-  // script that no longer audits the complete tree.
+  // Exact equality: the workflow assertion above would otherwise be satisfied
+  // by a script that no longer audits the complete tree at every severity.
   assert.equal(scripts["audit:dependencies"], FULL_AUDIT_COMMAND);
-  for (const weakening of ["--audit-level", "--omit", "--production", "--only=", "|| true", ";"]) {
-    assert.ok(!scripts["audit:dependencies"]!.includes(weakening), `the audit must not be weakened with ${weakening}`);
-  }
 });
 
 test("Pi development packages stay on one exact version", () => {

@@ -13,7 +13,7 @@
     "themes"
   ],
   "scripts": {
-    "audit:dependencies": "npm audit --include=prod --include=dev --include=optional --include=peer",
+    "audit:dependencies": "npm audit --audit-level=info --offline=false --include=prod --include=dev --include=optional --include=peer",
     "check": "npm run typecheck && npm run test",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "test:auto-mode": "node --experimental-strip-types --test test/auto-mode-core.test.ts test/auto-mode-index.test.ts",

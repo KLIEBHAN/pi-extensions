@@ -6,13 +6,19 @@ CI audits the complete dependency tree, development dependencies included. The r
 npm run audit:dependencies
 ```
 
-The script is a plain `npm audit` that includes every dependency class explicitly:
+The script is a plain `npm audit` with its scope pinned on the command line:
 
 ```bash
-npm audit --include=prod --include=dev --include=optional --include=peer
+npm audit --audit-level=info --offline=false --include=prod --include=dev --include=optional --include=peer
 ```
 
-`--include` outranks `--omit`, so an ambient `NODE_ENV=production` or `npm_config_omit` cannot shrink the audited tree. The command fails on any reported advisory, regardless of severity, and on any audit error. `test/dependency-security.test.ts` pins both the exact command and that the `release-audit` CI job runs it, so neither can be narrowed silently.
+Command-line flags outrank `.npmrc` files and `npm_config_*` environment variables, so each flag closes one way the audit could pass without auditing everything:
+
+- `--audit-level=info` fails on an advisory of any severity. npm otherwise treats the threshold as `low`, so an `info` advisory, or an ambient `audit-level`, would exit 0.
+- `--offline=false` forces the registry request. An ambient `offline` setting makes npm skip the audit and report a clean tree.
+- `--include=...` keeps every dependency class. npm drops included types from any ambient `omit`, including the one `NODE_ENV=production` implies.
+
+The command also fails on any audit error, for example an unreachable registry. `test/dependency-security.test.ts` pins the exact command and checks that the `release-audit` CI job runs it in a step that has no condition, no tolerated failure, and no injected environment.
 
 ## When an advisory is reported
 
