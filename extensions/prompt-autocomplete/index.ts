@@ -13,12 +13,12 @@ import { CustomEditor, type ExtensionAPI, type ExtensionContext, type Keybinding
 import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import {
   acquireCoalescedRequest,
-  buildLatestAssistantMessageContext,
-  buildLatestUserMessageContext,
   buildPromptAutocompleteCacheKey,
   buildPromptAutocompletePrefixContextKey,
-  buildRecentConversationContext,
   buildPromptAutocompleteBudgetSnapshot,
+  buildPromptAutocompleteRequestSnapshot,
+  renderPromptAutocompleteUserText,
+  type PromptAutocompleteRequestSnapshot,
   BUDGET_REQUESTS_MAX,
   BUDGET_REQUESTS_MIN,
   cancelAllCoalescedRequests,
@@ -36,6 +36,11 @@ import {
   DEFAULT_MIN_PROMPT_CHARS,
   MAX_ALTERNATIVES_MAX,
   MAX_ALTERNATIVES_MIN,
+  MAX_CONTEXT_MESSAGE_CHARS,
+  MAX_CONTEXT_MESSAGES,
+  MAX_DRAFT_CONTEXT_CHARS,
+  MAX_LATEST_ASSISTANT_MESSAGE_CHARS,
+  MAX_LATEST_USER_MESSAGE_CHARS,
   MAX_SUGGESTION_CHARS_MAX,
   MAX_SUGGESTION_CHARS_MIN,
   DEFAULT_PREFERRED_MODEL,
@@ -50,7 +55,6 @@ import {
   formatUsageStats,
   hostSupportsStreamedResponses,
   isInteractiveEditorHost,
-  MAX_DRAFT_CONTEXT_CHARS,
   normalizePromptSuggestions,
   parseBoundedIntFlag,
   parseExplicitBoundedIntFlag,
@@ -81,7 +85,6 @@ import {
   sanitizeTerminalText,
   SequenceOwnedSlot,
   shouldSkipPromptAutocomplete,
-  truncateDraftTail,
   type CoalescedRequestEntry,
   type CoalescedRequestSubscription,
   type PromptAutocompleteModelSelection,
@@ -120,7 +123,7 @@ const FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_CACHE_TTL_MS = 60_000;
 const REQUEST_CACHE_MAX_ENTRIES = 128;
 const COMMAND_USAGE =
-  "Usage: /prompt-autocomplete [on|off|toggle|status|stats|min-chars <n>|budget <n|off>|set <key> [value]|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]";
+  "Usage: /prompt-autocomplete [on|off|toggle|status|stats|inspect [draft]|min-chars <n>|budget <n|off>|set <key> [value]|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]";
 const SET_USAGE =
   "Usage: /prompt-autocomplete set [debounce-ms <0-5000>|min-chars <0-500>|max-chars <16-1000>|max-alternatives <1-5>|model <provider/model|active>]";
 const PRIVACY_NOTICE =
@@ -379,6 +382,11 @@ interface PromptAutocompleteSharedState {
   /** Refused model requests already reported, to avoid repeating them. */
   reportedModelRefusals: Set<string>;
   /**
+   * Set once the enabled-but-non-interactive notice was shown. A process cannot
+   * change its front-end, so this is never reset.
+   */
+  nonInteractiveNoticeShown?: boolean;
+  /**
    * Set once a mount attempt proved whether this host installs custom editors.
    *
    * A process cannot change its front-end, so this is deliberately never reset:
@@ -401,21 +409,15 @@ interface PromptAutocompleteSharedState {
   clearSpinner?: () => void;
 }
 
-interface SuggestionRequest {
+/** A request snapshot plus the local routing and cache identity around it. */
+interface SuggestionRequest extends PromptAutocompleteRequestSnapshot {
   activationId: number;
   conversationId: string;
-  draft: string;
-  draftTail: string;
   model: Model<Api>;
   modelLabel: string;
   cacheKey: string;
   prefixContextKey: string;
-  maxAlternatives: number;
-  maxSuggestionChars: number;
   useStreaming: boolean;
-  latestAssistantContext: string;
-  latestUserContext: string;
-  recentContext: string;
 }
 
 interface PendingSuggestionRequest {
@@ -745,18 +747,24 @@ function clearDebugUi(shared: PromptAutocompleteSharedState): void {
   shared.setStatusText?.(undefined);
 }
 
-function formatStatus(shared: PromptAutocompleteSharedState): string {
+function describeEditorState(shared: PromptAutocompleteSharedState, interactiveHost: boolean): string {
+  if (!interactiveHost) return "unavailable";
+  if (shared.editorMount) return shared.ownsEditor?.() ? "mounted" : "ownership-lost";
+  return shared.editorBlockedReason ? "blocked" : "unmounted";
+}
+
+/**
+ * Compact one-line status. `interactiveHost` is false only for the read-only
+ * status a non-interactive host (for example RPC) may request; there the
+ * editor is reported as unavailable instead of merely unmounted.
+ */
+function formatStatus(shared: PromptAutocompleteSharedState, interactiveHost = true): string {
   const resolvedModel = resolveSuggestionModel(shared);
-  const editorState = shared.editorMount
-    ? shared.ownsEditor?.()
-      ? "mounted"
-      : "ownership-lost"
-    : shared.editorBlockedReason
-      ? "blocked"
-      : "unmounted";
+  const editorState = describeEditorState(shared, interactiveHost);
   const requestedModel = describePromptAutocompleteModelSelection(shared.config.modelSelection);
 
   return [
+    interactiveHost ? undefined : "host=non-interactive",
     `enabled=${shared.enabled ? "yes" : "no"}(${
       resolvePersistedEnabled(
         shared.runtimeOverrides.enabled,
@@ -816,10 +824,133 @@ function formatStatus(shared: PromptAutocompleteSharedState): string {
     `state=${shared.debugState || "idle"}`,
     shared.lastError ? `error=${truncateDebug(shared.lastError, 90)}` : undefined,
     shared.lastRawResponse ? `raw=${truncateDebug(shared.lastRawResponse, 90)}` : undefined,
-    `keys=tab accept | ${formatPrimaryKey(WORD_ACCEPT_KEYS)} word | ${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle | ${formatPrimaryKey(CYCLE_NEXT_KEYS)} force one-shot`,
+    interactiveHost
+      ? `keys=tab accept | ${formatPrimaryKey(WORD_ACCEPT_KEYS)} word | ${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle | ${formatPrimaryKey(CYCLE_NEXT_KEYS)} force one-shot`
+      : undefined,
   ]
     .filter((value): value is string => !!value)
     .join(" | ");
+}
+
+const INSPECT_EXCERPT_CHARS = 120;
+
+function formatInspectionSection(label: string, text: string, cap: string): string {
+  if (!text) return `${label}: none`;
+  return `${label}: ${text.length} chars sent (${cap}): "${truncateDebug(text, INSPECT_EXCERPT_CHARS)}"`;
+}
+
+/**
+ * The shared gates a request must pass, in production order.
+ *
+ * Only state shared by every editor instance is evaluated. Cursor position,
+ * the built-in autocomplete menu, Escape dismissal, the per-editor error
+ * cooldown, and cached responses belong to the live editor and are not.
+ */
+function evaluateSharedRequestPolicy(
+  shared: PromptAutocompleteSharedState,
+  interactiveHost: boolean,
+  draft: string | undefined,
+): { automatic?: string; manual?: string } {
+  const blocks: Array<{ reason: string; manualToo: boolean }> = [];
+  if (!shared.enabled) blocks.push({ reason: "autocomplete is disabled", manualToo: true });
+  if (!interactiveHost) {
+    blocks.push({ reason: "this host has no interactive editor", manualToo: true });
+  } else if (!shared.editorMount || !shared.ownsEditor?.()) {
+    blocks.push({ reason: "the autocomplete editor is not active", manualToo: true });
+  }
+  if (!shared.config.allowWhileStreaming && shared.agentStreaming) {
+    blocks.push({ reason: "the main agent is working", manualToo: false });
+  }
+  const resolution = resolveSuggestionModelResolution(shared);
+  if (!resolution.model) {
+    blocks.push({
+      reason: resolution.reason ?? "no usable autocomplete model with configured auth",
+      manualToo: true,
+    });
+  }
+  if (draft !== undefined) {
+    if (draft.trim().length < shared.config.minPromptChars) {
+      blocks.push({ reason: `the draft is shorter than min-chars (${shared.config.minPromptChars})`, manualToo: false });
+    }
+    if (shouldSkipPromptAutocomplete(draft)) {
+      blocks.push({ reason: "the draft looks like a slash command or path", manualToo: true });
+    }
+  }
+  if (isBudgetExhausted(shared)) {
+    blocks.push({
+      reason: `the session budget is exhausted (${shared.budgetUsed}/${shared.config.budgetLimit})`,
+      manualToo: true,
+    });
+  }
+  return {
+    automatic: blocks[0]?.reason,
+    manual: blocks.find((block) => block.manualToo)?.reason,
+  };
+}
+
+/**
+ * Local, bounded preview of what an autocomplete request would transmit.
+ *
+ * It renders the same snapshot the provider path uses and makes no provider
+ * request. Without explicit draft text it reports the conversation sections
+ * only: the submitted slash command replaced the editor text, so the draft a
+ * real request would carry cannot be recovered and is not invented.
+ */
+function formatPromptAutocompleteInspection(
+  shared: PromptAutocompleteSharedState,
+  interactiveHost: boolean,
+  draft: string | undefined,
+): string {
+  const snapshot = buildCurrentRequestSnapshot(shared, draft ?? "");
+  const resolution = resolveSuggestionModelResolution(shared);
+  const requestedSource = resolvePersistedModelSelection(
+    shared.runtimeOverrides.modelSelection,
+    shared.modelFlagExplicit,
+    parsePersistedModelRaw(shared.persistedSettings.model),
+  ).source;
+  const policy = evaluateSharedRequestPolicy(shared, interactiveHost, draft);
+  const mainAgent = shared.agentStreaming
+    ? shared.config.allowWhileStreaming ? "working (requests allowed)" : "working"
+    : "idle";
+  const verdict = (reason: string | undefined) =>
+    reason ? `blocked (${truncateDebug(reason, 120)})` : "allowed";
+
+  const draftLine = draft === undefined
+    ? "Draft: not available — the slash command replaced the editor text. "
+      + "Run /prompt-autocomplete inspect <draft text> to preview one."
+    : `Draft: ${snapshot.draft.length} chars, ${snapshot.draftTail.length} sent `
+      + `(only the last ${MAX_DRAFT_CONTEXT_CHARS} are sent): "${truncateDebug(snapshot.draftTail, INSPECT_EXCERPT_CHARS)}"`;
+  const sizeLine = draft === undefined
+    ? `Request size: system prompt ${PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT.length} chars + one user message whose size depends on the draft`
+    : `Request size: system prompt ${PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT.length} chars + user message `
+      + `${renderPromptAutocompleteUserText(snapshot).length} chars`;
+
+  return [
+    "Prompt Autocomplete — request inspection (local only; no provider request was made)",
+    `Model: ${truncateDebug(formatModelLabel(resolution.model), 90)} · requested `
+      + `${describePromptAutocompleteModelSelection(shared.config.modelSelection)}(${requestedSource})`,
+    `Shared policy: automatic ${verdict(policy.automatic)} · manual ${verdict(policy.manual)}`,
+    `  enabled=${shared.enabled ? "yes" : "no"} editor=${describeEditorState(shared, interactiveHost)} `
+      + `main-agent=${mainAgent} auth=${resolution.model ? "configured" : "unavailable"} budget=${formatBudget(shared)}`,
+    draftLine,
+    formatInspectionSection(
+      "Latest assistant message",
+      snapshot.latestAssistantContext,
+      `cap ${MAX_LATEST_ASSISTANT_MESSAGE_CHARS}`,
+    ),
+    formatInspectionSection("Latest user message", snapshot.latestUserContext, `cap ${MAX_LATEST_USER_MESSAGE_CHARS}`),
+    formatInspectionSection(
+      "Recent conversation",
+      snapshot.recentContext,
+      `up to ${MAX_CONTEXT_MESSAGES} messages × ${MAX_CONTEXT_MESSAGE_CHARS} chars`,
+    ),
+    sizeLine,
+    `Output: up to ${snapshot.maxAlternatives} alternatives × ${snapshot.maxSuggestionChars} chars, `
+      + `at most ${computeRequestMaxTokens(snapshot.maxAlternatives, snapshot.maxSuggestionChars)} output tokens`,
+    "Not evaluated here (live editor state): cursor position, built-in autocomplete menu, "
+      + "Escape dismissal, error cooldown, cached responses.",
+    "The conversation id used for caching is local metadata and is never sent; credentials and headers are never shown.",
+  ].join("\n");
 }
 
 function cloneCacheEntry(entry: PromptAutocompleteCacheEntry): PromptAutocompleteCacheEntry {
@@ -1302,10 +1433,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
 
     if (!this.shared.ownsEditor?.()) {
-      this.cancelPendingRequest();
-      this.shared.editorBlockedReason = "Another extension replaced the prompt-autocomplete editor";
-      updateDebugState(this.shared, "ownership-lost", this.shared.editorBlockedReason);
-      this.setSuggestions([]);
+      this.releaseForOwnershipLoss();
       return;
     }
 
@@ -1428,12 +1556,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     const model = resolveSuggestionModel(this.shared);
     if (!model) return undefined;
 
-    const draft = this.getText();
-    const branch = this.shared.sessionManager?.getBranch?.() ?? [];
-    const latestAssistantContext = buildLatestAssistantMessageContext(branch);
-    const latestUserContext = buildLatestUserMessageContext(branch);
-    const recentContext = buildRecentConversationContext(branch);
-    const draftTail = truncateDraftTail(draft, MAX_DRAFT_CONTEXT_CHARS);
+    const snapshot = buildCurrentRequestSnapshot(this.shared, this.getText());
     const modelLabel = formatModelLabel(model);
     const conversationId = resolveCurrentConversationId(this.shared);
     this.shared.lastConversationId = conversationId;
@@ -1441,28 +1564,22 @@ class PromptAutocompleteEditor extends CustomEditor {
     const prefixContextIdentity = {
       conversationId,
       modelLabel,
-      maxAlternatives: this.shared.config.maxAlternatives,
-      maxSuggestionChars: this.shared.config.maxSuggestionChars,
-      latestAssistantContext,
-      latestUserContext,
-      recentContext,
+      maxAlternatives: snapshot.maxAlternatives,
+      maxSuggestionChars: snapshot.maxSuggestionChars,
+      latestAssistantContext: snapshot.latestAssistantContext,
+      latestUserContext: snapshot.latestUserContext,
+      recentContext: snapshot.recentContext,
     };
 
     return {
+      ...snapshot,
       activationId: this.activationId,
       conversationId,
-      draft,
-      draftTail,
       model,
       modelLabel,
-      cacheKey: buildPromptAutocompleteCacheKey({ ...prefixContextIdentity, draft }),
+      cacheKey: buildPromptAutocompleteCacheKey({ ...prefixContextIdentity, draft: snapshot.draft }),
       prefixContextKey: buildPromptAutocompletePrefixContextKey(prefixContextIdentity),
-      maxAlternatives: this.shared.config.maxAlternatives,
-      maxSuggestionChars: this.shared.config.maxSuggestionChars,
       useStreaming: this.shared.config.streamResponses && !!this.shared.streamSimple,
-      latestAssistantContext,
-      latestUserContext,
-      recentContext,
     };
   }
 
@@ -1494,6 +1611,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     try {
       const entry = await subscription.promise;
       if (!this.isRequestStillCurrent(request, seq)) {
+        if (seq === this.requestSeq && !this.shared.ownsEditor?.()) this.releaseForOwnershipLoss();
         return;
       }
 
@@ -1541,6 +1659,13 @@ class PromptAutocompleteEditor extends CustomEditor {
     spinnerOwner: string,
     suggestion: string,
   ): void {
+    // A replaced editor receives no more input, so streamed progress is the
+    // first boundary at which it can notice. Release the provider work here
+    // instead of letting it run to completion for an editor nobody renders.
+    if (seq === this.requestSeq && !this.shared.ownsEditor?.()) {
+      this.releaseForOwnershipLoss();
+      return;
+    }
     if (!this.isRequestStillCurrent(request, seq)) return;
     if (request.cacheKey === this.dismissedKey) return;
 
@@ -1578,48 +1703,9 @@ class PromptAutocompleteEditor extends CustomEditor {
       );
     }
 
-    const sections: string[] = [];
-    if (request.latestAssistantContext) {
-      sections.push(`Latest assistant message (primary context):\n${request.latestAssistantContext}`);
-    }
-    if (request.latestUserContext) {
-      sections.push(`Latest user message:\n${request.latestUserContext}`);
-    }
-    if (request.recentContext) {
-      sections.push(`Recent conversation summary:\n${request.recentContext}`);
-    }
-
-    if (request.draft.length === 0) {
-      sections.push("Current draft is empty.");
-      sections.push(
-        [
-          `Task: propose up to ${request.maxAlternatives} ranked full next prompts the user could send now.`,
-          "Each item must be a complete next prompt, not a continuation fragment.",
-          "Suggest the prompt most likely to move the overall project forward.",
-          "Prefer 3-10 words when possible.",
-        ].join("\n"),
-      );
-    } else {
-      if (request.draftTail.length < request.draft.length) {
-        sections.push(
-          `Current draft tail (the real draft is longer; the cursor is at the end of the full draft):\n${request.draftTail}`,
-        );
-      } else {
-        sections.push(`Current draft (cursor at end):\n${request.draft}`);
-      }
-
-      sections.push(
-        [
-          `Task: propose up to ${request.maxAlternatives} ranked continuations to insert at the cursor.`,
-          "Each item must be only the text after the cursor; never restate text the user already typed.",
-          "If the draft ends inside a partially typed word, complete that word directly without a leading space.",
-        ].join("\n"),
-      );
-    }
-
     const userMessage: UserMessage = {
       role: "user",
-      content: [{ type: "text", text: sections.join("\n\n") }],
+      content: [{ type: "text", text: renderPromptAutocompleteUserText(request) }],
       timestamp: Date.now(),
     };
 
@@ -1756,6 +1842,21 @@ class PromptAutocompleteEditor extends CustomEditor {
 
   private clearPendingRequestIfOwned(seq: number): void {
     this.pendingRequests.clearIfOwned(seq);
+  }
+
+  /**
+   * Stop owned work after another extension replaced this editor.
+   *
+   * Pi exposes no editor-change event, so loss is only noticed at the next
+   * boundary this instance observes: an edit, streamed progress, or a terminal
+   * response. A provider that never yields cannot be interrupted earlier. The
+   * foreign editor is never touched.
+   */
+  private releaseForOwnershipLoss(): void {
+    this.cancelPendingRequest();
+    this.shared.editorBlockedReason = "Another extension replaced the prompt-autocomplete editor";
+    updateDebugState(this.shared, "ownership-lost", this.shared.editorBlockedReason);
+    this.setSuggestions([]);
   }
 
   private cancelPendingRequest(): void {
@@ -1997,6 +2098,22 @@ function bindRuntimeContext(ctx: ExtensionContext, shared: PromptAutocompleteSha
 function readPhysicalSessionId(ctx: ExtensionContext): string {
   const sessionId = ctx.sessionManager?.getSessionId?.();
   return typeof sessionId === "string" ? sessionId : "";
+}
+
+/**
+ * The request snapshot for `draft` against the current branch and output
+ * configuration. Shared by the editor's provider path and by inspection.
+ */
+function buildCurrentRequestSnapshot(
+  shared: PromptAutocompleteSharedState,
+  draft: string,
+): PromptAutocompleteRequestSnapshot {
+  return buildPromptAutocompleteRequestSnapshot({
+    draft,
+    branch: shared.sessionManager?.getBranch?.() ?? [],
+    maxAlternatives: shared.config.maxAlternatives,
+    maxSuggestionChars: shared.config.maxSuggestionChars,
+  });
 }
 
 function resolveCurrentConversationId(shared: PromptAutocompleteSharedState): string {
@@ -2616,21 +2733,60 @@ function notifyPromptAutocompleteEnabled(
   ctx.ui.notify(`Prompt autocomplete enabled. ${keyHint} ${privacyNotice}`, "info");
 }
 
+/** Commands that only report state; they may run on any host with a notification channel. */
+const READ_ONLY_COMMANDS = new Set(["status", "stats", "inspect"]);
+
+/** Whether the host can show a notification, which read-only commands need. */
+function hasNotificationChannel(ctx: ExtensionContext): boolean {
+  const host = ctx as Partial<Pick<ExtensionContext, "hasUI" | "ui">>;
+  return host.hasUI === true && typeof host.ui?.notify === "function";
+}
+
+/**
+ * Run a read-only command. None of them mutates state, mounts an editor, or
+ * reaches a provider seam, which is what lets them run outside the TUI.
+ */
+function runReadOnlyCommand(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  command: string,
+  rest: string,
+  interactiveHost: boolean,
+): void {
+  if (command === "status") {
+    ctx.ui.notify(formatStatus(shared, interactiveHost), "info");
+    return;
+  }
+  if (command === "stats") {
+    const { value, source } = describeBudget(shared);
+    ctx.ui.notify(
+      `${formatPromptAutocompleteStats(shared.usageStats)}\nBudget: ${value} (${source})`,
+      "info",
+    );
+    return;
+  }
+  ctx.ui.notify(formatPromptAutocompleteInspection(shared, interactiveHost, rest || undefined), "info");
+}
+
+/**
+ * Tell a non-interactive host once per process that an enabled extension
+ * cannot issue requests there, instead of staying silently inert.
+ */
+function notifyEnabledWithoutEditorOnce(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
+  if (!shared.enabled || shared.nonInteractiveNoticeShown) return;
+  if (hostOwnsInteractiveEditor(ctx, shared) || !hasNotificationChannel(ctx)) return;
+  shared.nonInteractiveNoticeShown = true;
+  ctx.ui.notify(
+    "Prompt autocomplete is enabled, but this host has no interactive editor: no autocomplete requests will be issued.",
+    "info",
+  );
+}
+
 function createPromptAutocompleteCommandHandlers(
   ctx: ExtensionContext,
   shared: PromptAutocompleteSharedState,
 ): Record<string, () => void> {
   return {
-    status: () => {
-      ctx.ui.notify(formatStatus(shared), "info");
-    },
-    stats: () => {
-      const { value, source } = describeBudget(shared);
-      ctx.ui.notify(
-        `${formatPromptAutocompleteStats(shared.usageStats)}\nBudget: ${value} (${source})`,
-        "info",
-      );
-    },
     "debug-on": () => {
       setDebugDisplay(shared, true);
       ctx.ui.notify("Prompt autocomplete debug display enabled", "info");
@@ -2799,7 +2955,10 @@ export function createPromptAutocompleteExtension(
     bindRuntimeContext(ctx, shared);
     restoreBudgetFromSession(pi, shared);
 
-    if (!hostOwnsInteractiveEditor(ctx, shared) || !shared.enabled) return;
+    if (!hostOwnsInteractiveEditor(ctx, shared) || !shared.enabled) {
+      notifyEnabledWithoutEditorOnce(ctx, shared);
+      return;
+    }
     mountEditor(ctx, shared);
   });
 
@@ -2848,16 +3007,23 @@ export function createPromptAutocompleteExtension(
   pi.registerCommand("prompt-autocomplete", {
     description: "Enable, disable, or inspect inline prompt autocomplete and session stats",
     handler: async (args, ctx) => {
-      if (!hostOwnsInteractiveEditor(ctx, shared)) {
-        ctx.ui.notify("prompt-autocomplete requires interactive TUI mode", "warning");
-        return;
-      }
-
       const trimmed = args.trim();
       const space = trimmed.search(/\s/);
       const command = (space < 0 ? trimmed : trimmed.slice(0, space)).toLowerCase() || "status";
       const rest = space < 0 ? "" : trimmed.slice(space + 1).trim();
       const firstRestToken = rest.split(/\s+/, 1)[0];
+
+      // Reporting works wherever a notification can be shown; anything that
+      // changes state or touches the editor stays TUI-only.
+      const interactiveHost = hostOwnsInteractiveEditor(ctx, shared);
+      if (READ_ONLY_COMMANDS.has(command) && (interactiveHost || hasNotificationChannel(ctx))) {
+        runReadOnlyCommand(ctx, shared, command, rest, interactiveHost);
+        return;
+      }
+      if (!interactiveHost) {
+        ctx.ui.notify("prompt-autocomplete requires interactive TUI mode", "warning");
+        return;
+      }
 
       if (command === "while-streaming") {
         setWhileStreaming(ctx, shared, firstRestToken || undefined);

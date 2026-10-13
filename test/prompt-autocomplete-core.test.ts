@@ -10,6 +10,9 @@ import {
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
+  MAX_DRAFT_CONTEXT_CHARS,
+  buildPromptAutocompleteRequestSnapshot,
+  renderPromptAutocompleteUserText,
   buildPromptAutocompleteBudgetSnapshot,
   BUDGET_REQUESTS_MAX,
   BUDGET_REQUESTS_MIN,
@@ -1591,4 +1594,30 @@ test("budget resolution ranks session over flag over restored value", () => {
     limit: undefined,
     source: "saved",
   });
+});
+
+test("the request snapshot renders the transmitted user message", () => {
+  const empty = buildPromptAutocompleteRequestSnapshot({
+    draft: "",
+    branch: [],
+    maxAlternatives: 2,
+    maxSuggestionChars: 80,
+  });
+  assert.match(
+    renderPromptAutocompleteUserText(empty),
+    /^Current draft is empty\.\n\nTask: propose up to 2 ranked full next prompts/,
+  );
+
+  const long = "a".repeat(MAX_DRAFT_CONTEXT_CHARS + 5);
+  const truncated = buildPromptAutocompleteRequestSnapshot({
+    draft: long,
+    branch: [{ type: "message", message: { role: "user", content: "Earlier question" } }],
+    maxAlternatives: 3,
+    maxSuggestionChars: 160,
+  });
+  assert.equal(truncated.draftTail.length, MAX_DRAFT_CONTEXT_CHARS);
+  const text = renderPromptAutocompleteUserText(truncated);
+  assert.match(text, /^Latest user message:\nEarlier question\n\n/);
+  assert.match(text, /Current draft tail \(the real draft is longer; the cursor is at the end of the full draft\):\na+\n\n/);
+  assert.match(text, /Task: propose up to 3 ranked continuations/);
 });

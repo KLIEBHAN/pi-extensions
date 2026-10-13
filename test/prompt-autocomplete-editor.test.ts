@@ -20,7 +20,12 @@ import {
   createPromptAutocompleteExtension,
   type PromptAutocompleteDependencies,
 } from "../extensions/prompt-autocomplete/index.ts";
-import type { PromptAutocompletePersistedSettings } from "../extensions/prompt-autocomplete/core.ts";
+import {
+  buildPromptAutocompleteRequestSnapshot,
+  PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+  type PromptAutocompletePersistedSettings,
+  renderPromptAutocompleteUserText,
+} from "../extensions/prompt-autocomplete/core.ts";
 
 type Handler = (event: any, ctx: ExtensionContext) => Promise<unknown> | unknown;
 type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown> | unknown;
@@ -2537,4 +2542,102 @@ test("a session that never touches the budget writes no session entries", async 
   await flushAsyncWork();
 
   assert.equal(harness.getAppendedEntries().length, 0, "the default off path must stay write-free");
+});
+
+test("inspection renders exactly the request text the provider receives", async () => {
+  let calls = 0;
+  let capturedContext: any;
+  const harness = createEditorHarness({
+    completeSimple: (async (_model, context) => {
+      calls += 1;
+      capturedContext = context;
+      return makeCompletion([" with tests"]);
+    }) as CompleteSimple,
+  });
+  const branch = [
+    { type: "message", message: { role: "user", content: "Please harden the parser" } },
+    { type: "message", message: { role: "assistant", content: "The implementation is ready for review" } },
+  ];
+  harness.setBranch(branch);
+  const editor = await harness.createEditor();
+  editor.setText("Review it");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+
+  const sentText: string = capturedContext.messages[0].content[0].text;
+  const snapshot = buildPromptAutocompleteRequestSnapshot({
+    draft: "Review it",
+    branch,
+    maxAlternatives: 3,
+    maxSuggestionChars: 160,
+  });
+  assert.equal(sentText, renderPromptAutocompleteUserText(snapshot), "production uses the shared snapshot renderer");
+  assert.equal(capturedContext.systemPrompt, PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT);
+
+  await harness.command("inspect Review it");
+  const report = harness.notifications.at(-1) ?? "";
+  assert.match(report, /no provider request was made/);
+  assert.match(
+    report,
+    new RegExp(`system prompt ${PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT.length} chars \\+ user message ${sentText.length} chars`),
+    "inspection reports the size of the exact text the provider received",
+  );
+  assert.match(report, /Latest user message: 24 chars sent \(cap 1200\): "Please harden the parser"/);
+  assert.match(report, /Latest assistant message: 38 chars sent/);
+  assert.match(report, /Shared policy: automatic allowed · manual allowed/);
+  assert.equal(calls, 1, "inspection never calls the provider");
+});
+
+test("ownership loss during a stream releases the provider work at the next progress boundary", async () => {
+  const provider = controlledStream();
+  let signal: AbortSignal | undefined;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    streamSimple: ((_model, _context, options) => {
+      signal = options?.signal;
+      return provider.stream;
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+  provider.delta('{"completions":[" the implementation', " the implementation");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /the/);
+  assert.equal(signal?.aborted, false);
+
+  // Another extension takes the editor slot; the old editor receives no more input.
+  const foreignFactory = (() => ({})) as unknown as EditorFactory;
+  harness.replaceEditorExternally(foreignFactory);
+  provider.delta('{"completions":[" the implementation carefully', " carefully");
+  await flushAsyncWork();
+
+  assert.equal(signal?.aborted, true, "the first progress after ownership loss must abort the stream");
+  assert.doesNotMatch(renderedText(editor), /carefully/);
+  assert.equal(harness.getEditorFactory(), foreignFactory, "the foreign editor is never removed");
+
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /editor=ownership-lost/);
+});
+
+test("ownership loss before a complete response never paints it or touches the foreign editor", async () => {
+  const pending = deferred<CompletionResult>();
+  const harness = createEditorHarness({
+    completeSimple: (async () => await pending.promise) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  const foreignFactory = (() => ({})) as unknown as EditorFactory;
+  harness.replaceEditorExternally(foreignFactory);
+  pending.resolve(makeCompletion([" must not render"]));
+  await flushAsyncWork();
+
+  assert.doesNotMatch(renderedText(editor), /must not render/);
+  assert.equal(harness.getEditorFactory(), foreignFactory);
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /editor=ownership-lost \| editor-blocked=Another extension replaced/);
 });

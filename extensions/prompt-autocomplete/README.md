@@ -41,6 +41,7 @@ Or enable it for the current interactive session:
 | Dismiss the suggestion for this draft | `Escape` |
 | Enable, disable, or inspect configuration | `/prompt-autocomplete on\|off\|toggle\|status` |
 | Show current-session effectiveness and cost | `/prompt-autocomplete stats` |
+| Preview what a request would send, locally | `/prompt-autocomplete inspect [draft text]` |
 | Toggle streamed response previews | `/prompt-autocomplete stream on\|off\|toggle` |
 | Set and persist the minimum draft length | `/prompt-autocomplete min-chars <n>` |
 | Cap provider requests for this session | `/prompt-autocomplete budget <n\|off>` |
@@ -122,6 +123,14 @@ Budget: 4/25 (session)
 - A trailing `+` (`1832 tokens+`, `estimated cost ~$0.00214+`; compact `status`: `1832 tok+`, `~$0.00214 est+`) means at least one request did not report that metric, so the true total may be higher than shown. Tokens and cost are marked independently, because a response can report tokens without a cost figure.
 - Counters live only in memory, are scoped to the current session, and reset when a new session starts.
 
+### Inspecting a request
+
+`/prompt-autocomplete inspect [draft text]` shows locally what an autocomplete request would send. It makes no provider request, stores nothing, and never shows credentials or headers.
+
+- The report renders the same request snapshot the provider path uses: the resolved and requested model, the latest assistant and user messages, the recent-conversation summary, the transmitted draft tail, the exact request size, and the output and token ceilings. Long sections appear as character counts with short sanitized excerpts.
+- Without draft text the report covers the conversation sections only. The slash command replaced the editor text when you submitted it, so the draft a real request would carry cannot be recovered and is not invented; pass one explicitly to preview a complete request. Pi trims trailing whitespace from submitted commands.
+- `Shared policy` evaluates only the gates every editor shares — enabled state, editor ownership, the main-agent gate, model and auth, `min-chars` and slash/path detection for the given draft, and the session budget — separately for automatic requests and the manual `Ctrl+.` one-shot. Cursor position, the built-in autocomplete menu, Escape dismissal, the per-editor error cooldown, and cached responses belong to the live editor and are not evaluated.
+
 ## Privacy, providers, and cost
 
 Enabling Prompt Autocomplete permits additional model requests. Streaming changes only when the same response becomes visible; it does not add a second request. A request can contain:
@@ -143,10 +152,12 @@ The extension makes no autocomplete request while disabled. Automatic empty-draf
 ## Compatibility and editor ownership
 
 - Supported baseline: Pi `0.80.6`, Node.js `22.19.0` or newer.
-- Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor.
+- Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor and never reach a provider.
+- The read-only commands `status`, `stats`, and `inspect` also work on hosts that can show notifications, such as RPC; there `status` reports `host=non-interactive` and `editor=unavailable`. Every command that changes state or touches the editor stays TUI-only. If the extension is enabled on such a host, it says once per process that no autocomplete request will be issued.
 - Forks of Pi's extension API whose `ExtensionContext` predates `mode`, such as [prime-agent](https://www.npmjs.com/package/prime-agent), are supported. For those hosts the extension first requires UI availability and a custom-editor slot, and then verifies that the host actually installed the editor. A front-end that accepts an editor factory without installing it, as forked RPC and daemon modes do, is detected on the first attempt and stays inactive: it is not retried, not left enabled, and can neither render ghost text nor issue a provider request.
 - The simple completion API is imported from the `@earendil-works/pi-ai` root specifier, which Pi maps to its compat entrypoint and such forks export directly. If a host exposes that module without `streamSimple`, the extension uses the completion path instead of failing requests.
 - Prompt Autocomplete requires exclusive ownership of Pi's custom-editor slot. It refuses to replace another custom editor and never removes a later replacement editor.
+- If another extension replaces the editor while a request runs, the request is released at the next boundary the old editor observes — an edit, streamed progress, or the terminal response — and its result is never painted. Pi exposes no editor-change event, so a provider that never yields cannot be interrupted earlier.
 
 ## Development
 
