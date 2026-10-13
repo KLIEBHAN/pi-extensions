@@ -479,6 +479,8 @@ interface PromptAutocompleteSharedState {
   debugState: string;
   editorMount?: EditorMountState;
   editorBlockedReason?: string;
+  /** Whether requests go through the session's model registry rather than compat or injected seams. */
+  routesThroughHostRegistry: () => boolean;
   /** Mount-bound notification channel; cleared together with the editor runtime. */
   notify?: (message: string, type?: "info" | "warning" | "error") => void;
   /** Refused model requests already reported, to avoid repeating them. */
@@ -1801,9 +1803,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
 
     const auth = await this.shared.modelRegistry.getApiKeyAndHeaders(request.model);
-    if (!auth.ok || !auth.apiKey) {
-      throw new Error(auth.ok ? `No API key for ${request.modelLabel}` : auth.error);
-    }
+    // Through the host registry Pi resolves the stored credential itself, which
+    // may be header-only or ambient, so only the compat path needs a key here.
+    const viaRegistry = this.shared.routesThroughHostRegistry();
+    if (!auth.ok) throw new Error(auth.error);
+    if (!viaRegistry && !auth.apiKey) throw new Error(`No API key for ${request.modelLabel}`);
     if (signal.aborted) {
       throw new Error("Request was aborted");
     }
@@ -1830,8 +1834,10 @@ class PromptAutocompleteEditor extends CustomEditor {
       messages: [userMessage],
     };
     const requestOptions = {
-      apiKey: auth.apiKey,
-      headers: auth.headers,
+      // An explicit key makes Pi's registry skip the stored credential and with
+      // it any OAuth-derived endpoint (for example GitHub Copilot Enterprise),
+      // so credentials are only passed to the compat functions and to seams.
+      ...(viaRegistry ? {} : { apiKey: auth.apiKey, headers: auth.headers }),
       signal,
       maxTokens: computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars),
       timeoutMs: REQUEST_TIMEOUT_MS,
@@ -3093,6 +3099,8 @@ export function createPromptAutocompleteExtension(
     usageStats: createPromptAutocompleteUsageStats(),
     completeSimple: completeSimpleImpl,
     streamSimple: streamSimpleImpl,
+    routesThroughHostRegistry: () =>
+      !dependencies.completeSimple && !dependencies.streamSimple && registryStreamSimple(shared.modelRegistry) !== undefined,
     now,
     debugState: "idle",
     requestCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
