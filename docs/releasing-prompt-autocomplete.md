@@ -40,7 +40,7 @@ The video must stay H.264, 1200×676, `yuv420p`, and short.
 python3 scripts/demo/record-prompt-autocomplete-demo.py
 ```
 
-Pi runs in a private tmux server (`tmux -L pa-gallery-demo`, no user configuration) with a temporary `HOME`, agent directory, and settings file, offline, with only this extension and `scripts/demo/demo-provider.ts` loaded. The demo provider answers from the draft locally, so the recording needs no credentials and makes no network request. The script fails if a scene does not show its expected text, then renders each captured frame with Pillow and encodes the result with ffmpeg. Pass `--frames <dir>` to keep the rendered frames for review. Neither file is part of the published package.
+Pi runs in a private tmux server (`tmux -L pa-gallery-demo`, no user configuration) from a clean environment (`env -i` with an explicit allowlist, so no API key or Pi directory of the maintainer leaks in), with a temporary `HOME`, agent and session directory, and settings file, offline, with only this extension and `scripts/demo/demo-provider.ts` loaded. The demo provider answers from the draft locally, so the recording needs no credentials and makes no network request. The script fails if a scene does not show its expected text, then renders each captured frame with Pillow and encodes the result with ffmpeg. Pass `--frames <dir>` to keep the rendered frames for review; everything else is removed, also when a scene fails. Neither file is part of the published package.
 
 ## Versioning
 

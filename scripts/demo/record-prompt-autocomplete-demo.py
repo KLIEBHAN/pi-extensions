@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -312,27 +314,42 @@ def main() -> int:
 
     # Resolved, because Pi prints the real path (macOS: /var -> /private/var).
     workdir = Path(tempfile.mkdtemp(prefix="pa-demo-")).resolve()
+    try:
+        recorder = record(pi, workdir)
+        encode(recorder, workdir, args.out, args.frames or workdir / "frames")
+    finally:
+        # Only the caller's --frames directory and the video outlive the run.
+        shutil.rmtree(workdir, ignore_errors=True)
+    return 0
+
+
+def record(pi: Path, workdir: Path) -> Recorder:
     agent = workdir / "agent"
     project = workdir / "acme-api"
     agent.mkdir()
     project.mkdir()
     (agent / "settings.json").write_text(json.dumps({"quietStartup": True}))
+    # `env -i` starts Pi from an explicit allowlist, so nothing from the
+    # maintainer's environment (API keys, session or agent directories) leaks
+    # in. A private HOME also keeps the footer short (~/acme-api).
     env = {
-        # A private HOME keeps the footer short (~/acme-api) and keeps the
-        # recording away from the maintainer's own configuration.
         "HOME": str(workdir),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": "en_US.UTF-8",
         "PI_CODING_AGENT_DIR": str(agent),
+        "PI_CODING_AGENT_SESSION_DIR": str(workdir / "sessions"),
         "PI_OFFLINE": "1",
         "PI_PROMPT_AUTOCOMPLETE_SETTINGS": str(workdir / "prompt-autocomplete.json"),
     }
-    command = " ".join([
-        *(f"{key}={value}" for key, value in env.items()),
+    arguments = [
         str(pi), "--no-extensions", "--no-skills",
         "-e", str(REPO / "extensions/prompt-autocomplete"),
         "-e", str(DEMO_PROVIDER),
         "--model", "demo/autocomplete",
         "--prompt-autocomplete", "--prompt-autocomplete-debounce-ms", "120",
-    ])
+    ]
+    # TERM stays the one tmux gives the pane; every other token is quoted.
+    command = 'exec env -i TERM="$TERM" ' + shlex.join([*(f"{key}={value}" for key, value in env.items()), *arguments])
 
     recorder = Recorder()
     subprocess.run(["tmux", "-L", SOCKET, "kill-server"], capture_output=True)
@@ -350,25 +367,32 @@ def main() -> int:
         deadline = time.monotonic() + 20
         while "─" not in recorder.plain():
             if time.monotonic() > deadline:
-                raise TimeoutError("Pi did not start")
+                raise TimeoutError(f"Pi did not start:\n{recorder.plain()}")
             time.sleep(0.2)
         time.sleep(0.6)
         recorder.frames.clear()
         run_scenes(recorder)
     finally:
         subprocess.run(["tmux", "-L", SOCKET, "kill-server"], capture_output=True)
+    return recorder
 
+
+def concat_path(path: Path) -> str:
+    """Quote a path for ffmpeg's concat demuxer, which reads single-quoted strings."""
+    return "'" + str(path).replace("'", "'\\''") + "'"
+
+
+def encode(recorder: Recorder, workdir: Path, out: Path, frame_dir: Path) -> None:
     fonts = Fonts()
-    frame_dir = args.frames or workdir / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
     concat = []
     for index, frame in enumerate(recorder.frames):
         path = frame_dir / f"frame-{index:04d}.png"
         render(parse_capture(frame.capture), fonts).save(path)
-        concat.append(f"file '{path}'\nduration {frame.duration:.3f}")
-    concat.append(f"file '{frame_dir / f'frame-{len(recorder.frames) - 1:04d}.png'}'")
+        concat.append(f"file {concat_path(path)}\nduration {frame.duration:.3f}")
+    concat.append(f"file {concat_path(frame_dir / f'frame-{len(recorder.frames) - 1:04d}.png')}")
     (workdir / "frames.txt").write_text("\n".join(concat) + "\n")
-    args.out.parent.mkdir(parents=True, exist_ok=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
     total = sum(frame.duration for frame in recorder.frames)
     # The concat demuxer needs the last file listed twice and would otherwise
     # stretch the final frame, so the output is cut at the recorded length.
@@ -378,12 +402,9 @@ def main() -> int:
         # A mostly static terminal stays crisp at 20 fps and CRF 24 with a
         # fraction of the bytes; the video ships inside the npm package.
         "-vf", "fps=20,format=yuv420p", "-c:v", "libx264", "-preset", "slow", "-crf", "24", "-tune", "animation",
-        "-movflags", "+faststart", str(args.out),
+        "-movflags", "+faststart", str(out),
     ], check=True)
-    print(f"{len(recorder.frames)} frames, {total:.1f} s -> {args.out}")
-    if not args.frames:
-        shutil.rmtree(workdir, ignore_errors=True)
-    return 0
+    print(f"{len(recorder.frames)} frames, {total:.1f} s -> {out}")
 
 
 if __name__ == "__main__":
