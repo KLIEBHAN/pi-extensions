@@ -7,7 +7,7 @@ import type {
   ExtensionContext,
   KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   type AutocompleteProvider,
   CURSOR_MARKER,
@@ -133,6 +133,10 @@ interface EditorHarnessOptions {
   hasConfiguredAuth?: (model: { provider: string; id: string }) => boolean;
   /** Emulate forked hosts (prime-agent) whose ExtensionContext predates `mode`. */
   omitHostMode?: boolean;
+  /** A real host session manager instead of the in-test stub. */
+  sessionManager?: SessionManager;
+  /** Host session projection on the stub, e.g. one that throws. */
+  buildSessionProjection?: () => unknown;
   /** Control auth resolution, e.g. to defer two concurrent producers. */
   getApiKeyAndHeaders?: () => Promise<{ ok: true; apiKey: string; headers: Record<string, string> } | { ok: false; error: string }>;
   /** Emulate hosts without `pi.appendEntry`, where snapshots cannot be durable. */
@@ -185,11 +189,12 @@ function createEditorHarness(options: EditorHarnessOptions) {
         ? await options.getApiKeyAndHeaders()
         : ({ ok: true as const, apiKey: "test-key", headers: {} }),
   };
-  const sessionManager = {
+  const sessionManager = options.sessionManager ?? {
     getBranch: () => branch,
     getEntries: () => entries,
     getLeafId: () => leafId,
     getSessionId: () => sessionId,
+    ...(options.buildSessionProjection ? { buildSessionProjection: options.buildSessionProjection } : {}),
   };
   const ctx = {
     ...(options.omitHostMode ? {} : { mode: "tui" }),
@@ -364,34 +369,53 @@ test("a forked host without ExtensionContext.mode still renders and accepts sugg
   assert.match(status, /editor=mounted/);
 });
 
-test("a forked host that closes the cursor with ESC[27m still renders and accepts suggestions", async () => {
-  // prime-agent keeps its editor background surface alive by closing the fake
-  // cursor with \x1b[27m instead of Pi's full reset \x1b[0m. Simulate that host
-  // by rewriting the cursor token the base editor emits.
+test("every host cursor-cell form renders and accepts suggestions", async () => {
+  // The end-of-line cursor cell differs by host: Pi 0.x closes inverse video
+  // with a full reset, prime-agent closes it with \x1b[27m to keep its editor
+  // background, and Pi 1.x wraps the cell in fake-cursor APC markers. Emulate
+  // each host by rewriting whichever cell the installed base editor emits.
+  const baseCursorCell = /\x1b\[7m \x1b\[(?:0|27)m|\x1b_pi:fc\x07 \x1b_pi:\/fc\x07/g;
+  const hostCells = [
+    ["Pi 0.x", "\x1b[7m \x1b[0m"],
+    ["prime-agent", "\x1b[7m \x1b[27m"],
+    ["Pi 1.x", "\x1b_pi:fc\x07 \x1b_pi:/fc\x07"],
+  ] as const;
   const originalRender = CustomEditor.prototype.render;
-  CustomEditor.prototype.render = function (this: CustomEditor, width: number): string[] {
-    return originalRender
-      .call(this, width)
-      .map((line) => line.replaceAll("\x1b[7m \x1b[0m", "\x1b[7m \x1b[27m"));
-  };
-  try {
-    let calls = 0;
-    const harness = createEditorHarness({
-      completeSimple: (async () => {
-        calls += 1;
-        return calls === 1 ? makeCompletion([" the implementation carefully"]) : makeCompletion([]);
-      }) as CompleteSimple,
-    });
 
-    const editor = await harness.createEditor();
-    editor.setText("Review");
-    await flushAsyncWork();
+  for (const [host, cell] of hostCells) {
+    let rewrites = 0;
+    CustomEditor.prototype.render = function (this: CustomEditor, width: number): string[] {
+      return originalRender.call(this, width).map((line) =>
+        line.replace(baseCursorCell, () => {
+          rewrites += 1;
+          return cell;
+        }),
+      );
+    };
+    try {
+      let calls = 0;
+      const harness = createEditorHarness({
+        completeSimple: (async () => {
+          calls += 1;
+          return calls === 1 ? makeCompletion([" the implementation carefully"]) : makeCompletion([]);
+        }) as CompleteSimple,
+      });
 
-    assert.match(renderedText(editor), /the implementation carefully/);
-    editor.handleInput("\t");
-    assert.equal(editor.getText(), "Review the implementation carefully");
-  } finally {
-    CustomEditor.prototype.render = originalRender;
+      const editor = await harness.createEditor();
+      editor.setText("Review");
+      await flushAsyncWork();
+
+      const rawLines = editor.render(80);
+      assert.ok(rewrites > 0, `${host}: the base editor must emit a cursor cell to rewrite`);
+      assert.ok(
+        rawLines.some((line) => line.includes(`${cell}\x1b[2mthe implementation carefully`)),
+        `${host}: the cursor cell keeps its own opening and closing sequence before the ghost text`,
+      );
+      editor.handleInput("\t");
+      assert.equal(editor.getText(), "Review the implementation carefully", host);
+    } finally {
+      CustomEditor.prototype.render = originalRender;
+    }
   }
 });
 
@@ -2537,4 +2561,89 @@ test("a session that never touches the budget writes no session entries", async 
   await flushAsyncWork();
 
   assert.equal(harness.getAppendedEntries().length, 0, "the default off path must stay write-free");
+});
+
+test("provider requests carry only the model-visible context after a context edit", async () => {
+  let capturedContext: any;
+  const session = SessionManager.inMemory(process.cwd());
+  const secretId = session.appendMessage({ role: "user", content: "my secret token is abc123", timestamp: Date.now() });
+  session.appendMessage({ role: "user", content: "Now refactor the parser", timestamp: Date.now() });
+  session.appendContextEdit(secretId, null);
+
+  const harness = createEditorHarness({
+    sessionManager: session,
+    completeSimple: (async (_model, context) => {
+      capturedContext = context;
+      return makeCompletion([" next"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  const sentText: string = capturedContext.messages[0].content[0].text;
+  assert.doesNotMatch(sentText, /abc123/, "a message the model no longer sees is never sent for autocomplete");
+  assert.match(sentText, /Latest user message:\nNow refactor the parser/);
+});
+
+test("a host projection that throws sends no conversation context instead of the raw branch", async () => {
+  let capturedContext: any;
+  const harness = createEditorHarness({
+    buildSessionProjection: () => {
+      throw new Error("projection failed");
+    },
+    completeSimple: (async (_model, context) => {
+      capturedContext = context;
+      return makeCompletion([" next"]);
+    }) as CompleteSimple,
+  });
+  harness.setBranch([{ type: "message", message: { role: "user", content: "raw branch only" } }]);
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  const sentText: string = capturedContext.messages[0].content[0].text;
+  assert.doesNotMatch(sentText, /raw branch only/);
+  assert.match(sentText, /^Current draft \(cursor at end\):\nReview/);
+});
+
+test("the session projection is rebuilt per conversation change, not per keystroke", async () => {
+  const sentTexts: string[] = [];
+  const session = SessionManager.inMemory(process.cwd());
+  const secretId = session.appendMessage({ role: "user", content: "my secret token is abc123", timestamp: Date.now() });
+  session.appendMessage({ role: "user", content: "Now refactor the parser", timestamp: Date.now() });
+  let projections = 0;
+  const project = session.buildSessionProjection.bind(session);
+  session.buildSessionProjection = () => {
+    projections += 1;
+    return project();
+  };
+
+  const harness = createEditorHarness({
+    sessionManager: session,
+    completeSimple: (async (_model, context: any) => {
+      sentTexts.push(context.messages[0].content[0].text);
+      return makeCompletion([]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  for (const draft of ["R", "Re", "Rev", "Revi", "Review"]) {
+    editor.setText(draft);
+    await flushAsyncWork();
+  }
+  assert.equal(projections, 1, "keystrokes in one conversation reuse the projection");
+  assert.match(sentTexts.at(-1) ?? "", /abc123/);
+
+  // A metadata entry keeps the conversation id and the projection.
+  session.appendCustomEntry("unrelated-extension-state", { value: 1 });
+  editor.setText("Review the");
+  await flushAsyncWork();
+  assert.equal(projections, 1);
+
+  // A context edit changes the conversation id, so the redaction applies at once.
+  session.appendContextEdit(secretId, null);
+  editor.setText("Review the parser");
+  await flushAsyncWork();
+  assert.equal(projections, 2);
+  assert.doesNotMatch(sentTexts.at(-1) ?? "", /abc123/, "a redaction is never served from a stale projection");
 });

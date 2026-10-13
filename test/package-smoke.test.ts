@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import test from "node:test";
@@ -309,18 +309,19 @@ test("the supported Pi version still maps the pi-ai root specifier to the simple
   // mapped the "/compat" subpath. Pi only exposes completeSimple/streamSimple
   // under the root specifier through its extension alias tables, so this is a
   // CI canary: it fails the day Pi stops aliasing the root to compat.
-  const loaderSource = readFileSync(
-    join(projectRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "extensions", "loader.js"),
-    "utf8",
-  );
+  const extensionsDir = join(projectRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "extensions");
+  const loaderSource = readFileSync(join(extensionsDir, "loader.js"), "utf8");
   assert.match(
     loaderSource,
     /"@earendil-works\/pi-ai":\s*piAiCompatEntry/,
     "Pi must alias the pi-ai root specifier to its compat entrypoint for extensions",
   );
+  // Pi 1.x moved the bundled module table out of loader.js into virtual-modules.js.
+  const virtualModulesPath = join(extensionsDir, "virtual-modules.js");
+  const bundledTableSource = existsSync(virtualModulesPath) ? readFileSync(virtualModulesPath, "utf8") : loaderSource;
   assert.match(
-    loaderSource,
-    /"@earendil-works\/pi-ai":\s*_bundledPiAiCompat/,
+    bundledTableSource,
+    /"@earendil-works\/pi-ai":\s*_?bundledPiAiCompat/,
     "Pi must also map the pi-ai root specifier to compat in its bundled module table",
   );
 
