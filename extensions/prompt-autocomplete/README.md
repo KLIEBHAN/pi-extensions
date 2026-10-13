@@ -125,7 +125,7 @@ Budget: 4/25 (session)
 
 ### Inspecting a request
 
-`/prompt-autocomplete inspect [draft text]` shows locally what an autocomplete request would send. It makes no provider request, stores nothing, and never shows credentials or headers.
+`/prompt-autocomplete inspect [draft text]` shows locally what an autocomplete request would send. It makes no provider request, persists nothing, and never shows credentials or headers; at most it warms the in-memory context cache that the next request in the same conversation reuses.
 
 - The report renders the same request snapshot the provider path uses: the resolved and requested model, the latest assistant and user messages, the recent-conversation summary, the transmitted draft tail, the exact request size, and the output and token ceilings. Long sections appear as character counts with short sanitized excerpts.
 - Without draft text the report covers the conversation sections only. The slash command replaced the editor text when you submitted it, so the draft a real request would carry cannot be recovered and is not invented; pass one explicitly to preview a complete request. Pi trims trailing whitespace from submitted commands.

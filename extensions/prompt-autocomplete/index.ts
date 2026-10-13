@@ -2857,8 +2857,10 @@ function hasNotificationChannel(ctx: ExtensionContext): boolean {
 }
 
 /**
- * Run a read-only command. None of them mutates state, mounts an editor, or
- * reaches a provider seam, which is what lets them run outside the TUI.
+ * Run a read-only command. None of them changes settings, overrides, budget,
+ * or stats, mounts an editor, or reaches a provider seam, which is what lets
+ * them run outside the TUI. Inspection may warm the in-memory projection memo,
+ * a deterministic cache the next request in the same conversation reuses.
  */
 function runReadOnlyCommand(
   ctx: ExtensionContext,
