@@ -104,6 +104,8 @@ export const MAX_CONTEXT_MESSAGES = 6;
 export const MAX_CONTEXT_MESSAGE_CHARS = 600;
 export const MAX_LATEST_ASSISTANT_MESSAGE_CHARS = 3_000;
 export const MAX_LATEST_USER_MESSAGE_CHARS = 1_200;
+/** Bound for the latest compaction summary; the middle is elided so goal and next steps survive. */
+export const MAX_COMPACTION_SUMMARY_CHARS = 1_500;
 // Scale the completion budget with the requested alternatives so a JSON array of
 // several short suggestions cannot be truncated mid-string (which would break parsing).
 export const MIN_REQUEST_MAX_TOKENS = 192;
@@ -123,6 +125,7 @@ export interface PromptAutocompleteCacheIdentity {
   latestAssistantContext: string;
   latestUserContext: string;
   recentContext: string;
+  compactionSummaryContext: string;
 }
 
 /** Session entries that advance the raw leaf without changing autocomplete context. */
@@ -2070,7 +2073,10 @@ export function buildLatestUserMessageContext(
  * `context_edit` entries and compaction: an edit can omit an earlier message or
  * replace its content, for example to redact it. Autocomplete must not send
  * what the model itself no longer sees, so its context comes from that
- * projection. Only message entries contribute, as with the raw branch, and a
+ * projection. Message entries contribute their messages, as with the raw
+ * branch. A compaction contributes only its summary text, as a
+ * `compaction_summary` entry, because the projection replaced the summarized
+ * messages with it; the compaction's system checkpoint is never taken. A
  * malformed projection yields no conversation context rather than raw entries.
  */
 export function projectAutocompleteContextEntries(projection: unknown): unknown[] {
@@ -2078,12 +2084,40 @@ export function projectAutocompleteContextEntries(projection: unknown): unknown[
   const entries: unknown[] = [];
   for (const projected of projection.entries) {
     if (!isRecord(projected) || !isRecord(projected.sourceEntry) || !Array.isArray(projected.messages)) continue;
-    if (projected.sourceEntry.type !== "message") continue;
+    const source = projected.sourceEntry;
+    if (source.type === "compaction") {
+      for (const message of projected.messages) {
+        if (isRecord(message) && message.role === "compactionSummary" && typeof message.summary === "string") {
+          entries.push({ type: "compaction_summary", id: source.id, summary: message.summary });
+        }
+      }
+      continue;
+    }
+    if (source.type !== "message") continue;
     for (const message of projected.messages) {
-      entries.push({ type: "message", id: projected.sourceEntry.id, message });
+      entries.push({ type: "message", id: source.id, message });
     }
   }
   return entries;
+}
+
+/**
+ * The newest compaction summary among projected context entries, bounded with
+ * the middle elided. Raw branches never carry `compaction_summary` entries, so
+ * hosts without a projection send no summary: they still see the summarized
+ * messages themselves.
+ */
+export function buildCompactionSummaryContext(
+  entries: unknown[],
+  maxChars = MAX_COMPACTION_SUMMARY_CHARS,
+): string {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (!isRecord(entry) || entry.type !== "compaction_summary" || typeof entry.summary !== "string") continue;
+    const summary = entry.summary.trim();
+    if (summary) return truncateMiddle(summary, maxChars);
+  }
+  return "";
 }
 
 export function truncateDraftTail(draft: string, maxChars = MAX_DRAFT_CONTEXT_CHARS): string {
@@ -2106,6 +2140,8 @@ export interface PromptAutocompleteRequestSnapshot {
   latestAssistantContext: string;
   latestUserContext: string;
   recentContext: string;
+  /** Newest compaction summary the model sees; empty without one or without a host projection. */
+  compactionSummaryContext: string;
   maxAlternatives: number;
   maxSuggestionChars: number;
 }
@@ -2122,6 +2158,7 @@ export function buildPromptAutocompleteRequestSnapshot(input: {
     latestAssistantContext: buildLatestAssistantMessageContext(input.branch),
     latestUserContext: buildLatestUserMessageContext(input.branch),
     recentContext: buildRecentConversationContext(input.branch),
+    compactionSummaryContext: buildCompactionSummaryContext(input.branch),
     maxAlternatives: input.maxAlternatives,
     maxSuggestionChars: input.maxSuggestionChars,
   };
@@ -2144,6 +2181,9 @@ export function renderPromptAutocompleteUserText(snapshot: PromptAutocompleteReq
   }
   if (snapshot.recentContext) {
     sections.push(`Recent conversation summary:\n${snapshot.recentContext}`);
+  }
+  if (snapshot.compactionSummaryContext) {
+    sections.push(`Earlier conversation summary (compacted background):\n${snapshot.compactionSummaryContext}`);
   }
 
   if (snapshot.draft.length === 0) {

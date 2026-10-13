@@ -16,6 +16,8 @@ import {
   buildPromptAutocompleteRequestSnapshot,
   renderPromptAutocompleteUserText,
   projectAutocompleteContextEntries,
+  buildCompactionSummaryContext,
+  MAX_COMPACTION_SUMMARY_CHARS,
   buildPromptAutocompleteBudgetSnapshot,
   BUDGET_REQUESTS_MAX,
   BUDGET_REQUESTS_MIN,
@@ -133,6 +135,7 @@ test("prompt autocomplete cache identity includes draft, context, and output con
     latestAssistantContext: "Implementation finished",
     latestUserContext: "Please implement it",
     recentContext: "User: Please implement it\n\nAssistant: Implementation finished",
+    compactionSummaryContext: "",
   };
 
   const key = buildPromptAutocompleteCacheKey(base);
@@ -143,6 +146,11 @@ test("prompt autocomplete cache identity includes draft, context, and output con
     buildPromptAutocompleteCacheKey({ ...base, latestAssistantContext: "Tests are still failing" }),
   );
   assert.notEqual(key, buildPromptAutocompleteCacheKey({ ...base, maxSuggestionChars: 320 }));
+  assert.notEqual(
+    key,
+    buildPromptAutocompleteCacheKey({ ...base, compactionSummaryContext: "Migrated the schema to v2" }),
+    "a new compaction summary must not reuse suggestions built without it",
+  );
   assert.doesNotMatch(key, /Implementation finished|Please implement it|Review the change/);
 
   const { draft: _draft, ...prefixIdentity } = base;
@@ -1680,4 +1688,50 @@ test("a malformed host projection yields no conversation context", () => {
     [],
     "only message entries contribute, and an omission contributes nothing",
   );
+});
+
+test("a compaction contributes only its bounded summary to autocomplete context", () => {
+  // Uses the real Pi SessionManager, so the compaction projection is the host's own.
+  const session = SessionManager.inMemory(process.cwd());
+  session.appendMessage({ role: "user", content: "Old request about schema v1", timestamp: Date.now() });
+  const keptId = session.appendMessage({ role: "user", content: "Kept recent request", timestamp: Date.now() });
+  const summary = "## Goal\nMigrate the database to schema v2\n\n## Next Steps\nUpdate the API layer";
+  session.appendCompaction(summary, keptId, 12_000);
+
+  const projected = projectAutocompleteContextEntries(session.buildSessionProjection());
+  assert.equal(buildCompactionSummaryContext(projected), summary);
+  const recent = buildRecentConversationContext(projected);
+  assert.doesNotMatch(recent, /schema v1/, "summarized messages leave autocomplete context");
+  assert.match(recent, /Kept recent request/);
+  assert.equal(buildCompactionSummaryContext(session.getBranch()), "", "raw branches never carry a summary entry");
+
+  const text = renderPromptAutocompleteUserText(
+    buildPromptAutocompleteRequestSnapshot({ draft: "Next", branch: projected, maxAlternatives: 3, maxSuggestionChars: 160 }),
+  );
+  assert.match(text, /Earlier conversation summary \(compacted background\):\n## Goal\nMigrate the database to schema v2/);
+});
+
+test("a compaction summary is bounded with goal and next steps kept, and its checkpoint never taken", () => {
+  const long = `GOAL ${"x".repeat(5_000)} NEXT STEPS`;
+  const bounded = buildCompactionSummaryContext([{ type: "compaction_summary", summary: long }]);
+  assert.ok(bounded.length <= MAX_COMPACTION_SUMMARY_CHARS);
+  assert.ok(bounded.startsWith("GOAL"));
+  assert.ok(bounded.endsWith("NEXT STEPS"));
+
+  assert.deepEqual(
+    projectAutocompleteContextEntries({
+      entries: [
+        {
+          sourceEntry: { type: "compaction", id: "c1" },
+          messages: [
+            { role: "system", content: "SYSTEM PROMPT AND TOOL DECLARATIONS" },
+            { role: "compactionSummary", summary: "Summary" },
+          ],
+        },
+      ],
+    }),
+    [{ type: "compaction_summary", id: "c1", summary: "Summary" }],
+    "the compaction's system checkpoint never reaches autocomplete context",
+  );
+  assert.equal(buildCompactionSummaryContext([{ type: "compaction_summary", summary: "   " }]), "");
 });

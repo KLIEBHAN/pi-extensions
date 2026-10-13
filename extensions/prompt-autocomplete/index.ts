@@ -36,6 +36,7 @@ import {
   DEFAULT_MIN_PROMPT_CHARS,
   MAX_ALTERNATIVES_MAX,
   MAX_ALTERNATIVES_MIN,
+  MAX_COMPACTION_SUMMARY_CHARS,
   MAX_CONTEXT_MESSAGE_CHARS,
   MAX_CONTEXT_MESSAGES,
   MAX_DRAFT_CONTEXT_CHARS,
@@ -1019,6 +1020,11 @@ function formatPromptAutocompleteInspection(
       snapshot.recentContext,
       `up to ${MAX_CONTEXT_MESSAGES} messages × ${MAX_CONTEXT_MESSAGE_CHARS} chars`,
     ),
+    formatInspectionSection(
+      "Compaction summary",
+      snapshot.compactionSummaryContext,
+      `cap ${MAX_COMPACTION_SUMMARY_CHARS}, middle elided`,
+    ),
     sizeLine,
     `Output: up to ${snapshot.maxAlternatives} alternatives × ${snapshot.maxSuggestionChars} chars, `
       + `at most ${computeRequestMaxTokens(snapshot.maxAlternatives, snapshot.maxSuggestionChars)} output tokens`,
@@ -1651,6 +1657,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       latestAssistantContext: snapshot.latestAssistantContext,
       latestUserContext: snapshot.latestUserContext,
       recentContext: snapshot.recentContext,
+      compactionSummaryContext: snapshot.compactionSummaryContext,
     };
 
     return {
@@ -2210,9 +2217,11 @@ function buildCurrentRequestSnapshot(
  * instead of the raw branch. Older hosts have no context edits, so their raw
  * branch is used as before.
  *
- * Autocomplete context covers user and assistant message text only, as it
- * always has; the projection decides which of those messages the model still
- * sees and in which form.
+ * Autocomplete context covers user and assistant message text plus, on hosts
+ * with a projection, the newest compaction summary; the projection decides
+ * which of those the model still sees and in which form. Compaction system
+ * checkpoints, branch summaries, custom messages, and tool results are never
+ * included.
  */
 function readAutocompleteContextEntries(shared: PromptAutocompleteSharedState, conversationId: string): unknown[] {
   const manager = shared.sessionManager;
