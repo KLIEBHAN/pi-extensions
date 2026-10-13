@@ -2914,5 +2914,11 @@ test("Pi's command menu completes arguments over the full span in the real edito
   editor.handleInput("\r");
   assert.deepEqual(submitted, ["/prompt-autocomplete stream"], "a complete command submits with one Enter");
 
+  // `set min-chars` alone reports the value, so it submits with one Enter too.
+  editor.setText("");
+  await type("/prompt-autocomplete set min-chars");
+  editor.handleInput("\r");
+  assert.deepEqual(submitted, ["/prompt-autocomplete stream", "/prompt-autocomplete set min-chars"]);
+
   assert.equal(calls, 0, "command completion never asks the model for ghost text");
 });

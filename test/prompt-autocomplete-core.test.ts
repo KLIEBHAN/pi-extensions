@@ -1805,7 +1805,7 @@ test("argument completion covers empty, single-token, nested, and unmatched pref
 test("argument completion stays out of the way of complete submissions", () => {
   // While the menu is open, Enter applies a completion instead of submitting,
   // so a complete command must close the menu to keep a single Enter working.
-  for (const complete of ["on", "off", "stats", "status", "inspect", "set", "budget", "min-chars", "stream", "stream on", "budget off", "set model active", "debug-toggle"]) {
+  for (const complete of ["on", "off", "stats", "status", "inspect", "set", "set min-chars", "budget", "min-chars", "stream", "stream on", "budget off", "set model active", "debug-toggle"]) {
     assert.equal(completePromptAutocompleteArguments(complete), null, `${complete} submits directly`);
   }
   // A form that still needs a value keeps offering it.

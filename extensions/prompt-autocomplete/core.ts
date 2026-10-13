@@ -2482,11 +2482,12 @@ function commandSpec<Name extends string>(
 
 /**
  * Keys accepted by `/prompt-autocomplete set`. Numeric keys carry their bounds,
- * which both validation and the usage text use.
+ * which both validation and the usage text use. `bareReports` marks a key that
+ * reports its value when submitted without one, so it is a complete command.
  */
 export const PROMPT_AUTOCOMPLETE_SET_KEYS = [
   { key: "debounce-ms", min: DEBOUNCE_MS_MIN, max: DEBOUNCE_MS_MAX, description: "Delay before an automatic request, in milliseconds" },
-  { key: "min-chars", min: MIN_PROMPT_CHARS_MIN, max: MIN_PROMPT_CHARS_MAX, description: "Minimum draft length for automatic suggestions" },
+  { key: "min-chars", min: MIN_PROMPT_CHARS_MIN, max: MIN_PROMPT_CHARS_MAX, bareReports: true, description: "Minimum draft length for automatic suggestions" },
   { key: "max-chars", min: MAX_SUGGESTION_CHARS_MIN, max: MAX_SUGGESTION_CHARS_MAX, description: "Maximum characters per suggestion" },
   { key: "max-alternatives", min: MAX_ALTERNATIVES_MIN, max: MAX_ALTERNATIVES_MAX, description: "Maximum alternatives per request" },
   { key: "model", description: "Model for autocomplete requests" },
@@ -2592,6 +2593,7 @@ const ALL_COMMAND_COMPLETIONS: readonly PromptAutocompleteCommandCompletion[] = 
  */
 const COMPLETE_ARGUMENTS: ReadonlySet<string> = new Set([
   ...PROMPT_AUTOCOMPLETE_COMMANDS.filter((spec) => spec.bareComplete).map((spec) => spec.name),
+  ...PROMPT_AUTOCOMPLETE_SET_KEYS.filter((spec) => "bareReports" in spec).map((spec) => `set ${spec.key}`),
   ...ALL_COMMAND_COMPLETIONS.map((completion) => completion.value).filter((value) => !value.endsWith(" ")),
 ]);
 
