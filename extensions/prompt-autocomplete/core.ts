@@ -2063,6 +2063,29 @@ export function buildLatestUserMessageContext(
   return buildLatestRoleMessageContext(branch, "user", maxChars);
 }
 
+/**
+ * Model-visible conversation entries, in the shape the context builders read.
+ *
+ * Pi 1.x builds model context from a session projection that applies
+ * `context_edit` entries and compaction: an edit can omit an earlier message or
+ * replace its content, for example to redact it. Autocomplete must not send
+ * what the model itself no longer sees, so its context comes from that
+ * projection. Only message entries contribute, as with the raw branch, and a
+ * malformed projection yields no conversation context rather than raw entries.
+ */
+export function projectAutocompleteContextEntries(projection: unknown): unknown[] {
+  if (!isRecord(projection) || !Array.isArray(projection.entries)) return [];
+  const entries: unknown[] = [];
+  for (const projected of projection.entries) {
+    if (!isRecord(projected) || !isRecord(projected.sourceEntry) || !Array.isArray(projected.messages)) continue;
+    if (projected.sourceEntry.type !== "message") continue;
+    for (const message of projected.messages) {
+      entries.push({ type: "message", id: projected.sourceEntry.id, message });
+    }
+  }
+  return entries;
+}
+
 export function truncateDraftTail(draft: string, maxChars = MAX_DRAFT_CONTEXT_CHARS): string {
   if (draft.length <= maxChars) return draft;
   return draft.slice(-maxChars);

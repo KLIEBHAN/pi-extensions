@@ -7,7 +7,7 @@ import type {
   ExtensionContext,
   KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   type AutocompleteProvider,
   CURSOR_MARKER,
@@ -133,6 +133,10 @@ interface EditorHarnessOptions {
   hasConfiguredAuth?: (model: { provider: string; id: string }) => boolean;
   /** Emulate forked hosts (prime-agent) whose ExtensionContext predates `mode`. */
   omitHostMode?: boolean;
+  /** A real host session manager instead of the in-test stub. */
+  sessionManager?: SessionManager;
+  /** Host session projection on the stub, e.g. one that throws. */
+  buildSessionProjection?: () => unknown;
   /** Control auth resolution, e.g. to defer two concurrent producers. */
   getApiKeyAndHeaders?: () => Promise<{ ok: true; apiKey: string; headers: Record<string, string> } | { ok: false; error: string }>;
   /** Emulate hosts without `pi.appendEntry`, where snapshots cannot be durable. */
@@ -185,11 +189,12 @@ function createEditorHarness(options: EditorHarnessOptions) {
         ? await options.getApiKeyAndHeaders()
         : ({ ok: true as const, apiKey: "test-key", headers: {} }),
   };
-  const sessionManager = {
+  const sessionManager = options.sessionManager ?? {
     getBranch: () => branch,
     getEntries: () => entries,
     getLeafId: () => leafId,
     getSessionId: () => sessionId,
+    ...(options.buildSessionProjection ? { buildSessionProjection: options.buildSessionProjection } : {}),
   };
   const ctx = {
     ...(options.omitHostMode ? {} : { mode: "tui" }),
@@ -2556,4 +2561,48 @@ test("a session that never touches the budget writes no session entries", async 
   await flushAsyncWork();
 
   assert.equal(harness.getAppendedEntries().length, 0, "the default off path must stay write-free");
+});
+
+test("provider requests carry only the model-visible context after a context edit", async () => {
+  let capturedContext: any;
+  const session = SessionManager.inMemory(process.cwd());
+  const secretId = session.appendMessage({ role: "user", content: "my secret token is abc123", timestamp: Date.now() });
+  session.appendMessage({ role: "user", content: "Now refactor the parser", timestamp: Date.now() });
+  session.appendContextEdit(secretId, null);
+
+  const harness = createEditorHarness({
+    sessionManager: session,
+    completeSimple: (async (_model, context) => {
+      capturedContext = context;
+      return makeCompletion([" next"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  const sentText: string = capturedContext.messages[0].content[0].text;
+  assert.doesNotMatch(sentText, /abc123/, "a message the model no longer sees is never sent for autocomplete");
+  assert.match(sentText, /Latest user message:\nNow refactor the parser/);
+});
+
+test("a host projection that throws sends no conversation context instead of the raw branch", async () => {
+  let capturedContext: any;
+  const harness = createEditorHarness({
+    buildSessionProjection: () => {
+      throw new Error("projection failed");
+    },
+    completeSimple: (async (_model, context) => {
+      capturedContext = context;
+      return makeCompletion([" next"]);
+    }) as CompleteSimple,
+  });
+  harness.setBranch([{ type: "message", message: { role: "user", content: "raw branch only" } }]);
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  const sentText: string = capturedContext.messages[0].content[0].text;
+  assert.doesNotMatch(sentText, /raw branch only/);
+  assert.match(sentText, /^Current draft \(cursor at end\):\nReview/);
 });

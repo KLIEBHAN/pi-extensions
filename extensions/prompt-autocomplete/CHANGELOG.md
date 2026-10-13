@@ -7,6 +7,7 @@ All notable changes to this package are documented here. This project follows [S
 ### Changed
 
 - Supports Pi 1.x. Ghost text recognizes Pi 1.x fake-cursor markers next to the inverse-video cursor of Pi 0.x and the `\x1b[27m` variant of forked hosts, so suggestions keep rendering on all three. The compatibility matrix now covers Pi `0.80.6`, `0.83.0`, and `1.2.0`; the supported baseline stays `0.80.6`.
+- On Pi 1.x, autocomplete context follows the model-visible session projection: messages that a `context_edit` omitted or replaced, for example to redact them, are omitted or replaced in autocomplete requests too, so autocomplete never sends what the model itself no longer sees. A failing projection sends no conversation context instead of the raw history. Older hosts, which have no context edits, keep using the raw branch.
 - Cache and stream currency now follow the newest conversation entry that affects autocomplete context, not Pi's raw leaf. Custom, label, and session-info entries can move the leaf without discarding an otherwise identical cached suggestion.
 - Automatic suggestions wait for `agent_settled` on hosts that emit it, so a retry or queued continuation cannot use unfinished conversation context. Hosts without that event still settle on `agent_end`. Manual `Ctrl+.` remains an explicit one-shot.
 

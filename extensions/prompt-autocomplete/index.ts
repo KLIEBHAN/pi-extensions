@@ -63,6 +63,7 @@ import {
   parsePartialPromptSuggestion,
   parsePromptAutocompleteModelSelection,
   parsePromptAutocompletePersistedSettings,
+  projectAutocompleteContextEntries,
   findPromptAutocompleteBudgetSnapshot,
   PromptAutocompleteBudgetExhaustedError,
   type PromptAutocompleteBudgetSetting,
@@ -1439,7 +1440,7 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (!model) return undefined;
 
     const draft = this.getText();
-    const branch = this.shared.sessionManager?.getBranch?.() ?? [];
+    const branch = readAutocompleteContextEntries(this.shared);
     const latestAssistantContext = buildLatestAssistantMessageContext(branch);
     const latestUserContext = buildLatestUserMessageContext(branch);
     const recentContext = buildRecentConversationContext(branch);
@@ -2007,6 +2008,27 @@ function bindRuntimeContext(ctx: ExtensionContext, shared: PromptAutocompleteSha
 function readPhysicalSessionId(ctx: ExtensionContext): string {
   const sessionId = ctx.sessionManager?.getSessionId?.();
   return typeof sessionId === "string" ? sessionId : "";
+}
+
+/**
+ * Conversation entries autocomplete may draw context from.
+ *
+ * Hosts with a session projection (Pi 1.x) supply the model-visible context,
+ * so messages omitted or replaced by `context_edit` stay out of autocomplete
+ * requests as well. A projection that throws yields no conversation context
+ * instead of the raw branch. Older hosts have no context edits, so their raw
+ * branch is used as before.
+ */
+function readAutocompleteContextEntries(shared: PromptAutocompleteSharedState): unknown[] {
+  const manager = shared.sessionManager;
+  if (typeof manager?.buildSessionProjection === "function") {
+    try {
+      return projectAutocompleteContextEntries(manager.buildSessionProjection());
+    } catch {
+      return [];
+    }
+  }
+  return manager?.getBranch?.() ?? [];
 }
 
 function resolveCurrentConversationId(shared: PromptAutocompleteSharedState): string {
