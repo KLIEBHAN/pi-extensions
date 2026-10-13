@@ -2217,9 +2217,11 @@ function buildCurrentRequestSnapshot(
  * instead of the raw branch. Older hosts have no context edits, so their raw
  * branch is used as before.
  *
- * Autocomplete context covers user and assistant message text only, as it
- * always has; the projection decides which of those messages the model still
- * sees and in which form.
+ * Autocomplete context covers user and assistant message text plus, on hosts
+ * with a projection, the newest compaction summary; the projection decides
+ * which of those the model still sees and in which form. Compaction system
+ * checkpoints, branch summaries, custom messages, and tool results are never
+ * included.
  */
 function readAutocompleteContextEntries(shared: PromptAutocompleteSharedState, conversationId: string): unknown[] {
   const manager = shared.sessionManager;
