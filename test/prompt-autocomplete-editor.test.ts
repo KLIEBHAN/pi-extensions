@@ -3056,11 +3056,19 @@ async function createRealRegistry(toAuth: (access: string) => { apiKey?: string;
     // Availability of a newly registered provider settles asynchronously.
     await registry.refresh({ allowNetwork: false, providers: ["enterprise"] });
     /** Resolves once the provider received its first request, or fails after a bound. */
-    const waitForFirstRequest = () =>
-      Promise.race([
-        firstRequest,
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no request reached the provider")), 5_000)),
-      ]);
+    const waitForFirstRequest = async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          firstRequest,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("no request reached the provider")), 5_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
     return { registry, requests, waitForFirstRequest, cleanup };
   } catch (error) {
     cleanup();
