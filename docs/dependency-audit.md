@@ -2,87 +2,26 @@
 
 CI audits the complete dependency tree, development dependencies included. The repository toolchain executes during CI and release builds, so a production-only audit would leave that trusted path unchecked.
 
-This gate exists because of a specific upstream situation, not as permanent infrastructure. **When the exception list is empty and no new exception is expected, replace the gate with a bare `npm audit` step and delete it.** Reconciliation logic that outlives its reason becomes a place to hide things.
-
 ```bash
 npm run audit:dependencies
 ```
 
-The gate runs a full `npm audit --json` across production, development, optional, and peer dependencies, and reconciles the result against `.github/audit-exceptions.json`. It fails when any of the following is true:
+The script is a plain `npm audit` that includes every dependency class explicitly:
 
-- an advisory is reported that no declaration covers,
-- a reported vulnerability identifies no advisory the gate can reconcile,
-- a vulnerability is reported only as an effect of another package that no declaration covers for that dependent,
-- a declaration no longer matches any reported advisory,
-- a declaration has passed its `reviewBy` date,
-- the advisory changed severity or affected range,
-- the advisory is reported without an affected range or without any dependency path,
-- the reported dependency paths and the declared paths are not exactly equal,
-- an advisory carries no canonical GitHub advisory URL,
-- npm's own vulnerability count disagrees with the entries it described, or with its severity buckets,
-- a package's reported severity is higher than its own advisories account for,
-- an advisory names a package other than the one it is reported under,
-- a report key disagrees with the package name it describes,
-- npm exits with any status other than 0 or 1, or exits non-zero without reporting any vulnerability,
-- the report is unparsable or uses an unexpected schema version.
+```bash
+npm audit --include=prod --include=dev --include=optional --include=peer
+```
 
-An unreadable, incomplete, or self-inconsistent report is a failure, never an implicit pass. The gate also strips ambient `npm_config_omit` settings, so neither a workflow `env` entry nor an `.npmrc` can shrink the audited tree without changing the gate itself.
+`--include` outranks `--omit`, so an ambient `NODE_ENV=production` or `npm_config_omit` cannot shrink the audited tree. The command fails on any reported advisory, regardless of severity, and on any audit error. `test/dependency-security.test.ts` pins both the exact command and that the `release-audit` CI job runs it, so neither can be narrowed silently.
 
-The gate still trusts npm to report the advisories it knows about. It verifies that a report is internally consistent, not that the registry told the truth.
+## When an advisory is reported
 
-## What an exception may and may not say
+1. Upgrade the affected dependency, or the package that pulls it in.
+2. If a transitive version is only constrained by ordinary semver ranges, raise it through the root lockfile, or an `overrides` entry in `package.json` when a range blocks the fix.
+3. Re-run `npm run audit:dependencies` and the repository checks.
 
-The only statement an exception can express is:
+## Accepted advisories
 
-> This exact advisory, in this exact module, at exactly these dependency paths, is accepted until this date.
+None. Until October 2026 this repository ran a reconciliation gate that could accept individual advisories. It existed only because `@earendil-works/pi-coding-agent` 0.x published an `npm-shrinkwrap.json` that pinned vulnerable `brace-expansion` and `undici` copies, which no root lockfile or override can raise. Pi 1.x ships no shrinkwrap; after the development toolchain moved to Pi `1.2.0`, all seven accepted advisories resolved through this repository's own lockfile, and the gate was retired as its own documentation prescribed.
 
-There is deliberately no way to ignore a severity level, a package, or a path prefix. Wildcards are rejected, advisory IDs must be canonical GHSA identifiers, and the gate never receives `--audit-level`, `--omit`, or `--production`.
-
-Paths must match what npm reports **exactly**, in both directions. A new path was never assessed; a declared path that is no longer reported would pre-authorise a future move back into it.
-
-`reviewBy` may be at most 120 days after `acceptedOn`, so no entry can defer review indefinitely.
-
-If another package becomes vulnerable *through* an excepted one, npm reports it as a separate entry. That dependent must be named in the excepted entry's optional `effects` array; otherwise the gate fails. Cover is never inherited silently.
-
-`test/dependency-security.test.ts` enforces all of this, including by running the gate as a subprocess against a stubbed npm. Weakening the gate — even by removing its command-line entry point — breaks a test that states why it exists.
-
-## When an exception is justified
-
-Only when the vulnerable version cannot be raised from this repository. In practice that means an upstream package pins it through its own published `npm-shrinkwrap.json`, which is authoritative for its subtree: neither a root `overrides` entry nor `npm audit fix` can override it.
-
-Fixing the dependency always wins over documenting it. Before adding an entry, confirm that:
-
-1. a patched version exists,
-2. upgrading the direct dependency does not pull it in,
-3. a root `overrides` entry does not take effect,
-4. `npm audit fix` cannot resolve it.
-
-Record the result of that check in `reason`, and name the upstream change that would remove the entry in `upstreamFix`.
-
-## Adding or renewing an exception
-
-1. Reproduce the advisory and capture its paths:
-
-   ```bash
-   npm audit --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s).vulnerabilities;console.log(JSON.stringify(v,null,2))})'
-   ```
-
-2. Add one entry per advisory to `.github/audit-exceptions.json` with the advisory ID, module, severity, range, every reported path, a substantive `reason`, the `upstreamFix` that would retire it, `acceptedOn`, and a `reviewBy` date no more than 120 days later. Add `effects` only if npm reports dependents of the excepted package.
-3. Run the gate and the offline policy tests:
-
-   ```bash
-   npm run audit:dependencies
-   node --experimental-strip-types --test test/dependency-security.test.ts
-   ```
-
-`reviewBy` is a deadline, not a formality. When it passes, CI fails until someone re-checks the upstream state and either removes the entry or renews it with a fresh justification. That is the mechanism that stops an accepted risk from turning into a permanent one.
-
-## Removing an exception
-
-Once upstream ships the fix, upgrade the dependency and delete the entry. The gate fails on a declaration that matches nothing, so a stale entry cannot linger unnoticed.
-
-## Current exceptions
-
-None. Pi 1.x no longer publishes an `npm-shrinkwrap.json` inside `@earendil-works/pi-coding-agent`, so the `brace-expansion` and `undici` advisories that motivated this gate are resolved by this repository's own lockfile since the development toolchain moved to Pi `1.2.0`. The seven exceptions that expired on 2026-09-05 (GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895, GHSA-8xcm-r25x-g524, GHSA-4cwx-7wf7-3272, GHSA-m8rv-5g2x-5cg5, GHSA-jr45-8vmc-qm54, GHSA-v3r7-h72x-cjcm) were removed rather than renewed.
-
-The reconciliation gate is kept with an empty list until its retirement lands as a separately reviewed CI change, as the introduction prescribes. Until then it behaves like a full `npm audit` that fails on any advisory.
+If an upstream shrinkwrap ever pins a vulnerable version again, prefer upgrading or replacing that package. Accepting an advisory instead is a deliberate decision: restore the reconciliation gate from the repository history, with each exception naming one advisory, module, severity, range, and every reported path, a substantive reason, the upstream fix that would retire it, and a review date no more than 120 days out.
