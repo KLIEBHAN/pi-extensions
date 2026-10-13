@@ -53,11 +53,36 @@ function lockedVersions(packageName: string): Array<[path: string, version: stri
 const FULL_AUDIT_COMMAND =
   "npm audit --audit-level=info --offline=false --include=prod --include=dev --include=optional --include=peer";
 
-type WorkflowStep = { run?: unknown; if?: unknown; env?: unknown; "continue-on-error"?: unknown };
-type WorkflowJob = { steps?: WorkflowStep[]; if?: unknown; env?: unknown; "continue-on-error"?: unknown };
+type WorkflowStep = {
+  run?: unknown;
+  if?: unknown;
+  env?: unknown;
+  shell?: unknown;
+  "working-directory"?: unknown;
+  "continue-on-error"?: unknown;
+};
+type WorkflowJob = {
+  steps?: WorkflowStep[];
+  if?: unknown;
+  env?: unknown;
+  defaults?: unknown;
+  "continue-on-error"?: unknown;
+};
 
 test("CI audits the complete dependency tree in a step nothing can disable", () => {
-  const workflow = parse(ciWorkflowSource) as { env?: unknown; jobs?: Record<string, WorkflowJob> };
+  const workflow = parse(ciWorkflowSource) as {
+    on?: unknown;
+    env?: unknown;
+    defaults?: unknown;
+    jobs?: Record<string, WorkflowJob>;
+  };
+  // Every pull request and every push to main must reach the audit; a path or
+  // branch filter on pull requests would let some changes skip it.
+  assert.deepEqual(
+    workflow.on,
+    { push: { branches: ["main"] }, pull_request: null, workflow_dispatch: null },
+    "CI must run unfiltered on pull requests and on pushes to main",
+  );
   const releaseAudit = workflow.jobs?.["release-audit"];
   assert.ok(releaseAudit, "CI must define the release-audit job");
   assert.ok(Array.isArray(releaseAudit.steps), "release-audit must define steps");
@@ -72,6 +97,12 @@ test("CI audits the complete dependency tree in a step nothing can disable", () 
   for (const [label, holder] of [["workflow", workflow], ["release-audit job", releaseAudit], ["audit step", auditSteps[0]!]] as const) {
     assert.equal(holder.env, undefined, `the ${label} must not set environment variables for the audit`);
   }
+  // A different shell or working directory could run something other than the
+  // repository's audit script while the step still reports success.
+  assert.equal(workflow.defaults, undefined, "the workflow must not change how run steps execute");
+  assert.equal(releaseAudit.defaults, undefined, "the release-audit job must not change how run steps execute");
+  assert.equal(auditSteps[0]!.shell, undefined, "the audit step must use the default shell");
+  assert.equal(auditSteps[0]!["working-directory"], undefined, "the audit step must run in the repository root");
   for (const [label, holder] of [["release-audit job", releaseAudit], ["audit step", auditSteps[0]!]] as const) {
     assert.equal(holder.if, undefined, `the ${label} must not be conditional`);
     assert.equal(holder["continue-on-error"], undefined, `the ${label} must not tolerate failure`);
