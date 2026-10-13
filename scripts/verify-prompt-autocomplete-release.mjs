@@ -30,7 +30,8 @@ assert.deepEqual(
   "Gallery type keywords must classify this package only as an extension",
 );
 assert.equal(manifest.repository?.directory, "extensions/prompt-autocomplete");
-assert.match(changelog, new RegExp(`^## \\[${escapeRegex(manifest.version)}\\]`, "m"));
+const versionHeading = new RegExp(`^## \\[${escapeRegex(manifest.version)}\\](.*)$`, "m").exec(changelog);
+assert.ok(versionHeading, `CHANGELOG.md must have a heading for ${manifest.version}`);
 assert.match(readme, /Privacy, providers, and cost/);
 assert.match(readme, /disabled by default/i);
 assert.equal(SUPPORTED_PI_MATRIX[0], MINIMUM_SUPPORTED_PI, "the compat matrix must start at the documented minimum");
@@ -46,6 +47,12 @@ assert.equal(video.subarray(4, 8).toString("ascii"), "ftyp", "Gallery video is n
 
 if (suppliedTag) {
   assert.equal(suppliedTag, expectedTag, `release tag must be ${expectedTag}`);
+  // Development keeps "Unreleased"; a tagged release must say when it shipped.
+  const dated = /^ - (\d{4}-\d{2}-\d{2})$/.exec(versionHeading[1]);
+  assert.ok(
+    dated && !Number.isNaN(Date.parse(`${dated[1]}T00:00:00Z`)) && new Date(`${dated[1]}T00:00:00Z`).toISOString().startsWith(dated[1]),
+    `a release must date its CHANGELOG heading as "## [${manifest.version}] - YYYY-MM-DD", found "${versionHeading[0]}"`,
+  );
 }
 
 console.log(`Release metadata valid for ${manifest.name}@${manifest.version} (${expectedTag})`);

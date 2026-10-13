@@ -44,9 +44,9 @@ Pi runs in a private tmux server (`tmux -L pa-gallery-demo`, no user configurati
 
 ## Versioning
 
-1. Update `extensions/prompt-autocomplete/package.json`.
-2. Add the matching heading to `extensions/prompt-autocomplete/CHANGELOG.md`.
-3. Update the version-pinned `pi.video` release URL in the package manifest and package README.
+1. Update `extensions/prompt-autocomplete/package.json` and start an `## [<version>] - Unreleased` heading in `extensions/prompt-autocomplete/CHANGELOG.md`; never leave changed source under an already-published version.
+2. Update the version-pinned `pi.video` release URL in the package manifest, the package README, and the root README.
+3. Before tagging, replace `Unreleased` with the release date (`## [<version>] - YYYY-MM-DD`). A tagged release refuses an undated heading.
 4. Run the release gate from a clean commit.
 
 Tags are package-qualified because this repository contains several extensions:
