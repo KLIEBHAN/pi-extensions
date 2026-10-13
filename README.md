@@ -597,7 +597,7 @@ npm run audit:dependencies
 
 The package smoke tests build both the private collection tarball and the standalone `@kliebhan/pi-prompt-autocomplete` tarball, install them into temporary clean consumers, and verify exact Pi resource discovery against the pinned development Pi version. The standalone release process is documented in [`docs/releasing-prompt-autocomplete.md`](docs/releasing-prompt-autocomplete.md).
 
-`npm run audit:dependencies` audits the complete tree, development dependencies included, and fails on any advisory that is not explicitly documented and time-boxed in `.github/audit-exceptions.json`. See [`docs/dependency-audit.md`](docs/dependency-audit.md).
+`npm run audit:dependencies` runs a full `npm audit` over production, development, optional, and peer dependencies, at every severity, and fails on any reported advisory or audit error. See [`docs/dependency-audit.md`](docs/dependency-audit.md).
 
 Each extension should export a default function:
 
