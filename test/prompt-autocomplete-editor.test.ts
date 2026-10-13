@@ -364,34 +364,53 @@ test("a forked host without ExtensionContext.mode still renders and accepts sugg
   assert.match(status, /editor=mounted/);
 });
 
-test("a forked host that closes the cursor with ESC[27m still renders and accepts suggestions", async () => {
-  // prime-agent keeps its editor background surface alive by closing the fake
-  // cursor with \x1b[27m instead of Pi's full reset \x1b[0m. Simulate that host
-  // by rewriting the cursor token the base editor emits.
+test("every host cursor-cell form renders and accepts suggestions", async () => {
+  // The end-of-line cursor cell differs by host: Pi 0.x closes inverse video
+  // with a full reset, prime-agent closes it with \x1b[27m to keep its editor
+  // background, and Pi 1.x wraps the cell in fake-cursor APC markers. Emulate
+  // each host by rewriting whichever cell the installed base editor emits.
+  const baseCursorCell = /\x1b\[7m \x1b\[(?:0|27)m|\x1b_pi:fc\x07 \x1b_pi:\/fc\x07/g;
+  const hostCells = [
+    ["Pi 0.x", "\x1b[7m \x1b[0m"],
+    ["prime-agent", "\x1b[7m \x1b[27m"],
+    ["Pi 1.x", "\x1b_pi:fc\x07 \x1b_pi:/fc\x07"],
+  ] as const;
   const originalRender = CustomEditor.prototype.render;
-  CustomEditor.prototype.render = function (this: CustomEditor, width: number): string[] {
-    return originalRender
-      .call(this, width)
-      .map((line) => line.replaceAll("\x1b[7m \x1b[0m", "\x1b[7m \x1b[27m"));
-  };
-  try {
-    let calls = 0;
-    const harness = createEditorHarness({
-      completeSimple: (async () => {
-        calls += 1;
-        return calls === 1 ? makeCompletion([" the implementation carefully"]) : makeCompletion([]);
-      }) as CompleteSimple,
-    });
 
-    const editor = await harness.createEditor();
-    editor.setText("Review");
-    await flushAsyncWork();
+  for (const [host, cell] of hostCells) {
+    let rewrites = 0;
+    CustomEditor.prototype.render = function (this: CustomEditor, width: number): string[] {
+      return originalRender.call(this, width).map((line) =>
+        line.replace(baseCursorCell, () => {
+          rewrites += 1;
+          return cell;
+        }),
+      );
+    };
+    try {
+      let calls = 0;
+      const harness = createEditorHarness({
+        completeSimple: (async () => {
+          calls += 1;
+          return calls === 1 ? makeCompletion([" the implementation carefully"]) : makeCompletion([]);
+        }) as CompleteSimple,
+      });
 
-    assert.match(renderedText(editor), /the implementation carefully/);
-    editor.handleInput("\t");
-    assert.equal(editor.getText(), "Review the implementation carefully");
-  } finally {
-    CustomEditor.prototype.render = originalRender;
+      const editor = await harness.createEditor();
+      editor.setText("Review");
+      await flushAsyncWork();
+
+      const rawLines = editor.render(80);
+      assert.ok(rewrites > 0, `${host}: the base editor must emit a cursor cell to rewrite`);
+      assert.ok(
+        rawLines.some((line) => line.includes(`${cell}\x1b[2mthe implementation carefully`)),
+        `${host}: the cursor cell keeps its own opening and closing sequence before the ghost text`,
+      );
+      editor.handleInput("\t");
+      assert.equal(editor.getText(), "Review the implementation carefully", host);
+    } finally {
+      CustomEditor.prototype.render = originalRender;
+    }
   }
 });
 

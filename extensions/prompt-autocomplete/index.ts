@@ -93,13 +93,16 @@ import {
 const GHOST_TEXT_STYLE = "\x1b[2m";
 const GHOST_INDICATOR_STYLE = "\x1b[90m";
 const RESET = "\x1b[0m";
-// Hosts draw the end-of-line fake cursor as an inverse-video space. Pi closes
-// it with a full SGR reset (\x1b[0m); forks that keep an editor background
-// surface alive, such as prime-agent, close it with \x1b[27m so the background
-// survives the cursor cell. Accept both, otherwise the suggestion lookup never
-// finds the cursor and inline suggestions silently never render.
-const CURSOR_INVERSE_SPACE = "\x1b[7m ";
-const CURSOR_TOKEN_PATTERN = /\x1b\[7m \x1b\[(0|27)m/;
+// Hosts draw the end-of-line cursor as a marked space cell. Pi 0.x draws inverse
+// video closed by a full SGR reset (\x1b[0m); forks that keep an editor
+// background surface alive, such as prime-agent, close it with \x1b[27m so the
+// background survives the cursor cell; Pi 1.x wraps the cell in fake-cursor APC
+// markers that its TUI later turns into inverse video or the hardware cursor.
+// Accept all three, otherwise the suggestion lookup never finds the cursor and
+// inline suggestions silently never render. Each form is matched as a whole so
+// the cell is always rebuilt with its own opening and closing sequence.
+const CURSOR_CELL_OPENERS = ["\x1b[7m ", "\x1b_pi:fc\x07 "] as const;
+const CURSOR_CELL_PATTERN = /\x1b\[7m \x1b\[(?:0|27)m|\x1b_pi:fc\x07 \x1b_pi:\/fc\x07/;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 const SPINNER_INTERVAL_MS = 80;
 const SPINNER_LABEL = "Generating suggestion";
@@ -990,8 +993,9 @@ class PromptAutocompleteEditor extends CustomEditor {
     let cursorLineIndex = -1;
     let cursorMatch: RegExpMatchArray | undefined;
     for (let index = 0; index < lines.length; index++) {
-      if (!lines[index]!.includes(CURSOR_INVERSE_SPACE)) continue;
-      const match = lines[index]!.match(CURSOR_TOKEN_PATTERN);
+      const line = lines[index]!;
+      if (!CURSOR_CELL_OPENERS.some((opener) => line.includes(opener))) continue;
+      const match = line.match(CURSOR_CELL_PATTERN);
       if (match?.index !== undefined) {
         cursorLineIndex = index;
         cursorMatch = match;
@@ -1003,7 +1007,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     const cursorLine = lines[cursorLineIndex]!;
     const cursorIndex = cursorMatch.index;
     const cursorToken = cursorMatch[0];
-    const cursorReset = cursorMatch[1] === "27" ? "\x1b[27m" : "\x1b[0m";
+    // The cell holds one space and no escape sequence contains a space, so the
+    // space separates the opening sequence from the closing one.
+    const cursorSpace = cursorToken.indexOf(" ");
+    const cursorOpen = cursorToken.slice(0, cursorSpace);
+    const cursorClose = cursorToken.slice(cursorSpace + 1);
 
     const before = cursorLine.slice(0, cursorIndex);
     const after = cursorLine.slice(cursorIndex + cursorToken.length);
@@ -1015,7 +1023,9 @@ class PromptAutocompleteEditor extends CustomEditor {
     const firstPreviewChar = previewChars[0] ?? "";
     const absorbLeadingWhitespaceIntoCursor = /^[ \t]$/.test(firstPreviewChar);
 
-    const cursorCell = absorbLeadingWhitespaceIntoCursor ? `\x1b[7m${firstPreviewChar}${cursorReset}` : cursorToken;
+    const cursorCell = absorbLeadingWhitespaceIntoCursor
+      ? `${cursorOpen}${firstPreviewChar}${cursorClose}`
+      : cursorToken;
     const renderedPreviewText = absorbLeadingWhitespaceIntoCursor ? previewChars.slice(1).join("") : previewText;
 
     const indicator = this.suggestions.length > 1 ? `  ‹${this.suggestionIndex + 1}/${this.suggestions.length}›` : "";
