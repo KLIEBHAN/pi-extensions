@@ -43,12 +43,16 @@ Or enable it from inside an interactive session; the decision is saved for later
 | Show in-memory effectiveness and cost counters | `/prompt-autocomplete stats` |
 | Preview what a request would send, locally | `/prompt-autocomplete inspect [draft text]` |
 | Toggle streamed response previews | `/prompt-autocomplete stream on\|off\|toggle` |
+| Allow suggestions while the main agent works | `/prompt-autocomplete while-streaming on\|off\|toggle` |
 | Set and persist the minimum draft length | `/prompt-autocomplete min-chars <n>` |
 | Cap provider requests for this session | `/prompt-autocomplete budget <n\|off>` |
 | Persist remaining runtime knobs | `/prompt-autocomplete set debounce-ms\|max-chars\|max-alternatives\|model` |
 | Inspect effective runtime knobs | `/prompt-autocomplete set` |
+| Show or hide the debug status line | `/prompt-autocomplete debug-on\|debug-off\|debug-toggle` |
 
 Legacy fallbacks are available for terminals that forward them: `Ctrl+Tab`, `Alt+[`, and `Alt+]`.
+
+After `/prompt-autocomplete ` and a few letters, Pi's command menu completes the arguments, including nested forms such as `set debounce-ms` or `set model active`; `Tab` or `Enter` inserts the selection. A command that is already complete, such as `stats` or `stream on`, opens no menu, so `Enter` still submits it at once. Completion is local and installs no global autocomplete provider.
 
 Built-in slash-command and file/path completion keeps precedence over ghost suggestions.
 

@@ -70,6 +70,13 @@ import {
   parsePromptAutocompletePersistedSettings,
   projectAutocompleteContextEntries,
   findPromptAutocompleteBudgetSnapshot,
+  completePromptAutocompleteArguments,
+  findPromptAutocompleteCommand,
+  findPromptAutocompleteSetKey,
+  PROMPT_AUTOCOMPLETE_SET_USAGE,
+  PROMPT_AUTOCOMPLETE_USAGE,
+  type PromptAutocompleteCommandName,
+  type PromptAutocompleteSetKey,
   PromptAutocompleteBudgetExhaustedError,
   type PromptAutocompleteBudgetSetting,
   resolvePersistedEnabled,
@@ -127,10 +134,6 @@ const REQUEST_MAX_RETRY_DELAY_MS = 2_000;
 const FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_CACHE_TTL_MS = 60_000;
 const REQUEST_CACHE_MAX_ENTRIES = 128;
-const COMMAND_USAGE =
-  "Usage: /prompt-autocomplete [on|off|toggle|status|stats|inspect [draft]|min-chars <n>|budget <n|off>|set <key> [value]|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]";
-const SET_USAGE =
-  "Usage: /prompt-autocomplete set [debounce-ms <0-5000>|min-chars <0-500>|max-chars <16-1000>|max-alternatives <1-5>|model <provider/model|active>]";
 const PRIVACY_NOTICE =
   "Requests send the current draft and recent conversation context to the selected model and may incur provider usage.";
 // Keymap audit vs. pi defaults (packages/tui/src/keybindings.ts +
@@ -2669,7 +2672,7 @@ function setModelSetting(ctx: ExtensionContext, shared: PromptAutocompleteShared
     const resolution = resolveSuggestionModelResolution(shared, selection);
     if (!resolution.model) {
       ctx.ui.notify(
-        resolution.refusedRequest ?? resolution.reason ?? SET_USAGE,
+        resolution.refusedRequest ?? resolution.reason ?? PROMPT_AUTOCOMPLETE_SET_USAGE,
         "warning",
       );
       return;
@@ -2718,6 +2721,39 @@ function setModelSetting(ctx: ExtensionContext, shared: PromptAutocompleteShared
   });
 }
 
+/** What each `set` key changes; validation bounds come from the grammar. */
+const SET_KEY_RUNNERS: {
+  [Key in PromptAutocompleteSetKey]: (ctx: ExtensionContext, shared: PromptAutocompleteSharedState, value: string) => void;
+} = {
+  "debounce-ms": (ctx, shared, value) =>
+    setBoundedSetKey(ctx, shared, "debounce-ms", "debounceMs", value, false),
+  "min-chars": (ctx, shared, value) => setMinPromptChars(ctx, shared, value || undefined),
+  "max-chars": (ctx, shared, value) =>
+    setBoundedSetKey(ctx, shared, "max-chars", "maxSuggestionChars", value, true),
+  "max-alternatives": (ctx, shared, value) =>
+    setBoundedSetKey(ctx, shared, "max-alternatives", "maxAlternatives", value, true),
+  model: (ctx, shared, value) => {
+    if (!value) {
+      ctx.ui.notify("Usage: /prompt-autocomplete set model <provider/model|active>", "warning");
+      return;
+    }
+    setModelSetting(ctx, shared, value);
+  },
+};
+
+function setBoundedSetKey(
+  ctx: ExtensionContext,
+  shared: PromptAutocompleteSharedState,
+  key: "debounce-ms" | "max-chars" | "max-alternatives",
+  field: "debounceMs" | "maxSuggestionChars" | "maxAlternatives",
+  value: string,
+  affectsRequestIdentity: boolean,
+): void {
+  const spec = findPromptAutocompleteSetKey(key);
+  if (!spec || !("min" in spec)) return;
+  setBoundedConfigField(ctx, shared, { key, field, min: spec.min, max: spec.max, value, affectsRequestIdentity });
+}
+
 function handleSetCommand(ctx: ExtensionContext, shared: PromptAutocompleteSharedState, rest: string): void {
   if (!rest) {
     ctx.ui.notify(formatStatus(shared), "info");
@@ -2726,53 +2762,12 @@ function handleSetCommand(ctx: ExtensionContext, shared: PromptAutocompleteShare
   const space = rest.search(/\s/);
   const key = (space < 0 ? rest : rest.slice(0, space)).toLowerCase();
   const value = space < 0 ? "" : rest.slice(space + 1).trim();
-
-  if (key === "min-chars") {
-    setMinPromptChars(ctx, shared, value || undefined);
+  const spec = findPromptAutocompleteSetKey(key);
+  if (!spec) {
+    ctx.ui.notify(PROMPT_AUTOCOMPLETE_SET_USAGE, "warning");
     return;
   }
-  if (key === "debounce-ms") {
-    setBoundedConfigField(ctx, shared, {
-      key: "debounce-ms",
-      field: "debounceMs",
-      min: DEBOUNCE_MS_MIN,
-      max: DEBOUNCE_MS_MAX,
-      value,
-      affectsRequestIdentity: false,
-    });
-    return;
-  }
-  if (key === "max-chars") {
-    setBoundedConfigField(ctx, shared, {
-      key: "max-chars",
-      field: "maxSuggestionChars",
-      min: MAX_SUGGESTION_CHARS_MIN,
-      max: MAX_SUGGESTION_CHARS_MAX,
-      value,
-      affectsRequestIdentity: true,
-    });
-    return;
-  }
-  if (key === "max-alternatives") {
-    setBoundedConfigField(ctx, shared, {
-      key: "max-alternatives",
-      field: "maxAlternatives",
-      min: MAX_ALTERNATIVES_MIN,
-      max: MAX_ALTERNATIVES_MAX,
-      value,
-      affectsRequestIdentity: true,
-    });
-    return;
-  }
-  if (key === "model") {
-    if (!value) {
-      ctx.ui.notify("Usage: /prompt-autocomplete set model <provider/model|active>", "warning");
-      return;
-    }
-    setModelSetting(ctx, shared, value);
-    return;
-  }
-  ctx.ui.notify(SET_USAGE, "warning");
+  SET_KEY_RUNNERS[spec.key](ctx, shared, value);
 }
 
 function persistEnabledDecision(
@@ -2856,41 +2851,10 @@ function notifyPromptAutocompleteEnabled(
   ctx.ui.notify(`Prompt autocomplete enabled. ${keyHint} ${privacyNotice}`, "info");
 }
 
-/** Commands that only report state; they may run on any host with a notification channel. */
-const READ_ONLY_COMMANDS = new Set(["status", "stats", "inspect"]);
-
 /** Whether the host can show a notification, which read-only commands need. */
 function hasNotificationChannel(ctx: ExtensionContext): boolean {
   const host = ctx as Partial<Pick<ExtensionContext, "hasUI" | "ui">>;
   return host.hasUI === true && typeof host.ui?.notify === "function";
-}
-
-/**
- * Run a read-only command. None of them changes settings, overrides, budget,
- * or stats, mounts an editor, or reaches a provider seam, which is what lets
- * them run outside the TUI. Inspection may warm the in-memory projection memo,
- * a deterministic cache the next request in the same conversation reuses.
- */
-function runReadOnlyCommand(
-  ctx: ExtensionContext,
-  shared: PromptAutocompleteSharedState,
-  command: string,
-  payload: string,
-  interactiveHost: boolean,
-): void {
-  if (command === "status") {
-    ctx.ui.notify(formatStatus(shared, interactiveHost), "info");
-    return;
-  }
-  if (command === "stats") {
-    const { value, source } = describeBudget(shared);
-    ctx.ui.notify(
-      `${formatPromptAutocompleteStats(shared.usageStats)}\nBudget: ${value} (${source})`,
-      "info",
-    );
-    return;
-  }
-  ctx.ui.notify(formatPromptAutocompleteInspection(shared, interactiveHost, payload || undefined), "info");
 }
 
 /**
@@ -2907,71 +2871,103 @@ function notifyEnabledWithoutEditorOnce(ctx: ExtensionContext, shared: PromptAut
   );
 }
 
-function createPromptAutocompleteCommandHandlers(
-  ctx: ExtensionContext,
-  shared: PromptAutocompleteSharedState,
-): Record<string, () => void> {
-  return {
-    "debug-on": () => {
-      setDebugDisplay(shared, true);
-      ctx.ui.notify("Prompt autocomplete debug display enabled", "info");
-    },
-    "debug-off": () => {
-      setDebugDisplay(shared, false);
-      ctx.ui.notify("Prompt autocomplete debug display disabled", "info");
-    },
-    "debug-toggle": () => {
-      const nextDebugEnabled = !shared.config.debug;
-      setDebugDisplay(shared, nextDebugEnabled);
-      ctx.ui.notify(
-        nextDebugEnabled
-          ? "Prompt autocomplete debug display enabled"
-          : "Prompt autocomplete debug display disabled",
-        "info",
-      );
-    },
-    on: () => {
-      if (shared.enabled && shared.ownsEditor?.()) {
-        // Already in the requested state, but the user still expressed intent:
-        // record it so later sessions and processes do not fall back to the flag.
-        shared.runtimeOverrides.enabled = true;
-        persistEnabledDecision(ctx, shared, true);
-        ctx.ui.notify(`Prompt autocomplete already enabled (${formatStatus(shared)})`, "info");
-        return;
-      }
+/** Parsed command arguments, in the forms the individual commands consume. */
+interface CommandInput {
+  /** Everything after exactly one separator, verbatim (inspection keeps whitespace). */
+  payload: string;
+  /** The payload trimmed. */
+  rest: string;
+  /** The first whitespace-separated argument, if any. */
+  firstArgument: string | undefined;
+  interactiveHost: boolean;
+}
 
-      if (enablePromptAutocomplete(ctx, shared)) {
-        persistEnabledDecision(ctx, shared, true);
-        notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: true });
-      }
-    },
-    off: () => {
-      if (!shared.enabled) {
-        shared.runtimeOverrides.enabled = false;
-        persistEnabledDecision(ctx, shared, false);
-        ctx.ui.notify("Prompt autocomplete is already disabled", "info");
-        return;
-      }
+type CommandRunner = (ctx: ExtensionContext, shared: PromptAutocompleteSharedState, input: CommandInput) => void;
 
+/**
+ * One runner per grammar command. The mapped type makes a command without a
+ * runner, or a runner without a grammar entry, a type error.
+ *
+ * Read-only runners (the grammar marks them) change no settings, overrides,
+ * budget, or stats, mount no editor, and reach no provider seam, which is what
+ * lets them run outside the TUI. Inspection may warm the in-memory projection
+ * memo, a deterministic cache the next request in the same conversation reuses.
+ */
+const COMMAND_RUNNERS: { [Name in PromptAutocompleteCommandName]: CommandRunner } = {
+  on: (ctx, shared) => {
+    if (shared.enabled && shared.ownsEditor?.()) {
+      // Already in the requested state, but the user still expressed intent:
+      // record it so later sessions and processes do not fall back to the flag.
+      shared.runtimeOverrides.enabled = true;
+      persistEnabledDecision(ctx, shared, true);
+      ctx.ui.notify(`Prompt autocomplete already enabled (${formatStatus(shared)})`, "info");
+      return;
+    }
+
+    if (enablePromptAutocomplete(ctx, shared)) {
+      persistEnabledDecision(ctx, shared, true);
+      notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: true });
+    }
+  },
+  off: (ctx, shared) => {
+    if (!shared.enabled) {
+      shared.runtimeOverrides.enabled = false;
+      persistEnabledDecision(ctx, shared, false);
+      ctx.ui.notify("Prompt autocomplete is already disabled", "info");
+      return;
+    }
+
+    disablePromptAutocomplete(ctx, shared);
+    persistEnabledDecision(ctx, shared, false);
+    ctx.ui.notify("Prompt autocomplete disabled", "info");
+  },
+  toggle: (ctx, shared) => {
+    if (shared.enabled) {
       disablePromptAutocomplete(ctx, shared);
       persistEnabledDecision(ctx, shared, false);
       ctx.ui.notify("Prompt autocomplete disabled", "info");
-    },
-    toggle: () => {
-      if (shared.enabled) {
-        disablePromptAutocomplete(ctx, shared);
-        persistEnabledDecision(ctx, shared, false);
-        ctx.ui.notify("Prompt autocomplete disabled", "info");
-        return;
-      }
+      return;
+    }
 
-      if (enablePromptAutocomplete(ctx, shared)) {
-        persistEnabledDecision(ctx, shared, true);
-        notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: false });
-      }
-    },
-  };
-}
+    if (enablePromptAutocomplete(ctx, shared)) {
+      persistEnabledDecision(ctx, shared, true);
+      notifyPromptAutocompleteEnabled(ctx, shared, { includeModel: false });
+    }
+  },
+  status: (ctx, shared, { interactiveHost }) => {
+    ctx.ui.notify(formatStatus(shared, interactiveHost), "info");
+  },
+  stats: (ctx, shared) => {
+    const { value, source } = describeBudget(shared);
+    ctx.ui.notify(`${formatPromptAutocompleteStats(shared.usageStats)}\nBudget: ${value} (${source})`, "info");
+  },
+  inspect: (ctx, shared, { payload, interactiveHost }) => {
+    ctx.ui.notify(formatPromptAutocompleteInspection(shared, interactiveHost, payload || undefined), "info");
+  },
+  "min-chars": (ctx, shared, { firstArgument }) => setMinPromptChars(ctx, shared, firstArgument),
+  budget: (ctx, shared, { firstArgument }) => setBudgetLimit(ctx, shared, firstArgument),
+  set: (ctx, shared, { rest }) => handleSetCommand(ctx, shared, rest),
+  stream: (ctx, shared, { firstArgument }) => setStreamResponses(ctx, shared, firstArgument),
+  "while-streaming": (ctx, shared, { firstArgument }) => setWhileStreaming(ctx, shared, firstArgument),
+  "debug-on": (ctx, shared) => {
+    setDebugDisplay(shared, true);
+    ctx.ui.notify("Prompt autocomplete debug display enabled", "info");
+  },
+  "debug-off": (ctx, shared) => {
+    setDebugDisplay(shared, false);
+    ctx.ui.notify("Prompt autocomplete debug display disabled", "info");
+  },
+  "debug-toggle": (ctx, shared) => {
+    const nextDebugEnabled = !shared.config.debug;
+    setDebugDisplay(shared, nextDebugEnabled);
+    ctx.ui.notify(
+      nextDebugEnabled
+        ? "Prompt autocomplete debug display enabled"
+        : "Prompt autocomplete debug display disabled",
+      "info",
+    );
+  },
+};
 
 export function createPromptAutocompleteExtension(
   dependencies: PromptAutocompleteDependencies = {},
@@ -3132,58 +3128,36 @@ export function createPromptAutocompleteExtension(
 
   pi.registerCommand("prompt-autocomplete", {
     description: "Enable, disable, or inspect inline prompt autocomplete and session stats",
+    // Local and synchronous: Pi replaces the whole argument span with the value.
+    getArgumentCompletions: (argumentPrefix) => completePromptAutocompleteArguments(argumentPrefix),
     handler: async (args, ctx) => {
       const commandStart = args.trimStart();
       const space = commandStart.search(/\s/);
-      const command = (space < 0 ? commandStart : commandStart.slice(0, space)).toLowerCase() || "status";
+      const name = (space < 0 ? commandStart : commandStart.slice(0, space)).toLowerCase() || "status";
       // Everything after exactly one separator, verbatim: an inspected draft
       // must keep its leading and trailing whitespace to match production.
       const payload = space < 0 ? "" : commandStart.slice(space + 1);
       const rest = payload.trim();
-      const firstRestToken = rest.split(/\s+/, 1)[0];
+      const spec = findPromptAutocompleteCommand(name);
 
       // Reporting works wherever a notification can be shown; anything that
       // changes state or touches the editor stays TUI-only.
       const interactiveHost = hostOwnsInteractiveEditor(ctx, shared);
-      if (READ_ONLY_COMMANDS.has(command) && (interactiveHost || hasNotificationChannel(ctx))) {
-        runReadOnlyCommand(ctx, shared, command, payload, interactiveHost);
-        return;
-      }
-      if (!interactiveHost) {
+      if (!interactiveHost && !(spec?.readOnly && hasNotificationChannel(ctx))) {
         ctx.ui.notify("prompt-autocomplete requires interactive TUI mode", "warning");
         return;
       }
-
-      if (command === "while-streaming") {
-        setWhileStreaming(ctx, shared, firstRestToken || undefined);
-        return;
-      }
-      if (command === "stream") {
-        setStreamResponses(ctx, shared, firstRestToken || undefined);
-        return;
-      }
-      if (command === "min-chars") {
-        setMinPromptChars(ctx, shared, firstRestToken || undefined);
-        return;
-      }
-      if (command === "budget") {
-        setBudgetLimit(ctx, shared, firstRestToken || undefined);
-        return;
-      }
-      if (command === "set") {
-        handleSetCommand(ctx, shared, rest);
+      if (!spec) {
+        ctx.ui.notify(PROMPT_AUTOCOMPLETE_USAGE, "warning");
         return;
       }
 
-      const handlers = createPromptAutocompleteCommandHandlers(ctx, shared);
-      const handler = handlers[command];
-
-      if (handler) {
-        handler();
-        return;
-      }
-
-      ctx.ui.notify(COMMAND_USAGE, "warning");
+      COMMAND_RUNNERS[spec.name](ctx, shared, {
+        payload,
+        rest,
+        firstArgument: rest.split(/\s+/, 1)[0] || undefined,
+        interactiveHost,
+      });
     },
   });
   };

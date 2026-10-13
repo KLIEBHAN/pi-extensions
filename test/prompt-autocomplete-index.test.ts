@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { PromptAutocompletePersistedSettings } from "../extensions/prompt-autocomplete/core.ts";
+import {
+  completePromptAutocompleteArguments,
+  PROMPT_AUTOCOMPLETE_COMMANDS,
+  PROMPT_AUTOCOMPLETE_SET_USAGE,
+  PROMPT_AUTOCOMPLETE_USAGE,
+  type PromptAutocompletePersistedSettings,
+} from "../extensions/prompt-autocomplete/core.ts";
 import {
   createPromptAutocompleteExtension,
   type PromptAutocompleteDependencies,
@@ -12,6 +18,10 @@ import {
 
 type Handler = (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown;
 type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<unknown> | unknown;
+interface CommandDefinition {
+  handler: CommandHandler;
+  getArgumentCompletions?: (argumentPrefix: string) => unknown;
+}
 type EditorFactory = Exclude<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0], undefined>;
 
 interface HarnessOptions {
@@ -53,6 +63,8 @@ function createHarness(options: HarnessOptions = {}) {
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, CommandHandler>();
   const notifications: Array<{ message: string; type?: string }> = [];
+  const commandDefinitions = new Map<string, CommandDefinition>();
+  const autocompleteProviders: unknown[] = [];
   const editorSetCalls: Array<EditorFactory | undefined> = [];
   let editorFactory = options.existingEditorFactory;
 
@@ -64,6 +76,8 @@ function createHarness(options: HarnessOptions = {}) {
     },
     setWidget: () => undefined,
     notify: (message: string, type?: string) => notifications.push({ message, type }),
+    // Spy: argument completion must use the command API, never a global provider.
+    addAutocompleteProvider: (factory: unknown) => autocompleteProviders.push(factory),
   };
 
   const model = { provider: "test-provider", id: "test-model" };
@@ -116,8 +130,9 @@ function createHarness(options: HarnessOptions = {}) {
     on(name: string, handler: Handler) {
       handlers.set(name, handler);
     },
-    registerCommand(name: string, definition: { handler: CommandHandler }) {
+    registerCommand(name: string, definition: CommandDefinition) {
       commands.set(name, definition.handler);
+      commandDefinitions.set(name, definition);
     },
     appendEntry(customType: string, data: unknown) {
       branch = [...branch, { type: "custom", customType, data, id: `custom-${branch.length + 1}` }];
@@ -157,6 +172,8 @@ function createHarness(options: HarnessOptions = {}) {
     flags,
     handlers,
     notifications,
+    commandDefinitions,
+    autocompleteProviders,
     registeredFlags,
     settingsSaves,
     getStoredSettings: () => ({ ...storedSettings }),
@@ -1163,4 +1180,34 @@ test("a corrupt or frozen process-state occupant is replaced instead of trusted"
     Reflect.deleteProperty(globalThis, key);
     if (original) Reflect.defineProperty(globalThis, key, original);
   }
+});
+
+test("the registered command completes arguments locally without a global provider", async () => {
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  const definition = harness.commandDefinitions.get("prompt-autocomplete");
+  assert.ok(definition?.getArgumentCompletions, "the command registers argument completions");
+  assert.deepEqual(definition.getArgumentCompletions("stream o"), completePromptAutocompleteArguments("stream o"));
+  assert.equal(definition.getArgumentCompletions("stats"), null);
+
+  await emit(harness, "session_start");
+  for (const args of ["off", "on", "toggle", "toggle"]) await command(harness, args);
+  await emit(harness, "session_shutdown");
+  assert.deepEqual(harness.autocompleteProviders, [], "no global autocomplete provider is ever installed");
+  assert.equal(harness.getProviderCalls(), 0, "completion never reaches a provider");
+});
+
+test("every grammar command dispatches, and unknown commands show the usage", async () => {
+  for (const spec of PROMPT_AUTOCOMPLETE_COMMANDS) {
+    const harness = createHarness({ savedSettings: { enabled: true } });
+    await emit(harness, "session_start");
+    await command(harness, spec.name);
+    assert.doesNotMatch(lastStatus(harness), /^Usage: \/prompt-autocomplete \[/, `${spec.name} is dispatched`);
+    assert.doesNotMatch(lastStatus(harness), /requires interactive TUI mode/);
+  }
+  const harness = createHarness({ savedSettings: { enabled: true } });
+  await emit(harness, "session_start");
+  await command(harness, "bogus");
+  assert.equal(lastStatus(harness), PROMPT_AUTOCOMPLETE_USAGE);
+  await command(harness, "set bogus 1");
+  assert.equal(lastStatus(harness), PROMPT_AUTOCOMPLETE_SET_USAGE);
 });
