@@ -286,25 +286,49 @@ const PROCESS_STATE_KEY = Symbol.for("@kliebhan/pi-prompt-autocomplete/process-s
 const PROCESS_STATE_FIELDS = ["nonInteractiveNoticeShown", "hostInstallsEditors"] as const;
 
 /**
- * Accept only an occupant this extension could have written: extensible, with
- * every known field absent or a writable boolean. Anything else, such as a
- * frozen object or a stringly typed flag, is replaced rather than trusted.
+ * Accept only an occupant this extension could have written: an extensible
+ * plain object whose known fields are absent or own writable booleans. Anything
+ * else — a frozen object, a stringly typed flag, an inherited field, or a
+ * proxy whose traps throw — is replaced rather than trusted.
  */
 function isProcessState(value: unknown): value is PromptAutocompleteProcessState {
-  if (typeof value !== "object" || value === null || !Object.isExtensible(value)) return false;
-  return PROCESS_STATE_FIELDS.every((field) => {
-    const descriptor = Object.getOwnPropertyDescriptor(value, field);
-    return descriptor === undefined
-      || (descriptor.writable === true && (descriptor.value === undefined || typeof descriptor.value === "boolean"));
-  });
+  try {
+    if (typeof value !== "object" || value === null) return false;
+    if (Object.getPrototypeOf(value) !== Object.prototype || !Object.isExtensible(value)) return false;
+    return PROCESS_STATE_FIELDS.every((field) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, field);
+      return descriptor === undefined
+        || (descriptor.writable === true && (descriptor.value === undefined || typeof descriptor.value === "boolean"));
+    });
+  } catch {
+    return false;
+  }
 }
 
-/** The process-wide state object, created on first use and found again after a re-import. */
+/**
+ * The process-wide state object, created on first use and found again after a
+ * re-import.
+ *
+ * If another occupant holds the slot and cannot be replaced, there is no other
+ * process-wide store, so this runtime falls back to private state: a notice or
+ * the editor probe may then repeat after a runtime replacement, but nothing
+ * fails.
+ */
 function sharedProcessState(): PromptAutocompleteProcessState {
-  const existing: unknown = Reflect.get(globalThis, PROCESS_STATE_KEY);
+  let existing: unknown;
+  try {
+    existing = Reflect.get(globalThis, PROCESS_STATE_KEY);
+  } catch {
+    existing = undefined;
+  }
   if (isProcessState(existing)) return existing;
   const created: PromptAutocompleteProcessState = {};
-  Reflect.set(globalThis, PROCESS_STATE_KEY, created);
+  Reflect.defineProperty(globalThis, PROCESS_STATE_KEY, {
+    value: created,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
   return created;
 }
 

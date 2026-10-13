@@ -24,7 +24,7 @@ Prompt Autocomplete is **disabled by default**. Enable it explicitly for a proce
 pi --prompt-autocomplete
 ```
 
-Or enable it for the current interactive session:
+Or enable it from inside an interactive session; the decision is saved for later sessions:
 
 ```text
 /prompt-autocomplete on
@@ -40,7 +40,7 @@ Or enable it for the current interactive session:
 | Previous alternative | `Ctrl+,` |
 | Dismiss the suggestion for this draft | `Escape` |
 | Enable, disable, or inspect configuration | `/prompt-autocomplete on\|off\|toggle\|status` |
-| Show current-session effectiveness and cost | `/prompt-autocomplete stats` |
+| Show in-memory effectiveness and cost counters | `/prompt-autocomplete stats` |
 | Preview what a request would send, locally | `/prompt-autocomplete inspect [draft text]` |
 | Toggle streamed response previews | `/prompt-autocomplete stream on\|off\|toggle` |
 | Set and persist the minimum draft length | `/prompt-autocomplete min-chars <n>` |
@@ -98,7 +98,7 @@ Changing `max-chars`, `max-alternatives`, or `model` cancels in-flight autocompl
 
 ### Usage and cost accounting
 
-`/prompt-autocomplete stats` gives the current session a dedicated, readable report:
+`/prompt-autocomplete stats` gives the in-memory counters a dedicated, readable report:
 
 ```text
 Prompt Autocomplete — current session
@@ -121,7 +121,7 @@ Budget: 4/25 (session)
 - Token counts come from the provider.
 - **The cost is an estimate, not an invoice.** Pi derives it locally by multiplying the reported tokens with its own model price table, so it can disagree with what your provider actually bills.
 - A trailing `+` (`1832 tokens+`, `estimated cost ~$0.00214+`; compact `status`: `1832 tok+`, `~$0.00214 est+`) means at least one request did not report that metric, so the true total may be higher than shown. Tokens and cost are marked independently, because a response can report tokens without a cost figure.
-- Counters live only in memory, are scoped to the current session, and reset when a new session starts.
+- Counters live only in memory and belong to the current extension runtime: they restart whenever Pi replaces it — a new session, `/resume`, `/fork`, or `/reload`. The session request budget is the exception and survives `/reload` and `/resume` (see [Session request budget](#session-request-budget)).
 
 ### Inspecting a request
 

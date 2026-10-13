@@ -1113,21 +1113,54 @@ test("a proven no-op editor host stays inactive in a later runtime of the same p
 
 test("a corrupt or frozen process-state occupant is replaced instead of trusted", async () => {
   const key = Symbol.for("@kliebhan/pi-prompt-autocomplete/process-state");
-  const original: unknown = Reflect.get(globalThis, key);
+  const original = Reflect.getOwnPropertyDescriptor(globalThis, key);
   const notice = "no autocomplete requests will be issued";
+  const occupy = (descriptor: PropertyDescriptor) => {
+    Reflect.deleteProperty(globalThis, key);
+    assert.ok(Reflect.defineProperty(globalThis, key, { configurable: true, ...descriptor }));
+  };
   try {
-    for (const occupant of [{ nonInteractiveNoticeShown: "false" }, Object.freeze({}), "not-an-object"]) {
-      Reflect.set(globalThis, key, occupant);
+    const throwingProxy = new Proxy({}, {
+      getPrototypeOf() {
+        throw new Error("hostile trap");
+      },
+    });
+    const accessor = {};
+    Object.defineProperty(accessor, "hostInstallsEditors", { get: () => false, enumerable: true });
+    for (const occupant of [
+      { nonInteractiveNoticeShown: "false" },
+      Object.freeze({}),
+      "not-an-object",
+      Object.create({ nonInteractiveNoticeShown: true }),
+      accessor,
+      throwingProxy,
+    ]) {
+      occupy({ value: occupant, writable: true });
       const harness = createHarness({ enabled: true, mode: "rpc", useProcessGlobal: true });
       await emit(harness, "session_start");
       assert.equal(
         harness.notifications.filter((entry) => entry.message.includes(notice)).length,
         1,
-        `an invalid occupant (${JSON.stringify(occupant)}) must neither suppress the notice nor throw`,
+        "an invalid occupant must neither suppress the notice nor throw",
       );
     }
+
+    // An inherited negative probe result must not block a real interactive host.
+    occupy({ value: Object.create({ hostInstallsEditors: false }), writable: true });
+    const tui = createHarness({ enabled: true, mode: "tui", useProcessGlobal: true });
+    await emit(tui, "session_start");
+    assert.equal(tui.editorSetCalls.length, 1);
+
+    // A non-writable but configurable slot is still claimed, so later runtimes share it.
+    occupy({ value: "corrupt", writable: false });
+    const first = createHarness({ enabled: true, mode: "rpc", useProcessGlobal: true });
+    await emit(first, "session_start");
+    const reloaded = createHarness({ enabled: true, mode: "rpc", useProcessGlobal: true });
+    await emit(reloaded, "session_start");
+    assert.equal(first.notifications.filter((entry) => entry.message.includes(notice)).length, 1);
+    assert.equal(reloaded.notifications.filter((entry) => entry.message.includes(notice)).length, 0);
   } finally {
-    if (original === undefined) Reflect.deleteProperty(globalThis, key);
-    else Reflect.set(globalThis, key, original);
+    Reflect.deleteProperty(globalThis, key);
+    if (original) Reflect.defineProperty(globalThis, key, original);
   }
 });

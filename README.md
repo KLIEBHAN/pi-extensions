@@ -232,11 +232,11 @@ pi install npm:@kliebhan/pi-prompt-autocomplete
 - optional dedicated autocomplete model via `--prompt-autocomplete-model provider/model`
 - configurable alternative count via `--prompt-autocomplete-max-alternatives <1-5>`
 - clean default UI: debug/status lines stay hidden unless you opt into debug mode
-- `/prompt-autocomplete stats` reports current-session requests, failures, exact/prefix cache hits, suggestions offered and accepted, tokens, estimated cost, and mean provider latency
+- `/prompt-autocomplete stats` reports in-memory counters for the current extension runtime (they restart on a new session, `/resume`, `/fork`, or `/reload`): requests, failures, exact/prefix cache hits, suggestions offered and accepted, tokens, estimated cost, and mean provider latency
 - `/prompt-autocomplete inspect [draft text]` previews locally what a request would send, with sizes, sanitized excerpts, and the shared request policy, and makes no provider request
 - optional session request ceiling via `--prompt-autocomplete-max-requests <n|off>` or `/prompt-autocomplete budget <n|off>`: only real provider calls count, cache hits and in-flight joins stay free, and the ceiling is session-scoped (`/new` and `/fork` start fresh, `/reload` and `/resume` restore it)
 - the internal autocomplete system prompt lives in `extensions/prompt-autocomplete/system-prompt.template.md` and is rendered through a tiny mini-template helper with `{{PLACEHOLDER}}`, `{{PLACEHOLDER|fallback}}`, and escaped literals via `\{{PLACEHOLDER}}`, so prompt tuning stays decoupled from TypeScript while still allowing reusable prompt fragments
-- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable per session via `/prompt-autocomplete on|off|toggle`, `/prompt-autocomplete set`, `/prompt-autocomplete stream on|off|toggle`, and `/prompt-autocomplete while-streaming on|off|toggle`
+- can be auto-loaded from `~/.pi/agent/extensions/` and is controllable from inside Pi via `/prompt-autocomplete on|off|toggle`, `/prompt-autocomplete set`, `/prompt-autocomplete stream on|off|toggle`, and `/prompt-autocomplete while-streaming on|off|toggle`; `on`/`off` and `set` are saved for later sessions, while `stream` and `while-streaming` last for the current extension runtime
 
 ### Usage
 
@@ -252,7 +252,7 @@ After package installation:
 pi --prompt-autocomplete
 ```
 
-Or enable it for the current session from inside pi:
+Or enable it from inside pi; the decision is saved for later sessions:
 
 ```text
 /prompt-autocomplete on
@@ -300,7 +300,7 @@ The extension is disabled by default. Enabling it with the CLI flag or slash com
 - The default suggestion count is 3. Adjust it with `--prompt-autocomplete-max-alternatives <1-5>` if you want fewer or more.
 - Legacy `Ctrl+Tab` and `Alt+[` / `Alt+]` remain supported as fallbacks when your terminal forwards them.
 - Prompt autocomplete requires exclusive ownership of Pi's custom editor slot. If another custom editor is already active, it refuses to replace it and reports a warning; disabling autocomplete never removes a later replacement editor.
-- `/prompt-autocomplete status` retains compact request/cache/token/cost accounting for troubleshooting. `/prompt-autocomplete stats` presents the current session's issued and failed requests, exact and prefix cache hits, active suggestions offered, full and word/chunk acceptance, tokens, estimated cost, and mean provider latency. Token counts come from the provider, but cost is derived locally from pi's model price table and is therefore an estimate, not an invoice. A trailing `+` means at least one request did not report that metric, so the true total may be higher; tokens and cost are marked independently.
+- `/prompt-autocomplete status` retains compact request/cache/token/cost accounting for troubleshooting. `/prompt-autocomplete stats` presents the current extension runtime's issued and failed requests, exact and prefix cache hits, active suggestions offered, full and word/chunk acceptance, tokens, estimated cost, and mean provider latency. Token counts come from the provider, but cost is derived locally from pi's model price table and is therefore an estimate, not an invoice. A trailing `+` means at least one request did not report that metric, so the true total may be higher; tokens and cost are marked independently.
 - Slash-command toggles, including response streaming, outrank the CLI flags; `on`/`off`, `min-chars`, and `set` persist through the settings file, while runtime-only toggles such as `stream` end when Pi replaces the extension runtime on `/new`, `/resume`, `/fork`, or `/reload`. `status` labels each value `(flag)`, `(saved)`, or `(session)` and names the active `stream`, `complete`, or `complete-compat` request path.
 - For troubleshooting, start with `--prompt-autocomplete-debug` or run `/prompt-autocomplete debug-on` temporarily.
 - If you want to tune the internal autocomplete prompt, edit `extensions/prompt-autocomplete/system-prompt.template.md`; `{{PLACEHOLDER}}` variables are filled in by `extensions/prompt-autocomplete/core.ts`, `{{PLACEHOLDER|fallback}}` uses the fallback text when no variable is provided, and `\{{PLACEHOLDER}}` keeps the placeholder syntax literal.
