@@ -40,6 +40,8 @@ interface HarnessOptions {
   sessionId?: string;
   /** Process-lifetime state; share one object between harnesses to emulate runtimes of one process. */
   processState?: PromptAutocompleteProcessState;
+  /** Use the real process-wide default instead of an isolated state object. */
+  useProcessGlobal?: boolean;
 }
 
 function createHarness(options: HarnessOptions = {}) {
@@ -137,7 +139,7 @@ function createHarness(options: HarnessOptions = {}) {
   let providerCalls = 0;
   createPromptAutocompleteExtension({
     settingsStore,
-    processState: options.processState ?? {},
+    processState: options.useProcessGlobal ? undefined : (options.processState ?? {}),
     completeSimple: (async () => {
       providerCalls += 1;
       throw new Error("index tests must not reach the provider");
@@ -1087,5 +1089,45 @@ test("inspection output is sanitized and bounded", async () => {
   assert.match(report, /Draft: 5010 chars, 2000 sent \(only the last 2000 are sent\)/);
   for (const line of report.split("\n")) {
     assert.ok(line.length <= 400, `every report line stays bounded: ${line.length}`);
+  }
+});
+
+test("a proven no-op editor host stays inactive in a later runtime of the same process", async () => {
+  const processState: PromptAutocompleteProcessState = {};
+  const host = { enabled: true, omitMode: true, hasUI: true, noOpEditorSlot: true, processState } as const;
+  const first = createHarness(host);
+  await emit(first, "session_start");
+  assert.equal(first.editorSetCalls.length, 1, "the first runtime probes the host once");
+
+  const reloaded = createHarness(host);
+  await emit(reloaded, "session_start");
+  assert.equal(reloaded.editorSetCalls.length, 0, "a replaced runtime does not probe the proven host again");
+  assert.ok(
+    !reloaded.notifications.some((entry) => /installs custom editors in the terminal process/.test(entry.message)),
+    "the proven limitation is not reported again",
+  );
+  await command(reloaded, "on");
+  assert.equal(reloaded.editorSetCalls.length, 0);
+  assert.match(lastStatus(reloaded), /requires interactive TUI mode/);
+});
+
+test("a corrupt or frozen process-state occupant is replaced instead of trusted", async () => {
+  const key = Symbol.for("@kliebhan/pi-prompt-autocomplete/process-state");
+  const original: unknown = Reflect.get(globalThis, key);
+  const notice = "no autocomplete requests will be issued";
+  try {
+    for (const occupant of [{ nonInteractiveNoticeShown: "false" }, Object.freeze({}), "not-an-object"]) {
+      Reflect.set(globalThis, key, occupant);
+      const harness = createHarness({ enabled: true, mode: "rpc", useProcessGlobal: true });
+      await emit(harness, "session_start");
+      assert.equal(
+        harness.notifications.filter((entry) => entry.message.includes(notice)).length,
+        1,
+        `an invalid occupant (${JSON.stringify(occupant)}) must neither suppress the notice nor throw`,
+      );
+    }
+  } finally {
+    if (original === undefined) Reflect.deleteProperty(globalThis, key);
+    else Reflect.set(globalThis, key, original);
   }
 });

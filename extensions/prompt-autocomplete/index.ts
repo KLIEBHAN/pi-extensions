@@ -271,12 +271,32 @@ export interface PromptAutocompleteDependencies {
 export interface PromptAutocompleteProcessState {
   /** The enabled-but-non-interactive notice was already shown. */
   nonInteractiveNoticeShown?: boolean;
+  /**
+   * Set once a mount attempt proved whether this host installs custom editors.
+   *
+   * A process cannot change its front-end, so this is deliberately never reset:
+   * a host that dropped the editor factory once would drop it again, also in a
+   * later runtime. Restarting the host is the only way to re-probe.
+   */
+  hostInstallsEditors?: boolean;
 }
 
 const PROCESS_STATE_KEY = Symbol.for("@kliebhan/pi-prompt-autocomplete/process-state");
 
+const PROCESS_STATE_FIELDS = ["nonInteractiveNoticeShown", "hostInstallsEditors"] as const;
+
+/**
+ * Accept only an occupant this extension could have written: extensible, with
+ * every known field absent or a writable boolean. Anything else, such as a
+ * frozen object or a stringly typed flag, is replaced rather than trusted.
+ */
 function isProcessState(value: unknown): value is PromptAutocompleteProcessState {
-  return typeof value === "object" && value !== null;
+  if (typeof value !== "object" || value === null || !Object.isExtensible(value)) return false;
+  return PROCESS_STATE_FIELDS.every((field) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, field);
+    return descriptor === undefined
+      || (descriptor.writable === true && (descriptor.value === undefined || typeof descriptor.value === "boolean"));
+  });
 }
 
 /** The process-wide state object, created on first use and found again after a re-import. */
@@ -412,14 +432,6 @@ interface PromptAutocompleteSharedState {
   reportedModelRefusals: Set<string>;
   /** Process-lifetime state shared with later runtimes of this process. */
   processState: PromptAutocompleteProcessState;
-  /**
-   * Set once a mount attempt proved whether this host installs custom editors.
-   *
-   * A process cannot change its front-end, so this is deliberately never reset:
-   * a host that dropped the editor factory once would drop it again. Restarting
-   * the host is the only way to re-probe.
-   */
-  hostInstallsEditors?: boolean;
   lastError?: string;
   lastRawResponse?: string;
   requestCache: ExpiringLruCache<PromptAutocompleteCacheEntry>;
@@ -1927,7 +1939,7 @@ function releaseEditorRuntime(shared: PromptAutocompleteSharedState): void {
 function hostOwnsInteractiveEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): boolean {
   // A host that already accepted an editor factory without installing it is not
   // interactive, no matter what its capabilities claim.
-  if (shared.hostInstallsEditors === false) return false;
+  if (shared.processState.hostInstallsEditors === false) return false;
   const host = ctx as Partial<Pick<ExtensionContext, "mode" | "hasUI" | "ui">>;
   return isInteractiveEditorHost({
     mode: host.mode,
@@ -2049,7 +2061,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
   if (ctx.ui.getEditorComponent() !== installedFactory) {
     releaseEditorRuntime(shared);
     shared.editorMount = undefined;
-    shared.hostInstallsEditors = false;
+    shared.processState.hostInstallsEditors = false;
     // Nothing can render or request here, so the extension must not stay marked
     // enabled, no matter which path attempted the mount.
     shared.enabled = false;
@@ -2062,7 +2074,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
     return false;
   }
 
-  shared.hostInstallsEditors = true;
+  shared.processState.hostInstallsEditors = true;
   updateDebugState(shared, "mounted", "Editor extension attached");
   return true;
 }
@@ -2097,7 +2109,7 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   applyEffectiveConfig(pi, shared);
   // A host that never installs custom editors stays inactive for the rest of
   // the process, so flags must not re-enable it in a later session either.
-  if (shared.hostInstallsEditors === false) shared.enabled = false;
+  if (shared.processState.hostInstallsEditors === false) shared.enabled = false;
   shared.usageStats = createPromptAutocompleteUsageStats();
   shared.editorMount = undefined;
   shared.editorBlockedReason = undefined;
@@ -2691,7 +2703,7 @@ function enablePromptAutocomplete(ctx: ExtensionContext, shared: PromptAutocompl
   shared.enabled = true;
   shared.runtimeOverrides.enabled = true;
 
-  if (!mountEditor(ctx, shared) && shared.hostInstallsEditors === false) {
+  if (!mountEditor(ctx, shared) && shared.processState.hostInstallsEditors === false) {
     // The host accepted the editor factory without installing it. mountEditor
     // already cleared `enabled`; keep it cleared and drop the session override
     // so the refused activation is not replayed as a user decision later.
