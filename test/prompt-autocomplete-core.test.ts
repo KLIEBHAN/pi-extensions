@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
@@ -13,6 +15,7 @@ import {
   MAX_DRAFT_CONTEXT_CHARS,
   buildPromptAutocompleteRequestSnapshot,
   renderPromptAutocompleteUserText,
+  projectAutocompleteContextEntries,
   buildPromptAutocompleteBudgetSnapshot,
   BUDGET_REQUESTS_MAX,
   BUDGET_REQUESTS_MIN,
@@ -1620,4 +1623,61 @@ test("the request snapshot renders the transmitted user message", () => {
   assert.match(text, /^Latest user message:\nEarlier question\n\n/);
   assert.match(text, /Current draft tail \(the real draft is longer; the cursor is at the end of the full draft\):\na+\n\n/);
   assert.match(text, /Task: propose up to 3 ranked continuations/);
+});
+
+function assistantReply(text: string): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    api: "openai-responses",
+    provider: "test",
+    model: "test",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+}
+
+test("autocomplete context follows the host projection, including context edits", () => {
+  // Uses the real Pi SessionManager, so the projection contract is the host's own.
+  const session = SessionManager.inMemory(process.cwd());
+  const secretId = session.appendMessage({ role: "user", content: "my secret token is abc123", timestamp: Date.now() });
+  const replyId = session.appendMessage(assistantReply("Here is the token analysis"));
+  session.appendMessage({ role: "user", content: "Now refactor the parser", timestamp: Date.now() });
+  session.appendContextEdit(secretId, null);
+  session.appendContextEdit(replyId, { content: [{ type: "text", text: "[redacted reply]" }] });
+
+  const raw = buildRecentConversationContext(session.getBranch());
+  assert.match(raw, /abc123/, "the raw branch still holds the omitted message");
+
+  const projected = projectAutocompleteContextEntries(session.buildSessionProjection());
+  const recent = buildRecentConversationContext(projected);
+  assert.doesNotMatch(recent, /abc123/, "an omitted message never reaches autocomplete context");
+  assert.doesNotMatch(recent, /token analysis/, "a replaced message contributes only its replacement");
+  assert.match(recent, /\[redacted reply\]/);
+  assert.match(recent, /Now refactor the parser/);
+  assert.equal(buildLatestAssistantMessageContext(projected), "[redacted reply]");
+});
+
+test("a malformed host projection yields no conversation context", () => {
+  for (const projection of [undefined, null, "entries", { entries: "nope" }, { entries: [null, { sourceEntry: 1 }] }]) {
+    assert.deepEqual(projectAutocompleteContextEntries(projection), []);
+  }
+  assert.deepEqual(
+    projectAutocompleteContextEntries({
+      entries: [
+        { sourceEntry: { type: "custom_message", id: "c1" }, messages: [{ role: "user", content: "custom" }] },
+        { sourceEntry: { type: "message", id: "m1" }, messages: [] },
+      ],
+    }),
+    [],
+    "only message entries contribute, and an omission contributes nothing",
+  );
 });

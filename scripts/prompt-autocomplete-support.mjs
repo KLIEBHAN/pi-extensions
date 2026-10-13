@@ -13,7 +13,7 @@
 export const MINIMUM_SUPPORTED_PI = "0.80.6";
 
 /** Matched host triplets the matrix verifies, ascending. */
-export const SUPPORTED_PI_MATRIX = ["0.80.6", "0.82.0", "0.83.0"];
+export const SUPPORTED_PI_MATRIX = ["0.80.6", "0.83.0", "1.2.0"];
 
 /**
  * A host below the documented baseline, probed but not supported.
