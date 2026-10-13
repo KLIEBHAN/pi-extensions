@@ -2774,3 +2774,29 @@ test("the session projection is rebuilt per conversation change, not per keystro
   assert.equal(projections, 2);
   assert.doesNotMatch(sentTexts.at(-1) ?? "", /abc123/, "a redaction is never served from a stale projection");
 });
+
+test("inspection previews the model-visible context, never content a context edit removed", async () => {
+  let capturedContext: any;
+  const session = SessionManager.inMemory(process.cwd());
+  const secretId = session.appendMessage({ role: "user", content: "my secret token is abc123", timestamp: Date.now() });
+  session.appendMessage({ role: "user", content: "Now refactor the parser", timestamp: Date.now() });
+  session.appendContextEdit(secretId, null);
+
+  const harness = createEditorHarness({
+    sessionManager: session,
+    completeSimple: (async (_model, context) => {
+      capturedContext = context;
+      return makeCompletion([" next"]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+  const sentText: string = capturedContext.messages[0].content[0].text;
+
+  await harness.command("inspect Review");
+  const report = harness.notifications.at(-1) ?? "";
+  assert.doesNotMatch(report, /abc123/, "inspection never shows content the model no longer sees");
+  assert.match(report, /Latest user message: 23 chars sent \(cap 1200\): "Now refactor the parser"/);
+  assert.match(report, new RegExp(`user message ${sentText.length} chars`), "inspection and provider share one source");
+});
