@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, createProvider } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
   KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { CustomEditor, SessionManager } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, ModelRegistry, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   type AutocompleteProvider,
   CombinedAutocompleteProvider,
@@ -132,8 +135,13 @@ async function flushAsyncWork(): Promise<void> {
 
 interface EditorHarnessOptions {
   authConfigured?: boolean;
-  completeSimple: CompleteSimple;
+  /** Omit both seams to exercise the extension's own request routing. */
+  completeSimple?: CompleteSimple;
   streamSimple?: StreamSimple;
+  /** The session model registry's own request entry point (Pi 1.x). */
+  registryStreamSimple?: StreamSimple;
+  /** A real host model registry instead of the in-test stub. */
+  modelRegistry?: ModelRegistry;
   streamSetting?: "on" | "off";
   debounceMs?: number;
   maxAlternatives?: number;
@@ -192,7 +200,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
     setWidget: (key: string, content: string[] | undefined) => widgets.push({ key, content }),
     notify: (message: string) => notifications.push(message),
   };
-  const modelRegistry = {
+  const modelRegistry = options.modelRegistry ?? {
     find: (provider: string, id: string) =>
       options.findModel ? options.findModel(provider, id) : { provider, id },
     hasConfiguredAuth: (model: { provider: string; id: string }) =>
@@ -201,6 +209,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
       options.getApiKeyAndHeaders
         ? await options.getApiKeyAndHeaders()
         : ({ ok: true as const, apiKey: "test-key", headers: {} }),
+    ...(options.registryStreamSimple ? { streamSimple: options.registryStreamSimple } : {}),
   };
   const sessionManager = options.sessionManager ?? {
     getBranch: () => branch,
@@ -2921,4 +2930,218 @@ test("Pi's command menu completes arguments over the full span in the real edito
   assert.deepEqual(submitted, ["/prompt-autocomplete stream", "/prompt-autocomplete set min-chars"]);
 
   assert.equal(calls, 0, "command completion never asks the model for ghost text");
+});
+
+function registryStream(completions: string[]) {
+  const provider = controlledStream();
+  queueMicrotask(() => provider.done(completions, makeUsage(10, 5, 0.0001)));
+  return provider.stream;
+}
+
+test("without injected seams, requests route through the session model registry", async () => {
+  // A registry-only provider: the compat functions cannot serve it (and in
+  // plain Node they do not exist), so a suggestion proves the registry path.
+  const calls: Array<{ model: unknown; context: any; options: any }> = [];
+  const harness = createEditorHarness({
+    registryStreamSimple: ((model, context, options) => {
+      calls.push({ model, context, options });
+      return registryStream([" the patch for edge cases"]);
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.equal(calls.length, 1);
+  assert.match(renderedText(editor), /the patch for edge cases/);
+  assert.deepEqual(calls[0]!.model, { provider: "test-provider", id: "model-a" });
+  assert.match(calls[0]!.context.systemPrompt, /inline prompt suggestions/);
+  assert.match(calls[0]!.context.messages[0].content[0].text, /Current draft \(cursor at end\):\nReview/);
+  assert.equal(calls[0]!.options.apiKey, undefined, "the registry resolves the stored credential itself");
+  assert.equal(calls[0]!.options.headers, undefined);
+  assert.ok(calls[0]!.options.signal instanceof AbortSignal);
+  assert.equal(calls[0]!.options.timeoutMs, 8_000);
+  assert.equal(calls[0]!.options.maxRetries, 0);
+
+  editor.handleInput("\t");
+  assert.equal(editor.getText(), "Review the patch for edge cases");
+});
+
+test("the completion path also routes through the session model registry", async () => {
+  let calls = 0;
+  const harness = createEditorHarness({
+    streamSetting: "off",
+    registryStreamSimple: (() => {
+      calls += 1;
+      return registryStream([" the failing tests first"]);
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.equal(calls, 1);
+  assert.match(renderedText(editor), /the failing tests first/);
+});
+
+test("without a registry entry point, requests fall back to the compat functions", async () => {
+  const harness = createEditorHarness({});
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  // Plain Node has no Pi alias, so the compat fallback reports the missing API
+  // instead of reaching a provider.
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /requires streamSimple\(\) from @earendil-works\/pi-ai/);
+});
+
+/**
+ * A real Pi 1.x model registry with one provider that, like GitHub Copilot
+ * Enterprise, derives a credential-specific endpoint from its stored OAuth
+ * credential, and records what each request reached. No network is used: the
+ * provider streams locally and the catalog refresh is offline.
+ */
+async function createRealRegistry(toAuth: (access: string) => { apiKey?: string; headers?: Record<string, string>; baseUrl?: string }) {
+  const directory = mkdtempSync(join(tmpdir(), "pa-registry-"));
+  const cleanup = () => rmSync(directory, { recursive: true, force: true });
+  try {
+    writeFileSync(
+      join(directory, "auth.json"),
+      JSON.stringify({ enterprise: { type: "oauth", access: "oauth-token", refresh: "refresh", expires: Date.now() + 3_600_000 } }),
+    );
+    const runtime = await ModelRuntime.create({ authPath: join(directory, "auth.json"), modelsPath: null, refreshOnCreate: false });
+    const registry = new ModelRegistry(runtime);
+    const requests: Array<{ baseUrl: string; apiKey?: string; headers?: unknown }> = [];
+    let resolveFirstRequest!: () => void;
+    const firstRequest = new Promise<void>((resolve) => {
+      resolveFirstRequest = resolve;
+    });
+    const streamSimple: StreamSimple = (model, _context, options) => {
+      requests.push({ baseUrl: model.baseUrl, apiKey: options?.apiKey, headers: options?.headers });
+      resolveFirstRequest();
+      return registryStream([" the patch for edge cases"]);
+    };
+    registry.registerProvider(createProvider({
+      id: "enterprise",
+      baseUrl: "https://individual.example/api",
+      auth: {
+        apiKey: {
+          name: "API key",
+          resolve: async ({ credential }) => (credential ? { auth: { apiKey: credential.key } } : undefined),
+        },
+        oauth: {
+          name: "OAuth",
+          login: async () => {
+            throw new Error("not used");
+          },
+          refresh: async (credential) => credential,
+          toAuth: async (credential) => toAuth(credential.access),
+        },
+      },
+      models: [{
+        id: "chat",
+        name: "Chat",
+        api: "enterprise-chat",
+        provider: "enterprise",
+        baseUrl: "https://individual.example/api",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 8_000,
+        maxTokens: 1_000,
+      }],
+      api: { stream: streamSimple, streamSimple },
+    }));
+    // Availability of a newly registered provider settles asynchronously.
+    await registry.refresh({ allowNetwork: false, providers: ["enterprise"] });
+    /** Resolves once the provider received its first request, or fails after a bound. */
+    const waitForFirstRequest = async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          firstRequest,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("no request reached the provider")), 5_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    return { registry, requests, waitForFirstRequest, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+}
+
+test("requests through the real registry keep the OAuth-derived endpoint of the stored credential", async () => {
+  const { registry, requests, waitForFirstRequest, cleanup } = await createRealRegistry((access) => ({
+    apiKey: access,
+    baseUrl: "https://enterprise.example/api",
+  }));
+  try {
+    const harness = createEditorHarness({ modelRegistry: registry, preferredModel: "enterprise/chat" });
+    const editor = await harness.createEditor();
+    editor.setText("Review");
+    await waitForFirstRequest();
+    await flushAsyncWork();
+
+    assert.deepEqual(requests, [{ baseUrl: "https://enterprise.example/api", apiKey: "oauth-token", headers: undefined }]);
+    assert.match(renderedText(editor), /the patch for edge cases/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("header-only credentials work through the registry while the compat path still needs a key", async () => {
+  const { registry, requests, waitForFirstRequest, cleanup } = await createRealRegistry((access) => ({
+    headers: { Authorization: `Bearer ${access}` },
+  }));
+  try {
+    const harness = createEditorHarness({ modelRegistry: registry, preferredModel: "enterprise/chat" });
+    const editor = await harness.createEditor();
+    editor.setText("Review");
+    await waitForFirstRequest();
+    await flushAsyncWork();
+    assert.equal(requests.length, 1, "a key-less credential reaches the provider through the registry");
+    assert.match(renderedText(editor), /the patch for edge cases/);
+  } finally {
+    cleanup();
+  }
+
+  let calls = 0;
+  const compat = createEditorHarness({
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([" never"]);
+    }) as CompleteSimple,
+    getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "", headers: { Authorization: "Bearer token" } }),
+  });
+  const compatEditor = await compat.createEditor();
+  compatEditor.setText("Review");
+  await flushAsyncWork();
+  assert.equal(calls, 0, "without the registry a request still needs an API key");
+});
+
+test("any injected seam keeps the registry out of both request paths", async () => {
+  let registryCalls = 0;
+  const harness = createEditorHarness({
+    // Only the streaming seam is injected, but streaming is off: the completion
+    // path must not quietly fall back to the registry with credentials attached.
+    streamSimple: (() => controlledStream().stream) as StreamSimple,
+    streamSetting: "off",
+    registryStreamSimple: (() => {
+      registryCalls += 1;
+      return registryStream([" never"]);
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Review");
+  await flushAsyncWork();
+
+  assert.equal(registryCalls, 0);
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /requires completeSimple\(\) from @earendil-works\/pi-ai/);
 });

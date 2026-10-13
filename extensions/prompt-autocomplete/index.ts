@@ -259,6 +259,27 @@ const hostStreamSimple = ((model, context, options) =>
     options,
   )) as StreamSimpleFunction;
 
+/** The model registry's own request entry point, which Pi 1.x provides. */
+type RegistryStreamSimple = (...args: Parameters<StreamSimpleFunction>) => ReturnType<StreamSimpleFunction>;
+
+/**
+ * Where a request goes when no seam was injected.
+ *
+ * Pi 1.x serves every chat model, including those that extensions register
+ * with their own streaming implementation, through the session's model
+ * registry; the global `pi-ai` compat functions only know Pi's built-in APIs
+ * there and fail for extension providers. The registry also applies the
+ * provider's request-time base URL and environment. Hosts without it (Pi 0.x
+ * and forks of that API) keep the compat functions, which serve every model
+ * there.
+ */
+function registryStreamSimple(registry: unknown): RegistryStreamSimple | undefined {
+  if (typeof registry !== "object" || registry === null) return undefined;
+  const streamSimple: unknown = Reflect.get(registry, "streamSimple");
+  if (typeof streamSimple !== "function") return undefined;
+  return (model, context, options) => Reflect.apply(streamSimple, registry, [model, context, options]);
+}
+
 export interface PromptAutocompleteDependencies {
   completeSimple?: CompleteSimpleFunction;
   streamSimple?: StreamSimpleFunction;
@@ -458,6 +479,8 @@ interface PromptAutocompleteSharedState {
   debugState: string;
   editorMount?: EditorMountState;
   editorBlockedReason?: string;
+  /** Whether requests go through the session's model registry rather than compat or injected seams. */
+  routesThroughHostRegistry: () => boolean;
   /** Mount-bound notification channel; cleared together with the editor runtime. */
   notify?: (message: string, type?: "info" | "warning" | "error") => void;
   /** Refused model requests already reported, to avoid repeating them. */
@@ -1780,9 +1803,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
 
     const auth = await this.shared.modelRegistry.getApiKeyAndHeaders(request.model);
-    if (!auth.ok || !auth.apiKey) {
-      throw new Error(auth.ok ? `No API key for ${request.modelLabel}` : auth.error);
-    }
+    // Through the host registry Pi resolves the stored credential itself, which
+    // may be header-only or ambient, so only the compat path needs a key here.
+    const viaRegistry = this.shared.routesThroughHostRegistry();
+    if (!auth.ok) throw new Error(auth.error);
+    if (!viaRegistry && !auth.apiKey) throw new Error(`No API key for ${request.modelLabel}`);
     if (signal.aborted) {
       throw new Error("Request was aborted");
     }
@@ -1809,8 +1834,10 @@ class PromptAutocompleteEditor extends CustomEditor {
       messages: [userMessage],
     };
     const requestOptions = {
-      apiKey: auth.apiKey,
-      headers: auth.headers,
+      // An explicit key makes Pi's registry skip the stored credential and with
+      // it any OAuth-derived endpoint (for example GitHub Copilot Enterprise),
+      // so credentials are only passed to the compat functions and to seams.
+      ...(viaRegistry ? {} : { apiKey: auth.apiKey, headers: auth.headers }),
       signal,
       maxTokens: computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars),
       timeoutMs: REQUEST_TIMEOUT_MS,
@@ -2972,16 +2999,34 @@ const COMMAND_RUNNERS: { [Name in PromptAutocompleteCommandName]: CommandRunner 
 export function createPromptAutocompleteExtension(
   dependencies: PromptAutocompleteDependencies = {},
 ): (pi: ExtensionAPI) => void {
-  const completeSimpleImpl = dependencies.completeSimple ?? hostCompleteSimple;
   const hostStreaming = hostSupportsStreamedResponses(piAiSimpleApi);
+  const now = dependencies.now ?? Date.now;
+
+  return function promptAutocompleteExtension(pi: ExtensionAPI): void {
+  // Injected seams win; otherwise each request routes through the session's
+  // model registry when it has one, and through the compat functions if not.
+  // The registry is read per request because a new session may bring another.
+  // This one function decides routing for both paths and for the credential
+  // handling in the producer, so they cannot disagree. Any injected seam keeps
+  // the registry out entirely, including for the path that was not injected.
+  const injectedSeams = !!(dependencies.completeSimple || dependencies.streamSimple);
+  const hostRegistryStream = (): RegistryStreamSimple | undefined =>
+    injectedSeams ? undefined : registryStreamSimple(shared.modelRegistry);
+  const routedCompleteSimple: CompleteSimpleFunction = (model, context, options) => {
+    const viaRegistry = hostRegistryStream();
+    return viaRegistry ? viaRegistry(model, context, options).result() : hostCompleteSimple(model, context, options);
+  };
+  const routedStreamSimple: StreamSimpleFunction = (model, context, options) => {
+    const viaRegistry = hostRegistryStream();
+    return viaRegistry ? viaRegistry(model, context, options) : hostStreamSimple(model, context, options);
+  };
+  const completeSimpleImpl = dependencies.completeSimple ?? routedCompleteSimple;
   // Existing deterministic harnesses inject only completeSimple. Never let such
   // a harness fall through to the real network-capable stream implementation.
   const streamSimpleImpl =
     dependencies.streamSimple
-    ?? (dependencies.completeSimple || !hostStreaming ? undefined : hostStreamSimple);
-  const now = dependencies.now ?? Date.now;
+    ?? (dependencies.completeSimple || !hostStreaming ? undefined : routedStreamSimple);
 
-  return function promptAutocompleteExtension(pi: ExtensionAPI): void {
   const settingsStore = dependencies.settingsStore ?? createFileSettingsStore(resolvePromptAutocompleteSettingsPath());
   let persistedSettings: PromptAutocompletePersistedSettings;
   try {
@@ -3060,6 +3105,7 @@ export function createPromptAutocompleteExtension(
     usageStats: createPromptAutocompleteUsageStats(),
     completeSimple: completeSimpleImpl,
     streamSimple: streamSimpleImpl,
+    routesThroughHostRegistry: () => hostRegistryStream() !== undefined,
     now,
     debugState: "idle",
     requestCache: new ExpiringLruCache(REQUEST_CACHE_TTL_MS, REQUEST_CACHE_MAX_ENTRIES, now),
