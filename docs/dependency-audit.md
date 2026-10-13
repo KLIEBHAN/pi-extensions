@@ -84,3 +84,5 @@ Once upstream ships the fix, upgrade the dependency and delete the entry. The ga
 ## Current exceptions
 
 None. Pi 1.x no longer publishes an `npm-shrinkwrap.json` inside `@earendil-works/pi-coding-agent`, so the `brace-expansion` and `undici` advisories that motivated this gate are resolved by this repository's own lockfile since the development toolchain moved to Pi `1.2.0`. The seven exceptions that expired on 2026-09-05 (GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895, GHSA-8xcm-r25x-g524, GHSA-4cwx-7wf7-3272, GHSA-m8rv-5g2x-5cg5, GHSA-jr45-8vmc-qm54, GHSA-v3r7-h72x-cjcm) were removed rather than renewed.
+
+The reconciliation gate is kept with an empty list until its retirement lands as a separately reviewed CI change, as the introduction prescribes. Until then it behaves like a full `npm audit` that fails on any advisory.

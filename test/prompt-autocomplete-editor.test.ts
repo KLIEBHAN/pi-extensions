@@ -2606,3 +2606,44 @@ test("a host projection that throws sends no conversation context instead of the
   assert.doesNotMatch(sentText, /raw branch only/);
   assert.match(sentText, /^Current draft \(cursor at end\):\nReview/);
 });
+
+test("the session projection is rebuilt per conversation change, not per keystroke", async () => {
+  const sentTexts: string[] = [];
+  const session = SessionManager.inMemory(process.cwd());
+  const secretId = session.appendMessage({ role: "user", content: "my secret token is abc123", timestamp: Date.now() });
+  session.appendMessage({ role: "user", content: "Now refactor the parser", timestamp: Date.now() });
+  let projections = 0;
+  const project = session.buildSessionProjection.bind(session);
+  session.buildSessionProjection = () => {
+    projections += 1;
+    return project();
+  };
+
+  const harness = createEditorHarness({
+    sessionManager: session,
+    completeSimple: (async (_model, context: any) => {
+      sentTexts.push(context.messages[0].content[0].text);
+      return makeCompletion([]);
+    }) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  for (const draft of ["R", "Re", "Rev", "Revi", "Review"]) {
+    editor.setText(draft);
+    await flushAsyncWork();
+  }
+  assert.equal(projections, 1, "keystrokes in one conversation reuse the projection");
+  assert.match(sentTexts.at(-1) ?? "", /abc123/);
+
+  // A metadata entry keeps the conversation id and the projection.
+  session.appendCustomEntry("unrelated-extension-state", { value: 1 });
+  editor.setText("Review the");
+  await flushAsyncWork();
+  assert.equal(projections, 1);
+
+  // A context edit changes the conversation id, so the redaction applies at once.
+  session.appendContextEdit(secretId, null);
+  editor.setText("Review the parser");
+  await flushAsyncWork();
+  assert.equal(projections, 2);
+  assert.doesNotMatch(sentTexts.at(-1) ?? "", /abc123/, "a redaction is never served from a stale projection");
+});

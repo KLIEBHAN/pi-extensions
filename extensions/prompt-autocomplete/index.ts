@@ -383,6 +383,15 @@ interface PromptAutocompleteSharedState {
   /** Refused model requests already reported, to avoid repeating them. */
   reportedModelRefusals: Set<string>;
   /**
+   * Projected context entries and the conversation id they belong to.
+   *
+   * The host projection scans the whole session, every branch included, so it
+   * is rebuilt only when a context-relevant entry changes the conversation id —
+   * a message, a context edit, a compaction, or a branch switch — and not on
+   * every keystroke. Metadata entries such as budget snapshots keep the id.
+   */
+  projectedContextMemo?: { conversationId: string; entries: unknown[] };
+  /**
    * Set once a mount attempt proved whether this host installs custom editors.
    *
    * A process cannot change its front-end, so this is deliberately never reset:
@@ -1440,14 +1449,14 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (!model) return undefined;
 
     const draft = this.getText();
-    const branch = readAutocompleteContextEntries(this.shared);
+    const conversationId = resolveCurrentConversationId(this.shared);
+    this.shared.lastConversationId = conversationId;
+    const branch = readAutocompleteContextEntries(this.shared, conversationId);
     const latestAssistantContext = buildLatestAssistantMessageContext(branch);
     const latestUserContext = buildLatestUserMessageContext(branch);
     const recentContext = buildRecentConversationContext(branch);
     const draftTail = truncateDraftTail(draft, MAX_DRAFT_CONTEXT_CHARS);
     const modelLabel = formatModelLabel(model);
-    const conversationId = resolveCurrentConversationId(this.shared);
-    this.shared.lastConversationId = conversationId;
 
     const prefixContextIdentity = {
       conversationId,
@@ -1989,6 +1998,7 @@ function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteShare
   shared.lastError = undefined;
   shared.lastRawResponse = undefined;
   shared.reportedModelRefusals.clear();
+  shared.projectedContextMemo = undefined;
   shared.requestCache.clear();
   shared.prefixReuseCache.clear();
   cancelAllCoalescedRequests(shared.inFlightRequests);
@@ -2018,12 +2028,20 @@ function readPhysicalSessionId(ctx: ExtensionContext): string {
  * requests as well. A projection that throws yields no conversation context
  * instead of the raw branch. Older hosts have no context edits, so their raw
  * branch is used as before.
+ *
+ * Autocomplete context covers user and assistant message text only, as it
+ * always has; the projection decides which of those messages the model still
+ * sees and in which form.
  */
-function readAutocompleteContextEntries(shared: PromptAutocompleteSharedState): unknown[] {
+function readAutocompleteContextEntries(shared: PromptAutocompleteSharedState, conversationId: string): unknown[] {
   const manager = shared.sessionManager;
   if (typeof manager?.buildSessionProjection === "function") {
+    const memo = shared.projectedContextMemo;
+    if (memo?.conversationId === conversationId) return memo.entries;
     try {
-      return projectAutocompleteContextEntries(manager.buildSessionProjection());
+      const entries = projectAutocompleteContextEntries(manager.buildSessionProjection());
+      shared.projectedContextMemo = { conversationId, entries };
+      return entries;
     } catch {
       return [];
     }
