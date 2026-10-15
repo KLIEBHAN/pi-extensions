@@ -33,7 +33,8 @@ const standalonePackageRoot = join(projectRoot, "extensions", "prompt-autocomple
 const fixturePath = join(projectRoot, "test", "fixtures", "pi-triplet-editor-smoke.ts");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const skipMatrix = process.env.PI_COMPAT_MATRIX === "0";
-const npmInstallTimeoutMs = 300_000;
+// Covers the slow `tmpdir()` fallback below (up to eight minutes measured).
+const npmInstallTimeoutMs = 600_000;
 
 const CORE_PACKAGES = ["pi-coding-agent", "pi-ai", "pi-tui"] as const;
 
