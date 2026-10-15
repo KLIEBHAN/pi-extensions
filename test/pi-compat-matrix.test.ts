@@ -25,9 +25,7 @@ import {
  *     against that triplet's actual CustomEditor and pi-tui runtime.
  *
  * Requires registry access. Set PI_COMPAT_MATRIX=0 to skip locally when
- * offline; CI never sets it. Windows CI still skips the registry installs:
- * `npm.cmd` via `spawnSync` hits the 10-minute timeout per triplet and then
- * leaves `EBUSY` temp trees. Ubuntu and macOS remain the executable contract.
+ * offline; CI never sets it. Ubuntu, macOS, and Windows CI all run it.
  */
 
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -35,15 +33,23 @@ const standalonePackageRoot = join(projectRoot, "extensions", "prompt-autocomple
 const fixturePath = join(projectRoot, "test", "fixtures", "pi-triplet-editor-smoke.ts");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const skipMatrix = process.env.PI_COMPAT_MATRIX === "0";
-const skipRegistrySmokes = skipMatrix || process.platform === "win32";
-const npmInstallTimeoutMs = process.platform === "win32" ? 600_000 : 300_000;
+// Covers the slow `tmpdir()` fallback below (up to eight minutes measured).
+const npmInstallTimeoutMs = 600_000;
 
 const CORE_PACKAGES = ["pi-coding-agent", "pi-ai", "pi-tui"] as const;
 
 /**
- * Windows CI timed out when the matrix and the below-baseline probe installed
- * triplets in parallel against one shared npm cache. Keep one install at a
- * time, and give each consumer its own cache directory.
+ * Each triplet unpacks roughly 35,000 files. On GitHub's Windows runners the
+ * system drive behind `tmpdir()` needs up to eight minutes per triplet for
+ * that, the runner's work drive behind `RUNNER_TEMP` about 20 seconds. Consumers live
+ * there in CI and under `tmpdir()` everywhere else.
+ */
+const consumerTempBase = process.env.RUNNER_TEMP || tmpdir();
+
+/**
+ * Concurrent installs bring no gain on the work drive and starve each other on
+ * slower disks. Keep one install at a time, and give each consumer its own
+ * cache directory.
  */
 let npmInstallQueue = Promise.resolve();
 
@@ -198,8 +204,8 @@ test("the support constants and the repository baseline agree", () => {
   );
 });
 
-test("supported Pi host triplets pass discovery and editor lifecycle smokes", { skip: skipRegistrySmokes }, async (t) => {
-  const tempRoot = mkdtempSync(join(tmpdir(), "pi-compat-matrix-"));
+test("supported Pi host triplets pass discovery and editor lifecycle smokes", { skip: skipMatrix }, async (t) => {
+  const tempRoot = mkdtempSync(join(consumerTempBase, "pi-compat-matrix-"));
 
   try {
     const tarball = packStandalone(join(tempRoot, "pack"));
@@ -227,13 +233,13 @@ test("the below-baseline probe is strictly under the documented minimum", () => 
   );
 });
 
-test("the below-baseline probe documents the current technical floor", { skip: skipRegistrySmokes }, async () => {
+test("the below-baseline probe documents the current technical floor", { skip: skipMatrix }, async () => {
   // Pi 0.79 is below the supported baseline and carries no promise. It happens
   // to work today because the pre-split pi-ai root exported the simple
   // completion API directly. When this test starts failing, the documented
   // baseline has become the technical floor: convert both smokes into
   // expected-failure assertions that pin the failure mode; do not delete them.
-  const tempRoot = mkdtempSync(join(tmpdir(), "pi-compat-probe-"));
+  const tempRoot = mkdtempSync(join(consumerTempBase, "pi-compat-probe-"));
 
   try {
     const tarball = packStandalone(join(tempRoot, "pack"));
