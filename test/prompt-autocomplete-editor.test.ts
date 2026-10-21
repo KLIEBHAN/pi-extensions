@@ -1382,6 +1382,201 @@ test("escape dismissal persists until a manual one-shot re-arms the same draft",
   assert.match(renderedText(editor), /rearmed/);
 });
 
+const ESCAPE = "\x1b";
+const BACKSPACE = "\x7f";
+
+function createDismissalHarness(options: Partial<EditorHarnessOptions> = {}) {
+  let calls = 0;
+  const harness = createEditorHarness({
+    maxAlternatives: 1,
+    completeSimple: (async () => {
+      calls += 1;
+      return makeCompletion([calls === 1 ? " dismiss me" : " rearmed"]);
+    }) as CompleteSimple,
+    ...options,
+  });
+  return { harness, calls: () => calls };
+}
+
+function typeText(editor: EditorComponent, text: string): void {
+  for (const char of text) editor.handleInput(char);
+}
+
+test("escape holds while the draft continues, without requests or prefix reuse", async () => {
+  const { harness, calls } = createDismissalHarness();
+  const editor = await harness.createEditor();
+  editor.setText("Escape");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /dismiss me/);
+
+  editor.handleInput(ESCAPE);
+  // Typing the dismissed suggestion's own next characters would otherwise be
+  // served by prefix reuse, and a diverging character would start a request.
+  typeText(editor, " dis");
+  await flushAsyncWork();
+  assert.doesNotMatch(renderedText(editor), /miss me/);
+  typeText(editor, "z");
+  await flushAsyncWork();
+  assert.equal(calls(), 1);
+  assert.doesNotMatch(renderedText(editor), /rearmed|miss me/);
+});
+
+test("backspacing below the dismissed draft ends the dismissal for good", async () => {
+  const { harness, calls } = createDismissalHarness();
+  const editor = await harness.createEditor();
+  editor.setText("Escape");
+  await flushAsyncWork();
+  editor.handleInput(ESCAPE);
+
+  editor.handleInput(BACKSPACE);
+  await flushAsyncWork();
+  assert.equal(calls(), 2);
+  assert.match(renderedText(editor), /rearmed/);
+
+  // Retyping the dismissed draft does not restore the dismissal.
+  typeText(editor, "e");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /dismiss me/);
+});
+
+test("a model switch away and back ends the dismissal, also via a model without auth", async () => {
+  const modelA = { provider: "test-provider", id: "model-a" };
+  const modelB = { provider: "test-provider", id: "model-b" };
+  const { harness, calls } = createDismissalHarness({
+    hasConfiguredAuth: (model) => model.id !== "model-b",
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Escape");
+  await flushAsyncWork();
+  editor.handleInput(ESCAPE);
+
+  harness.setModel(modelB);
+  await harness.emit("model_select", { model: modelB, previousModel: modelA, source: "set" });
+  await flushAsyncWork();
+  assert.doesNotMatch(renderedText(editor), /dismiss me/);
+
+  harness.setModel(modelA);
+  await harness.emit("model_select", { model: modelA, previousModel: modelB, source: "set" });
+  await flushAsyncWork();
+  assert.equal(calls(), 1, "the cached suggestion returns without a request");
+  assert.match(renderedText(editor), /dismiss me/);
+});
+
+test("a conversation change ends the dismissal", async () => {
+  const { harness, calls } = createDismissalHarness();
+  const editor = await harness.createEditor();
+  editor.setText("Escape");
+  await flushAsyncWork();
+  editor.handleInput(ESCAPE);
+
+  harness.setLeafId("leaf-2");
+  harness.setBranch([{ type: "message", message: { role: "assistant", content: "Next reply" } }]);
+  await harness.emit("session_tree", { oldLeafId: "leaf-1", newLeafId: "leaf-2" });
+  await flushAsyncWork();
+  assert.equal(calls(), 2);
+  assert.match(renderedText(editor), /rearmed/);
+});
+
+test("submit, history, and clear end the dismissal even when min-chars hides the empty draft", async () => {
+  const { harness, calls } = createDismissalHarness();
+  const editor = await harness.createEditor();
+  assert.ok(editor.addToHistory);
+  editor.setText("Escape");
+  await flushAsyncWork();
+  editor.handleInput(ESCAPE);
+
+  editor.handleInput("\r");
+  editor.addToHistory("Escape");
+  await flushAsyncWork();
+  assert.equal(editor.getText(), "");
+  // History restores the identical draft with the cursor at its start;
+  // moving to the end makes it eligible again.
+  editor.handleInput("\x1b[A");
+  editor.handleInput("\x05");
+  await flushAsyncWork();
+  assert.equal(editor.getText(), "Escape");
+  assert.match(renderedText(editor), /dismiss me/);
+
+  editor.handleInput(ESCAPE);
+  editor.setText("");
+  editor.setText("Escape");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /dismiss me/);
+  assert.equal(calls(), 1);
+});
+
+test("escape on an empty-draft suggestion holds only while the draft stays empty", async () => {
+  const { harness, calls } = createDismissalHarness();
+  await harness.command("min-chars 0");
+  const editor = await harness.createEditor();
+  editor.setText("");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /dismiss me/);
+
+  editor.handleInput(ESCAPE);
+  editor.setText("");
+  await flushAsyncWork();
+  assert.equal(calls(), 1);
+  assert.doesNotMatch(renderedText(editor), /dismiss me/);
+
+  typeText(editor, "a");
+  await flushAsyncWork();
+  assert.equal(calls(), 2);
+  assert.match(renderedText(editor), /rearmed/);
+});
+
+test("escape on a streamed partial cancels the stream and holds while typing", async () => {
+  const stream = controlledStream();
+  const signals: AbortSignal[] = [];
+  let calls = 0;
+  const harness = createEditorHarness({
+    completeSimple: (async () => {
+      throw new Error("completion path must not run");
+    }) as CompleteSimple,
+    streamSimple: ((_model, _context, options) => {
+      calls += 1;
+      signals.push(options?.signal as AbortSignal);
+      return stream.stream;
+    }) as StreamSimple,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Stream");
+  await flushAsyncWork();
+  stream.delta('{"completions":[" partial text', " partial text");
+  await flushAsyncWork();
+  // Partials show complete words only.
+  assert.match(renderedText(editor), /partial/);
+
+  editor.handleInput(ESCAPE);
+  assert.equal(signals[0]?.aborted, true);
+  typeText(editor, " more");
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+  assert.doesNotMatch(renderedText(editor), /partial/);
+  stream.error("aborted", undefined, "aborted");
+  await flushAsyncWork();
+});
+
+test("a model without auth at escape time neither loses nor misattributes the dismissal", async () => {
+  let authenticated = true;
+  const { harness, calls } = createDismissalHarness({ hasConfiguredAuth: () => authenticated });
+  const editor = await harness.createEditor();
+  editor.setText("Escape");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /dismiss me/);
+
+  // No request can be built at this moment; the dismissal still binds to the
+  // context the visible suggestion came from.
+  authenticated = false;
+  editor.handleInput(ESCAPE);
+  authenticated = true;
+  editor.setText("Escape");
+  typeText(editor, "!");
+  await flushAsyncWork();
+  assert.equal(calls(), 1);
+  assert.doesNotMatch(renderedText(editor), /dismiss me|rearmed/);
+});
+
 test("Pi built-in autocomplete keeps Tab precedence over ghost suggestions", async () => {
   let calls = 0;
   const harness = createEditorHarness({

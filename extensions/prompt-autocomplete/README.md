@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.3.0/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.4.0/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -38,7 +38,7 @@ Or enable it from inside an interactive session; the decision is saved for later
 | Accept the next word or chunk | `Ctrl+Space` |
 | Next alternative / manual one-shot | `Ctrl+.` |
 | Previous alternative | `Ctrl+,` |
-| Dismiss the suggestion for this draft | `Escape` |
+| Dismiss suggestions while you keep typing this draft | `Escape` |
 | Enable, disable, or inspect configuration | `/prompt-autocomplete on\|off\|toggle\|status` |
 | Show in-memory effectiveness and cost counters | `/prompt-autocomplete stats` |
 | Preview what a request would send, locally | `/prompt-autocomplete inspect [draft text]` |
@@ -77,6 +77,7 @@ pi \
 - Partial text advances monotonically: Latin text waits for complete word boundaries, while CJK and other no-space scripts remain grapheme-safe. Alternatives appear only after the response finishes.
 - `Tab` accepts all partial text currently visible. `Ctrl+Space` accepts only its next visible word/chunk. Both cancel that stream, and unlike accepting a completed suggestion, neither automatically starts another paid request.
 - Suggestions pause while the **main agent** is working by default, and stay paused until `agent_settled` on hosts that emit it. This is separate from streamed autocomplete responses. Use `--prompt-autocomplete-while-streaming` or `/prompt-autocomplete while-streaming on` to change that behavior.
+- `Escape` dismissal lasts while the draft extends the dismissed text: further typing starts no request and does not bring the suggestion back. It ends for good when the draft stops extending it (`Backspace`, submit, clear, history), when the conversation, autocomplete model, `max-chars`, or `max-alternatives` changes, or on `Ctrl+.`, accept, or cycling. Dismissing an empty-draft suggestion lasts only while the draft stays empty.
 - `Ctrl+.` with no active suggestion is an explicit one-shot request and may bypass the main-agent-streaming, cooldown, and minimum-length gates. Model, authentication, slash-command, and path safety checks still apply.
 - Use `--prompt-autocomplete-debug` or `/prompt-autocomplete debug-on` for troubleshooting.
 

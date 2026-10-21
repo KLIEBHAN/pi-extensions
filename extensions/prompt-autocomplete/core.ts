@@ -176,6 +176,48 @@ export function buildPromptAutocompletePrefixContextKey(
   return `${identity.modelLabel}|prefix|${hashPromptAutocompleteIdentity(identity)}`;
 }
 
+/** What an Escape dismissal is bound to besides the draft. */
+export interface PromptAutocompleteDismissalContextIdentity {
+  conversationId: string;
+  /** `provider/id` of the requested model, whether or not it can serve a request right now. */
+  requestedModel: string;
+  maxAlternatives: number;
+  maxSuggestionChars: number;
+}
+
+/**
+ * Context identity of an Escape dismissal.
+ *
+ * Unlike the prefix context key it needs no resolved, authenticated model, so a
+ * refresh can compare it before any gate: switching to a model that cannot
+ * serve a request still ends the dismissal.
+ */
+export function buildPromptAutocompleteDismissalContext(
+  identity: PromptAutocompleteDismissalContextIdentity,
+): string {
+  return JSON.stringify([
+    identity.conversationId,
+    identity.requestedModel,
+    identity.maxAlternatives,
+    identity.maxSuggestionChars,
+  ]);
+}
+
+/**
+ * Whether an Escape dismissal still covers this draft in this context.
+ *
+ * A non-empty dismissed draft covers every draft that extends it. An empty one
+ * covers only the empty draft, because every draft extends "".
+ */
+export function promptAutocompleteDismissalCovers(
+  dismissal: { draft: string; context: string },
+  draft: string,
+  context: string,
+): boolean {
+  if (dismissal.context !== context) return false;
+  return dismissal.draft.length === 0 ? draft.length === 0 : draft.startsWith(dismissal.draft);
+}
+
 export class ExpiringLruCache<T> {
   private readonly entries = new Map<string, { value: T; expiresAt: number }>();
   private readonly ttlMs: number;

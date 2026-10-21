@@ -8,6 +8,7 @@ import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
   buildPromptAutocompleteCacheKey,
+  buildPromptAutocompleteDismissalContext,
   buildPromptAutocompletePrefixContextKey,
   buildRecentConversationContext,
   cancelAllCoalescedRequests,
@@ -87,6 +88,7 @@ import {
   SequenceOwnedSlot,
   shouldSkipPromptAutocomplete,
   truncateDraftTail,
+  promptAutocompleteDismissalCovers,
   type CoalescedRequestEntry,
 } from "../extensions/prompt-autocomplete/core.ts";
 
@@ -1831,4 +1833,33 @@ test("the package README documents every command and set key", () => {
   for (const { key } of PROMPT_AUTOCOMPLETE_SET_KEYS) {
     assert.ok(readme.includes(key), `README mentions set ${key}`);
   }
+});
+
+test("escape dismissals cover extending drafts in the same context only", () => {
+  const identity = {
+    conversationId: "entry-1",
+    requestedModel: "openai/gpt-5.4-mini",
+    maxAlternatives: 3,
+    maxSuggestionChars: 160,
+  };
+  const context = buildPromptAutocompleteDismissalContext(identity);
+  for (const changed of [
+    { conversationId: "entry-2" },
+    { requestedModel: "openai/other" },
+    { maxAlternatives: 2 },
+    { maxSuggestionChars: 200 },
+  ]) {
+    assert.notEqual(buildPromptAutocompleteDismissalContext({ ...identity, ...changed }), context);
+  }
+
+  const dismissal = { draft: "Fix the", context };
+  assert.equal(promptAutocompleteDismissalCovers(dismissal, "Fix the", context), true);
+  assert.equal(promptAutocompleteDismissalCovers(dismissal, "Fix the tests", context), true);
+  assert.equal(promptAutocompleteDismissalCovers(dismissal, "Fix th", context), false);
+  assert.equal(promptAutocompleteDismissalCovers(dismissal, "Fix the tests", "other"), false);
+
+  // Every draft extends "", so an empty-draft dismissal covers only "".
+  const empty = { draft: "", context };
+  assert.equal(promptAutocompleteDismissalCovers(empty, "", context), true);
+  assert.equal(promptAutocompleteDismissalCovers(empty, "a", context), false);
 });
