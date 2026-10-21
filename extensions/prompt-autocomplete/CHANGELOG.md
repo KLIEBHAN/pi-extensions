@@ -8,6 +8,10 @@ All notable changes to this package are documented here. This project follows [S
 
 - `Escape` now dismisses a suggestion for as long as you keep typing the same draft, instead of only until the next keystroke. Previously the next character brought the dismissed suggestion back, from the prefix cache or through a new provider request. The dismissal ends for good when the draft no longer extends the dismissed text (for example after `Backspace`, submitting, clearing, or recalling another prompt), when the conversation, the autocomplete model, `max-chars`, or `max-alternatives` changes, or when you press `Ctrl+.`, accept, or cycle. An `Escape` on an empty-draft suggestion lasts only while the draft stays empty.
 
+### Fixed
+
+- The word-accept and cycle keys (`Ctrl+Space`, `Ctrl+Tab`, `Ctrl+.`, `Alt+]`, `Ctrl+,`, `Alt+[`) no longer take input that Pi would use. A Pi action you bind to one of them in `keybindings.json`, including history and interrupt, another extension's shortcut on the same key, and a pending character jump (`Ctrl+]`) now get the key as they would without Prompt Autocomplete; previously visible ghost text took it. The check uses Pi's current keymap, so remaps loaded by `/reload` apply at once. `/prompt-autocomplete status` lists such keys under `keys-used-by-pi`. Pi's default keymap uses none of them, so nothing changes without remaps.
+
 ## [0.3.0] - 2026-10-13
 
 ### Changed

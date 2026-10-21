@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { stripVTControlCharacters } from "node:util";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import type { KeyId, KeybindingsConfig } from "@earendil-works/pi-tui";
 
 const TEMPLATE_VARIABLE_PATTERN = /(?<!\\)\{\{\s*([A-Z0-9_]+)\s*(?:\|\s*([\s\S]*?))?\s*\}\}/g;
 const ESCAPED_TEMPLATE_VARIABLE_PATTERN = /\\(\{\{\s*[A-Z0-9_]+\s*(?:\|\s*[\s\S]*?)?\s*\}\})/g;
@@ -2560,6 +2561,90 @@ const ON_OFF_TOGGLE = (subject: string) => [
   ["off", `Turn ${subject} off`],
   ["toggle", `Switch ${subject}`],
 ] as const;
+
+/**
+ * Prompt Autocomplete's key actions and their keys; the first key is the one
+ * hints show.
+ *
+ * `accept` and `dismiss` take `tab` and `escape` only while ghost text is
+ * visible. The yielding actions act only on input that Pi leaves free, so a
+ * user's Pi keymap or a Pi default on the same key always wins.
+ */
+export const PROMPT_AUTOCOMPLETE_KEY_ACTIONS = {
+  accept: { keys: ["tab"], yieldsToPi: false },
+  acceptWord: { keys: ["ctrl+space", "ctrl+tab"], yieldsToPi: true },
+  /** Also the manual one-shot trigger when no suggestion is shown. */
+  cycleNext: { keys: ["ctrl+.", "alt+]"], yieldsToPi: true },
+  cyclePrev: { keys: ["ctrl+,", "alt+["], yieldsToPi: true },
+  dismiss: { keys: ["escape"], yieldsToPi: false },
+} as const satisfies Record<string, { keys: readonly KeyId[]; yieldsToPi: boolean }>;
+
+export type PromptAutocompleteKeyAction = keyof typeof PROMPT_AUTOCOMPLETE_KEY_ACTIONS;
+
+const KEY_MODIFIER_ORDER = ["ctrl", "shift", "alt", "super"] as const;
+const KEY_NAME_ALIASES: Record<string, string> = { esc: "escape", return: "enter" };
+/** US-layout symbols that Shift produces; Pi matches both spellings of such a key. */
+const SHIFTED_SYMBOLS: Record<string, string> = {
+  "`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
+  "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|", ";": ":", ",": "<", ".": ">", "/": "?",
+};
+/** Key ids that legacy terminals encode as the same bytes as another key id. */
+const LEGACY_EQUIVALENT_KEYS: Record<string, string> = {
+  "ctrl+i": "tab",
+  "ctrl+[": "escape",
+  "ctrl+m": "enter",
+  "ctrl+h": "backspace",
+  "ctrl+_": "ctrl+-",
+};
+
+/**
+ * Comparable form of a key id: lowercase, modifiers in a fixed order, Pi's key
+ * name aliases resolved, Shift plus a symbol folded into the shifted symbol,
+ * and legacy byte-equivalent keys folded together.
+ */
+export function canonicalKeyId(key: string): string {
+  let rest = key.toLowerCase();
+  const modifiers = new Set<string>();
+  for (let matched = true; matched;) {
+    matched = false;
+    for (const modifier of KEY_MODIFIER_ORDER) {
+      // `ctrl++` keeps its `+` key: a modifier needs a key after it.
+      if (rest.startsWith(`${modifier}+`) && rest.length > modifier.length + 1) {
+        modifiers.add(modifier);
+        rest = rest.slice(modifier.length + 1);
+        matched = true;
+      }
+    }
+  }
+  let base = KEY_NAME_ALIASES[rest] ?? rest;
+  // `ctrl+shift+=` and `ctrl++` name the same keypress.
+  const shifted = modifiers.has("shift") ? SHIFTED_SYMBOLS[base] : undefined;
+  if (shifted) {
+    modifiers.delete("shift");
+    base = shifted;
+  }
+  const canonical = [...KEY_MODIFIER_ORDER.filter((modifier) => modifiers.has(modifier)), base].join("+");
+  return LEGACY_EQUIVALENT_KEYS[canonical] ?? canonical;
+}
+
+/**
+ * Pi actions whose resolved keys look like `key`.
+ *
+ * For diagnostics only. The editor decides at input time with Pi's own
+ * matcher, so a miss here can hide a warning but never let a key act on input
+ * that Pi uses.
+ */
+export function findPiKeyConflicts(key: string, resolvedBindings: KeybindingsConfig): string[] {
+  const wanted = canonicalKeyId(key);
+  const conflicts: string[] = [];
+  for (const [action, keys] of Object.entries(resolvedBindings)) {
+    if (keys === undefined) continue;
+    if ((Array.isArray(keys) ? keys : [keys]).some((bound) => canonicalKeyId(bound) === wanted)) {
+      conflicts.push(action);
+    }
+  }
+  return conflicts;
+}
 
 /**
  * The `/prompt-autocomplete` grammar: the single source for dispatch, usage

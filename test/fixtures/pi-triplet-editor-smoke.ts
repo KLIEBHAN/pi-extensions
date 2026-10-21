@@ -12,10 +12,16 @@
  * checks for the final marker line.
  */
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, matchesKey, type EditorTheme, type KeyId, type TUI } from "@earendil-works/pi-tui";
 import { createPromptAutocompleteExtension } from "./pkg/index.ts";
+// Pi's app keymap is not exported from the package root; every supported host
+// ships it at this path. Defaults only: the agent directory has no keybindings.json.
+import { KeybindingsManager } from "./node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown;
 type EditorFactory = Exclude<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0], undefined>;
@@ -66,7 +72,7 @@ createPromptAutocompleteExtension({
     providerCalls += 1;
     return {
       role: "assistant",
-      content: [{ type: "text", text: JSON.stringify({ completions: [" the implementation carefully"] }) }],
+      content: [{ type: "text", text: JSON.stringify({ completions: [" the implementation carefully", " it"] }) }],
       stopReason: "stop",
     };
   }) as never,
@@ -92,7 +98,38 @@ const editorTheme: EditorTheme = {
     noMatch: passthrough,
   },
 };
-const editor = editorFactory(tui, editorTheme, { matches: () => false } as never);
+const agentDir = mkdtempSync(join(tmpdir(), "pi-smoke-agent-"));
+const keybindings = KeybindingsManager.create(agentDir);
+rmSync(agentDir, { recursive: true, force: true });
+assert.equal(typeof keybindings.getResolvedBindings, "function", "the host keymap must list its bindings");
+assert.equal(typeof decodeKittyPrintable, "function", "pi-tui must export decodeKittyPrintable");
+
+// Every encoding of Prompt Autocomplete's default yielding keys must be free in
+// the host's default keymap, or that key would silently go to Pi.
+const DEFAULT_KEY_INPUTS: Array<[KeyId, string]> = [
+  ["ctrl+space", "\x00"],
+  ["ctrl+space", "\x1b[32;5u"],
+  ["ctrl+tab", "\x1b[9;5u"],
+  ["ctrl+.", "\x1b[46;5u"],
+  ["alt+]", "\x1b]"],
+  ["alt+]", "\x1b[93;3u"],
+  ["ctrl+,", "\x1b[44;5u"],
+  ["alt+[", "\x1b[91;3u"],
+];
+const recognizedKeys = new Set<KeyId>();
+for (const [key, input] of DEFAULT_KEY_INPUTS) {
+  // Older hosts do not decode every legacy form (Pi 0.80 ignores ESC ] for
+  // alt+]); such an input cannot trigger the key there either.
+  if (!matchesKey(input, key)) continue;
+  recognizedKeys.add(key);
+  for (const [action, keys] of Object.entries(keybindings.getResolvedBindings())) {
+    const bound = keys === undefined ? [] : Array.isArray(keys) ? keys : [keys];
+    assert.ok(!bound.some((boundKey) => matchesKey(input, boundKey)), `${key} is bound to ${action} by default`);
+  }
+}
+assert.equal(recognizedKeys.size, new Set(DEFAULT_KEY_INPUTS.map(([key]) => key)).size, "every default key needs a recognized encoding");
+
+const editor = editorFactory(tui, editorTheme, keybindings as never);
 
 editor.setText("Review");
 for (let index = 0; index < 6; index += 1) {
@@ -106,8 +143,38 @@ const rendered = editor
   .join("\n");
 assert.match(rendered, /the implementation carefully/, `ghost text missing. rendered:\n${rendered}`);
 
+// Free keys reach Pi's editor first, which must leave text, cursor, and change
+// notifications alone; only the cycling itself may happen.
+let changes = 0;
+editor.onChange = () => {
+  changes += 1;
+};
+const cursorBefore = editor.getCursor();
+editor.handleInput("\x1b[46;5u");
+assert.match(editor.render(80).map((line: string) => stripVTControlCharacters(line)).join("\n"), /‹2\/2›/, "Ctrl+. must cycle");
+editor.handleInput("\x1b[44;5u");
+assert.equal(editor.getText(), "Review", "free keys must not edit the draft");
+assert.deepEqual(editor.getCursor(), cursorBefore, "free keys must not move the cursor");
+assert.equal(changes, 0, "free keys must not report a change");
+
+// The real keymap leaves Ctrl+Space free, and Pi's editor does nothing with it.
+editor.handleInput("\x1b[32;5u");
+assert.equal(editor.getText(), "Review the ", "Ctrl+Space must accept exactly one word");
 editor.handleInput("\t");
 assert.equal(editor.getText(), "Review the implementation carefully", "Tab must accept the suggestion");
+
+// The host consults other extensions' shortcuts first; so does Prompt Autocomplete.
+let shortcutRuns = 0;
+const shortcutEditor = editor as typeof editor & { onExtensionShortcut?: (data: string) => boolean };
+shortcutEditor.onExtensionShortcut = (data) => {
+  if (!matchesKey(data, "ctrl+.")) return false;
+  shortcutRuns += 1;
+  return true;
+};
+const callsBefore = providerCalls;
+editor.handleInput("\x1b[46;5u");
+assert.equal(shortcutRuns, 1, "an extension shortcut on Ctrl+. must run exactly once");
+assert.equal(providerCalls, callsBefore, "Ctrl+. must not also trigger a request");
 assert.ok(renderRequests > 0, "the editor must request renders");
 
 await handlers.get("session_shutdown")?.({}, ctx);

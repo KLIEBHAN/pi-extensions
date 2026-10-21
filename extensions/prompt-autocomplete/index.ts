@@ -10,7 +10,15 @@ import type {
   UserMessage,
 } from "@earendil-works/pi-ai";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  decodeKittyPrintable,
+  matchesKey,
+  truncateToWidth,
+  type EditorTheme,
+  type KeyId,
+  type TUI,
+  visibleWidth,
+} from "@earendil-works/pi-tui";
 import {
   acquireCoalescedRequest,
   buildPromptAutocompleteCacheKey,
@@ -86,6 +94,8 @@ import {
   serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
+  PROMPT_AUTOCOMPLETE_KEY_ACTIONS,
+  findPiKeyConflicts,
   promptAutocompleteDismissalCovers,
   recordProviderLatency,
   recordProviderUsage,
@@ -138,15 +148,9 @@ const REQUEST_CACHE_TTL_MS = 60_000;
 const REQUEST_CACHE_MAX_ENTRIES = 128;
 const PRIVACY_NOTICE =
   "Requests send the current draft and recent conversation context to the selected model and may incur provider usage.";
-// Keymap audit vs. pi defaults (packages/tui/src/keybindings.ts +
-// packages/coding-agent/src/core/keybindings.ts): none of the keys below are bound
-// by pi's default keymap, so the editor can safely own them — including the
-// broadened `ctrl+.`/`alt+]` one-shot trigger, which shadows no base action. The
-// only nearby defaults are `ctrl+]` (jumpForward) and `ctrl+alt+]` (jumpBackward),
-// both distinct from our `alt+]`.
-const WORD_ACCEPT_KEYS: readonly KeyId[] = ["ctrl+space", "ctrl+tab"];
-const CYCLE_NEXT_KEYS: readonly KeyId[] = ["ctrl+.", "alt+]"];
-const CYCLE_PREV_KEYS: readonly KeyId[] = ["ctrl+,", "alt+["];
+const WORD_ACCEPT_KEYS = PROMPT_AUTOCOMPLETE_KEY_ACTIONS.acceptWord.keys;
+const CYCLE_NEXT_KEYS = PROMPT_AUTOCOMPLETE_KEY_ACTIONS.cycleNext.keys;
+const CYCLE_PREV_KEYS = PROMPT_AUTOCOMPLETE_KEY_ACTIONS.cyclePrev.keys;
 const NAVIGATION_ACTIONS = [
   "tui.editor.cursorUp",
   "tui.editor.cursorDown",
@@ -505,6 +509,8 @@ interface PromptAutocompleteSharedState {
   inFlightRequests: Map<string, CoalescedRequestEntry<PromptAutocompleteCacheEntry, string>>;
   ownsEditor?: () => boolean;
   refreshEditor?: (options?: SuggestionRefreshOptions) => void;
+  /** Pi's keymap as last handed to the editor factory; read by `status`. */
+  keybindings?: KeybindingsManager;
   cancelActiveRequest?: () => void;
   /** Cancel a pending debounce timer without aborting an in-flight provider call. */
   cancelScheduledRequest?: () => void;
@@ -524,6 +530,15 @@ interface SuggestionRequest extends PromptAutocompleteRequestSnapshot {
   /** Context an Escape dismissal of this request's suggestions is bound to. */
   dismissalContext: string;
   useStreaming: boolean;
+}
+
+/** Key actions that act only on input Pi leaves free. */
+type YieldingKeyAction = "cycle" | "manual" | "acceptWord";
+
+interface EditorInputState {
+  text: string;
+  cursor: { line: number; col: number };
+  autocomplete: boolean;
 }
 
 interface PendingSuggestionRequest {
@@ -609,6 +624,49 @@ async function consumeAssistantStream(
 
 function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
   return keys.some((key) => matchesKey(data, key));
+}
+
+/**
+ * What in Pi uses this exact input, if anything; a yielding Prompt Autocomplete
+ * key must then leave it to Pi.
+ *
+ * Every action in Pi's current keymap counts, in any scope; Pi's own matcher
+ * decides, so its byte and shifted-symbol equivalences apply, and remaps loaded
+ * by `/reload` count at once. Inputs that Pi's editor handles outside its keymap
+ * count as well: Shift+Space/Backspace/Delete, newline encodings, and printable
+ * text. A host whose keymap cannot be listed keeps the keys, as before 0.4.0.
+ */
+function findPiUseOfInput(keybindings: KeybindingsManager, data: string): string | undefined {
+  if (typeof keybindings.getResolvedBindings === "function") {
+    for (const [action, keys] of Object.entries(keybindings.getResolvedBindings())) {
+      if (keys === undefined) continue;
+      if ((Array.isArray(keys) ? keys : [keys]).some((key) => matchesKey(data, key))) return action;
+    }
+  }
+  if (matchesKey(data, "shift+space") || matchesKey(data, "shift+backspace") || matchesKey(data, "shift+delete")) {
+    return "the editor";
+  }
+  // Newline encodings the pi-tui editor accepts besides `tui.input.newLine`.
+  if (data === "\n" || data === "\x1b\r" || data === "\x1b[13;2~") return "the editor";
+  if (data.length > 1 && (data.charCodeAt(0) === 10 || (data.includes("\x1b") && data.includes("\r")))) {
+    return "the editor";
+  }
+  return data.charCodeAt(0) >= 32 || decodeKittyPrintable(data) !== undefined ? "text input" : undefined;
+}
+
+/** `status` note on yielding keys that Pi's keymap also binds. */
+function formatKeyConflicts(keybindings: KeybindingsManager | undefined): string | undefined {
+  if (typeof keybindings?.getResolvedBindings !== "function") return undefined;
+  const resolved = keybindings.getResolvedBindings();
+  const notes: string[] = [];
+  for (const action of Object.values(PROMPT_AUTOCOMPLETE_KEY_ACTIONS)) {
+    if (!action.yieldsToPi) continue;
+    for (const key of action.keys) {
+      const conflicts = findPiKeyConflicts(key, resolved);
+      if (conflicts.length > 0) notes.push(`${key} (${conflicts.join(", ")})`);
+    }
+  }
+  return notes.length > 0 ? `keys-used-by-pi=${notes.join(", ")}` : undefined;
 }
 
 function formatPrimaryKey(keys: readonly KeyId[]): string {
@@ -933,6 +991,7 @@ function formatStatus(shared: PromptAutocompleteSharedState, interactiveHost = t
     interactiveHost
       ? `keys=tab accept | ${formatPrimaryKey(WORD_ACCEPT_KEYS)} word | ${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle | ${formatPrimaryKey(CYCLE_NEXT_KEYS)} force one-shot`
       : undefined,
+    interactiveHost ? formatKeyConflicts(shared.keybindings) : undefined,
   ]
     .filter((value): value is string => !!value)
     .join(" | ");
@@ -1185,18 +1244,22 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
-    if (this.canCycleSuggestions(data)) {
-      this.cycleSuggestions(matchesAnyKey(data, CYCLE_NEXT_KEYS) ? 1 : -1);
-      return;
-    }
-
-    if (this.canTriggerManualSuggestion(data)) {
-      this.triggerManualSuggestion();
-      return;
-    }
-
-    if (this.canAcceptInlineSuggestionByWord(data)) {
-      this.acceptInlineSuggestionByWord();
+    const action = this.matchYieldingKeyAction(data);
+    const piUse = action ? findPiUseOfInput(this.appKeybindings, data) : undefined;
+    if (piUse) {
+      // Shown until the refresh after Pi's handling reports something newer.
+      updateDebugState(this.shared, "yielded", `Key left to Pi: ${piUse}`);
+    } else if (action) {
+      // Pi's order: another extension's shortcut on the same key comes first.
+      const before = this.captureInputState();
+      if (this.onExtensionShortcut?.(data)) {
+        this.refreshAfterInput(before);
+        return;
+      }
+      // For input Pi leaves free, Pi's editor only cancels a pending character
+      // jump, exactly as without this extension.
+      super.handleInput(data);
+      this.runYieldingKeyAction(action, data);
       return;
     }
 
@@ -1207,19 +1270,39 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     this.clearInlineSuggestionForUserIntent(data);
 
-    const beforeText = this.getText();
-    const beforeCursor = this.getCursor();
-    const beforeAutocomplete = this.isShowingAutocomplete();
-
+    const before = this.captureInputState();
     super.handleInput(data);
+    this.refreshAfterInput(before);
+  }
 
-    const afterText = this.getText();
-    const afterCursor = this.getCursor();
-    const afterAutocomplete = this.isShowingAutocomplete();
+  /** The yielding key action this input would trigger right now, if any. */
+  private matchYieldingKeyAction(data: string): YieldingKeyAction | undefined {
+    if (this.canCycleSuggestions(data)) return "cycle";
+    if (this.canTriggerManualSuggestion(data)) return "manual";
+    if (this.canAcceptInlineSuggestionByWord(data)) return "acceptWord";
+    return undefined;
+  }
 
-    const textChanged = beforeText !== afterText;
-    const cursorChanged = beforeCursor.line !== afterCursor.line || beforeCursor.col !== afterCursor.col;
-    const autocompleteChanged = beforeAutocomplete !== afterAutocomplete;
+  private runYieldingKeyAction(action: YieldingKeyAction, data: string): void {
+    if (action === "cycle") {
+      this.cycleSuggestions(matchesAnyKey(data, CYCLE_NEXT_KEYS) ? 1 : -1);
+    } else if (action === "manual") {
+      this.triggerManualSuggestion();
+    } else {
+      this.acceptInlineSuggestionByWord();
+    }
+  }
+
+  private captureInputState(): EditorInputState {
+    return { text: this.getText(), cursor: this.getCursor(), autocomplete: this.isShowingAutocomplete() };
+  }
+
+  /** Refresh suggestions after input that the editor or Pi handled. */
+  private refreshAfterInput(before: EditorInputState): void {
+    const after = this.captureInputState();
+    const textChanged = before.text !== after.text;
+    const cursorChanged = before.cursor.line !== after.cursor.line || before.cursor.col !== after.cursor.col;
+    const autocompleteChanged = before.autocomplete !== after.autocomplete;
 
     if (textChanged || cursorChanged || autocompleteChanged) {
       this.refreshSuggestion({ clearExisting: true });
@@ -2158,6 +2241,7 @@ function mountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedStat
 
   const installedFactory: EditorFactory = (tui, theme, keybindings) => {
     const editor = new PromptAutocompleteEditor(tui, theme, keybindings, shared, activationId);
+    shared.keybindings = keybindings;
     shared.refreshEditor = (options) => {
       if (activationId !== shared.activationId) return;
       editor.refreshFromExternalChange(options);
