@@ -416,13 +416,23 @@ export function resolvePromptAutocompleteSettingsPath(
  * decisions are never replaced by the new one alone. Two processes saving in
  * the same instant can still lose one decision; there is no lock.
  */
-export function createPromptAutocompleteFileSettingsStore(path: string): PromptAutocompleteSettingsStore {
+export function createPromptAutocompleteFileSettingsStore(
+  path: string,
+  fileSystem: SettingsFileSystem = NODE_SETTINGS_FILE_SYSTEM,
+): PromptAutocompleteSettingsStore {
   const readText = (): string | undefined => {
     try {
-      return readFileSync(path, "utf8");
+      return fileSystem.readFileSync(path, "utf8");
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) return undefined;
       throw error;
+    }
+  };
+  const removeTemporaryFile = (tempPath: string): void => {
+    try {
+      fileSystem.rmSync(tempPath, { force: true });
+    } catch {
+      // The write failure is the error worth reporting.
     }
   };
   return {
@@ -436,25 +446,36 @@ export function createPromptAutocompleteFileSettingsStore(path: string): PromptA
     update(patch: Partial<PromptAutocompletePersistedSettings>): void {
       const merged = mergePromptAutocompleteSettingsText(readText(), patch);
       const tempPath = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-      mkdirSync(dirname(path), { recursive: true });
+      fileSystem.mkdirSync(dirname(path), { recursive: true });
       try {
         // `wx` creates the file or fails; it never writes through an entry
         // that already exists under that name, such as a planted link.
-        writeFileSync(tempPath, merged, { encoding: "utf8", flag: "wx", mode: 0o600 });
-        renameSync(tempPath, path);
+        fileSystem.writeFileSync(tempPath, merged, { encoding: "utf8", flag: "wx", mode: 0o600 });
       } catch (error) {
-        if (!hasErrorCode(error, "EEXIST")) {
-          try {
-            rmSync(tempPath, { force: true });
-          } catch {
-            // The write failure is the error worth reporting.
-          }
-        }
+        // An entry that already existed is not ours to remove.
+        if (!hasErrorCode(error, "EEXIST")) removeTemporaryFile(tempPath);
+        throw error;
+      }
+      try {
+        fileSystem.renameSync(tempPath, path);
+      } catch (error) {
+        removeTemporaryFile(tempPath);
         throw error;
       }
     },
   };
 }
+
+/** The file operations the settings store uses; tests replace them to inject failures. */
+export interface SettingsFileSystem {
+  readFileSync(path: string, encoding: "utf8"): string;
+  writeFileSync(path: string, data: string, options: { encoding: "utf8"; flag: string; mode: number }): void;
+  renameSync(oldPath: string, newPath: string): void;
+  rmSync(path: string, options: { force: boolean }): void;
+  mkdirSync(path: string, options: { recursive: true }): unknown;
+}
+
+const NODE_SETTINGS_FILE_SYSTEM: SettingsFileSystem = { readFileSync, writeFileSync, renameSync, rmSync, mkdirSync };
 
 function hasErrorCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;

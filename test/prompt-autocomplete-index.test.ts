@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import {
 import {
   createPromptAutocompleteExtension,
   createPromptAutocompleteFileSettingsStore,
+  type SettingsFileSystem,
   type PromptAutocompleteDependencies,
   type PromptAutocompleteProcessState,
   resolvePromptAutocompleteSettingsPath,
@@ -1264,20 +1265,44 @@ test("a saved settings file is readable by its owner only", { skip: process.plat
     const path = join(dir, "settings.json");
     createPromptAutocompleteFileSettingsStore(path).update({ enabled: true });
     assert.equal(statSync(path).mode & 0o777, 0o600);
+    // A file an older version wrote with default permissions is tightened too.
+    chmodSync(path, 0o644);
+    createPromptAutocompleteFileSettingsStore(path).update({ minPromptChars: 2 });
+    assert.equal(statSync(path).mode & 0o777, 0o600);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("a failed settings save leaves no temporary file", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pa-settings-"));
-  try {
-    // A non-empty directory where the file belongs makes the final rename fail.
-    const path = join(dir, "settings.json");
-    mkdirSync(join(path, "occupied"), { recursive: true });
-    assert.throws(() => createPromptAutocompleteFileSettingsStore(path).update({ enabled: true }));
-    assert.deepEqual(readdirSync(dir), ["settings.json"]);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test("a failed settings save removes its own temporary file and nothing else", () => {
+  const removed: string[] = [];
+  const failure = (code: string) => Object.assign(new Error(code), { code });
+  const fileSystem = (overrides: Partial<SettingsFileSystem>): SettingsFileSystem => ({
+    readFileSync: () => JSON.stringify({ enabled: true }),
+    writeFileSync: () => undefined,
+    renameSync: () => undefined,
+    rmSync: (path) => {
+      removed.push(path);
+    },
+    mkdirSync: () => undefined,
+    ...overrides,
+  });
+
+  const renameFails = createPromptAutocompleteFileSettingsStore("/settings.json", fileSystem({
+    // Even EEXIST from the rename leaves a temporary file this save created.
+    renameSync: () => {
+      throw failure("EEXIST");
+    },
+  }));
+  assert.throws(() => renameFails.update({ debounceMs: 200 }), /EEXIST/);
+  assert.equal(removed.length, 1, "the created temporary file is removed");
+  assert.match(removed[0]!, /^\/settings\.json\.\d+\.[0-9a-f]{12}\.tmp$/);
+
+  const planted = createPromptAutocompleteFileSettingsStore("/settings.json", fileSystem({
+    writeFileSync: () => {
+      throw failure("EEXIST");
+    },
+  }));
+  assert.throws(() => planted.update({ debounceMs: 200 }), /EEXIST/);
+  assert.equal(removed.length, 1, "an entry that already existed is left alone");
 });
