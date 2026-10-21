@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  applyPromptAutocompleteSettingsPatch,
   completePromptAutocompleteArguments,
   PROMPT_AUTOCOMPLETE_COMMANDS,
   PROMPT_AUTOCOMPLETE_SET_USAGE,
@@ -11,6 +14,7 @@ import {
 } from "../extensions/prompt-autocomplete/core.ts";
 import {
   createPromptAutocompleteExtension,
+  createPromptAutocompleteFileSettingsStore,
   type PromptAutocompleteDependencies,
   type PromptAutocompleteProcessState,
   resolvePromptAutocompleteSettingsPath,
@@ -143,10 +147,10 @@ function createHarness(options: HarnessOptions = {}) {
   const settingsSaves: PromptAutocompletePersistedSettings[] = [];
   const settingsStore = {
     load: () => ({ ...storedSettings }),
-    save: (settings: PromptAutocompletePersistedSettings) => {
+    update: (patch: Partial<PromptAutocompletePersistedSettings>) => {
       if (options.failingSettingsSave) throw new Error("read-only config directory");
-      storedSettings = { ...settings };
-      settingsSaves.push({ ...settings });
+      storedSettings = applyPromptAutocompleteSettingsPatch(storedSettings, patch);
+      settingsSaves.push({ ...storedSettings });
     },
   };
 
@@ -1210,4 +1214,29 @@ test("every grammar command dispatches, and unknown commands show the usage", as
   assert.equal(lastStatus(harness), PROMPT_AUTOCOMPLETE_USAGE);
   await command(harness, "set bogus 1");
   assert.equal(lastStatus(harness), PROMPT_AUTOCOMPLETE_SET_USAGE);
+});
+
+test("the settings file keeps decisions other processes saved and fields it does not know", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pa-settings-"));
+  try {
+    const path = join(dir, "settings.json");
+    writeFileSync(path, JSON.stringify({ enabled: true, futureSetting: { kept: true } }), "utf8");
+    // Two Pi processes: both load at activation, then save one decision each.
+    const first = createPromptAutocompleteFileSettingsStore(path);
+    const second = createPromptAutocompleteFileSettingsStore(path);
+    assert.deepEqual(first.load(), { enabled: true });
+    second.update({ minPromptChars: 3 });
+    first.update({ debounceMs: 200, keys: { acceptLine: ["alt+l"] } });
+
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), {
+      enabled: true,
+      futureSetting: { kept: true },
+      minPromptChars: 3,
+      debounceMs: 200,
+      keys: { acceptLine: ["alt+l"] },
+    });
+    assert.deepEqual(readdirSync(dir), ["settings.json"], "no temporary file is left behind");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

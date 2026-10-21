@@ -735,6 +735,8 @@ export interface PromptAutocompletePersistedSettings {
   maxAlternatives?: number;
   /** Raw dedicated model, or `active` for the session model. Invalid values are dropped on load. */
   model?: string;
+  /** Keys per configurable action; invalid key names are dropped on load. */
+  keys?: PromptAutocompleteKeySettings;
 }
 
 /**
@@ -780,12 +782,98 @@ export function parsePromptAutocompletePersistedSettings(
     const model = parsePersistedModelRaw(record.model);
     if (model !== undefined) settings.model = persistableModelRaw(model);
   }
+  const keys = readPersistedKeys(record.keys);
+  if (keys) settings.keys = keys;
   return settings;
+}
+
+/** Saved keys per configurable action, keeping only names in Pi's key grammar. */
+function readPersistedKeys(value: unknown): PromptAutocompleteKeySettings | undefined {
+  if (!isRecord(value)) return undefined;
+  const keys: PromptAutocompleteKeySettings = {};
+  for (const action of PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS) {
+    const entry = value[action];
+    if (!Array.isArray(entry)) continue;
+    keys[action] = entry.flatMap((raw) => {
+      const key = typeof raw === "string" ? parsePromptAutocompleteKeyId(raw) : undefined;
+      return key ? [key] : [];
+    });
+  }
+  return Object.keys(keys).length > 0 ? keys : undefined;
+}
+
+/**
+ * Apply a settings decision to the in-memory settings.
+ *
+ * `keys` merges per action, and an action set to `undefined` returns to its
+ * default keys.
+ */
+export function applyPromptAutocompleteSettingsPatch(
+  settings: PromptAutocompletePersistedSettings,
+  patch: Partial<PromptAutocompletePersistedSettings>,
+): PromptAutocompletePersistedSettings {
+  const next = { ...settings, ...patch };
+  if (patch.keys) next.keys = mergeKeySettings(settings.keys ?? {}, patch.keys);
+  if (next.keys === undefined) delete next.keys;
+  return next;
+}
+
+function mergeKeySettings(
+  current: PromptAutocompleteKeySettings,
+  patch: PromptAutocompleteKeySettings,
+): PromptAutocompleteKeySettings | undefined {
+  const merged: PromptAutocompleteKeySettings = { ...current, ...patch };
+  for (const action of PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS) {
+    if (merged[action] === undefined) delete merged[action];
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/**
+ * Write one settings decision into the current settings file text.
+ *
+ * The file is re-read right before every save, so a decision another Pi
+ * process saved in the meantime survives; only the decision itself changes.
+ * Fields this version does not know, such as a newer version's settings, stay
+ * as they are. Invalid values in the patch are not written.
+ */
+export function mergePromptAutocompleteSettingsText(
+  currentText: string | undefined,
+  patch: Partial<PromptAutocompletePersistedSettings>,
+): string {
+  let current: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = currentText ? JSON.parse(currentText) : {};
+    if (isRecord(parsed)) current = parsed;
+  } catch {
+    // An unreadable file is replaced by the decision, as on first save.
+  }
+  const { keys: patchKeys, ...scalars } = patch;
+  const next: Record<string, unknown> = { ...current, ...toPersistedPayload(scalars) };
+  if (patchKeys) {
+    // Other actions, including ones this version does not know, stay as written.
+    const keys: Record<string, unknown> = isRecord(current.keys) ? { ...current.keys } : {};
+    const valid = toPersistedPayload({ keys: patchKeys }).keys ?? {};
+    for (const action of PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS) {
+      if (!(action in patchKeys)) continue;
+      const value = valid[action];
+      if (value === undefined) delete keys[action];
+      else keys[action] = value;
+    }
+    if (Object.keys(keys).length > 0) next.keys = keys;
+    else delete next.keys;
+  }
+  return `${JSON.stringify(next, null, 2)}\n`;
 }
 
 export function serializePromptAutocompletePersistedSettings(
   settings: PromptAutocompletePersistedSettings,
 ): string {
+  return `${JSON.stringify(toPersistedPayload(settings), null, 2)}\n`;
+}
+
+/** The valid decisions in `settings`, as they are written to the file. */
+function toPersistedPayload(settings: PromptAutocompletePersistedSettings): PromptAutocompletePersistedSettings {
   const payload: PromptAutocompletePersistedSettings = {};
   if (typeof settings.enabled === "boolean") payload.enabled = settings.enabled;
   if (
@@ -822,7 +910,15 @@ export function serializePromptAutocompletePersistedSettings(
   }
   const model = parsePersistedModelRaw(settings.model);
   if (model !== undefined) payload.model = persistableModelRaw(model);
-  return `${JSON.stringify(payload, null, 2)}\n`;
+  if (settings.keys) {
+    const keys: PromptAutocompleteKeySettings = {};
+    for (const action of PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS) {
+      const entry = settings.keys[action];
+      if (entry) keys[action] = entry.filter((key) => parsePromptAutocompleteKeyId(key) === key);
+    }
+    if (Object.keys(keys).length > 0) payload.keys = keys;
+  }
+  return payload;
 }
 
 function readPersistedBoundedInt(
@@ -2389,6 +2485,15 @@ export function reusePromptAutocompleteSuggestions(
   return suggestions.length > 0 ? { suggestions, origins } : undefined;
 }
 
+/**
+ * The suggestion up to and including its first line break, or all of it when
+ * it has one line; accepting it leaves the cursor at the start of the next line.
+ */
+export function extractSuggestionLine(suggestion: string): string {
+  const lineBreak = suggestion.indexOf("\n");
+  return lineBreak < 0 ? suggestion : suggestion.slice(0, lineBreak + 1);
+}
+
 export function extractNextSuggestionChunk(suggestion: string): string | undefined {
   if (!suggestion) return undefined;
 
@@ -2534,13 +2639,15 @@ export const PROMPT_AUTOCOMPLETE_SET_KEYS = [
   { key: "max-chars", min: MAX_SUGGESTION_CHARS_MIN, max: MAX_SUGGESTION_CHARS_MAX, description: "Maximum characters per suggestion" },
   { key: "max-alternatives", min: MAX_ALTERNATIVES_MIN, max: MAX_ALTERNATIVES_MAX, description: "Maximum alternatives per request" },
   { key: "model", description: "Model for autocomplete requests" },
+  { key: "key", description: "Keys for a Prompt Autocomplete action" },
 ] as const;
 
 export type PromptAutocompleteSetKey = (typeof PROMPT_AUTOCOMPLETE_SET_KEYS)[number]["key"];
 
 /** Usage placeholder of one set key, e.g. `<0-5000>`. */
 export function formatSetKeyPlaceholder(spec: (typeof PROMPT_AUTOCOMPLETE_SET_KEYS)[number]): string {
-  return "min" in spec ? `<${spec.min}-${spec.max}>` : "<provider/model|active>";
+  if ("min" in spec) return `<${spec.min}-${spec.max}>`;
+  return spec.key === "key" ? "<action> <key...|default|none>" : "<provider/model|active>";
 }
 
 const SET_COMPLETIONS: readonly PromptAutocompleteCommandCompletion[] = PROMPT_AUTOCOMPLETE_SET_KEYS.flatMap((spec) => [
@@ -2551,10 +2658,11 @@ const SET_COMPLETIONS: readonly PromptAutocompleteCommandCompletion[] = PROMPT_A
     value: `set ${spec.key} `,
     // `active` has its own entry above, so the model label leaves it out and
     // fits Pi's 30-column label space.
-    label: `set ${spec.key} ${"min" in spec ? formatSetKeyPlaceholder(spec) : "<provider/model>"}`,
+    label: `set ${spec.key} ${"min" in spec ? formatSetKeyPlaceholder(spec) : spec.key === "key" ? "<action> <keys>" : "<provider/model>"}`,
     description: spec.description,
   },
 ]);
+
 
 const ON_OFF_TOGGLE = (subject: string) => [
   ["on", `Turn ${subject} on`],
@@ -2563,23 +2671,43 @@ const ON_OFF_TOGGLE = (subject: string) => [
 ] as const;
 
 /**
- * Prompt Autocomplete's key actions and their keys; the first key is the one
- * hints show.
+ * Prompt Autocomplete's key actions: command name for `set key`, label for
+ * hints, and default keys, the first of which hints show.
  *
  * `accept` and `dismiss` take `tab` and `escape` only while ghost text is
- * visible. The yielding actions act only on input that Pi leaves free, so a
- * user's Pi keymap or a Pi default on the same key always wins.
+ * visible and are fixed. The configurable actions act only on input that Pi
+ * leaves free, so a user's Pi keymap or a Pi default on the same key wins.
  */
 export const PROMPT_AUTOCOMPLETE_KEY_ACTIONS = {
-  accept: { keys: ["tab"], yieldsToPi: false },
-  acceptWord: { keys: ["ctrl+space", "ctrl+tab"], yieldsToPi: true },
+  accept: { command: "accept", keys: ["tab"] },
+  acceptWord: { command: "accept-word", keys: ["ctrl+space", "ctrl+tab"] },
+  acceptLine: { command: "accept-line", keys: [] },
   /** Also the manual one-shot trigger when no suggestion is shown. */
-  cycleNext: { keys: ["ctrl+.", "alt+]"], yieldsToPi: true },
-  cyclePrev: { keys: ["ctrl+,", "alt+["], yieldsToPi: true },
-  dismiss: { keys: ["escape"], yieldsToPi: false },
-} as const satisfies Record<string, { keys: readonly KeyId[]; yieldsToPi: boolean }>;
+  cycleNext: { command: "cycle-next", keys: ["ctrl+.", "alt+]"] },
+  cyclePrev: { command: "cycle-prev", keys: ["ctrl+,", "alt+["] },
+  dismiss: { command: "dismiss", keys: ["escape"] },
+} as const satisfies Record<string, { command: string; keys: readonly KeyId[] }>;
 
 export type PromptAutocompleteKeyAction = keyof typeof PROMPT_AUTOCOMPLETE_KEY_ACTIONS;
+
+/** Actions whose keys `set key` changes, in resolution order. */
+export const PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS = [
+  "acceptWord",
+  "acceptLine",
+  "cycleNext",
+  "cyclePrev",
+] as const satisfies readonly PromptAutocompleteKeyAction[];
+
+export type PromptAutocompleteConfigurableKeyAction = (typeof PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS)[number];
+
+/** Saved keys per configurable action; an empty list unbinds the action. */
+export type PromptAutocompleteKeySettings = Partial<Record<PromptAutocompleteConfigurableKeyAction, KeyId[]>>;
+
+export function findConfigurableKeyAction(command: string): PromptAutocompleteConfigurableKeyAction | undefined {
+  return PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS.find(
+    (action) => PROMPT_AUTOCOMPLETE_KEY_ACTIONS[action].command === command,
+  );
+}
 
 const KEY_MODIFIER_ORDER = ["ctrl", "shift", "alt", "super"] as const;
 const KEY_NAME_ALIASES: Record<string, string> = { esc: "escape", return: "enter" };
@@ -2596,19 +2724,28 @@ const LEGACY_EQUIVALENT_KEYS: Record<string, string> = {
   "ctrl+h": "backspace",
   "ctrl+_": "ctrl+-",
 };
-
 /**
- * Comparable form of a key id: lowercase, modifiers in a fixed order, Pi's key
- * name aliases resolved, Shift plus a symbol folded into the shifted symbol,
- * and legacy byte-equivalent keys folded together.
+ * Pi's named keys, the values of pi-tui's `Key` (a test keeps them equal).
+ * Listed here because importing pi-tui at runtime would stop this module from
+ * loading where `Intl.Segmenter` is missing.
  */
-export function canonicalKeyId(key: string): string {
+export const PI_KEY_NAMES: readonly string[] = [
+  "escape", "esc", "enter", "return", "tab", "space", "backspace", "delete", "insert", "clear", "home", "end",
+  "pageUp", "pageDown", "up", "down", "left", "right",
+  "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+  "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/", "!", "@", "#", "$", "%", "^", "&", "*", "(", ")",
+  "_", "+", "|", "~", "{", "}", ":", "<", ">", "?",
+];
+/** Pi's key names by lowercase spelling (`pageup` → `pageUp`). */
+const PI_KEY_NAMES_BY_LOWERCASE = new Map(PI_KEY_NAMES.map((name) => [name.toLowerCase(), name] as const));
+
+/** Modifiers and base key of a key id; `ctrl++` keeps its `+` key. */
+function splitKeyId(key: string): { modifiers: Set<string>; base: string } {
   let rest = key.toLowerCase();
   const modifiers = new Set<string>();
   for (let matched = true; matched;) {
     matched = false;
     for (const modifier of KEY_MODIFIER_ORDER) {
-      // `ctrl++` keeps its `+` key: a modifier needs a key after it.
       if (rest.startsWith(`${modifier}+`) && rest.length > modifier.length + 1) {
         modifiers.add(modifier);
         rest = rest.slice(modifier.length + 1);
@@ -2616,15 +2753,154 @@ export function canonicalKeyId(key: string): string {
       }
     }
   }
-  let base = KEY_NAME_ALIASES[rest] ?? rest;
+  const base = KEY_NAME_ALIASES[rest] ?? rest;
   // `ctrl+shift+=` and `ctrl++` name the same keypress.
   const shifted = modifiers.has("shift") ? SHIFTED_SYMBOLS[base] : undefined;
-  if (shifted) {
-    modifiers.delete("shift");
-    base = shifted;
+  if (!shifted) return { modifiers, base };
+  modifiers.delete("shift");
+  return { modifiers, base: shifted };
+}
+
+/**
+ * Comparable form of a key id: lowercase, modifiers in a fixed order, Pi's key
+ * name aliases resolved, Shift plus a symbol folded into the shifted symbol,
+ * and legacy byte-equivalent keys folded together.
+ */
+export function canonicalKeyId(key: string): string {
+  const normalized = normalizeKeyId(key);
+  return LEGACY_EQUIVALENT_KEYS[normalized] ?? normalized;
+}
+
+/** `canonicalKeyId` without folding legacy byte equivalents. */
+function normalizeKeyId(key: string): string {
+  const { modifiers, base } = splitKeyId(key);
+  return [...KEY_MODIFIER_ORDER.filter((modifier) => modifiers.has(modifier)), base].join("+");
+}
+
+/** Pi's spelling of a key id in its documented grammar, or undefined. */
+function spellKeyId(raw: string): string | undefined {
+  let rest = raw.trim().toLowerCase();
+  const modifiers: string[] = [];
+  for (;;) {
+    const modifier = KEY_MODIFIER_ORDER.find(
+      (candidate) => rest.startsWith(`${candidate}+`) && rest.length > candidate.length + 1,
+    );
+    if (!modifier) break;
+    if (modifiers.includes(modifier)) return undefined;
+    modifiers.push(modifier);
+    rest = rest.slice(modifier.length + 1);
   }
-  const canonical = [...KEY_MODIFIER_ORDER.filter((modifier) => modifiers.has(modifier)), base].join("+");
-  return LEGACY_EQUIVALENT_KEYS[canonical] ?? canonical;
+  const base = /^[a-z0-9]$/.test(rest) ? rest : PI_KEY_NAMES_BY_LOWERCASE.get(rest);
+  return base === undefined ? undefined : [...modifiers, base].join("+");
+}
+
+function isKeyId(value: string): value is KeyId {
+  return spellKeyId(value) === value;
+}
+
+/**
+ * Parse a key in Pi's documented grammar (`ctrl+shift+x`, `alt+]`, `f5`):
+ * modifiers `ctrl`, `shift`, `alt`, `super` at most once each, then a letter,
+ * digit, or one of Pi's key names. Case-insensitive; returns Pi's spelling.
+ */
+export function parsePromptAutocompleteKeyId(raw: string): KeyId | undefined {
+  const spelled = spellKeyId(raw);
+  return spelled !== undefined && isKeyId(spelled) ? spelled : undefined;
+}
+
+const RESERVED_KEYS = new Set(["tab", "escape", "enter", "backspace"]);
+const EDITOR_HARD_CODED_KEYS = new Set(["shift+space", "shift+backspace", "shift+delete", "shift+enter"]);
+
+/**
+ * Why a key cannot be a Prompt Autocomplete key, or undefined if it can.
+ *
+ * Tab, Escape, Enter, and Backspace (also as their legacy aliases such as
+ * `ctrl+i`), the keys Pi's editor handles outside its keymap, and keys that
+ * type text would never reach the action, or would take text away.
+ */
+export function describeUnusablePromptAutocompleteKey(key: string): string | undefined {
+  const canonical = canonicalKeyId(key);
+  if (RESERVED_KEYS.has(canonical)) {
+    return LEGACY_EQUIVALENT_KEYS[normalizeKeyId(key)] ? `${key} is the same input as ${canonical}` : `${key} is reserved`;
+  }
+  if (EDITOR_HARD_CODED_KEYS.has(canonical)) return `Pi's editor handles ${key}`;
+  const { modifiers, base } = splitKeyId(key);
+  const typesText = [...modifiers].every((modifier) => modifier === "shift")
+    && (base.length === 1 || base === "space");
+  return typesText ? `${key} types text` : undefined;
+}
+
+/** Effective Prompt Autocomplete keys, where each came from, and what was dropped. */
+export interface PromptAutocompleteKeymap {
+  keys: Record<PromptAutocompleteKeyAction, readonly KeyId[]>;
+  sources: Record<PromptAutocompleteConfigurableKeyAction, "default" | "saved">;
+  /** Saved keys that cannot be used, with the reason. */
+  ignored: string[];
+}
+
+/** Every action with its effective keys and their source, in hint order. */
+export function listPromptAutocompleteKeys(
+  keymap: PromptAutocompleteKeymap,
+): Array<{ command: string; keys: readonly KeyId[]; source: "default" | "saved" | "fixed" }> {
+  const fixed = (action: "accept" | "dismiss") => ({
+    command: PROMPT_AUTOCOMPLETE_KEY_ACTIONS[action].command,
+    keys: keymap.keys[action],
+    source: "fixed" as const,
+  });
+  return [
+    fixed("accept"),
+    ...PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS.map((action) => ({
+      command: PROMPT_AUTOCOMPLETE_KEY_ACTIONS[action].command,
+      keys: keymap.keys[action],
+      source: keymap.sources[action],
+    })),
+    fixed("dismiss"),
+  ];
+}
+
+/**
+ * Resolve saved keys over the defaults.
+ *
+ * A key that cannot be used, or that an earlier action already has (fixed
+ * actions first, then the configurable ones in table order), is dropped, so
+ * one keypress always means one action.
+ */
+export function resolvePromptAutocompleteKeymap(saved: PromptAutocompleteKeySettings = {}): PromptAutocompleteKeymap {
+  const { accept, dismiss } = PROMPT_AUTOCOMPLETE_KEY_ACTIONS;
+  const owners = new Map<string, PromptAutocompleteKeyAction>();
+  for (const key of accept.keys) owners.set(canonicalKeyId(key), "accept");
+  for (const key of dismiss.keys) owners.set(canonicalKeyId(key), "dismiss");
+  const configurable: Record<PromptAutocompleteConfigurableKeyAction, KeyId[]> = {
+    acceptWord: [],
+    acceptLine: [],
+    cycleNext: [],
+    cyclePrev: [],
+  };
+  const sources: PromptAutocompleteKeymap["sources"] = {
+    acceptWord: "default",
+    acceptLine: "default",
+    cycleNext: "default",
+    cyclePrev: "default",
+  };
+  const ignored: string[] = [];
+  for (const action of PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS) {
+    const configured = saved[action];
+    if (configured) sources[action] = "saved";
+    for (const key of configured ?? PROMPT_AUTOCOMPLETE_KEY_ACTIONS[action].keys) {
+      const canonical = canonicalKeyId(key);
+      const owner = owners.get(canonical);
+      if (owner === action) continue;
+      const reason = describeUnusablePromptAutocompleteKey(key)
+        ?? (owner ? `${key} already ${PROMPT_AUTOCOMPLETE_KEY_ACTIONS[owner].command}` : undefined);
+      if (reason) {
+        ignored.push(reason);
+        continue;
+      }
+      owners.set(canonical, action);
+      configurable[action].push(key);
+    }
+  }
+  return { keys: { ...configurable, accept: accept.keys, dismiss: dismiss.keys }, sources, ignored };
 }
 
 /**
@@ -2645,6 +2921,17 @@ export function findPiKeyConflicts(key: string, resolvedBindings: KeybindingsCon
   }
   return conflicts;
 }
+
+/** `set key` forms, offered once `set key ` is typed so `set ` stays short. */
+const SET_KEY_COMPLETIONS: readonly PromptAutocompleteCommandCompletion[] = PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS
+  .flatMap((action) => {
+    const { command } = PROMPT_AUTOCOMPLETE_KEY_ACTIONS[action];
+    return [
+      { value: `set key ${command} `, label: `set key ${command} <keys>`, description: "Space-separated keys" },
+      { value: `set key ${command} default`, label: `set key ${command} default`, description: "Restore the default keys" },
+      { value: `set key ${command} none`, label: `set key ${command} none`, description: "Unbind the action" },
+    ];
+  });
 
 /**
  * The `/prompt-autocomplete` grammar: the single source for dispatch, usage
@@ -2672,6 +2959,7 @@ export const PROMPT_AUTOCOMPLETE_COMMANDS = [
     ...commandSpec("set", "Show runtime knobs", { usage: "<key> [value]", bareComplete: true }),
     completions: SET_COMPLETIONS,
   },
+  commandSpec("keys", "Show the key for every action", { readOnly: true }),
   commandSpec("stream", "Toggle streamed response previews", {
     usage: "on|off|toggle",
     choices: ON_OFF_TOGGLE("streamed previews"),
@@ -2721,7 +3009,9 @@ const ALL_COMMAND_COMPLETIONS: readonly PromptAutocompleteCommandCompletion[] = 
 const COMPLETE_ARGUMENTS: ReadonlySet<string> = new Set([
   ...PROMPT_AUTOCOMPLETE_COMMANDS.filter((spec) => spec.bareComplete).map((spec) => spec.name),
   ...PROMPT_AUTOCOMPLETE_SET_KEYS.filter((spec) => "bareReports" in spec).map((spec) => `set ${spec.key}`),
-  ...ALL_COMMAND_COMPLETIONS.map((completion) => completion.value).filter((value) => !value.endsWith(" ")),
+  ...[...ALL_COMMAND_COMPLETIONS, ...SET_KEY_COMPLETIONS]
+    .map((completion) => completion.value)
+    .filter((value) => !value.endsWith(" ")),
 ]);
 
 /**
@@ -2737,7 +3027,7 @@ export function completePromptAutocompleteArguments(
 ): PromptAutocompleteCommandCompletion[] | null {
   const typed = argumentPrefix.trimStart().replace(/\s+/g, " ").toLowerCase();
   if (COMPLETE_ARGUMENTS.has(typed)) return null;
-  const matches = ALL_COMMAND_COMPLETIONS
+  const matches = (typed.startsWith("set key ") ? SET_KEY_COMPLETIONS : ALL_COMMAND_COMPLETIONS)
     .filter((completion) => completion.value.length > typed.length && completion.value.startsWith(typed))
     .map((completion) => ({ ...completion }));
   return matches.length > 0 ? matches : null;

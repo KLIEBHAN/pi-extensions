@@ -38,6 +38,7 @@ Or enable it from inside an interactive session; the decision is saved for later
 | Accept the next word or chunk | `Ctrl+Space` |
 | Next alternative / manual one-shot | `Ctrl+.` |
 | Previous alternative | `Ctrl+,` |
+| Accept up to the end of the line | none by default; see [Keys](#keys) |
 | Dismiss suggestions while you keep typing this draft | `Escape` |
 | Enable, disable, or inspect configuration | `/prompt-autocomplete on\|off\|toggle\|status` |
 | Show in-memory effectiveness and cost counters | `/prompt-autocomplete stats` |
@@ -48,11 +49,19 @@ Or enable it from inside an interactive session; the decision is saved for later
 | Cap provider requests for this session | `/prompt-autocomplete budget <n\|off>` |
 | Persist remaining runtime knobs | `/prompt-autocomplete set debounce-ms\|max-chars\|max-alternatives\|model` |
 | Inspect effective runtime knobs | `/prompt-autocomplete set` |
+| Show the key of every action | `/prompt-autocomplete keys` |
+| Change and persist an action's keys | `/prompt-autocomplete set key <action> <key...\|default\|none>` |
 | Show or hide the debug status line | `/prompt-autocomplete debug-on\|debug-off\|debug-toggle` |
 
 Legacy fallbacks are available for terminals that forward them: `Ctrl+Tab`, `Alt+[`, and `Alt+]`.
 
-Pi comes first: if your Pi keymap (`keybindings.json`) binds one of the word-accept or cycle keys, or another extension registers it as a shortcut, the key does what Pi or that extension defines, and `/prompt-autocomplete status` lists it under `keys-used-by-pi`. `Tab` and `Escape` keep their ghost-text meaning while a suggestion is visible.
+### Keys
+
+`/prompt-autocomplete set key <action> <key...>` changes the keys of `accept-word`, `accept-line`, `cycle-next` (also the manual one-shot), or `cycle-prev`; it applies at once and is saved with the other [persistent settings](#persistent-settings). Separate several keys with spaces, since `,` is a key itself: `set key cycle-prev ctrl+, alt+[`. `default` restores an action's default keys and `none` unbinds it. `accept-line` has no default key; `set key accept-line alt+l` gives it one. Accepting a line inserts the suggestion up to and including its first line break; a one-line suggestion is accepted whole.
+
+Keys use Pi's syntax (`ctrl+shift+x`, `alt+l`, `f5`; see Pi's `docs/keybindings.md`). Keys that cannot reach an action are rejected: `Tab`, `Escape`, `Enter`, `Backspace` and their legacy aliases such as `ctrl+i`, keys Pi's editor handles itself such as `shift+enter`, and keys that type text such as `a` or `shift+a`. A key another Prompt Autocomplete action has must be freed there first. `Tab` (accept) and `Escape` (dismiss) are fixed. `/prompt-autocomplete keys` shows every action's keys, whether they are the default or saved, and saved keys that are ignored.
+
+Pi comes first: if your Pi keymap (`keybindings.json`) binds one of these keys, or another extension registers it as a shortcut, the key does what Pi or that extension defines. `keys` and `status` (`keys-used-by-pi`) list such keys once the editor is active, and `set key` warns when you choose one. `Tab` and `Escape` keep their ghost-text meaning while a suggestion is visible.
 
 After `/prompt-autocomplete ` and a few letters, Pi's command menu completes the arguments, including nested forms such as `set debounce-ms` or `set model active`; `Tab` or `Enter` inserts the selection. A command that is already complete, such as `stats` or `stream on`, opens no menu, so `Enter` still submits it at once. Completion is local and installs no global autocomplete provider.
 
@@ -101,7 +110,7 @@ Changing `max-chars`, `max-alternatives`, or `model` cancels in-flight autocompl
 
 #### Persistent settings
 
-`/prompt-autocomplete on`, `off`, `min-chars <n>`, and `/prompt-autocomplete set` (`debounce-ms`, `max-chars`, `max-alternatives`, `model`) are durable: the decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (falling back to `~/.config`; override the location with `PI_PROMPT_AUTOCOMPLETE_SETTINGS`) and applies to later processes without any CLI flag. `/prompt-autocomplete min-chars` remains the canonical command; `set min-chars` dispatches to it. An explicit CLI flag still outranks the saved value for that invocation — for numeric knobs and the model flag, passing the registered default is indistinguishable from not passing the flag and defers to the saved value. `set model` validates syntax, registry presence, and auth before saving: a dedicated model must resolve, and `active` commits while no active model is known yet but is rejected when the known active model is unusable. `active` is an explicit sentinel for the session model, mixed-case model ids are preserved, and a cross-provider change restates the privacy notice. An enable decision is only recorded when the host actually installs the editor. The file stores nothing but these decisions; deleting it restores flag-only behaviour. `status` labels each value with its source, and success notices only claim durability when the file was actually written.
+`/prompt-autocomplete on`, `off`, `min-chars <n>`, and `/prompt-autocomplete set` (`debounce-ms`, `max-chars`, `max-alternatives`, `model`, `key`) are durable: the decision is saved to `$XDG_CONFIG_HOME/pi-prompt-autocomplete/settings.json` (falling back to `~/.config`; override the location with `PI_PROMPT_AUTOCOMPLETE_SETTINGS`) and applies to later processes without any CLI flag. `/prompt-autocomplete min-chars` remains the canonical command; `set min-chars` dispatches to it. An explicit CLI flag still outranks the saved value for that invocation — for numeric knobs and the model flag, passing the registered default is indistinguishable from not passing the flag and defers to the saved value. `set model` validates syntax, registry presence, and auth before saving: a dedicated model must resolve, and `active` commits while no active model is known yet but is rejected when the known active model is unusable. `active` is an explicit sentinel for the session model, mixed-case model ids are preserved, and a cross-provider change restates the privacy notice. An enable decision is only recorded when the host actually installs the editor. The file stores nothing but these decisions; deleting it restores flag-only behaviour. Each save re-reads the file and changes only the decision being saved, so decisions another Pi process saved in the meantime survive, as do fields a newer version wrote. Two saves in the same instant can still lose one decision; there is no lock. `status` labels each value with its source, and success notices only claim durability when the file was actually written.
 
 ### Usage and cost accounting
 
