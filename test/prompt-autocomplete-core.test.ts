@@ -1925,10 +1925,13 @@ test("keys that Pi's editor handles or that type text are unusable", () => {
     ["shift+a", /types text/],
     ["shift+1", /types text/],
     ["space", /types text/],
+    ["alt+esc", /does not recognize/],
+    ["ctrl+f1", /does not recognize/],
+    ["shift+f12", /does not recognize/],
   ] as const) {
     assert.match(describeUnusablePromptAutocompleteKey(key) ?? "", reason, key);
   }
-  for (const key of ["alt+l", "ctrl+shift+.", "ctrl++", "f5", "super+k"]) {
+  for (const key of ["alt+l", "ctrl+shift+.", "ctrl++", "f5", "super+k", "ctrl+home", "alt+up"]) {
     assert.equal(describeUnusablePromptAutocompleteKey(key), undefined, key);
   }
 });

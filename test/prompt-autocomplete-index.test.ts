@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1236,6 +1236,19 @@ test("the settings file keeps decisions other processes saved and fields it does
       keys: { acceptLine: ["alt+l"] },
     });
     assert.deepEqual(readdirSync(dir), ["settings.json"], "no temporary file is left behind");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed settings save leaves no temporary file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pa-settings-"));
+  try {
+    // A non-empty directory where the file belongs makes the final rename fail.
+    const path = join(dir, "settings.json");
+    mkdirSync(join(path, "occupied"), { recursive: true });
+    assert.throws(() => createPromptAutocompleteFileSettingsStore(path).update({ enabled: true }));
+    assert.deepEqual(readdirSync(dir), ["settings.json"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

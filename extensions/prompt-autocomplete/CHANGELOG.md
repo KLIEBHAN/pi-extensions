@@ -6,7 +6,7 @@ All notable changes to this package are documented here. This project follows [S
 
 ### Added
 
-- Configurable keys: `/prompt-autocomplete set key <action> <key...|default|none>` changes the keys of `accept-word`, `accept-line`, `cycle-next`, and `cycle-prev`, applies them at once, and saves them in the settings file. Keys follow Pi's key syntax and are space-separated. Keys that could never reach an action (Tab, Escape, Enter, Backspace and their legacy aliases, keys Pi's editor handles itself, keys that type text) and keys another action already has are rejected; a key that Pi's keymap binds is accepted with a warning, because Pi keeps it. `Tab` and `Escape` stay fixed.
+- Configurable keys: `/prompt-autocomplete set key <action> <key...|default|none>` changes the keys of `accept-word`, `accept-line`, `cycle-next`, and `cycle-prev`, applies them at once, and saves them in the settings file. Keys follow Pi's key syntax and are space-separated. Keys that could never reach an action (Tab, Escape, Enter, Backspace and their legacy aliases, keys Pi's editor handles itself, keys that type text, Escape and F1–F12 with a modifier) and keys another action already has are rejected; a key that Pi's keymap binds is accepted with a warning, because Pi keeps it. `Tab` and `Escape` stay fixed.
 - `/prompt-autocomplete keys` shows every action's keys, whether they are the default or saved, saved keys that are ignored, and keys Pi's keymap also binds.
 - `accept-line` accepts a suggestion up to and including its first line break; a one-line suggestion is accepted whole. It has no default key.
 

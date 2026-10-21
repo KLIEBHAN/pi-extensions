@@ -1899,6 +1899,8 @@ test("accept-line on a streamed partial cancels the stream without a new request
   assert.equal(signals[0]?.aborted, true);
   await flushAsyncWork();
   assert.equal(calls, 1);
+  await harness.command("stats");
+  assert.match(harness.notifications.at(-1) ?? "", /0 full, 1 word\/chunk/, "a streamed partial is a partial accept");
   stream.error("aborted", undefined, "aborted");
   await flushAsyncWork();
 });
@@ -1919,6 +1921,8 @@ test("set key rejects malformed, unusable, and taken keys and saves nothing", as
     ["key accept-line shift+space", /editor handles shift\+space/],
     ["key accept-line a", /a types text/],
     ["key accept-line shift+a", /shift\+a types text/],
+    ["key accept-line alt+esc", /Pi does not recognize alt\+esc/],
+    ["key accept-line ctrl+f5", /Pi does not recognize ctrl\+f5/],
     ["key accept-word ctrl+.", /ctrl\+\. is already cycle-next/],
   ] as const) {
     await harness.command(`set ${args}`);

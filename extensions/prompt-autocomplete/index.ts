@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import * as piAi from "@earendil-works/pi-ai";
@@ -428,8 +428,17 @@ export function createPromptAutocompleteFileSettingsStore(path: string): PromptA
     update(patch: Partial<PromptAutocompletePersistedSettings>): void {
       const tempPath = `${path}.${process.pid}.tmp`;
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(tempPath, mergePromptAutocompleteSettingsText(readText(), patch), "utf8");
-      renameSync(tempPath, path);
+      try {
+        writeFileSync(tempPath, mergePromptAutocompleteSettingsText(readText(), patch), "utf8");
+        renameSync(tempPath, path);
+      } catch (error) {
+        try {
+          rmSync(tempPath, { force: true });
+        } catch {
+          // The write failure is the error worth reporting.
+        }
+        throw error;
+      }
     },
   };
 }
@@ -1670,12 +1679,13 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.acceptInlineSuggestionPart(extractNextSuggestionChunk(suggestion) ?? suggestion, "accepted-word");
   }
 
-  /** Accept up to the first line break; a one-line suggestion is a full accept. */
+  /** Accept up to the first line break; a completed one-line suggestion is a full accept. */
   private acceptInlineSuggestionByLine(): void {
     const suggestion = this.getActiveSuggestion();
     if (!suggestion) return;
     const line = extractSuggestionLine(suggestion);
-    if (line === suggestion) {
+    // A streamed partial is not the whole suggestion, even without a line break.
+    if (line === suggestion && !this.suggestionsProvisional) {
       this.acceptInlineSuggestion();
       return;
     }
