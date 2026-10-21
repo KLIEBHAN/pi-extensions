@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - Unreleased
+
+### Changed
+
+- `Escape` now dismisses a suggestion for as long as you keep typing the same draft, instead of only until the next keystroke. Previously the next character brought the dismissed suggestion back, from the prefix cache or through a new provider request. The dismissal ends for good when the draft no longer extends the dismissed text (for example after `Backspace`, submitting, clearing, or recalling another prompt), when the conversation, the autocomplete model, `max-chars`, or `max-alternatives` changes, or when you press `Ctrl+.`, accept, or cycle. An `Escape` on an empty-draft suggestion lasts only while the draft stays empty.
+
 ## [0.3.0] - 2026-10-13
 
 ### Changed

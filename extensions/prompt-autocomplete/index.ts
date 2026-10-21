@@ -14,6 +14,7 @@ import { matchesKey, truncateToWidth, type EditorTheme, type KeyId, type TUI, vi
 import {
   acquireCoalescedRequest,
   buildPromptAutocompleteCacheKey,
+  buildPromptAutocompleteDismissalContext,
   buildPromptAutocompletePrefixContextKey,
   buildPromptAutocompleteBudgetSnapshot,
   buildPromptAutocompleteRequestSnapshot,
@@ -85,6 +86,7 @@ import {
   serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
+  promptAutocompleteDismissalCovers,
   recordProviderLatency,
   recordProviderUsage,
   resolveAutocompleteConversationId,
@@ -519,6 +521,8 @@ interface SuggestionRequest extends PromptAutocompleteRequestSnapshot {
   modelLabel: string;
   cacheKey: string;
   prefixContextKey: string;
+  /** Context an Escape dismissal of this request's suggestions is bound to. */
+  dismissalContext: string;
   useStreaming: boolean;
 }
 
@@ -1140,7 +1144,10 @@ class PromptAutocompleteEditor extends CustomEditor {
   // shared spinner alive until every active owner has released it.
   private activeSpinnerOwner?: string;
   private suspendedUntil = 0;
-  private dismissedKey?: string;
+  /** Escape dismissal: holds while the draft extends `draft` in `context`. */
+  private dismissal?: { draft: string; context: string };
+  /** Dismissal context under which the shown suggestions were produced. */
+  private suggestionsContext?: string;
 
   constructor(
     tui: TUI,
@@ -1167,8 +1174,14 @@ class PromptAutocompleteEditor extends CustomEditor {
 
   override handleInput(data: string): void {
     if (this.canDismissInlineSuggestion(data)) {
-      this.dismissedKey = this.buildRequest()?.cacheKey;
-      this.clearInlineSuggestion("dismissed", "Suggestion dismissed for current draft");
+      // Bound to the context the visible suggestion came from, not a freshly
+      // built request, which a model or auth failure could not provide.
+      this.dismissal = {
+        draft: this.getText(),
+        context: this.suggestionsContext
+          ?? buildDismissalContext(this.shared, resolveCurrentConversationId(this.shared)),
+      };
+      this.clearInlineSuggestion("dismissed", "Suggestion dismissed while this draft continues");
       return;
     }
 
@@ -1323,8 +1336,15 @@ class PromptAutocompleteEditor extends CustomEditor {
 
   private setSuggestions(
     nextSuggestions: string[],
-    options: { provisional?: boolean; origins?: string[]; preferredOrigin?: string } = {},
+    options: {
+      provisional?: boolean;
+      origins?: string[];
+      preferredOrigin?: string;
+      /** Dismissal context of the request that produced the suggestions. */
+      context?: string;
+    } = {},
   ): void {
+    this.suggestionsContext = nextSuggestions.length > 0 ? options.context : undefined;
     const provisional = options.provisional ?? false;
     const nextOrigins = options.origins?.length === nextSuggestions.length
       ? [...options.origins]
@@ -1377,13 +1397,33 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.tui.requestRender();
   }
 
+  /**
+   * End a dismissal for good once the draft or its context moved on.
+   *
+   * Returns whether the dismissal still holds. Returning to the dismissed draft
+   * or context later does not restore a dismissal that ended.
+   */
+  private reconcileDismissal(): boolean {
+    if (!this.dismissal) return false;
+    const context = buildDismissalContext(this.shared, resolveCurrentConversationId(this.shared));
+    if (promptAutocompleteDismissalCovers(this.dismissal, this.getText(), context)) return true;
+    this.dismissal = undefined;
+    return false;
+  }
+
+  /** Whether a response for `request` arrives into a standing dismissal. */
+  private dismissalCovers(request: SuggestionRequest): boolean {
+    return !!this.dismissal
+      && promptAutocompleteDismissalCovers(this.dismissal, request.draft, request.dismissalContext);
+  }
+
   private cycleSuggestions(delta: 1 | -1): void {
     if (this.suggestions.length <= 1) return;
     const nextIndex = (this.suggestionIndex + delta + this.suggestions.length) % this.suggestions.length;
     if (nextIndex === this.suggestionIndex) return;
     this.suggestionIndex = nextIndex;
     this.shared.usageStats.suggestionsOffered += 1;
-    this.dismissedKey = undefined;
+    this.dismissal = undefined;
     updateDebugState(this.shared, "cycled", `Now showing ${nextIndex + 1}/${this.suggestions.length}`);
     this.tui.requestRender();
   }
@@ -1400,7 +1440,7 @@ class PromptAutocompleteEditor extends CustomEditor {
   private triggerManualSuggestion(): void {
     // refreshSuggestion immediately sets its own debug state, so we only clear any
     // standing dismissal here and let the refresh report the real outcome.
-    this.dismissedKey = undefined;
+    this.dismissal = undefined;
     this.refreshSuggestion({ clearExisting: true, immediate: true, manual: true });
   }
 
@@ -1461,7 +1501,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     const wasProvisional = this.suggestionsProvisional;
     this.shared.usageStats.fullAccepts += 1;
-    this.dismissedKey = undefined;
+    this.dismissal = undefined;
     this.clearInlineSuggestion("accepted", wasProvisional ? "Accepted streamed partial suggestion" : "Accepted full suggestion");
     super.insertTextAtCursor(suggestion);
     // A provisional accept is explicit cancellation of the request. Starting a
@@ -1479,7 +1519,7 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     const wasProvisional = this.suggestionsProvisional;
     this.shared.usageStats.chunkAccepts += 1;
-    this.dismissedKey = undefined;
+    this.dismissal = undefined;
     this.clearInlineSuggestion("accepted-word", `Accepted chunk: ${chunk}`);
     super.insertTextAtCursor(chunk);
     if (!wasProvisional) this.refreshSuggestion({ preferredOrigin: origin });
@@ -1534,6 +1574,9 @@ class PromptAutocompleteEditor extends CustomEditor {
 
   private refreshSuggestion(options: SuggestionRefreshOptions = {}): void {
     const preferredOrigin = options.preferredOrigin ?? this.getActiveSuggestionOrigin();
+    // Before every gate: a draft or context that moved on ends the dismissal
+    // even when a gate or a model without auth stops this refresh.
+    const dismissed = this.reconcileDismissal();
     if (options.clearExisting) {
       this.cancelPendingRequest();
       this.setSuggestions([]);
@@ -1548,6 +1591,15 @@ class PromptAutocompleteEditor extends CustomEditor {
 
     if (!this.shared.ownsEditor?.()) {
       this.releaseForOwnershipLoss();
+      return;
+    }
+
+    // A standing dismissal settles the refresh before any gate, model lookup, or
+    // request snapshot, so continued typing stays cheap.
+    if (!options.manual && dismissed) {
+      this.cancelPendingRequest();
+      updateDebugState(this.shared, "dismissed", "Suggestion dismissed while this draft continues");
+      this.setSuggestions([]);
       return;
     }
 
@@ -1574,13 +1626,6 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
-    if (!options.manual && request.cacheKey === this.dismissedKey) {
-      this.cancelPendingRequest();
-      updateDebugState(this.shared, "dismissed", "Suggestion dismissed for current draft");
-      this.setSuggestions([]);
-      return;
-    }
-
     const cachedEntry = getCachedRequest(this.shared, request.cacheKey, { bypass: options.manual });
     if (cachedEntry) {
       this.shared.usageStats.cacheHits += 1;
@@ -1594,6 +1639,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       this.setSuggestions(cachedEntry.suggestions, {
         origins: cachedEntry.suggestions,
         preferredOrigin,
+        context: request.dismissalContext,
       });
       return;
     }
@@ -1608,6 +1654,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       this.setSuggestions(prefixReused.entry.suggestions, {
         origins: prefixReused.origins,
         preferredOrigin,
+        context: request.dismissalContext,
       });
       updateDebugState(
         this.shared,
@@ -1694,6 +1741,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       modelLabel,
       cacheKey: buildPromptAutocompleteCacheKey({ ...prefixContextIdentity, draft: snapshot.draft }),
       prefixContextKey: buildPromptAutocompletePrefixContextKey(prefixContextIdentity),
+      dismissalContext: buildDismissalContext(this.shared, conversationId),
       useStreaming: this.shared.config.streamResponses && !!this.shared.streamSimple,
     };
   }
@@ -1736,8 +1784,8 @@ class PromptAutocompleteEditor extends CustomEditor {
       if (entry.suggestions.length === 0) {
         updateDebugState(this.shared, "no-suggestion", entry.debugState || "No usable suggestions");
       }
-      if (request.cacheKey !== this.dismissedKey) {
-        this.setSuggestions(entry.suggestions);
+      if (!this.dismissalCovers(request)) {
+        this.setSuggestions(entry.suggestions, { context: request.dismissalContext });
       }
     } catch (error) {
       if (error instanceof PromptAutocompleteBudgetExhaustedError) {
@@ -1782,14 +1830,14 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
     if (!this.isRequestStillCurrent(request, seq)) return;
-    if (request.cacheKey === this.dismissedKey) return;
+    if (this.dismissalCovers(request)) return;
 
     const current = this.getActiveSuggestion();
     // Progress is strictly monotonic. If a provider revises earlier text, keep
     // the last honest preview and let the terminal response replace it.
     if (current && (!suggestion.startsWith(current) || suggestion.length <= current.length)) return;
 
-    this.setSuggestions([suggestion], { provisional: true });
+    this.setSuggestions([suggestion], { provisional: true, context: request.dismissalContext });
     this.deactivateSpinner(spinnerOwner);
   }
 
@@ -2273,6 +2321,28 @@ function resolveCurrentConversationId(shared: PromptAutocompleteSharedState): st
   const branch = shared.sessionManager?.getBranch?.() ?? [];
   const leafId = shared.sessionManager?.getLeafId?.() ?? "";
   return resolveAutocompleteConversationId(branch, leafId || shared.physicalSessionId);
+}
+
+/**
+ * Dismissal context for the given conversation.
+ *
+ * The model part is what is requested, not what resolves: a dedicated model's
+ * reference, or the active session model in `active` mode. It therefore changes
+ * on a switch to a model without auth, which no request could be built for.
+ */
+function buildDismissalContext(shared: PromptAutocompleteSharedState, conversationId: string): string {
+  const selection = shared.config.modelSelection;
+  const requestedModel = selection.kind === "dedicated"
+    ? `${selection.ref.provider}/${selection.ref.id}`
+    : selection.kind === "invalid"
+      ? selection.raw
+      : formatModelLabel(shared.currentModel);
+  return buildPromptAutocompleteDismissalContext({
+    conversationId,
+    requestedModel,
+    maxAlternatives: shared.config.maxAlternatives,
+    maxSuggestionChars: shared.config.maxSuggestionChars,
+  });
 }
 
 function rememberAgentSettledSupport(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
