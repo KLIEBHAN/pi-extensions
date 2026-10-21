@@ -2809,7 +2809,8 @@ export function parsePromptAutocompleteKeyId(raw: string): KeyId | undefined {
 }
 
 const RESERVED_KEYS = new Set(["tab", "escape", "enter", "backspace"]);
-const EDITOR_HARD_CODED_KEYS = new Set(["shift+space", "shift+backspace", "shift+delete", "shift+enter"]);
+// `ctrl+j` arrives as a line feed in legacy terminals, which the editor inserts as a newline.
+const EDITOR_HARD_CODED_KEYS = new Set(["shift+space", "shift+backspace", "shift+delete", "shift+enter", "ctrl+j"]);
 
 /**
  * Why a key cannot be a Prompt Autocomplete key, or undefined if it can.

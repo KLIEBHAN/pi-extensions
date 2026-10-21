@@ -1865,6 +1865,7 @@ test("accept-line takes one line, keeps the rest, and is one undo step", async (
   assert.equal(editor.getText(), "Plan first step\n");
   await flushAsyncWork();
   assert.match(renderedText(editor), /second step/, "the rest stays offered");
+  assert.equal(renderedText(editor).split("first step").length - 1, 1, "only the rest is offered, not the whole suggestion");
   editor.handleInput(CTRL_MINUS);
   assert.equal(editor.getText(), "Plan");
 

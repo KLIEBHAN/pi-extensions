@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -409,38 +410,54 @@ export function resolvePromptAutocompleteSettingsPath(
 /**
  * The settings file as a store.
  *
- * Every update re-reads the file and writes it atomically through a temporary
- * file of its own process. Two processes saving in the same instant can still
- * lose one decision; there is no lock.
+ * Every update re-reads the file and replaces it atomically through a new,
+ * owner-only temporary file with an unpredictable name. Only a missing file
+ * counts as empty: any other read error aborts the update, so the saved
+ * decisions are never replaced by the new one alone. Two processes saving in
+ * the same instant can still lose one decision; there is no lock.
  */
 export function createPromptAutocompleteFileSettingsStore(path: string): PromptAutocompleteSettingsStore {
   const readText = (): string | undefined => {
     try {
       return readFileSync(path, "utf8");
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return undefined;
+      throw error;
     }
   };
   return {
     load(): PromptAutocompletePersistedSettings {
-      return parsePromptAutocompletePersistedSettings(readText());
+      try {
+        return parsePromptAutocompletePersistedSettings(readText());
+      } catch {
+        return {};
+      }
     },
     update(patch: Partial<PromptAutocompletePersistedSettings>): void {
-      const tempPath = `${path}.${process.pid}.tmp`;
+      const merged = mergePromptAutocompleteSettingsText(readText(), patch);
+      const tempPath = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
       mkdirSync(dirname(path), { recursive: true });
       try {
-        writeFileSync(tempPath, mergePromptAutocompleteSettingsText(readText(), patch), "utf8");
+        // `wx` creates the file or fails; it never writes through an entry
+        // that already exists under that name, such as a planted link.
+        writeFileSync(tempPath, merged, { encoding: "utf8", flag: "wx", mode: 0o600 });
         renameSync(tempPath, path);
       } catch (error) {
-        try {
-          rmSync(tempPath, { force: true });
-        } catch {
-          // The write failure is the error worth reporting.
+        if (!hasErrorCode(error, "EEXIST")) {
+          try {
+            rmSync(tempPath, { force: true });
+          } catch {
+            // The write failure is the error worth reporting.
+          }
         }
         throw error;
       }
     },
   };
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 interface PromptAutocompleteSharedState {

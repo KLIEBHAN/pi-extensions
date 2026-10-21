@@ -1921,6 +1921,7 @@ test("keys that Pi's editor handles or that type text are unusable", () => {
     ["esc", /esc is reserved/],
     ["shift+enter", /editor handles/],
     ["shift+space", /editor handles/],
+    ["ctrl+j", /editor handles/],
     ["a", /types text/],
     ["shift+a", /types text/],
     ["shift+1", /types text/],

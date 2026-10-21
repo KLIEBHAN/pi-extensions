@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1236,6 +1236,34 @@ test("the settings file keeps decisions other processes saved and fields it does
       keys: { acceptLine: ["alt+l"] },
     });
     assert.deepEqual(readdirSync(dir), ["settings.json"], "no temporary file is left behind");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a settings file that cannot be read is not replaced", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "pa-settings-"));
+  const path = join(dir, "settings.json");
+  try {
+    writeFileSync(path, JSON.stringify({ enabled: true, minPromptChars: 4 }), "utf8");
+    chmodSync(path, 0o000);
+    const store = createPromptAutocompleteFileSettingsStore(path);
+    assert.deepEqual(store.load(), {}, "load stays non-throwing");
+    assert.throws(() => store.update({ debounceMs: 200 }), /EACCES/);
+    chmodSync(path, 0o600);
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { enabled: true, minPromptChars: 4 });
+    assert.deepEqual(readdirSync(dir), ["settings.json"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a saved settings file is readable by its owner only", { skip: process.platform === "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "pa-settings-"));
+  try {
+    const path = join(dir, "settings.json");
+    createPromptAutocompleteFileSettingsStore(path).update({ enabled: true });
+    assert.equal(statSync(path).mode & 0o777, 0o600);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
