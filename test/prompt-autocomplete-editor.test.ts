@@ -18,6 +18,12 @@ import {
   CURSOR_MARKER,
   type EditorComponent,
   type EditorTheme,
+  getKeybindings,
+  type KeybindingsConfig,
+  KeybindingsManager as TuiKeybindingsManager,
+  matchesKey,
+  setKeybindings,
+  TUI_KEYBINDINGS,
   type TUI,
   visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -163,6 +169,8 @@ interface EditorHarnessOptions {
   omitAppendEntry?: boolean;
   /** When true, `ctx.isIdle` exists so automatic requests wait for `agent_settled`. */
   emitsAgentSettled?: boolean;
+  /** Pi's keymap as handed to the editor factory; defaults to one that matches nothing. */
+  keybindings?: TuiKeybindingsManager;
   /** Injected settings store so two factories can share persisted decisions. */
   settingsStore?: {
     load(): PromptAutocompletePersistedSettings;
@@ -286,7 +294,8 @@ function createEditorHarness(options: EditorHarnessOptions) {
     createEditor: async (): Promise<EditorComponent> => {
       await handlers.get("session_start")?.({ reason: "startup" }, ctx);
       assert.ok(editorFactory, "session_start should install an editor factory");
-      const keybindings = { matches: () => false } as unknown as KeybindingsManager;
+      // Pi hands its app keymap, a subclass of pi-tui's manager, to the factory.
+      const keybindings = (options.keybindings ?? { matches: () => false }) as unknown as KeybindingsManager;
       return editorFactory(tui, editorTheme, keybindings);
     },
     /** Instantiate the currently installed factory without starting a session. */
@@ -1635,6 +1644,150 @@ test("Pi built-in autocomplete keeps Tab precedence over ghost suggestions", asy
   assert.equal(calls, 0, "slash commands must not call the model");
   editor.handleInput("\t");
   assert.equal(editor.getText(), "/help");
+});
+
+const CTRL_TAB = "\x1b[9;5u";
+const ALT_RIGHT_BRACKET = "\x1b]";
+const CTRL_RIGHT_BRACKET = "\x1d";
+
+/** Pi's TUI keymap plus the app actions these tests bind, with user remaps. */
+function createPiKeymap(userBindings: KeybindingsConfig = {}): TuiKeybindingsManager {
+  return new TuiKeybindingsManager(
+    {
+      ...TUI_KEYBINDINGS,
+      "app.interrupt": { defaultKeys: "escape" },
+      "app.model.select": { defaultKeys: "ctrl+l" },
+      "app.tree.filter.all": { defaultKeys: "ctrl+a" },
+    },
+    userBindings,
+  );
+}
+
+/** Pi installs its app keymap globally, which pi-tui's own editor reads. */
+async function withGlobalKeymap(keymap: TuiKeybindingsManager, run: () => Promise<void>): Promise<void> {
+  const previous = getKeybindings();
+  setKeybindings(keymap);
+  try {
+    await run();
+  } finally {
+    setKeybindings(previous);
+  }
+}
+
+async function createKeyHarness(keymap: TuiKeybindingsManager, completions: string[][] = [[" the rest", " other"]]) {
+  let calls = 0;
+  const harness = createEditorHarness({
+    keybindings: keymap,
+    completeSimple: (async () => makeCompletion(completions[Math.min(calls++, completions.length - 1)]!)) as CompleteSimple,
+  });
+  const editor = await harness.createEditor();
+  assert.ok(editor instanceof CustomEditor);
+  return { harness, editor, calls: () => calls };
+}
+
+test("default keys act with Pi's default keymap", async () => {
+  const { editor } = await createKeyHarness(createPiKeymap());
+  editor.setText("Fix");
+  await flushAsyncWork();
+  editor.handleInput(CTRL_DOT);
+  assert.match(renderedText(editor), /‹2\/2›/);
+  editor.handleInput(CTRL_SPACE);
+  assert.equal(editor.getText(), "Fix other");
+});
+
+test("a key that Pi's keymap binds goes to Pi, also after a reload", async () => {
+  const keymap = createPiKeymap({ "app.model.select": "ctrl+space" });
+  const { harness, editor, calls } = await createKeyHarness(keymap);
+  let modelSelectorOpened = 0;
+  editor.onAction("app.model.select", () => {
+    modelSelectorOpened += 1;
+  });
+  editor.setText("Fix");
+  await flushAsyncWork();
+
+  editor.handleInput(CTRL_SPACE);
+  assert.equal(modelSelectorOpened, 1);
+  assert.equal(editor.getText(), "Fix", "the suggestion must not also be accepted");
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /keys-used-by-pi=ctrl\+space \(app\.model\.select\)/);
+
+  editor.handleInput(CTRL_TAB);
+  assert.equal(editor.getText(), "Fix the ", "the other word-accept key stays free");
+
+  // Pi re-reads keybindings.json into the same manager after session_start.
+  keymap.setUserBindings({});
+  editor.setText("Fix");
+  await flushAsyncWork();
+  editor.handleInput(CTRL_SPACE);
+  assert.equal(editor.getText(), "Fix the ");
+  keymap.setUserBindings({ "app.model.select": "ctrl+space" });
+  editor.setText("Fix");
+  await flushAsyncWork();
+  editor.handleInput(CTRL_SPACE);
+  assert.equal(modelSelectorOpened, 2);
+  assert.equal(editor.getText(), "Fix");
+  assert.equal(calls(), 1, "no extra provider request");
+});
+
+test("interrupt, history, and picker bindings on a default key go to Pi", async () => {
+  const interrupt = createPiKeymap({ "app.interrupt": "ctrl+." });
+  const interrupted = await createKeyHarness(interrupt);
+  let interrupts = 0;
+  interrupted.editor.onEscape = () => {
+    interrupts += 1;
+  };
+  interrupted.editor.setText("Fix");
+  await flushAsyncWork();
+  interrupted.editor.handleInput(CTRL_DOT);
+  assert.equal(interrupts, 1);
+  assert.match(renderedText(interrupted.editor), /‹1\/2›/, "no cycling");
+
+  const history = createPiKeymap({ "tui.editor.historyPrevious": "ctrl+." });
+  await withGlobalKeymap(history, async () => {
+    const recalled = await createKeyHarness(history);
+    recalled.editor.addToHistory("Earlier prompt");
+    recalled.editor.handleInput(CTRL_DOT);
+    assert.equal(recalled.editor.getText(), "Earlier prompt");
+  });
+
+  const picker = await createKeyHarness(createPiKeymap({ "app.tree.filter.all": "ctrl+space" }));
+  picker.editor.setText("Fix");
+  await flushAsyncWork();
+  picker.editor.handleInput(CTRL_SPACE);
+  assert.equal(picker.editor.getText(), "Fix", "any scope counts, conservatively");
+});
+
+test("another extension's shortcut on a default key runs once and wins", async () => {
+  const { editor } = await createKeyHarness(createPiKeymap());
+  let shortcutRuns = 0;
+  editor.onExtensionShortcut = (data) => {
+    if (!matchesKey(data, "ctrl+.")) return false;
+    shortcutRuns += 1;
+    return true;
+  };
+  editor.setText("Fix");
+  await flushAsyncWork();
+  editor.handleInput(CTRL_DOT);
+  assert.equal(shortcutRuns, 1);
+  assert.match(renderedText(editor), /‹1\/2›/, "no cycling");
+});
+
+test("a default key cancels Pi's pending character jump before it acts", async () => {
+  const keymap = createPiKeymap();
+  await withGlobalKeymap(keymap, async () => {
+    const { editor, calls } = await createKeyHarness(keymap, [[], [" the rest"]]);
+    editor.setText("Fix");
+    await flushAsyncWork();
+    assert.equal(calls(), 1);
+
+    editor.handleInput(CTRL_RIGHT_BRACKET);
+    editor.handleInput(ALT_RIGHT_BRACKET);
+    await flushAsyncWork();
+    assert.equal(calls(), 2, "the manual one-shot request ran");
+    // With the jump still pending, "F" would move the cursor to the first "F".
+    editor.handleInput("F");
+    assert.equal(editor.getText(), "FixF");
+  });
 });
 
 test("rendering preserves IME cursor marker and display widths for Unicode and narrow terminals", async () => {

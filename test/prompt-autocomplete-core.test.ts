@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { KeybindingsConfig } from "@earendil-works/pi-tui";
 import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
@@ -11,6 +12,8 @@ import {
   buildPromptAutocompleteDismissalContext,
   buildPromptAutocompletePrefixContextKey,
   buildRecentConversationContext,
+  canonicalKeyId,
+  findPiKeyConflicts,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
   completePromptAutocompleteArguments,
@@ -1862,4 +1865,22 @@ test("escape dismissals cover extending drafts in the same context only", () => 
   const empty = { draft: "", context };
   assert.equal(promptAutocompleteDismissalCovers(empty, "", context), true);
   assert.equal(promptAutocompleteDismissalCovers(empty, "a", context), false);
+});
+
+test("key conflicts compare canonical key ids, including legacy byte equivalents", () => {
+  assert.equal(canonicalKeyId("shift+ctrl+X"), "ctrl+shift+x");
+  assert.equal(canonicalKeyId("alt+esc"), "alt+escape");
+  assert.equal(canonicalKeyId("ctrl+i"), "tab");
+  assert.equal(canonicalKeyId("ctrl+_"), canonicalKeyId("ctrl+-"));
+  assert.equal(canonicalKeyId("ctrl++"), "ctrl++");
+  assert.equal(canonicalKeyId("alt+["), "alt+[");
+
+  const resolved: KeybindingsConfig = {
+    "app.model.select": ["ctrl+l", "ctrl+space"],
+    "tui.input.tab": "tab",
+    "app.session.new": undefined,
+  };
+  assert.deepEqual(findPiKeyConflicts("ctrl+space", resolved), ["app.model.select"]);
+  assert.deepEqual(findPiKeyConflicts("ctrl+i", resolved), ["tui.input.tab"]);
+  assert.deepEqual(findPiKeyConflicts("ctrl+.", resolved), []);
 });

@@ -52,6 +52,8 @@ Or enable it from inside an interactive session; the decision is saved for later
 
 Legacy fallbacks are available for terminals that forward them: `Ctrl+Tab`, `Alt+[`, and `Alt+]`.
 
+Pi comes first: if your Pi keymap (`keybindings.json`) binds one of the word-accept or cycle keys, or another extension registers it as a shortcut, the key does what Pi or that extension defines, and `/prompt-autocomplete status` lists it under `keys-used-by-pi`. `Tab` and `Escape` keep their ghost-text meaning while a suggestion is visible.
+
 After `/prompt-autocomplete ` and a few letters, Pi's command menu completes the arguments, including nested forms such as `set debounce-ms` or `set model active`; `Tab` or `Enter` inserts the selection. A command that is already complete, such as `stats` or `stream on`, opens no menu, so `Enter` still submits it at once. Completion is local and installs no global autocomplete provider.
 
 Built-in slash-command and file/path completion keeps precedence over ghost suggestions.
