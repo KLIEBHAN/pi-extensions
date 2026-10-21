@@ -1873,6 +1873,8 @@ test("key conflicts compare canonical key ids, including legacy byte equivalents
   assert.equal(canonicalKeyId("ctrl+i"), "tab");
   assert.equal(canonicalKeyId("ctrl+_"), canonicalKeyId("ctrl+-"));
   assert.equal(canonicalKeyId("ctrl++"), "ctrl++");
+  assert.equal(canonicalKeyId("ctrl+shift+="), "ctrl++");
+  assert.equal(canonicalKeyId("ctrl+shift+-"), canonicalKeyId("ctrl+-"));
   assert.equal(canonicalKeyId("alt+["), "alt+[");
 
   const resolved: KeybindingsConfig = {
@@ -1883,4 +1885,5 @@ test("key conflicts compare canonical key ids, including legacy byte equivalents
   assert.deepEqual(findPiKeyConflicts("ctrl+space", resolved), ["app.model.select"]);
   assert.deepEqual(findPiKeyConflicts("ctrl+i", resolved), ["tui.input.tab"]);
   assert.deepEqual(findPiKeyConflicts("ctrl+.", resolved), []);
+  assert.deepEqual(findPiKeyConflicts("ctrl++", { "app.example": "ctrl+shift+=" }), ["app.example"]);
 });

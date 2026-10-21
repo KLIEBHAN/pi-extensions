@@ -1710,6 +1710,7 @@ test("a key that Pi's keymap binds goes to Pi, also after a reload", async () =>
   assert.equal(editor.getText(), "Fix", "the suggestion must not also be accepted");
   await harness.command("status");
   assert.match(harness.notifications.at(-1) ?? "", /keys-used-by-pi=ctrl\+space \(app\.model\.select\)/);
+  assert.match(harness.notifications.at(-1) ?? "", /state=yielded/);
 
   editor.handleInput(CTRL_TAB);
   assert.equal(editor.getText(), "Fix the ", "the other word-accept key stays free");

@@ -2583,6 +2583,11 @@ export type PromptAutocompleteKeyAction = keyof typeof PROMPT_AUTOCOMPLETE_KEY_A
 
 const KEY_MODIFIER_ORDER = ["ctrl", "shift", "alt", "super"] as const;
 const KEY_NAME_ALIASES: Record<string, string> = { esc: "escape", return: "enter" };
+/** US-layout symbols that Shift produces; Pi matches both spellings of such a key. */
+const SHIFTED_SYMBOLS: Record<string, string> = {
+  "`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
+  "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|", ";": ":", ",": "<", ".": ">", "/": "?",
+};
 /** Key ids that legacy terminals encode as the same bytes as another key id. */
 const LEGACY_EQUIVALENT_KEYS: Record<string, string> = {
   "ctrl+i": "tab",
@@ -2594,7 +2599,8 @@ const LEGACY_EQUIVALENT_KEYS: Record<string, string> = {
 
 /**
  * Comparable form of a key id: lowercase, modifiers in a fixed order, Pi's key
- * name aliases resolved, and legacy byte-equivalent keys folded together.
+ * name aliases resolved, Shift plus a symbol folded into the shifted symbol,
+ * and legacy byte-equivalent keys folded together.
  */
 export function canonicalKeyId(key: string): string {
   let rest = key.toLowerCase();
@@ -2610,7 +2616,13 @@ export function canonicalKeyId(key: string): string {
       }
     }
   }
-  const base = KEY_NAME_ALIASES[rest] ?? rest;
+  let base = KEY_NAME_ALIASES[rest] ?? rest;
+  // `ctrl+shift+=` and `ctrl++` name the same keypress.
+  const shifted = modifiers.has("shift") ? SHIFTED_SYMBOLS[base] : undefined;
+  if (shifted) {
+    modifiers.delete("shift");
+    base = shifted;
+  }
   const canonical = [...KEY_MODIFIER_ORDER.filter((modifier) => modifiers.has(modifier)), base].join("+");
   return LEGACY_EQUIVALENT_KEYS[canonical] ?? canonical;
 }

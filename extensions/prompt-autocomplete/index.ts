@@ -627,8 +627,8 @@ function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
 }
 
 /**
- * Whether Pi uses this exact input, so a yielding Prompt Autocomplete key must
- * leave it to Pi.
+ * What in Pi uses this exact input, if anything; a yielding Prompt Autocomplete
+ * key must then leave it to Pi.
  *
  * Every action in Pi's current keymap counts, in any scope; Pi's own matcher
  * decides, so its byte and shifted-symbol equivalences apply, and remaps loaded
@@ -636,20 +636,22 @@ function matchesAnyKey(data: string, keys: readonly KeyId[]): boolean {
  * count as well: Shift+Space/Backspace/Delete, newline encodings, and printable
  * text. A host whose keymap cannot be listed keeps the keys, as before 0.4.0.
  */
-function isInputUsedByPi(keybindings: KeybindingsManager, data: string): boolean {
+function findPiUseOfInput(keybindings: KeybindingsManager, data: string): string | undefined {
   if (typeof keybindings.getResolvedBindings === "function") {
-    for (const keys of Object.values(keybindings.getResolvedBindings())) {
+    for (const [action, keys] of Object.entries(keybindings.getResolvedBindings())) {
       if (keys === undefined) continue;
-      if ((Array.isArray(keys) ? keys : [keys]).some((key) => matchesKey(data, key))) return true;
+      if ((Array.isArray(keys) ? keys : [keys]).some((key) => matchesKey(data, key))) return action;
     }
   }
   if (matchesKey(data, "shift+space") || matchesKey(data, "shift+backspace") || matchesKey(data, "shift+delete")) {
-    return true;
+    return "the editor";
   }
   // Newline encodings the pi-tui editor accepts besides `tui.input.newLine`.
-  if (data === "\n" || data === "\x1b\r" || data === "\x1b[13;2~") return true;
-  if (data.length > 1 && (data.charCodeAt(0) === 10 || (data.includes("\x1b") && data.includes("\r")))) return true;
-  return data.charCodeAt(0) >= 32 || decodeKittyPrintable(data) !== undefined;
+  if (data === "\n" || data === "\x1b\r" || data === "\x1b[13;2~") return "the editor";
+  if (data.length > 1 && (data.charCodeAt(0) === 10 || (data.includes("\x1b") && data.includes("\r")))) {
+    return "the editor";
+  }
+  return data.charCodeAt(0) >= 32 || decodeKittyPrintable(data) !== undefined ? "text input" : undefined;
 }
 
 /** `status` note on yielding keys that Pi's keymap also binds. */
@@ -1243,7 +1245,11 @@ class PromptAutocompleteEditor extends CustomEditor {
     }
 
     const action = this.matchYieldingKeyAction(data);
-    if (action && !isInputUsedByPi(this.appKeybindings, data)) {
+    const piUse = action ? findPiUseOfInput(this.appKeybindings, data) : undefined;
+    if (piUse) {
+      // Shown until the refresh after Pi's handling reports something newer.
+      updateDebugState(this.shared, "yielded", `Key left to Pi: ${piUse}`);
+    } else if (action) {
       // Pi's order: another extension's shortcut on the same key comes first.
       const before = this.captureInputState();
       if (this.onExtensionShortcut?.(data)) {

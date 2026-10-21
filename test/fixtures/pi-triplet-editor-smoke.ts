@@ -72,7 +72,7 @@ createPromptAutocompleteExtension({
     providerCalls += 1;
     return {
       role: "assistant",
-      content: [{ type: "text", text: JSON.stringify({ completions: [" the implementation carefully"] }) }],
+      content: [{ type: "text", text: JSON.stringify({ completions: [" the implementation carefully", " it"] }) }],
       stopReason: "stop",
     };
   }) as never,
@@ -142,6 +142,20 @@ const rendered = editor
   .map((line: string) => stripVTControlCharacters(line))
   .join("\n");
 assert.match(rendered, /the implementation carefully/, `ghost text missing. rendered:\n${rendered}`);
+
+// Free keys reach Pi's editor first, which must leave text, cursor, and change
+// notifications alone; only the cycling itself may happen.
+let changes = 0;
+editor.onChange = () => {
+  changes += 1;
+};
+const cursorBefore = editor.getCursor();
+editor.handleInput("\x1b[46;5u");
+assert.match(editor.render(80).map((line: string) => stripVTControlCharacters(line)).join("\n"), /‹2\/2›/, "Ctrl+. must cycle");
+editor.handleInput("\x1b[44;5u");
+assert.equal(editor.getText(), "Review", "free keys must not edit the draft");
+assert.deepEqual(editor.getCursor(), cursorBefore, "free keys must not move the cursor");
+assert.equal(changes, 0, "free keys must not report a change");
 
 // The real keymap leaves Ctrl+Space free, and Pi's editor does nothing with it.
 editor.handleInput("\x1b[32;5u");
