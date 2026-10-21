@@ -1557,6 +1557,34 @@ test("escape on a streamed partial cancels the stream and holds while typing", a
   await flushAsyncWork();
 });
 
+test("a standing dismissal settles refreshes before the agent and model gates", async () => {
+  let authenticated = true;
+  const { harness, calls } = createDismissalHarness({
+    preferredModel: "test-provider/model-a",
+    hasConfiguredAuth: () => authenticated,
+  });
+  const editor = await harness.createEditor();
+  editor.setText("Escape");
+  await flushAsyncWork();
+  editor.handleInput(ESCAPE);
+
+  await harness.emit("agent_start");
+  await harness.command("status");
+  assert.match(harness.notifications.at(-1) ?? "", /state=dismissed/);
+  await harness.emit("agent_end");
+
+  // While dismissed, a dedicated model that lost its auth is not even looked up.
+  authenticated = false;
+  typeText(editor, "!");
+  await flushAsyncWork();
+  assert.equal(harness.notifications.some((message) => /no configured auth/.test(message)), false);
+  editor.handleInput(BACKSPACE);
+  editor.handleInput(BACKSPACE);
+  await flushAsyncWork();
+  assert.equal(harness.notifications.some((message) => /no configured auth/.test(message)), true);
+  assert.equal(calls(), 1);
+});
+
 test("a model without auth at escape time neither loses nor misattributes the dismissal", async () => {
   let authenticated = true;
   const { harness, calls } = createDismissalHarness({ hasConfiguredAuth: () => authenticated });

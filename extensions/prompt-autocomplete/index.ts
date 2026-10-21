@@ -1594,6 +1594,15 @@ class PromptAutocompleteEditor extends CustomEditor {
       return;
     }
 
+    // A standing dismissal settles the refresh before any gate, model lookup, or
+    // request snapshot, so continued typing stays cheap.
+    if (!options.manual && dismissed) {
+      this.cancelPendingRequest();
+      updateDebugState(this.shared, "dismissed", "Suggestion dismissed while this draft continues");
+      this.setSuggestions([]);
+      return;
+    }
+
     if (this.isShowingAutocomplete()) {
       this.cancelPendingRequest();
       updateDebugState(this.shared, "paused", "Built-in autocomplete is active");
@@ -1613,13 +1622,6 @@ class PromptAutocompleteEditor extends CustomEditor {
     if (!request) {
       this.cancelPendingRequest();
       updateDebugState(this.shared, "waiting", "No request could be built");
-      this.setSuggestions([]);
-      return;
-    }
-
-    if (!options.manual && dismissed) {
-      this.cancelPendingRequest();
-      updateDebugState(this.shared, "dismissed", "Suggestion dismissed while this draft continues");
       this.setSuggestions([]);
       return;
     }
