@@ -2817,7 +2817,8 @@ const EDITOR_HARD_CODED_KEYS = new Set(["shift+space", "shift+backspace", "shift
  * Tab, Escape, Enter, and Backspace (also as their legacy aliases such as
  * `ctrl+i`), the keys Pi's editor handles outside its keymap, keys that type
  * text, and keys Pi's matcher never recognizes (Escape or F1–F12 with a
- * modifier) would never reach the action, or would take text away.
+ * modifier, Clear with anything but Shift or Ctrl alone) would never reach
+ * the action, or would take text away.
  */
 export function describeUnusablePromptAutocompleteKey(key: string): string | undefined {
   const canonical = canonicalKeyId(key);
@@ -2826,7 +2827,12 @@ export function describeUnusablePromptAutocompleteKey(key: string): string | und
   }
   if (EDITOR_HARD_CODED_KEYS.has(canonical)) return `Pi's editor handles ${key}`;
   const { modifiers, base } = splitKeyId(key);
-  if (modifiers.size > 0 && (base === "escape" || /^f([1-9]|1[0-2])$/.test(base))) {
+  // Pi's matcher has no encoding for these modifier combinations.
+  const onlyShiftOrCtrl = modifiers.size === 1 && (modifiers.has("shift") || modifiers.has("ctrl"));
+  if (
+    modifiers.size > 0
+    && (base === "escape" || /^f([1-9]|1[0-2])$/.test(base) || (base === "clear" && !onlyShiftOrCtrl))
+  ) {
     return `Pi does not recognize ${key}`;
   }
   const typesText = [...modifiers].every((modifier) => modifier === "shift")
