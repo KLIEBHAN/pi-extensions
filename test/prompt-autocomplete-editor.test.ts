@@ -32,6 +32,7 @@ import {
   type PromptAutocompleteDependencies,
 } from "../extensions/prompt-autocomplete/index.ts";
 import {
+  applyPromptAutocompleteSettingsPatch,
   buildPromptAutocompleteRequestSnapshot,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   type PromptAutocompletePersistedSettings,
@@ -174,7 +175,7 @@ interface EditorHarnessOptions {
   /** Injected settings store so two factories can share persisted decisions. */
   settingsStore?: {
     load(): PromptAutocompletePersistedSettings;
-    save(settings: PromptAutocompletePersistedSettings): void;
+    update(patch: Partial<PromptAutocompletePersistedSettings>): void;
   };
 }
 
@@ -273,7 +274,7 @@ function createEditorHarness(options: EditorHarnessOptions) {
     // read on load and slash commands never write outside the test.
     settingsStore: options.settingsStore ?? {
       load: () => ({}),
-      save: () => undefined,
+      update: () => undefined,
     },
   })(pi);
 
@@ -969,8 +970,8 @@ test("a replacement factory keeps saved settings and starts stats at zero", asyn
   let stored: PromptAutocompletePersistedSettings = {};
   const settingsStore = {
     load: () => ({ ...stored }),
-    save: (settings: PromptAutocompletePersistedSettings) => {
-      stored = { ...settings };
+    update: (patch: Partial<PromptAutocompletePersistedSettings>) => {
+      stored = applyPromptAutocompleteSettingsPatch(stored, patch);
     },
   };
   let firstCalls = 0;
@@ -1240,8 +1241,8 @@ test("an invalid set model leaves the previous config active and makes no provid
     findModel: (provider, id) => (provider === "missing" ? undefined : { provider, id }),
     settingsStore: {
       load: () => ({ ...stored }),
-      save: (settings) => {
-        stored = { ...settings };
+      update: (patch) => {
+        stored = applyPromptAutocompleteSettingsPatch(stored, patch);
       },
     },
     completeSimple: (async () => {
@@ -1789,6 +1790,197 @@ test("a default key cancels Pi's pending character jump before it acts", async (
     editor.handleInput("F");
     assert.equal(editor.getText(), "FixF");
   });
+});
+
+const ALT_L = "\x1b[108;3u";
+const ALT_N = "\x1b[110;3u";
+const CTRL_MINUS = "\x1f";
+
+function createKeySettingsHarness(
+  options: Partial<EditorHarnessOptions> & { completions?: (draft: string) => string[] } = {},
+) {
+  let stored: PromptAutocompletePersistedSettings = {};
+  let calls = 0;
+  const settingsStore = {
+    load: () => ({ ...stored }),
+    update: (patch: Partial<PromptAutocompletePersistedSettings>) => {
+      stored = applyPromptAutocompleteSettingsPatch(stored, patch);
+    },
+  };
+  const completions = options.completions ?? (() => [" the rest", " other"]);
+  const create = () => createEditorHarness({
+    settingsStore,
+    completeSimple: (async (_model, context) => {
+      calls += 1;
+      const content = context.messages[0]?.content ?? "";
+      const text = typeof content === "string"
+        ? content
+        : content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
+      const draft = /Current draft \(cursor at end\):\n(.*)\n/.exec(text)?.[1]?.trim() ?? "";
+      return makeCompletion(completions(draft));
+    }) as CompleteSimple,
+    ...options,
+  });
+  return { create, stored: () => stored, calls: () => calls };
+}
+
+test("set key applies at once, persists, and a fresh runtime keeps it", async () => {
+  const keys = createKeySettingsHarness();
+  const first = keys.create();
+  const editor = await first.createEditor();
+  await first.command("set key cycle-next alt+n");
+  assert.match(first.notifications.at(-1) ?? "", /cycle-next keys set to alt\+n \(saved for future sessions\)/);
+  assert.deepEqual(keys.stored().keys, { cycleNext: ["alt+n"] });
+
+  editor.setText("Fix");
+  await flushAsyncWork();
+  editor.handleInput(CTRL_DOT);
+  assert.match(renderedText(editor), /‹1\/2›/, "the old key no longer cycles");
+  editor.handleInput(ALT_N);
+  assert.match(renderedText(editor), /‹2\/2›/, "the new key cycles without a reload");
+
+  const second = keys.create();
+  const fresh = await second.createEditor();
+  fresh.setText("Fix");
+  await flushAsyncWork();
+  fresh.handleInput(ALT_N);
+  assert.match(renderedText(fresh), /‹2\/2›/);
+  await second.command("keys");
+  assert.match(second.notifications.at(-1) ?? "", /cycle-next alt\+n \(saved\)/);
+  assert.match(second.notifications.at(-1) ?? "", /accept-line none \(default\)/);
+});
+
+test("accept-line takes one line, keeps the rest, and is one undo step", async () => {
+  const keys = createKeySettingsHarness({
+    maxAlternatives: 1,
+    completions: (draft) => (draft === "Plan" ? [" first step\nsecond step"] : draft === "One" ? [" line only"] : []),
+  });
+  const harness = keys.create();
+  const editor = await harness.createEditor();
+  await harness.command("set key accept-line alt+l");
+
+  editor.setText("Plan");
+  await flushAsyncWork();
+  editor.handleInput(ALT_L);
+  assert.equal(editor.getText(), "Plan first step\n");
+  await flushAsyncWork();
+  assert.match(renderedText(editor), /second step/, "the rest stays offered");
+  assert.equal(renderedText(editor).split("first step").length - 1, 1, "only the rest is offered, not the whole suggestion");
+  editor.handleInput(CTRL_MINUS);
+  assert.equal(editor.getText(), "Plan");
+
+  editor.setText("One");
+  await flushAsyncWork();
+  editor.handleInput(ALT_L);
+  assert.equal(editor.getText(), "One line only", "a one-line suggestion is a full accept");
+  await harness.command("stats");
+  assert.match(harness.notifications.at(-1) ?? "", /1 full, 1 word\/chunk/);
+});
+
+test("accept-line on a streamed partial cancels the stream without a new request", async () => {
+  const stream = controlledStream();
+  const signals: AbortSignal[] = [];
+  let calls = 0;
+  const keys = createKeySettingsHarness({
+    streamSimple: ((_model, _context, options) => {
+      calls += 1;
+      signals.push(options?.signal as AbortSignal);
+      return stream.stream;
+    }) as StreamSimple,
+  });
+  const harness = keys.create();
+  const editor = await harness.createEditor();
+  await harness.command("set key accept-line alt+l");
+  editor.setText("Stream");
+  await flushAsyncWork();
+  stream.delta('{"completions":[" partial words here', " partial words here");
+  await flushAsyncWork();
+  editor.handleInput(ALT_L);
+  assert.equal(editor.getText(), "Stream partial words");
+  assert.equal(signals[0]?.aborted, true);
+  await flushAsyncWork();
+  assert.equal(calls, 1);
+  await harness.command("stats");
+  assert.match(harness.notifications.at(-1) ?? "", /0 full, 1 word\/chunk/, "a streamed partial is a partial accept");
+  stream.error("aborted", undefined, "aborted");
+  await flushAsyncWork();
+});
+
+test("set key rejects malformed, unusable, and taken keys and saves nothing", async () => {
+  const keys = createKeySettingsHarness();
+  const harness = keys.create();
+  await harness.createEditor();
+  for (const [args, reply] of [
+    ["key", /Usage: \/prompt-autocomplete set key <accept-word\|accept-line\|cycle-next\|cycle-prev> <key\.\.\.\|default\|none>/],
+    ["key dismiss alt+x", /Usage: \/prompt-autocomplete set key/],
+    ["key accept-line", /Usage: \/prompt-autocomplete set key/],
+    ["key accept-line ctrl+ctrl+a", /ctrl\+ctrl\+a is not a key/],
+    ["key accept-line ctrl+i", /same input as tab/],
+    ["key accept-line ctrl+[", /same input as escape/],
+    ["key accept-line tab", /tab is reserved/],
+    ["key accept-line shift+enter", /editor handles shift\+enter/],
+    ["key accept-line shift+space", /editor handles shift\+space/],
+    ["key accept-line a", /a types text/],
+    ["key accept-line shift+a", /shift\+a types text/],
+    ["key accept-line alt+esc", /Pi does not recognize alt\+esc/],
+    ["key accept-line ctrl+f5", /Pi does not recognize ctrl\+f5/],
+    ["key accept-word ctrl+.", /ctrl\+\. is already cycle-next/],
+  ] as const) {
+    await harness.command(`set ${args}`);
+    assert.match(harness.notifications.at(-1) ?? "", reply, args);
+  }
+  assert.deepEqual(keys.stored(), {});
+
+  await harness.command("set key cycle-prev ctrl+shift+.");
+  await harness.command("set key accept-line shift+ctrl+.");
+  assert.match(harness.notifications.at(-1) ?? "", /already cycle-prev/, "modifier order does not matter");
+  assert.deepEqual(keys.stored().keys, { cyclePrev: ["ctrl+shift+."] });
+});
+
+test("set key none unbinds and default restores", async () => {
+  const keys = createKeySettingsHarness();
+  const harness = keys.create();
+  const editor = await harness.createEditor();
+  await harness.command("set key accept-word none");
+  editor.setText("Fix");
+  await flushAsyncWork();
+  editor.handleInput(CTRL_SPACE);
+  assert.equal(editor.getText(), "Fix");
+  await harness.command("status");
+  assert.doesNotMatch(harness.notifications.at(-1) ?? "", /word \|/);
+
+  await harness.command("set key accept-word default");
+  assert.match(harness.notifications.at(-1) ?? "", /accept-word keys set to ctrl\+space ctrl\+tab \(default\)/);
+  assert.equal(keys.stored().keys, undefined);
+  editor.handleInput(CTRL_SPACE);
+  assert.equal(editor.getText(), "Fix the ");
+});
+
+test("keys reports Pi's keymap once the editor has it and set key warns about keys Pi uses", async () => {
+  const keys = createKeySettingsHarness({ keybindings: createPiKeymap({ "app.model.select": "alt+l" }) });
+  const harness = keys.create();
+  await harness.command("keys");
+  assert.match(harness.notifications.at(-1) ?? "", /Pi's keymap is checked once the editor is active/);
+
+  await harness.createEditor();
+  await harness.command("set key accept-line alt+l");
+  assert.match(harness.notifications.at(-1) ?? "", /Pi's keymap also binds alt\+l \(app\.model\.select\), so Pi keeps those keys/);
+  await harness.command("keys");
+  assert.match(harness.notifications.at(-1) ?? "", /used by Pi, so Pi keeps them: alt\+l \(app\.model\.select\)/);
+});
+
+test("saved keys that cannot be used are ignored and reported", async () => {
+  const harness = createEditorHarness({
+    settingsStore: {
+      load: () => ({ keys: { acceptWord: ["ctrl+i", "alt+w"] } }),
+      update: () => undefined,
+    },
+    completeSimple: (async () => makeCompletion([" the rest"])) as CompleteSimple,
+  });
+  await harness.createEditor();
+  await harness.command("keys");
+  assert.match(harness.notifications.at(-1) ?? "", /accept-word alt\+w \(saved\)/);
+  assert.match(harness.notifications.at(-1) ?? "", /ignored: ctrl\+i is the same input as tab/);
 });
 
 test("rendering preserves IME cursor marker and display widths for Unicode and narrow terminals", async () => {

@@ -4,13 +4,24 @@ All notable changes to this package are documented here. This project follows [S
 
 ## [0.4.0] - Unreleased
 
+### Added
+
+- Configurable keys: `/prompt-autocomplete set key <action> <key...|default|none>` changes the keys of `accept-word`, `accept-line`, `cycle-next`, and `cycle-prev`, applies them at once, and saves them in the settings file. Keys follow Pi's key syntax and are space-separated. Keys that could never reach an action (Tab, Escape, Enter, Backspace and their legacy aliases, keys Pi's editor handles itself, keys that type text, Escape and F1–F12 with a modifier, Clear with other modifiers than Shift or Ctrl alone) and keys another action already has are rejected; a key that Pi's keymap binds is accepted with a warning, because Pi keeps it. `Tab` and `Escape` stay fixed.
+- `/prompt-autocomplete keys` shows every action's keys, whether they are the default or saved, saved keys that are ignored, and keys Pi's keymap also binds.
+- `accept-line` accepts a suggestion up to and including its first line break; a one-line suggestion is accepted whole. It has no default key.
+
 ### Changed
 
 - `Escape` now dismisses a suggestion for as long as you keep typing the same draft, instead of only until the next keystroke. Previously the next character brought the dismissed suggestion back, from the prefix cache or through a new provider request. The dismissal ends for good when the draft no longer extends the dismissed text (for example after `Backspace`, submitting, clearing, or recalling another prompt), when the conversation, the autocomplete model, `max-chars`, or `max-alternatives` changes, or when you press `Ctrl+.`, accept, or cycle. An `Escape` on an empty-draft suggestion lasts only while the draft stays empty.
 
 ### Fixed
 
+- Saving a setting no longer overwrites a decision another Pi process saved after this one started, and no longer drops fields a newer version wrote: each save re-reads the settings file and changes only its own decision. A read error other than a missing file aborts the save instead of replacing the file. The file is replaced atomically through a new owner-only temporary file with an unpredictable name, so on POSIX systems the settings file is now readable by its owner only. Two saves in the same instant can still lose one decision.
 - The word-accept and cycle keys (`Ctrl+Space`, `Ctrl+Tab`, `Ctrl+.`, `Alt+]`, `Ctrl+,`, `Alt+[`) no longer take input that Pi would use. A Pi action you bind to one of them in `keybindings.json`, including history and interrupt, another extension's shortcut on the same key, and a pending character jump (`Ctrl+]`) now get the key as they would without Prompt Autocomplete; previously visible ghost text took it. The check uses Pi's current keymap, so remaps loaded by `/reload` apply at once. `/prompt-autocomplete status` lists such keys under `keys-used-by-pi`. Pi's default keymap uses none of them, so nothing changes without remaps.
+
+### Upgrading
+
+- Version 0.3.0 and earlier drop the saved `keys`, like any other field they do not know, the next time they save a setting; the actions then return to their default keys.
 
 ## [0.3.0] - 2026-10-13
 

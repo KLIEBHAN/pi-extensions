@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  applyPromptAutocompleteSettingsPatch,
   completePromptAutocompleteArguments,
   PROMPT_AUTOCOMPLETE_COMMANDS,
   PROMPT_AUTOCOMPLETE_SET_USAGE,
@@ -11,6 +14,8 @@ import {
 } from "../extensions/prompt-autocomplete/core.ts";
 import {
   createPromptAutocompleteExtension,
+  createPromptAutocompleteFileSettingsStore,
+  type SettingsFileSystem,
   type PromptAutocompleteDependencies,
   type PromptAutocompleteProcessState,
   resolvePromptAutocompleteSettingsPath,
@@ -143,10 +148,10 @@ function createHarness(options: HarnessOptions = {}) {
   const settingsSaves: PromptAutocompletePersistedSettings[] = [];
   const settingsStore = {
     load: () => ({ ...storedSettings }),
-    save: (settings: PromptAutocompletePersistedSettings) => {
+    update: (patch: Partial<PromptAutocompletePersistedSettings>) => {
       if (options.failingSettingsSave) throw new Error("read-only config directory");
-      storedSettings = { ...settings };
-      settingsSaves.push({ ...settings });
+      storedSettings = applyPromptAutocompleteSettingsPatch(storedSettings, patch);
+      settingsSaves.push({ ...storedSettings });
     },
   };
 
@@ -1210,4 +1215,94 @@ test("every grammar command dispatches, and unknown commands show the usage", as
   assert.equal(lastStatus(harness), PROMPT_AUTOCOMPLETE_USAGE);
   await command(harness, "set bogus 1");
   assert.equal(lastStatus(harness), PROMPT_AUTOCOMPLETE_SET_USAGE);
+});
+
+test("the settings file keeps decisions other processes saved and fields it does not know", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pa-settings-"));
+  try {
+    const path = join(dir, "settings.json");
+    writeFileSync(path, JSON.stringify({ enabled: true, futureSetting: { kept: true } }), "utf8");
+    // Two Pi processes: both load at activation, then save one decision each.
+    const first = createPromptAutocompleteFileSettingsStore(path);
+    const second = createPromptAutocompleteFileSettingsStore(path);
+    assert.deepEqual(first.load(), { enabled: true });
+    second.update({ minPromptChars: 3 });
+    first.update({ debounceMs: 200, keys: { acceptLine: ["alt+l"] } });
+
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), {
+      enabled: true,
+      futureSetting: { kept: true },
+      minPromptChars: 3,
+      debounceMs: 200,
+      keys: { acceptLine: ["alt+l"] },
+    });
+    assert.deepEqual(readdirSync(dir), ["settings.json"], "no temporary file is left behind");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a settings file that cannot be read is not replaced", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "pa-settings-"));
+  const path = join(dir, "settings.json");
+  try {
+    writeFileSync(path, JSON.stringify({ enabled: true, minPromptChars: 4 }), "utf8");
+    chmodSync(path, 0o000);
+    const store = createPromptAutocompleteFileSettingsStore(path);
+    assert.deepEqual(store.load(), {}, "load stays non-throwing");
+    assert.throws(() => store.update({ debounceMs: 200 }), /EACCES/);
+    chmodSync(path, 0o600);
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { enabled: true, minPromptChars: 4 });
+    assert.deepEqual(readdirSync(dir), ["settings.json"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a saved settings file is readable by its owner only", { skip: process.platform === "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "pa-settings-"));
+  try {
+    const path = join(dir, "settings.json");
+    createPromptAutocompleteFileSettingsStore(path).update({ enabled: true });
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    // A file an older version wrote with default permissions is tightened too.
+    chmodSync(path, 0o644);
+    createPromptAutocompleteFileSettingsStore(path).update({ minPromptChars: 2 });
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed settings save removes its own temporary file and nothing else", () => {
+  const removed: string[] = [];
+  const failure = (code: string) => Object.assign(new Error(code), { code });
+  const fileSystem = (overrides: Partial<SettingsFileSystem>): SettingsFileSystem => ({
+    readFileSync: () => JSON.stringify({ enabled: true }),
+    writeFileSync: () => undefined,
+    renameSync: () => undefined,
+    rmSync: (path) => {
+      removed.push(path);
+    },
+    mkdirSync: () => undefined,
+    ...overrides,
+  });
+
+  const renameFails = createPromptAutocompleteFileSettingsStore("/settings.json", fileSystem({
+    // Even EEXIST from the rename leaves a temporary file this save created.
+    renameSync: () => {
+      throw failure("EEXIST");
+    },
+  }));
+  assert.throws(() => renameFails.update({ debounceMs: 200 }), /EEXIST/);
+  assert.equal(removed.length, 1, "the created temporary file is removed");
+  assert.match(removed[0]!, /^\/settings\.json\.\d+\.[0-9a-f]{12}\.tmp$/);
+
+  const planted = createPromptAutocompleteFileSettingsStore("/settings.json", fileSystem({
+    writeFileSync: () => {
+      throw failure("EEXIST");
+    },
+  }));
+  assert.throws(() => planted.update({ debounceMs: 200 }), /EEXIST/);
+  assert.equal(removed.length, 1, "an entry that already existed is left alone");
 });

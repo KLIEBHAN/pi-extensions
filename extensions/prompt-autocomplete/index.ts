@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import * as piAi from "@earendil-works/pi-ai";
@@ -91,11 +92,21 @@ import {
   resolvePersistedEnabled,
   resolvePersistedNumber,
   resolvePromptAutocompleteBudgetLimit,
-  serializePromptAutocompletePersistedSettings,
   PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
   PROMPT_AUTOCOMPLETE_BUDGET_ENTRY_TYPE,
   PROMPT_AUTOCOMPLETE_KEY_ACTIONS,
+  PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS,
+  applyPromptAutocompleteSettingsPatch,
+  describeUnusablePromptAutocompleteKey,
+  canonicalKeyId,
+  extractSuggestionLine,
+  findConfigurableKeyAction,
   findPiKeyConflicts,
+  mergePromptAutocompleteSettingsText,
+  parsePromptAutocompleteKeyId,
+  listPromptAutocompleteKeys,
+  resolvePromptAutocompleteKeymap,
+  type PromptAutocompleteKeymap,
   promptAutocompleteDismissalCovers,
   recordProviderLatency,
   recordProviderUsage,
@@ -148,9 +159,6 @@ const REQUEST_CACHE_TTL_MS = 60_000;
 const REQUEST_CACHE_MAX_ENTRIES = 128;
 const PRIVACY_NOTICE =
   "Requests send the current draft and recent conversation context to the selected model and may incur provider usage.";
-const WORD_ACCEPT_KEYS = PROMPT_AUTOCOMPLETE_KEY_ACTIONS.acceptWord.keys;
-const CYCLE_NEXT_KEYS = PROMPT_AUTOCOMPLETE_KEY_ACTIONS.cycleNext.keys;
-const CYCLE_PREV_KEYS = PROMPT_AUTOCOMPLETE_KEY_ACTIONS.cyclePrev.keys;
 const NAVIGATION_ACTIONS = [
   "tui.editor.cursorUp",
   "tui.editor.cursorDown",
@@ -371,11 +379,13 @@ function sharedProcessState(): PromptAutocompleteProcessState {
  * Persistence boundary for cross-process decisions.
  *
  * `load` runs once per activation and must not throw for a missing or
- * malformed store; `save` may throw and the caller reports the failure.
+ * malformed store. `update` writes one decision on top of what the store holds
+ * at that moment, so decisions other processes saved meanwhile survive; it may
+ * throw and the caller reports the failure.
  */
 export interface PromptAutocompleteSettingsStore {
   load(): PromptAutocompletePersistedSettings;
-  save(settings: PromptAutocompletePersistedSettings): void;
+  update(patch: Partial<PromptAutocompletePersistedSettings>): void;
 }
 
 /**
@@ -397,25 +407,78 @@ export function resolvePromptAutocompleteSettingsPath(
   return join(configHome, "pi-prompt-autocomplete", "settings.json");
 }
 
-function createFileSettingsStore(path: string): PromptAutocompleteSettingsStore {
+/**
+ * The settings file as a store.
+ *
+ * Every update re-reads the file and replaces it atomically through a new,
+ * owner-only temporary file with an unpredictable name. Only a missing file
+ * counts as empty: any other read error aborts the update, so the saved
+ * decisions are never replaced by the new one alone. Two processes saving in
+ * the same instant can still lose one decision; there is no lock.
+ */
+export function createPromptAutocompleteFileSettingsStore(
+  path: string,
+  fileSystem: SettingsFileSystem = NODE_SETTINGS_FILE_SYSTEM,
+): PromptAutocompleteSettingsStore {
+  const readText = (): string | undefined => {
+    try {
+      return fileSystem.readFileSync(path, "utf8");
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return undefined;
+      throw error;
+    }
+  };
+  const removeTemporaryFile = (tempPath: string): void => {
+    try {
+      fileSystem.rmSync(tempPath, { force: true });
+    } catch {
+      // The write failure is the error worth reporting.
+    }
+  };
   return {
     load(): PromptAutocompletePersistedSettings {
-      let text: string;
       try {
-        text = readFileSync(path, "utf8");
+        return parsePromptAutocompletePersistedSettings(readText());
       } catch {
         return {};
       }
-      return parsePromptAutocompletePersistedSettings(text);
     },
-    save(settings: PromptAutocompletePersistedSettings): void {
-      // Atomic replace so a crash mid-write cannot corrupt the settings file.
-      const tempPath = `${path}.tmp`;
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(tempPath, serializePromptAutocompletePersistedSettings(settings), "utf8");
-      renameSync(tempPath, path);
+    update(patch: Partial<PromptAutocompletePersistedSettings>): void {
+      const merged = mergePromptAutocompleteSettingsText(readText(), patch);
+      const tempPath = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+      fileSystem.mkdirSync(dirname(path), { recursive: true });
+      try {
+        // `wx` creates the file or fails; it never writes through an entry
+        // that already exists under that name, such as a planted link.
+        fileSystem.writeFileSync(tempPath, merged, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      } catch (error) {
+        // An entry that already existed is not ours to remove.
+        if (!hasErrorCode(error, "EEXIST")) removeTemporaryFile(tempPath);
+        throw error;
+      }
+      try {
+        fileSystem.renameSync(tempPath, path);
+      } catch (error) {
+        removeTemporaryFile(tempPath);
+        throw error;
+      }
     },
   };
+}
+
+/** The file operations the settings store uses; tests replace them to inject failures. */
+export interface SettingsFileSystem {
+  readFileSync(path: string, encoding: "utf8"): string;
+  writeFileSync(path: string, data: string, options: { encoding: "utf8"; flag: string; mode: number }): void;
+  renameSync(oldPath: string, newPath: string): void;
+  rmSync(path: string, options: { force: boolean }): void;
+  mkdirSync(path: string, options: { recursive: true }): unknown;
+}
+
+const NODE_SETTINGS_FILE_SYSTEM: SettingsFileSystem = { readFileSync, writeFileSync, renameSync, rmSync, mkdirSync };
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 interface PromptAutocompleteSharedState {
@@ -448,6 +511,8 @@ interface PromptAutocompleteSharedState {
   /** Decisions persisted across processes; loaded once per activation. */
   persistedSettings: PromptAutocompletePersistedSettings;
   settingsStore?: PromptAutocompleteSettingsStore;
+  /** Effective keys from the saved keys; replaced by `set key`, read at every keypress. */
+  keymap: PromptAutocompleteKeymap;
   /** Last enabled-flag value seen by applyEffectiveConfig, for status attribution. */
   enabledFlagValue: boolean;
   /** Explicit min-chars flag value seen by applyEffectiveConfig, undefined when defaulted. */
@@ -533,7 +598,7 @@ interface SuggestionRequest extends PromptAutocompleteRequestSnapshot {
 }
 
 /** Key actions that act only on input Pi leaves free. */
-type YieldingKeyAction = "cycle" | "manual" | "acceptWord";
+type YieldingKeyAction = "cycle" | "manual" | "acceptWord" | "acceptLine";
 
 interface EditorInputState {
   text: string;
@@ -654,23 +719,75 @@ function findPiUseOfInput(keybindings: KeybindingsManager, data: string): string
   return data.charCodeAt(0) >= 32 || decodeKittyPrintable(data) !== undefined ? "text input" : undefined;
 }
 
-/** `status` note on yielding keys that Pi's keymap also binds. */
-function formatKeyConflicts(keybindings: KeybindingsManager | undefined): string | undefined {
+/**
+ * Those of `keys` that Pi's keymap also binds, as `ctrl+space (app.model.select)`;
+ * undefined while the editor has not received Pi's keymap.
+ */
+function listKeysUsedByPi(keybindings: KeybindingsManager | undefined, keys: readonly KeyId[]): string[] | undefined {
   if (typeof keybindings?.getResolvedBindings !== "function") return undefined;
   const resolved = keybindings.getResolvedBindings();
-  const notes: string[] = [];
-  for (const action of Object.values(PROMPT_AUTOCOMPLETE_KEY_ACTIONS)) {
-    if (!action.yieldsToPi) continue;
-    for (const key of action.keys) {
-      const conflicts = findPiKeyConflicts(key, resolved);
-      if (conflicts.length > 0) notes.push(`${key} (${conflicts.join(", ")})`);
-    }
-  }
-  return notes.length > 0 ? `keys-used-by-pi=${notes.join(", ")}` : undefined;
+  return keys.flatMap((key) => {
+    const conflicts = findPiKeyConflicts(key, resolved);
+    return conflicts.length > 0 ? [`${key} (${conflicts.join(", ")})`] : [];
+  });
 }
 
-function formatPrimaryKey(keys: readonly KeyId[]): string {
-  return keys[0] ?? "";
+function configurableKeys(keymap: PromptAutocompleteKeymap): KeyId[] {
+  return PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS.flatMap((action) => keymap.keys[action]);
+}
+
+function formatKeysUsedByPi(shared: PromptAutocompleteSharedState): string | undefined {
+  const usedByPi = listKeysUsedByPi(shared.keybindings, configurableKeys(shared.keymap));
+  return usedByPi && usedByPi.length > 0 ? `keys-used-by-pi=${usedByPi.join(", ")}` : undefined;
+}
+
+/** Key hints for `status` and the enable notice; each names an action's first key. */
+function formatKeyHints(keymap: PromptAutocompleteKeymap): { status: string; notice: string } {
+  const [word, line, next, prev] = [
+    keymap.keys.acceptWord[0],
+    keymap.keys.acceptLine[0],
+    keymap.keys.cycleNext[0],
+    keymap.keys.cyclePrev[0],
+  ];
+  const cycle = [prev, next].filter((key) => key !== undefined).join("/");
+  const status = [
+    "tab accept",
+    word && `${word} word`,
+    line && `${line} line`,
+    cycle && `${cycle} cycle`,
+    next && `${next} force one-shot`,
+  ];
+  const notice = [
+    "Tab accepts all",
+    word && `${word} accepts one word`,
+    line && `${line} accepts one line`,
+    cycle && `${cycle} cycle alternatives`,
+    next && `${next} also forces a one-shot suggestion when none is shown (even while the agent works)`,
+  ];
+  return {
+    status: status.filter((part) => !!part).join(" | "),
+    notice: `${notice.filter((part) => !!part).join(", ")}.`,
+  };
+}
+
+/** `/prompt-autocomplete keys`: every action with its keys and where they come from. */
+function formatKeymap(shared: PromptAutocompleteSharedState): string {
+  const { keymap } = shared;
+  const actions = listPromptAutocompleteKeys(keymap).map(
+    ({ command, keys, source }) => `${command} ${keys.join(" ") || "none"} (${source})`,
+  );
+  const usedByPi = listKeysUsedByPi(shared.keybindings, configurableKeys(keymap));
+  return [
+    `Prompt autocomplete keys: ${actions.join(" | ")}`,
+    keymap.ignored.length > 0 ? `ignored: ${keymap.ignored.join(", ")}` : undefined,
+    usedByPi === undefined
+      ? "Pi's keymap is checked once the editor is active"
+      : usedByPi.length > 0
+        ? `used by Pi, so Pi keeps them: ${usedByPi.join(", ")}`
+        : undefined,
+  ]
+    .filter((part) => part !== undefined)
+    .join(" | ");
 }
 
 interface SuggestionModelResolution {
@@ -988,10 +1105,8 @@ function formatStatus(shared: PromptAutocompleteSharedState, interactiveHost = t
     `state=${shared.debugState || "idle"}`,
     shared.lastError ? `error=${truncateDebug(shared.lastError, 90)}` : undefined,
     shared.lastRawResponse ? `raw=${truncateDebug(shared.lastRawResponse, 90)}` : undefined,
-    interactiveHost
-      ? `keys=tab accept | ${formatPrimaryKey(WORD_ACCEPT_KEYS)} word | ${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle | ${formatPrimaryKey(CYCLE_NEXT_KEYS)} force one-shot`
-      : undefined,
-    interactiveHost ? formatKeyConflicts(shared.keybindings) : undefined,
+    interactiveHost ? `keys=${formatKeyHints(shared.keymap).status}` : undefined,
+    interactiveHost ? formatKeysUsedByPi(shared) : undefined,
   ]
     .filter((value): value is string => !!value)
     .join(" | ");
@@ -1279,17 +1394,20 @@ class PromptAutocompleteEditor extends CustomEditor {
   private matchYieldingKeyAction(data: string): YieldingKeyAction | undefined {
     if (this.canCycleSuggestions(data)) return "cycle";
     if (this.canTriggerManualSuggestion(data)) return "manual";
-    if (this.canAcceptInlineSuggestionByWord(data)) return "acceptWord";
+    if (this.canAcceptInlineSuggestionPart(data, this.shared.keymap.keys.acceptWord)) return "acceptWord";
+    if (this.canAcceptInlineSuggestionPart(data, this.shared.keymap.keys.acceptLine)) return "acceptLine";
     return undefined;
   }
 
   private runYieldingKeyAction(action: YieldingKeyAction, data: string): void {
     if (action === "cycle") {
-      this.cycleSuggestions(matchesAnyKey(data, CYCLE_NEXT_KEYS) ? 1 : -1);
+      this.cycleSuggestions(matchesAnyKey(data, this.shared.keymap.keys.cycleNext) ? 1 : -1);
     } else if (action === "manual") {
       this.triggerManualSuggestion();
-    } else {
+    } else if (action === "acceptWord") {
       this.acceptInlineSuggestionByWord();
+    } else {
+      this.acceptInlineSuggestionByLine();
     }
   }
 
@@ -1517,7 +1635,7 @@ class PromptAutocompleteEditor extends CustomEditor {
   private canTriggerManualSuggestion(data: string): boolean {
     if (!this.shared.enabled || this.activationId !== this.shared.activationId) return false;
     if (this.isShowingAutocomplete()) return false;
-    return matchesAnyKey(data, CYCLE_NEXT_KEYS);
+    return matchesAnyKey(data, this.shared.keymap.keys.cycleNext);
   }
 
   private triggerManualSuggestion(): void {
@@ -1535,14 +1653,15 @@ class PromptAutocompleteEditor extends CustomEditor {
     return this.shouldRenderInlineSuggestion() && !!this.getActiveSuggestion() && matchesKey(data, "tab");
   }
 
-  private canAcceptInlineSuggestionByWord(data: string): boolean {
-    return this.shouldRenderInlineSuggestion() && !!this.getActiveSuggestion() && matchesAnyKey(data, WORD_ACCEPT_KEYS);
+  private canAcceptInlineSuggestionPart(data: string, keys: readonly KeyId[]): boolean {
+    return this.shouldRenderInlineSuggestion() && !!this.getActiveSuggestion() && matchesAnyKey(data, keys);
   }
 
   private canCycleSuggestions(data: string): boolean {
     if (!this.shouldRenderInlineSuggestion()) return false;
     if (this.suggestions.length <= 1) return false;
-    return matchesAnyKey(data, CYCLE_NEXT_KEYS) || matchesAnyKey(data, CYCLE_PREV_KEYS);
+    const { cycleNext, cyclePrev } = this.shared.keymap.keys;
+    return matchesAnyKey(data, cycleNext) || matchesAnyKey(data, cyclePrev);
   }
 
   private clearInlineSuggestion(state: string, details: string): void {
@@ -1595,15 +1714,30 @@ class PromptAutocompleteEditor extends CustomEditor {
   private acceptInlineSuggestionByWord(): void {
     const suggestion = this.getActiveSuggestion();
     if (!suggestion) return;
+    this.acceptInlineSuggestionPart(extractNextSuggestionChunk(suggestion) ?? suggestion, "accepted-word");
+  }
 
-    const origin = this.getActiveSuggestionOrigin();
-    const chunk = extractNextSuggestionChunk(suggestion) ?? suggestion;
+  /** Accept up to the first line break; a completed one-line suggestion is a full accept. */
+  private acceptInlineSuggestionByLine(): void {
+    const suggestion = this.getActiveSuggestion();
+    if (!suggestion) return;
+    const line = extractSuggestionLine(suggestion);
+    // A streamed partial is not the whole suggestion, even without a line break.
+    if (line === suggestion && !this.suggestionsProvisional) {
+      this.acceptInlineSuggestion();
+      return;
+    }
+    this.acceptInlineSuggestionPart(line, "accepted-line");
+  }
+
+  /** Insert the start of the active suggestion and keep offering the rest. */
+  private acceptInlineSuggestionPart(chunk: string, state: string): void {
     if (!chunk) return;
-
+    const origin = this.getActiveSuggestionOrigin();
     const wasProvisional = this.suggestionsProvisional;
     this.shared.usageStats.chunkAccepts += 1;
     this.dismissal = undefined;
-    this.clearInlineSuggestion("accepted-word", `Accepted chunk: ${chunk}`);
+    this.clearInlineSuggestion(state, `Accepted chunk: ${chunk}`);
     super.insertTextAtCursor(chunk);
     if (!wasProvisional) this.refreshSuggestion({ preferredOrigin: origin });
   }
@@ -2636,11 +2770,11 @@ function persistSettingsDecision(
   shared: PromptAutocompleteSharedState,
   patch: Partial<PromptAutocompletePersistedSettings>,
 ): boolean {
-  shared.persistedSettings = { ...shared.persistedSettings, ...patch };
+  shared.persistedSettings = applyPromptAutocompleteSettingsPatch(shared.persistedSettings, patch);
   const store = shared.settingsStore;
   if (!store) return false;
   try {
-    store.save(shared.persistedSettings);
+    store.update(patch);
     return true;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -2920,7 +3054,73 @@ const SET_KEY_RUNNERS: {
     }
     setModelSetting(ctx, shared, value);
   },
+  key: (ctx, shared, value) => setActionKeys(ctx, shared, value),
 };
+
+const SET_KEY_USAGE = `Usage: /prompt-autocomplete set key <${
+  PROMPT_AUTOCOMPLETE_CONFIGURABLE_KEY_ACTIONS.map((action) => PROMPT_AUTOCOMPLETE_KEY_ACTIONS[action].command).join("|")
+}> <key...|default|none>`;
+
+/**
+ * `set key <action> <key...|default|none>`: change one action's keys, save
+ * them, and apply them to the editor at once.
+ *
+ * Keys are whitespace-separated, because `,` is a key. A key that another
+ * Prompt Autocomplete action has must be freed there first, so one keypress
+ * never means two actions. A key Pi's keymap binds is accepted with a note:
+ * the editor leaves it to Pi.
+ */
+function setActionKeys(ctx: ExtensionContext, shared: PromptAutocompleteSharedState, value: string): void {
+  const [command = "", ...tokens] = value.split(/\s+/).filter((token) => token.length > 0);
+  const action = findConfigurableKeyAction(command.toLowerCase());
+  if (!action || tokens.length === 0) {
+    ctx.ui.notify(SET_KEY_USAGE, "warning");
+    return;
+  }
+  const choice = tokens.length === 1 ? tokens[0]!.toLowerCase() : undefined;
+  let keys: KeyId[] | undefined;
+  if (choice === "none") {
+    keys = [];
+  } else if (choice !== "default") {
+    keys = [];
+    for (const token of tokens) {
+      const key = parsePromptAutocompleteKeyId(token);
+      if (!key) {
+        ctx.ui.notify(`${truncateDebug(token, 40)} is not a key. ${SET_KEY_USAGE}`, "warning");
+        return;
+      }
+      const unusable = describeUnusablePromptAutocompleteKey(key);
+      if (unusable) {
+        ctx.ui.notify(`Prompt autocomplete cannot use this key: ${unusable}.`, "warning");
+        return;
+      }
+      if (!keys.some((existing) => canonicalKeyId(existing) === canonicalKeyId(key))) keys.push(key);
+    }
+  }
+
+  for (const key of keys ?? PROMPT_AUTOCOMPLETE_KEY_ACTIONS[action].keys) {
+    const owner = listPromptAutocompleteKeys(shared.keymap).find(
+      (entry) => entry.command !== command.toLowerCase()
+        && entry.keys.some((owned) => canonicalKeyId(owned) === canonicalKeyId(key)),
+    );
+    if (owner) {
+      ctx.ui.notify(`${key} is already ${owner.command}; change that action first.`, "warning");
+      return;
+    }
+  }
+
+  const persisted = persistSettingsDecision(ctx, shared, { keys: { [action]: keys } });
+  shared.keymap = resolvePromptAutocompleteKeymap(shared.persistedSettings.keys);
+  const effective = shared.keymap.keys[action];
+  const usedByPi = listKeysUsedByPi(shared.keybindings, effective) ?? [];
+  ctx.ui.notify(
+    `Prompt autocomplete ${command.toLowerCase()} keys set to ${effective.join(" ") || "none"}`
+      + `${keys === undefined ? " (default)" : ""}`
+      + `${persisted ? " (saved for future sessions)" : " (session only — could not save for future sessions)"}`
+      + `${usedByPi.length > 0 ? `. Pi's keymap also binds ${usedByPi.join(", ")}, so Pi keeps those keys.` : ""}`,
+    usedByPi.length > 0 ? "warning" : "info",
+  );
+}
 
 function setBoundedSetKey(
   ctx: ExtensionContext,
@@ -2993,10 +3193,7 @@ function notifyPromptAutocompleteEnabled(
   shared: PromptAutocompleteSharedState,
   options: { includeModel: boolean },
 ): void {
-  const keyHint =
-    `Tab accepts all, ${formatPrimaryKey(WORD_ACCEPT_KEYS)} accepts one word, ` +
-    `${formatPrimaryKey(CYCLE_PREV_KEYS)}/${formatPrimaryKey(CYCLE_NEXT_KEYS)} cycle alternatives, ` +
-    `${formatPrimaryKey(CYCLE_NEXT_KEYS)} also forces a one-shot suggestion when none is shown (even while the agent works).`;
+  const keyHint = formatKeyHints(shared.keymap).notice;
   const resolution = resolveSuggestionModelResolution(shared);
   const resolvedModel = resolution.model;
   const privacyNotice = PRIVACY_NOTICE;
@@ -3128,6 +3325,7 @@ const COMMAND_RUNNERS: { [Name in PromptAutocompleteCommandName]: CommandRunner 
   "min-chars": (ctx, shared, { firstArgument }) => setMinPromptChars(ctx, shared, firstArgument),
   budget: (ctx, shared, { firstArgument }) => setBudgetLimit(ctx, shared, firstArgument),
   set: (ctx, shared, { rest }) => handleSetCommand(ctx, shared, rest),
+  keys: (ctx, shared) => ctx.ui.notify(formatKeymap(shared), "info"),
   stream: (ctx, shared, { firstArgument }) => setStreamResponses(ctx, shared, firstArgument),
   "while-streaming": (ctx, shared, { firstArgument }) => setWhileStreaming(ctx, shared, firstArgument),
   "debug-on": (ctx, shared) => {
@@ -3181,7 +3379,8 @@ export function createPromptAutocompleteExtension(
     dependencies.streamSimple
     ?? (dependencies.completeSimple || !hostStreaming ? undefined : routedStreamSimple);
 
-  const settingsStore = dependencies.settingsStore ?? createFileSettingsStore(resolvePromptAutocompleteSettingsPath());
+  const settingsStore = dependencies.settingsStore
+    ?? createPromptAutocompleteFileSettingsStore(resolvePromptAutocompleteSettingsPath());
   let persistedSettings: PromptAutocompletePersistedSettings;
   try {
     persistedSettings = settingsStore.load();
@@ -3253,6 +3452,7 @@ export function createPromptAutocompleteExtension(
     runtimeOverrides: {},
     persistedSettings,
     settingsStore,
+    keymap: resolvePromptAutocompleteKeymap(persistedSettings.keys),
     enabledFlagValue: false,
     budgetUsed: 0,
     budgetBlockNotices: new Set(),

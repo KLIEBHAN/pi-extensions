@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { KeybindingsConfig } from "@earendil-works/pi-tui";
+import { Key, type KeybindingsConfig } from "@earendil-works/pi-tui";
 import {
   acquireCoalescedRequest,
   buildLatestAssistantMessageContext,
@@ -12,8 +12,15 @@ import {
   buildPromptAutocompleteDismissalContext,
   buildPromptAutocompletePrefixContextKey,
   buildRecentConversationContext,
+  applyPromptAutocompleteSettingsPatch,
   canonicalKeyId,
+  describeUnusablePromptAutocompleteKey,
+  extractSuggestionLine,
   findPiKeyConflicts,
+  mergePromptAutocompleteSettingsText,
+  parsePromptAutocompleteKeyId,
+  PI_KEY_NAMES,
+  resolvePromptAutocompleteKeymap,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
   completePromptAutocompleteArguments,
@@ -1750,11 +1757,11 @@ test("a compaction summary is bounded with goal and next steps kept, and its che
 test("the command grammar reproduces the published usage text exactly", () => {
   assert.equal(
     PROMPT_AUTOCOMPLETE_USAGE,
-    "Usage: /prompt-autocomplete [on|off|toggle|status|stats|inspect [draft]|min-chars <n>|budget <n|off>|set <key> [value]|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
+    "Usage: /prompt-autocomplete [on|off|toggle|status|stats|inspect [draft]|min-chars <n>|budget <n|off>|set <key> [value]|keys|stream on|off|toggle|while-streaming on|off|toggle|debug-on|debug-off|debug-toggle]",
   );
   assert.equal(
     PROMPT_AUTOCOMPLETE_SET_USAGE,
-    "Usage: /prompt-autocomplete set [debounce-ms <0-5000>|min-chars <0-500>|max-chars <16-1000>|max-alternatives <1-5>|model <provider/model|active>]",
+    "Usage: /prompt-autocomplete set [debounce-ms <0-5000>|min-chars <0-500>|max-chars <16-1000>|max-alternatives <1-5>|model <provider/model|active>|key <action> <key...|default|none>]",
   );
 });
 
@@ -1763,7 +1770,7 @@ test("the command grammar is consistent", () => {
   assert.equal(new Set(names).size, names.length, "command names are unique");
   assert.deepEqual(
     PROMPT_AUTOCOMPLETE_COMMANDS.filter((spec) => spec.readOnly).map((spec) => spec.name),
-    ["status", "stats", "inspect"],
+    ["status", "stats", "inspect", "keys"],
     "only reporting commands are read-only",
   );
   for (const spec of PROMPT_AUTOCOMPLETE_COMMANDS) {
@@ -1886,4 +1893,118 @@ test("key conflicts compare canonical key ids, including legacy byte equivalents
   assert.deepEqual(findPiKeyConflicts("ctrl+i", resolved), ["tui.input.tab"]);
   assert.deepEqual(findPiKeyConflicts("ctrl+.", resolved), []);
   assert.deepEqual(findPiKeyConflicts("ctrl++", { "app.example": "ctrl+shift+=" }), ["app.example"]);
+});
+
+test("Pi's key names match pi-tui's Key values", () => {
+  assert.deepEqual(
+    [...PI_KEY_NAMES].sort(),
+    Object.values(Key).flatMap((value): string[] => (typeof value === "string" ? [value] : [])).sort(),
+  );
+});
+
+test("keys parse in Pi's grammar and normalize to Pi's spelling", () => {
+  assert.equal(parsePromptAutocompleteKeyId("Ctrl+PageUp"), "ctrl+pageUp");
+  assert.equal(parsePromptAutocompleteKeyId(" alt+L "), "alt+l");
+  assert.equal(parsePromptAutocompleteKeyId("ctrl+,"), "ctrl+,");
+  assert.equal(parsePromptAutocompleteKeyId("ctrl++"), "ctrl++");
+  assert.equal(parsePromptAutocompleteKeyId("shift+ctrl+."), "shift+ctrl+.");
+  for (const invalid of ["ctrl+ctrl+a", "hyper+x", "ctrl+", "ab", "ctrl+pageup+x", ""]) {
+    assert.equal(parsePromptAutocompleteKeyId(invalid), undefined, invalid);
+  }
+});
+
+test("keys that Pi's editor handles or that type text are unusable", () => {
+  for (const [key, reason] of [
+    ["ctrl+i", /same input as tab/],
+    ["ctrl+[", /same input as escape/],
+    ["ctrl+m", /same input as enter/],
+    ["esc", /esc is reserved/],
+    ["shift+enter", /editor handles/],
+    ["shift+space", /editor handles/],
+    ["ctrl+j", /editor handles/],
+    ["a", /types text/],
+    ["shift+a", /types text/],
+    ["shift+1", /types text/],
+    ["space", /types text/],
+    ["alt+esc", /does not recognize/],
+    ["ctrl+f1", /does not recognize/],
+    ["shift+f12", /does not recognize/],
+    ["alt+clear", /does not recognize/],
+    ["ctrl+shift+clear", /does not recognize/],
+  ] as const) {
+    assert.match(describeUnusablePromptAutocompleteKey(key) ?? "", reason, key);
+  }
+  for (const key of ["alt+l", "ctrl+shift+.", "ctrl++", "f5", "super+k", "ctrl+home", "alt+up", "ctrl+clear", "shift+clear"]) {
+    assert.equal(describeUnusablePromptAutocompleteKey(key), undefined, key);
+  }
+});
+
+test("saved keys resolve over the defaults, one action per key", () => {
+  const defaults = resolvePromptAutocompleteKeymap();
+  assert.deepEqual(defaults.keys.acceptWord, ["ctrl+space", "ctrl+tab"]);
+  assert.deepEqual(defaults.keys.acceptLine, []);
+  assert.deepEqual(defaults.ignored, []);
+
+  const keymap = resolvePromptAutocompleteKeymap({
+    acceptLine: ["alt+l", "ctrl+.", "alt+l"],
+    cycleNext: ["ctrl+i", "alt+n"],
+    cyclePrev: [],
+  });
+  assert.deepEqual(keymap.keys.acceptLine, ["alt+l", "ctrl+."], "a repeated key counts once");
+  assert.deepEqual(keymap.keys.cycleNext, ["alt+n"]);
+  assert.deepEqual(keymap.keys.cyclePrev, [], "an empty list unbinds");
+  assert.deepEqual(keymap.ignored, ["ctrl+i is the same input as tab"]);
+  assert.deepEqual(keymap.sources, { acceptWord: "default", acceptLine: "saved", cycleNext: "saved", cyclePrev: "saved" });
+
+  // An earlier action keeps a key that a later default also has.
+  const taken = resolvePromptAutocompleteKeymap({ acceptWord: ["ctrl+."] });
+  assert.deepEqual(taken.keys.cycleNext, ["alt+]"]);
+  assert.deepEqual(taken.ignored, ["ctrl+. already accept-word"]);
+});
+
+test("a settings decision merges into the current file and keeps unknown fields", () => {
+  const current = JSON.stringify({
+    enabled: true,
+    minPromptChars: 4,
+    futureSetting: { nested: true },
+    keys: { cycleNext: ["alt+n"], futureAction: ["alt+f"] },
+  });
+  const merged = JSON.parse(mergePromptAutocompleteSettingsText(current, {
+    debounceMs: 200,
+    keys: { acceptLine: ["alt+l"], cycleNext: undefined },
+  }));
+  assert.deepEqual(merged, {
+    enabled: true,
+    minPromptChars: 4,
+    futureSetting: { nested: true },
+    keys: { futureAction: ["alt+f"], acceptLine: ["alt+l"] },
+    debounceMs: 200,
+  });
+  // Invalid values in a decision are not written; unreadable files start over.
+  assert.deepEqual(JSON.parse(mergePromptAutocompleteSettingsText("{not json", { debounceMs: -1, enabled: false })), {
+    enabled: false,
+  });
+});
+
+test("an in-memory settings decision merges keys per action", () => {
+  const settings = applyPromptAutocompleteSettingsPatch(
+    { enabled: true, keys: { acceptWord: ["alt+w"], cycleNext: ["alt+n"] } },
+    { keys: { acceptWord: undefined, acceptLine: ["alt+l"] } },
+  );
+  assert.deepEqual(settings, { enabled: true, keys: { cycleNext: ["alt+n"], acceptLine: ["alt+l"] } });
+  assert.deepEqual(applyPromptAutocompleteSettingsPatch({ keys: { acceptWord: [] } }, { keys: { acceptWord: undefined } }), {});
+});
+
+test("saved keys load with invalid key names dropped", () => {
+  assert.deepEqual(
+    parsePromptAutocompletePersistedSettings(JSON.stringify({
+      keys: { acceptWord: ["Alt+W", "nonsense", 3], dismiss: ["alt+x"], cyclePrev: [] },
+    })),
+    { keys: { acceptWord: ["alt+w"], cyclePrev: [] } },
+  );
+});
+
+test("line acceptance takes the first line with its line break", () => {
+  assert.equal(extractSuggestionLine(" first line\n  second"), " first line\n");
+  assert.equal(extractSuggestionLine(" only line"), " only line");
 });
