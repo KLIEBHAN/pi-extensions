@@ -223,10 +223,10 @@ pi install npm:@kliebhan/pi-prompt-autocomplete
 - reuses a still-valid terminal suggestion locally while you type its prefix, showing only the remaining suffix instead of issuing another provider request
 - shows 3 alternatives after the response completes, with configurable limit via flag
 - `Tab` accepts the whole current suggestion
-- `Ctrl+Space` accepts the next word/chunk from the current suggestion; `accept-line` (no default key) accepts up to the end of its first line
+- `Ctrl+Space` accepts the next word/chunk from the current suggestion; `accept-line` (no default key) accepts up to and including its first line break
 - `Ctrl+,` and `Ctrl+.` cycle through alternative suggestions; when there is nothing to cycle, `Ctrl+.` forces a one-shot suggestion (even while the agent is working and while-streaming is off)
 - legacy fallbacks remain supported when your terminal forwards them: `Ctrl+Tab`, `Alt+[`, `Alt+]`
-- `Escape` dismisses suggestions for as long as you keep typing the same draft; editing below the dismissed text, submitting, a new reply, or a model change ends the dismissal, and `Ctrl+.` brings a suggestion back at once
+- `Escape` dismisses suggestions for as long as you keep typing the same draft; the dismissal ends when the draft no longer extends the dismissed text (`Backspace`, submit, clear, recalling another prompt), when a new reply arrives, or when the autocomplete model changes, and the one-shot key (`cycle-next`, `Ctrl+.` by default) brings a suggestion back at once
 - keys are configurable with `/prompt-autocomplete set key <action> <key...|default|none>` and listed with `/prompt-autocomplete keys`; a key your Pi keymap or another extension's shortcut uses goes to Pi or that extension
 - repeated acceptance can keep extending the prompt step by step
 - defaults to the current active model for autocomplete
@@ -297,7 +297,7 @@ The extension is disabled by default. Enabling it with the CLI flag or slash com
 - The extension suggests when the cursor is at the end of a draft that meets `--prompt-autocomplete-min-chars` (default: `1`). Set it to `0` to opt into automatic empty-draft next-prompt suggestions.
 - Built-in slash-command and file/path autocomplete keep working.
 - Autocomplete responses stream into ghost text by default. Disable this at startup with `--prompt-autocomplete-stream off`, or toggle it for the current extension runtime with `/prompt-autocomplete stream on|off|toggle`. Partial Latin text advances only at complete word boundaries; CJK, combining characters, flags, and emoji remain grapheme-safe. Alternatives appear only after the terminal response.
-- `Tab` accepts all visible partial text; `Ctrl+Space` accepts only its next visible word/chunk, and `accept-line` its visible text up to the first line break. Each cancels that stream without automatically starting a second paid request.
+- `Tab` accepts all visible partial text; `Ctrl+Space` accepts only its next visible word/chunk, and `accept-line` its visible text up to and including the first line break. Each cancels that stream without automatically starting a second paid request.
 - By default suggestions pause while the **main agent** is working so they can use the finished conversation context, and they stay paused until `agent_settled` when the host emits it. This is separate from response streaming. Override it at startup with `--prompt-autocomplete-while-streaming`, or toggle it for the current extension runtime with `/prompt-autocomplete while-streaming on|off|toggle`.
 - Even while-streaming is off, press `Ctrl+.` with no active suggestion to force a single one-shot completion during an agent turn; it ignores the streaming gate, the post-error cooldown, and the min-chars threshold for that one request (model/auth and slash/path checks still apply).
 - Terminal-friendly defaults are `Ctrl+Space` for word/chunk accept and `Ctrl+,` / `Ctrl+.` for cycling (and `Ctrl+.` doubles as the one-shot trigger). `/prompt-autocomplete set key` changes them; `Tab` and `Escape` stay fixed.
