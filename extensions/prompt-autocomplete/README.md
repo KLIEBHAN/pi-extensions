@@ -86,7 +86,7 @@ pi \
 - Provider responses stream into the first ghost-text suggestion by default. Use `--prompt-autocomplete-stream off` or `/prompt-autocomplete stream off` to wait for complete responses instead. This changes rendering only: each suggestion request still uses the same context and token budget.
 - Changing `/prompt-autocomplete stream` cancels active autocomplete work but does **not** start a replacement request; the selected path applies to the next edit or manual one-shot.
 - Partial text advances monotonically: Latin text waits for complete word boundaries, while CJK and other no-space scripts remain grapheme-safe. Alternatives appear only after the response finishes.
-- `Tab` accepts all partial text currently visible. `Ctrl+Space` accepts only its next visible word/chunk. Both cancel that stream, and unlike accepting a completed suggestion, neither automatically starts another paid request.
+- `Tab` accepts all partial text currently visible. `Ctrl+Space` accepts only its next visible word/chunk, and `accept-line` its visible text up to the first line break. Each cancels that stream, and unlike accepting a completed suggestion, none automatically starts another paid request.
 - Suggestions pause while the **main agent** is working by default, and stay paused until `agent_settled` on hosts that emit it. This is separate from streamed autocomplete responses. Use `--prompt-autocomplete-while-streaming` or `/prompt-autocomplete while-streaming on` to change that behavior.
 - `Escape` dismissal lasts while the draft extends the dismissed text: further typing starts no request and does not bring the suggestion back. It ends for good when the draft stops extending it (`Backspace`, submit, clear, history), when the conversation, autocomplete model, `max-chars`, or `max-alternatives` changes, or on `Ctrl+.`, accept, or cycling. Dismissing an empty-draft suggestion lasts only while the draft stays empty.
 - `Ctrl+.` with no active suggestion is an explicit one-shot request and may bypass the main-agent-streaming, cooldown, and minimum-length gates. Model, authentication, slash-command, and path safety checks still apply.
@@ -131,7 +131,7 @@ Budget: 4/25 (session)
 - `issued` counts provider calls actually made. Cache hits add no provider request, tokens, cost, or latency sample.
 - Cache hits distinguish exact-draft results from prefix reuse while you type through a cached suggestion.
 - `offered` counts active ghost-text suggestions handed to the editor. Streamed revisions of the same active suggestion do not inflate it; cycling to another alternative counts a new offer. A terminal that is too narrow to draw ghost text can still count an offer.
-- Full and word/chunk acceptance are counted separately, including acceptance of visible streamed partials.
+- Full and word/chunk acceptance are counted separately, including acceptance of visible streamed partials. `accept-line` counts as word/chunk, except when it accepts a completed one-line suggestion whole.
 - `failed` includes provider errors and aborted requests. Tokens from a failed response are counted when the provider returns its terminal usage report within the bounded cancellation drain; otherwise `tok+`/`est+` marks the totals incomplete.
 - Mean provider latency measures local elapsed time from each actual provider invocation until it resolves or rejects; cache hits are excluded.
 - Token counts come from the provider.
