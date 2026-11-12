@@ -13,6 +13,7 @@ All notable changes to this package are documented here. This project follows [S
 
 ### Changed
 
+- Every release is now also verified against Pi `1.5.2`, next to `0.80.6`, `0.83.0`, and `1.2.0`.
 - `Escape` now dismisses a suggestion for as long as you keep typing the same draft, instead of only until the next keystroke. Previously the next character brought the dismissed suggestion back, from the prefix cache or through a new provider request. The dismissal ends for good when the draft no longer extends the dismissed text (for example after `Backspace`, submitting, clearing, or recalling another prompt), when the conversation, the autocomplete model, `max-chars`, or `max-alternatives` changes, or when you press the one-shot key (`cycle-next`, `Ctrl+.` by default), accept, or cycle. An `Escape` on an empty-draft suggestion lasts only while the draft stays empty.
 
 ### Fixed
