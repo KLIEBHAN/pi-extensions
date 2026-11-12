@@ -152,7 +152,7 @@ Budget: 4/25 (session)
 With `--prompt-autocomplete-next-prompt`, Pi in RPC mode predicts your next prompt after each settled turn and sends it to the host with `set_editor_text` (`ctx.ui.setEditorText`). The host decides what to do with it. Upstream T3 Code ignores the call; the T3 Code branch [`KLIEBHAN/t3code@pi-prompt-suggestions`](https://github.com/KLIEBHAN/t3code/tree/pi-prompt-suggestions) shows it as the suggested next prompt when **Suggest next prompt** is on in Settings > Labs.
 
 - It applies only to `--mode rpc`, with or without `--prompt-autocomplete`; the TUI keeps its ghost text.
-- Each settled turn makes one request with an empty draft and one alternative. The autocomplete model, `max-chars`, the session budget, and the `stats` counters apply as in the editor. A new turn or session aborts a pending request.
+- Each settled turn makes one request with an empty draft and one alternative. The autocomplete model, `max-chars`, the session budget, and the `stats` counters apply as in the editor. A new turn or session aborts a pending request, and a result that arrives while the agent is busy again or after the conversation moved to another branch is dropped.
 - In T3 Code, add the flag to Settings > Providers > Pi > Launch arguments. T3 Code starts Pi for delegated threads with the same arguments, so those turns cost a request as well, although T3 Code shows no suggestion for them.
 - Hosts that ignore `set_editor_text` still pay for each request, so enable the flag only for a host that shows the suggestion.
 

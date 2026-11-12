@@ -59,6 +59,8 @@ interface HarnessOptions {
   useProcessGlobal?: boolean;
   /** Pass `--prompt-autocomplete-next-prompt`. */
   nextPrompt?: boolean;
+  /** Emulate hosts with `ctx.isIdle` (Pi 0.80.5 and later). */
+  isIdle?: () => boolean;
   /** Provider seam; by default every provider call fails the test. */
   completeSimple?: NonNullable<PromptAutocompleteDependencies["completeSimple"]>;
 }
@@ -127,6 +129,7 @@ function createHarness(options: HarnessOptions = {}) {
     modelRegistry,
     sessionManager,
     ui: hostUi,
+    ...(options.isIdle ? { isIdle: options.isIdle } : {}),
   } as unknown as ExtensionContext;
 
   const pi = {
@@ -192,6 +195,10 @@ function createHarness(options: HarnessOptions = {}) {
     settingsSaves,
     getStoredSettings: () => ({ ...storedSettings }),
     getBranch: () => branch,
+    /** Append a session entry, as a new message or a branch switch would. */
+    appendBranchEntry: (entry: unknown) => {
+      branch = [...branch, entry];
+    },
     getProviderCalls: () => providerCalls,
     getEditorFactory: () => editorFactory,
     replaceEditorExternally: (factory: EditorFactory | undefined) => {
@@ -1044,6 +1051,16 @@ async function settle(done: () => boolean): Promise<void> {
   assert.ok(done(), "detached work did not finish");
 }
 
+type CompleteSeam = NonNullable<PromptAutocompleteDependencies["completeSimple"]>;
+
+function makeCompletion(completions: string[]): Awaited<ReturnType<CompleteSeam>> {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: JSON.stringify({ completions }) }],
+    stopReason: "stop",
+  } as unknown as Awaited<ReturnType<CompleteSeam>>;
+}
+
 test("--prompt-autocomplete-next-prompt hands an RPC host one predicted prompt per settled turn", async () => {
   const requests: string[] = [];
   const responders: Array<() => void> = [];
@@ -1057,12 +1074,8 @@ test("--prompt-autocomplete-next-prompt hands an RPC host one predicted prompt p
       await new Promise<void>((resolve) => {
         responders.push(resolve);
       });
-      return {
-        role: "assistant",
-        content: [{ type: "text", text: JSON.stringify({ completions: ["Run the parser tests", "Ship it"] }) }],
-        stopReason: "stop",
-      };
-    }) as NonNullable<PromptAutocompleteDependencies["completeSimple"]>,
+      return makeCompletion(["Run the parser tests", "Ship it"]);
+    }) as CompleteSeam,
   });
   await emit(harness, "session_start");
   await emit(harness, "agent_start");
@@ -1082,6 +1095,33 @@ test("--prompt-autocomplete-next-prompt hands an RPC host one predicted prompt p
   await settle(() => harness.getProviderCalls() === 2);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(harness.editorTexts, ["Run the parser tests"]);
+
+  // The conversation moved on while the prediction was pending.
+  await emit(harness, "agent_settled");
+  await settle(() => responders.length === 3);
+  harness.appendBranchEntry({ type: "message", id: "other-branch", message: { role: "user", content: "Something else" } });
+  responders[2]?.();
+  await settle(() => harness.getProviderCalls() === 3);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.editorTexts, ["Run the parser tests"]);
+
+  // Pi marks a new run busy before `agent_start` reaches extensions.
+  let idle = true;
+  const busy = createHarness({
+    mode: "rpc",
+    nextPrompt: true,
+    branch: conversationBranch,
+    isIdle: () => idle,
+    completeSimple: (async () => {
+      idle = false;
+      return makeCompletion(["Run the parser tests"]);
+    }) as CompleteSeam,
+  });
+  await emit(busy, "session_start");
+  await emit(busy, "agent_settled");
+  await settle(() => busy.getProviderCalls() === 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(busy.editorTexts, []);
 
   // The interactive editor keeps its ghost text; the flag is for RPC hosts.
   const tui = createHarness({ mode: "tui", nextPrompt: true, branch: conversationBranch });

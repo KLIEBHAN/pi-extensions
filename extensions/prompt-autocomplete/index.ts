@@ -2604,7 +2604,9 @@ function settleAgentTurn(shared: PromptAutocompleteSharedState, details: string)
  * RPC hosts started with `--prompt-autocomplete-next-prompt`: after a settled
  * turn, predict the user's next prompt and hand it over with `setEditorText`,
  * which T3 Code shows as its suggested next prompt. Budget, model selection,
- * and stats apply as in the editor; a new turn or session aborts the request.
+ * and stats apply as in the editor. A new turn or session aborts the request,
+ * and a result is dropped when the agent is busy again or the conversation
+ * moved to another branch while it was pending.
  */
 async function suggestNextPrompt(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): Promise<void> {
   cancelNextPrompt(shared);
@@ -2621,7 +2623,11 @@ async function suggestNextPrompt(ctx: ExtensionContext, shared: PromptAutocomple
       () => undefined,
     );
     const suggestion = entry.suggestions[0];
-    if (suggestion && !controller.signal.aborted) ctx.ui.setEditorText(suggestion);
+    if (!suggestion || controller.signal.aborted) return;
+    // Pi marks a new run busy before `agent_start` reaches this extension.
+    if (typeof ctx.isIdle === "function" && !ctx.isIdle()) return;
+    if (resolveCurrentConversationId(shared) !== request.conversationId) return;
+    ctx.ui.setEditorText(suggestion);
   } catch (error) {
     if (!controller.signal.aborted) shared.lastError = error instanceof Error ? error.message : String(error);
   } finally {
