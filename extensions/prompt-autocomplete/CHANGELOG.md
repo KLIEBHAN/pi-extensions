@@ -9,6 +9,7 @@ All notable changes to this package are documented here. This project follows [S
 - Configurable keys: `/prompt-autocomplete set key <action> <key...|default|none>` changes the keys of `accept-word`, `accept-line`, `cycle-next`, and `cycle-prev`, applies them at once, and saves them in the settings file. Keys follow Pi's key syntax and are space-separated. Keys that could never reach an action are rejected: Tab, Escape, Enter, and Backspace with their legacy aliases such as `ctrl+i`, keys Pi's editor handles itself such as `shift+enter` or `ctrl+j`, keys that type text, and keys Pi never recognizes (Escape or F1–F12 with a modifier, Clear with anything but Shift or Ctrl alone). So are keys another action already has; a key that Pi's keymap binds is accepted, with a warning once the editor is active, because Pi keeps it. `Tab` and `Escape` stay fixed.
 - `/prompt-autocomplete keys` shows every action's keys, whether they are the default or saved, saved keys that are ignored, and, once the editor is active, keys Pi's keymap also binds.
 - `accept-line` accepts a suggestion up to and including its first line break; a one-line suggestion is accepted whole. It has no default key.
+- `--prompt-autocomplete-next-prompt`: in RPC mode, after each settled turn, one request predicts the next prompt and hands it to the host with `set_editor_text`, for hosts such as a T3 Code build that shows it as the suggested next prompt. A new turn or session aborts it; model, budget, and stats apply as in the editor.
 
 ### Changed
 

@@ -147,6 +147,15 @@ Budget: 4/25 (session)
 - Without draft text the report covers the conversation sections only. The slash command replaced the editor text when you submitted it, so the draft a real request would carry cannot be recovered and is not invented; pass one explicitly to preview a complete request. Pi trims trailing whitespace from submitted commands.
 - `Shared policy` evaluates only the gates every editor shares — enabled state, editor ownership, the main-agent gate, model and auth, `min-chars` and slash/path detection for the given draft, and the session budget — separately for automatic requests and the manual `Ctrl+.` one-shot. Cursor position, the built-in autocomplete menu, Escape dismissal, the per-editor error cooldown, and cached responses belong to the live editor and are not evaluated.
 
+### Next prompt for RPC hosts (T3 Code)
+
+With `--prompt-autocomplete-next-prompt`, Pi in RPC mode predicts your next prompt after each settled turn and sends it to the host with `set_editor_text` (`ctx.ui.setEditorText`). The host decides what to do with it. Upstream T3 Code ignores the call; the T3 Code branch [`KLIEBHAN/t3code@pi-prompt-suggestions`](https://github.com/KLIEBHAN/t3code/tree/pi-prompt-suggestions) shows it as the suggested next prompt when **Suggest next prompt** is on in Settings > Labs.
+
+- It applies only to `--mode rpc`, with or without `--prompt-autocomplete`; the TUI keeps its ghost text.
+- Each settled turn makes one request with an empty draft and one alternative. The autocomplete model, `max-chars`, the session budget, and the `stats` counters apply as in the editor. A new turn or session aborts a pending request.
+- In T3 Code, add the flag to Settings > Providers > Pi > Launch arguments. T3 Code starts Pi for delegated threads with the same arguments, so those turns cost a request as well, although T3 Code shows no suggestion for them.
+- Hosts that ignore `set_editor_text` still pay for each request, so enable the flag only for a host that shows the suggestion.
+
 ## Privacy, providers, and cost
 
 Enabling Prompt Autocomplete permits additional model requests. Streaming changes only when the same response becomes visible; it does not add a second request. A request can contain:
@@ -171,7 +180,7 @@ The extension makes no autocomplete request while disabled. Automatic empty-draf
 - Supported baseline: Pi `0.80.6`, Node.js `22.19.0` or newer.
 - Every release is verified against Pi `0.80.6`, `0.83.0`, and `1.2.0`. Pi 1.x draws the editor cursor through fake-cursor markers instead of inverse video; ghost text supports both forms.
 - On hosts that expose Pi's model-visible session projection (Pi 1.x), autocomplete context follows it: a message that `context_edit` omitted or replaced, for example to redact it, is omitted or replaced in autocomplete requests too. If that projection fails, requests carry no conversation context rather than the raw history. Besides user and assistant message text, autocomplete sends only the newest compaction summary, so suggestions keep the summarized background after a compaction; custom messages, tool results, and the compaction's system checkpoint are not sent.
-- Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor and never reach a provider.
+- Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor and never reach a provider, except RPC mode with [`--prompt-autocomplete-next-prompt`](#next-prompt-for-rpc-hosts-t3-code).
 - The read-only commands `status`, `stats`, and `inspect` also work on hosts that can show notifications, such as RPC; there `status` reports `host=non-interactive` and `editor=unavailable`. Every command that changes state or touches the editor stays TUI-only. If the extension is enabled on such a host, it says once per process that no autocomplete request will be issued.
 - Forks of Pi's extension API whose `ExtensionContext` predates `mode`, such as [prime-agent](https://www.npmjs.com/package/prime-agent), are supported. For those hosts the extension first requires UI availability and a custom-editor slot, and then verifies that the host actually installed the editor. A front-end that accepts an editor factory without installing it, as forked RPC and daemon modes do, is detected on the first attempt and stays inactive: it is not retried, not left enabled, and can neither render ghost text nor issue a provider request.
 - On Pi 1.x, requests go through the session's model registry, which resolves each provider's stored credential itself. Models from providers that other extensions register therefore work as well, as do OAuth credentials that derive their own endpoint (such as GitHub Copilot Enterprise) and header-only or ambient credentials. Older hosts use the simple completion API below and need an API key.
