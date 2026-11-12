@@ -198,6 +198,8 @@ interface PromptAutocompleteConfig {
   modelSelection: PromptAutocompleteModelSelection;
   /** Effective provider-request ceiling; undefined means off. */
   budgetLimit?: number;
+  /** RPC hosts only: send a predicted next prompt through `setEditorText` after each settled turn. */
+  nextPrompt: boolean;
 }
 
 interface PromptAutocompleteCacheEntry {
@@ -579,6 +581,8 @@ interface PromptAutocompleteSharedState {
   cancelActiveRequest?: () => void;
   /** Cancel a pending debounce timer without aborting an in-flight provider call. */
   cancelScheduledRequest?: () => void;
+  /** The running next-prompt request; a new turn or session makes it stale. */
+  nextPromptAbort?: AbortController;
   setStatusText?: (text: string | undefined) => void;
   setSpinnerActive?: (owner: string, active: boolean) => void;
   clearSpinner?: () => void;
@@ -907,6 +911,7 @@ function parseConfig(pi: ExtensionAPI): PromptAutocompleteConfig {
     ),
     modelSelection: parsePromptAutocompleteModelSelection(pi.getFlag("prompt-autocomplete-model")),
     budgetLimit: parsePromptAutocompleteBudgetFlag(pi.getFlag("prompt-autocomplete-max-requests")),
+    nextPrompt: pi.getFlag("prompt-autocomplete-next-prompt") === true,
   };
 }
 
@@ -1931,36 +1936,7 @@ class PromptAutocompleteEditor extends CustomEditor {
   }
 
   private buildRequest(): SuggestionRequest | undefined {
-    const model = resolveSuggestionModel(this.shared);
-    if (!model) return undefined;
-
-    const conversationId = resolveCurrentConversationId(this.shared);
-    this.shared.lastConversationId = conversationId;
-    const snapshot = buildCurrentRequestSnapshot(this.shared, this.getText(), conversationId);
-    const modelLabel = formatModelLabel(model);
-
-    const prefixContextIdentity = {
-      conversationId,
-      modelLabel,
-      maxAlternatives: snapshot.maxAlternatives,
-      maxSuggestionChars: snapshot.maxSuggestionChars,
-      latestAssistantContext: snapshot.latestAssistantContext,
-      latestUserContext: snapshot.latestUserContext,
-      recentContext: snapshot.recentContext,
-      compactionSummaryContext: snapshot.compactionSummaryContext,
-    };
-
-    return {
-      ...snapshot,
-      activationId: this.activationId,
-      conversationId,
-      model,
-      modelLabel,
-      cacheKey: buildPromptAutocompleteCacheKey({ ...prefixContextIdentity, draft: snapshot.draft }),
-      prefixContextKey: buildPromptAutocompletePrefixContextKey(prefixContextIdentity),
-      dismissalContext: buildDismissalContext(this.shared, conversationId),
-      useStreaming: this.shared.config.streamResponses && !!this.shared.streamSimple,
-    };
+    return buildSuggestionRequest(this.shared, this.getText(), this.activationId);
   }
 
   private async fetchSuggestion(request: SuggestionRequest, seq: number, spinnerOwner: string): Promise<void> {
@@ -1975,7 +1951,7 @@ class PromptAutocompleteEditor extends CustomEditor {
       this.shared.inFlightRequests,
       request.cacheKey,
       subscriberId,
-      (signal, publish) => this.fetchSuggestionUncached(request, signal, publish),
+      (signal, publish) => fetchSuggestionUncached(this.shared, request, signal, publish),
       (suggestion) => this.showStreamedSuggestion(request, seq, spinnerOwner, suggestion),
     );
 
@@ -2058,133 +2034,6 @@ class PromptAutocompleteEditor extends CustomEditor {
     this.deactivateSpinner(spinnerOwner);
   }
 
-  private async fetchSuggestionUncached(
-    request: SuggestionRequest,
-    signal: AbortSignal,
-    publish: (suggestion: string) => void,
-  ): Promise<PromptAutocompleteCacheEntry> {
-    if (!this.shared.modelRegistry) {
-      throw new Error("No model registry available");
-    }
-
-    const auth = await this.shared.modelRegistry.getApiKeyAndHeaders(request.model);
-    // Through the host registry Pi resolves the stored credential itself, which
-    // may be header-only or ambient, so only the compat path needs a key here.
-    const viaRegistry = this.shared.routesThroughHostRegistry();
-    if (!auth.ok) throw new Error(auth.error);
-    if (!viaRegistry && !auth.apiKey) throw new Error(`No API key for ${request.modelLabel}`);
-    if (signal.aborted) {
-      throw new Error("Request was aborted");
-    }
-    // Last await is done: reserving here and invoking below without another
-    // await is what keeps two concurrent producers from overshooting a ceiling.
-    if (!reserveBudgetRequest(this.shared)) {
-      throw new PromptAutocompleteBudgetExhaustedError(
-        this.shared.config.budgetLimit ?? this.shared.budgetUsed,
-        this.shared.budgetUsed,
-      );
-    }
-
-    const userMessage: UserMessage = {
-      role: "user",
-      content: [{ type: "text", text: renderPromptAutocompleteUserText(request) }],
-      timestamp: Date.now(),
-    };
-
-    const stats = this.shared.usageStats;
-    stats.providerRequests += 1;
-
-    const context = {
-      systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
-      messages: [userMessage],
-    };
-    const requestOptions = {
-      // An explicit key makes Pi's registry skip the stored credential and with
-      // it any OAuth-derived endpoint (for example GitHub Copilot Enterprise),
-      // so credentials are only passed to the compat functions and to seams.
-      ...(viaRegistry ? {} : { apiKey: auth.apiKey, headers: auth.headers }),
-      signal,
-      maxTokens: computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars),
-      timeoutMs: REQUEST_TIMEOUT_MS,
-      maxRetries: REQUEST_MAX_RETRIES,
-      maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
-    };
-
-    const providerStartedAt = this.shared.now();
-    let response: AssistantMessage;
-    try {
-      if (request.useStreaming && this.shared.streamSimple) {
-        const hardDeadlineController = new AbortController();
-        const streamSignal = AbortSignal.any([signal, hardDeadlineController.signal]);
-        const stream = this.shared.streamSimple(request.model, context, {
-          ...requestOptions,
-          signal: streamSignal,
-        });
-        let lastPublished = "";
-
-        // Exactly one consumer receives the terminal message. Partial text is
-        // fanned out through coalescing; after UI cancellation the callback is
-        // gone, but the bounded drain can still retain terminal usage.
-        response = await consumeAssistantStream(stream, streamSignal, () => hardDeadlineController.abort(), (partial) => {
-          // `partial` is cumulative. Appending delta plus text_end.content would
-          // duplicate the completed block on providers that emit both.
-          const partialText = extractAssistantText(partial);
-          const suggestion = parsePartialPromptSuggestion(request.draft, partialText, request.maxSuggestionChars);
-          if (!suggestion || suggestion === lastPublished) return;
-          if (lastPublished && !suggestion.startsWith(lastPublished)) return;
-          lastPublished = suggestion;
-          publish(suggestion);
-        });
-      } else {
-        response = await this.shared.completeSimple(request.model, context, requestOptions);
-      }
-    } catch (error) {
-      stats.failedRequests += 1;
-      throw error;
-    } finally {
-      recordProviderLatency(stats, this.shared.now() - providerStartedAt);
-    }
-
-    // Tokens spent on a failed or aborted response are still spent, so usage is
-    // recorded before the stop-reason check rejects the request.
-    recordProviderUsage(stats, response.usage);
-
-    const contentTypes = response.content.map((block) => block.type).join(", ") || "(none)";
-    const text = extractAssistantText(response);
-
-    const responseError = response.errorMessage?.trim();
-    const rawResponse = text || responseError || `[types=${contentTypes}; stopReason=${response.stopReason}]`;
-
-    if (response.stopReason === "error" || response.stopReason === "aborted") {
-      stats.failedRequests += 1;
-      throw new Error(responseError || `Provider returned stopReason=${response.stopReason}`);
-    }
-    if (signal.aborted) {
-      stats.failedRequests += 1;
-      throw new Error("Request was aborted");
-    }
-
-    const normalized = normalizePromptSuggestions(
-      request.draft,
-      text,
-      request.maxSuggestionChars,
-      request.maxAlternatives,
-    );
-
-    const debugState =
-      normalized.length === 0
-        ? text || `No text blocks returned (types: ${contentTypes}; stopReason: ${response.stopReason})`
-        : `${normalized.length} suggestion(s) ready`;
-
-    return storeCachedRequest(this.shared, request.cacheKey, {
-      draft: request.draft,
-      prefixContextKey: request.prefixContextKey,
-      suggestions: normalized,
-      rawResponse,
-      debugState,
-    });
-  }
-
   private isRequestStillCurrent(request: SuggestionRequest, seq: number): boolean {
     if (!this.shared.enabled) return false;
     if (!this.shared.ownsEditor?.()) return false;
@@ -2257,6 +2106,138 @@ class PromptAutocompleteEditor extends CustomEditor {
     subscription?.release();
     this.deactivateSpinner(pending?.spinnerOwner);
   }
+}
+
+/**
+ * One provider call for `request`, outside any editor: reserves budget, records
+ * usage, and caches the normalized result. `publish` receives streamed partials.
+ */
+async function fetchSuggestionUncached(
+  shared: PromptAutocompleteSharedState,
+  request: SuggestionRequest,
+  signal: AbortSignal,
+  publish: (suggestion: string) => void,
+): Promise<PromptAutocompleteCacheEntry> {
+  if (!shared.modelRegistry) {
+    throw new Error("No model registry available");
+  }
+
+  const auth = await shared.modelRegistry.getApiKeyAndHeaders(request.model);
+  // Through the host registry Pi resolves the stored credential itself, which
+  // may be header-only or ambient, so only the compat path needs a key here.
+  const viaRegistry = shared.routesThroughHostRegistry();
+  if (!auth.ok) throw new Error(auth.error);
+  if (!viaRegistry && !auth.apiKey) throw new Error(`No API key for ${request.modelLabel}`);
+  if (signal.aborted) {
+    throw new Error("Request was aborted");
+  }
+  // Last await is done: reserving here and invoking below without another
+  // await is what keeps two concurrent producers from overshooting a ceiling.
+  if (!reserveBudgetRequest(shared)) {
+    throw new PromptAutocompleteBudgetExhaustedError(
+      shared.config.budgetLimit ?? shared.budgetUsed,
+      shared.budgetUsed,
+    );
+  }
+
+  const userMessage: UserMessage = {
+    role: "user",
+    content: [{ type: "text", text: renderPromptAutocompleteUserText(request) }],
+    timestamp: Date.now(),
+  };
+
+  const stats = shared.usageStats;
+  stats.providerRequests += 1;
+
+  const context = {
+    systemPrompt: PROMPT_AUTOCOMPLETE_SYSTEM_PROMPT,
+    messages: [userMessage],
+  };
+  const requestOptions = {
+    // An explicit key makes Pi's registry skip the stored credential and with
+    // it any OAuth-derived endpoint (for example GitHub Copilot Enterprise),
+    // so credentials are only passed to the compat functions and to seams.
+    ...(viaRegistry ? {} : { apiKey: auth.apiKey, headers: auth.headers }),
+    signal,
+    maxTokens: computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars),
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    maxRetries: REQUEST_MAX_RETRIES,
+    maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
+  };
+
+  const providerStartedAt = shared.now();
+  let response: AssistantMessage;
+  try {
+    if (request.useStreaming && shared.streamSimple) {
+      const hardDeadlineController = new AbortController();
+      const streamSignal = AbortSignal.any([signal, hardDeadlineController.signal]);
+      const stream = shared.streamSimple(request.model, context, {
+        ...requestOptions,
+        signal: streamSignal,
+      });
+      let lastPublished = "";
+
+      // Exactly one consumer receives the terminal message. Partial text is
+      // fanned out through coalescing; after UI cancellation the callback is
+      // gone, but the bounded drain can still retain terminal usage.
+      response = await consumeAssistantStream(stream, streamSignal, () => hardDeadlineController.abort(), (partial) => {
+        // `partial` is cumulative. Appending delta plus text_end.content would
+        // duplicate the completed block on providers that emit both.
+        const partialText = extractAssistantText(partial);
+        const suggestion = parsePartialPromptSuggestion(request.draft, partialText, request.maxSuggestionChars);
+        if (!suggestion || suggestion === lastPublished) return;
+        if (lastPublished && !suggestion.startsWith(lastPublished)) return;
+        lastPublished = suggestion;
+        publish(suggestion);
+      });
+    } else {
+      response = await shared.completeSimple(request.model, context, requestOptions);
+    }
+  } catch (error) {
+    stats.failedRequests += 1;
+    throw error;
+  } finally {
+    recordProviderLatency(stats, shared.now() - providerStartedAt);
+  }
+
+  // Tokens spent on a failed or aborted response are still spent, so usage is
+  // recorded before the stop-reason check rejects the request.
+  recordProviderUsage(stats, response.usage);
+
+  const contentTypes = response.content.map((block) => block.type).join(", ") || "(none)";
+  const text = extractAssistantText(response);
+
+  const responseError = response.errorMessage?.trim();
+  const rawResponse = text || responseError || `[types=${contentTypes}; stopReason=${response.stopReason}]`;
+
+  if (response.stopReason === "error" || response.stopReason === "aborted") {
+    stats.failedRequests += 1;
+    throw new Error(responseError || `Provider returned stopReason=${response.stopReason}`);
+  }
+  if (signal.aborted) {
+    stats.failedRequests += 1;
+    throw new Error("Request was aborted");
+  }
+
+  const normalized = normalizePromptSuggestions(
+    request.draft,
+    text,
+    request.maxSuggestionChars,
+    request.maxAlternatives,
+  );
+
+  const debugState =
+    normalized.length === 0
+      ? text || `No text blocks returned (types: ${contentTypes}; stopReason: ${response.stopReason})`
+      : `${normalized.length} suggestion(s) ready`;
+
+  return storeCachedRequest(shared, request.cacheKey, {
+    draft: request.draft,
+    prefixContextKey: request.prefixContextKey,
+    suggestions: normalized,
+    rawResponse,
+    debugState,
+  });
 }
 
 function releaseEditorRuntime(shared: PromptAutocompleteSharedState): void {
@@ -2442,6 +2423,7 @@ function unmountEditor(ctx: ExtensionContext, shared: PromptAutocompleteSharedSt
 
 function resetSharedForSession(pi: ExtensionAPI, shared: PromptAutocompleteSharedState): void {
   shared.cancelActiveRequest?.();
+  cancelNextPrompt(shared);
   shared.cancelActiveRequest = undefined;
   shared.cancelScheduledRequest = undefined;
   // Budget accounting is physical-session scoped: a new session starts fresh.
@@ -2495,13 +2477,57 @@ function buildCurrentRequestSnapshot(
   shared: PromptAutocompleteSharedState,
   draft: string,
   conversationId: string,
+  maxAlternatives = shared.config.maxAlternatives,
 ): PromptAutocompleteRequestSnapshot {
   return buildPromptAutocompleteRequestSnapshot({
     draft,
     branch: readAutocompleteContextEntries(shared, conversationId),
-    maxAlternatives: shared.config.maxAlternatives,
+    maxAlternatives,
     maxSuggestionChars: shared.config.maxSuggestionChars,
   });
+}
+
+/**
+ * A provider request for `draft` against the current conversation, or
+ * undefined when no usable model resolves. Used by the editor and by the
+ * next-prompt path, which asks for one alternative only.
+ */
+function buildSuggestionRequest(
+  shared: PromptAutocompleteSharedState,
+  draft: string,
+  activationId: number,
+  maxAlternatives = shared.config.maxAlternatives,
+): SuggestionRequest | undefined {
+  const model = resolveSuggestionModel(shared);
+  if (!model) return undefined;
+
+  const conversationId = resolveCurrentConversationId(shared);
+  shared.lastConversationId = conversationId;
+  const snapshot = buildCurrentRequestSnapshot(shared, draft, conversationId, maxAlternatives);
+  const modelLabel = formatModelLabel(model);
+
+  const prefixContextIdentity = {
+    conversationId,
+    modelLabel,
+    maxAlternatives: snapshot.maxAlternatives,
+    maxSuggestionChars: snapshot.maxSuggestionChars,
+    latestAssistantContext: snapshot.latestAssistantContext,
+    latestUserContext: snapshot.latestUserContext,
+    recentContext: snapshot.recentContext,
+    compactionSummaryContext: snapshot.compactionSummaryContext,
+  };
+
+  return {
+    ...snapshot,
+    activationId,
+    conversationId,
+    model,
+    modelLabel,
+    cacheKey: buildPromptAutocompleteCacheKey({ ...prefixContextIdentity, draft: snapshot.draft }),
+    prefixContextKey: buildPromptAutocompletePrefixContextKey(prefixContextIdentity),
+    dismissalContext: buildDismissalContext(shared, conversationId),
+    useStreaming: shared.config.streamResponses && !!shared.streamSimple,
+  };
 }
 
 /**
@@ -2572,6 +2598,46 @@ function settleAgentTurn(shared: PromptAutocompleteSharedState, details: string)
   shared.agentStreaming = false;
   if (!shared.enabled) return;
   refreshEditorImmediately(shared, "ready", details);
+}
+
+/**
+ * RPC hosts started with `--prompt-autocomplete-next-prompt`: after a settled
+ * turn, predict the user's next prompt and hand it over with `setEditorText`,
+ * which T3 Code shows as its suggested next prompt. Budget, model selection,
+ * and stats apply as in the editor. A new turn or session aborts the request,
+ * and a result is dropped when the agent is busy again or the conversation
+ * moved to another branch while it was pending.
+ */
+async function suggestNextPrompt(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): Promise<void> {
+  cancelNextPrompt(shared);
+  if (!shared.config.nextPrompt || ctx.mode !== "rpc") return;
+  const request = buildSuggestionRequest(shared, "", shared.activationId, 1);
+  if (!request) return;
+  const controller = new AbortController();
+  shared.nextPromptAbort = controller;
+  try {
+    const entry = await fetchSuggestionUncached(
+      shared,
+      { ...request, useStreaming: false },
+      controller.signal,
+      () => undefined,
+    );
+    const suggestion = entry.suggestions[0];
+    if (!suggestion || controller.signal.aborted) return;
+    // Pi marks a new run busy before `agent_start` reaches this extension.
+    if (typeof ctx.isIdle === "function" && !ctx.isIdle()) return;
+    if (resolveCurrentConversationId(shared) !== request.conversationId) return;
+    ctx.ui.setEditorText(suggestion);
+  } catch (error) {
+    if (!controller.signal.aborted) shared.lastError = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (shared.nextPromptAbort === controller) shared.nextPromptAbort = undefined;
+  }
+}
+
+function cancelNextPrompt(shared: PromptAutocompleteSharedState): void {
+  shared.nextPromptAbort?.abort();
+  shared.nextPromptAbort = undefined;
 }
 
 function refreshEditorImmediately(shared: PromptAutocompleteSharedState, state: string, details: string): void {
@@ -3240,7 +3306,7 @@ function hasNotificationChannel(ctx: ExtensionContext): boolean {
  * cannot issue requests there, instead of staying silently inert.
  */
 function notifyEnabledWithoutEditorOnce(ctx: ExtensionContext, shared: PromptAutocompleteSharedState): void {
-  if (!shared.enabled || shared.processState.nonInteractiveNoticeShown) return;
+  if (!shared.enabled || shared.config.nextPrompt || shared.processState.nonInteractiveNoticeShown) return;
   if (hostOwnsInteractiveEditor(ctx, shared) || !hasNotificationChannel(ctx)) return;
   shared.processState.nonInteractiveNoticeShown = true;
   ctx.ui.notify(
@@ -3441,6 +3507,11 @@ export function createPromptAutocompleteExtension(
     type: "string",
     default: DEFAULT_BUDGET_REQUESTS_FLAG,
   });
+  pi.registerFlag("prompt-autocomplete-next-prompt", {
+    description: "RPC mode: suggest the next prompt after each turn through setEditorText (T3 Code)",
+    type: "boolean",
+    default: false,
+  });
 
   const shared: PromptAutocompleteSharedState = {
     enabled: false,
@@ -3488,6 +3559,7 @@ export function createPromptAutocompleteExtension(
     // Teardown, not a user decision: leave runtimeOverrides untouched.
     shared.enabled = false;
     shared.cancelActiveRequest?.();
+    cancelNextPrompt(shared);
     shared.requestCache.clear();
     shared.prefixReuseCache.clear();
     cancelAllCoalescedRequests(shared.inFlightRequests);
@@ -3512,6 +3584,7 @@ export function createPromptAutocompleteExtension(
 
   pi.on("agent_start", async () => {
     shared.agentStreaming = true;
+    cancelNextPrompt(shared);
     if (!shared.enabled || shared.config.allowWhileStreaming) return;
     refreshEditorImmediately(shared, "waiting", "Main agent is still working");
   });
@@ -3522,8 +3595,10 @@ export function createPromptAutocompleteExtension(
     settleAgentTurn(shared, "Agent finished; autocomplete can request suggestions again");
   });
 
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (_event, ctx) => {
     settleAgentTurn(shared, "Agent settled; autocomplete can request suggestions again");
+    // Not awaited: Pi waits for handlers, and the turn is already over.
+    void suggestNextPrompt(ctx, shared);
   });
 
   pi.registerCommand("prompt-autocomplete", {

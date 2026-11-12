@@ -57,12 +57,19 @@ interface HarnessOptions {
   processState?: PromptAutocompleteProcessState;
   /** Use the real process-wide default instead of an isolated state object. */
   useProcessGlobal?: boolean;
+  /** Pass `--prompt-autocomplete-next-prompt`. */
+  nextPrompt?: boolean;
+  /** Emulate hosts with `ctx.isIdle` (Pi 0.80.5 and later). */
+  isIdle?: () => boolean;
+  /** Provider seam; by default every provider call fails the test. */
+  completeSimple?: NonNullable<PromptAutocompleteDependencies["completeSimple"]>;
 }
 
 function createHarness(options: HarnessOptions = {}) {
   const mode = options.mode ?? "tui";
   const flags = new Map<string, boolean | string>();
   if (options.enabled !== undefined) flags.set("prompt-autocomplete", options.enabled);
+  if (options.nextPrompt) flags.set("prompt-autocomplete-next-prompt", true);
 
   const registeredFlags = new Map<string, { type: "boolean" | "string"; default?: boolean | string }>();
   const handlers = new Map<string, Handler>();
@@ -71,6 +78,7 @@ function createHarness(options: HarnessOptions = {}) {
   const commandDefinitions = new Map<string, CommandDefinition>();
   const autocompleteProviders: unknown[] = [];
   const editorSetCalls: Array<EditorFactory | undefined> = [];
+  const editorTexts: string[] = [];
   let editorFactory = options.existingEditorFactory;
 
   const ui = {
@@ -80,6 +88,7 @@ function createHarness(options: HarnessOptions = {}) {
       editorSetCalls.push(factory);
     },
     setWidget: () => undefined,
+    setEditorText: (text: string) => editorTexts.push(text),
     notify: (message: string, type?: string) => notifications.push({ message, type }),
     // Spy: argument completion must use the command API, never a global provider.
     addAutocompleteProvider: (factory: unknown) => autocompleteProviders.push(factory),
@@ -120,6 +129,7 @@ function createHarness(options: HarnessOptions = {}) {
     modelRegistry,
     sessionManager,
     ui: hostUi,
+    ...(options.isIdle ? { isIdle: options.isIdle } : {}),
   } as unknown as ExtensionContext;
 
   const pi = {
@@ -160,8 +170,9 @@ function createHarness(options: HarnessOptions = {}) {
   createPromptAutocompleteExtension({
     settingsStore,
     processState: options.useProcessGlobal ? undefined : (options.processState ?? {}),
-    completeSimple: (async () => {
+    completeSimple: (async (...args: Parameters<NonNullable<PromptAutocompleteDependencies["completeSimple"]>>) => {
       providerCalls += 1;
+      if (options.completeSimple) return options.completeSimple(...args);
       throw new Error("index tests must not reach the provider");
     }) as unknown as NonNullable<PromptAutocompleteDependencies["completeSimple"]>,
     streamSimple: (() => {
@@ -174,6 +185,7 @@ function createHarness(options: HarnessOptions = {}) {
     commands,
     ctx,
     editorSetCalls,
+    editorTexts,
     flags,
     handlers,
     notifications,
@@ -183,6 +195,10 @@ function createHarness(options: HarnessOptions = {}) {
     settingsSaves,
     getStoredSettings: () => ({ ...storedSettings }),
     getBranch: () => branch,
+    /** Append a session entry, as a new message or a branch switch would. */
+    appendBranchEntry: (entry: unknown) => {
+      branch = [...branch, entry];
+    },
     getProviderCalls: () => providerCalls,
     getEditorFactory: () => editorFactory,
     replaceEditorExternally: (factory: EditorFactory | undefined) => {
@@ -1025,6 +1041,94 @@ test("hosts without a notification channel refuse every command and stay silent"
     assert.equal(harness.editorSetCalls.length, 0);
     assert.equal(harness.getProviderCalls(), 0);
   }
+});
+
+/** Let detached handler work run until `done` holds; fails after a bounded number of turns. */
+async function settle(done: () => boolean): Promise<void> {
+  for (let turn = 0; turn < 100 && !done(); turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(done(), "detached work did not finish");
+}
+
+type CompleteSeam = NonNullable<PromptAutocompleteDependencies["completeSimple"]>;
+
+function makeCompletion(completions: string[]): Awaited<ReturnType<CompleteSeam>> {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: JSON.stringify({ completions }) }],
+    stopReason: "stop",
+  } as unknown as Awaited<ReturnType<CompleteSeam>>;
+}
+
+test("--prompt-autocomplete-next-prompt hands an RPC host one predicted prompt per settled turn", async () => {
+  const requests: string[] = [];
+  const responders: Array<() => void> = [];
+  const harness = createHarness({
+    mode: "rpc",
+    nextPrompt: true,
+    branch: conversationBranch,
+    completeSimple: (async (_model, context) => {
+      const [message] = context.messages;
+      requests.push(JSON.stringify(message?.content));
+      await new Promise<void>((resolve) => {
+        responders.push(resolve);
+      });
+      return makeCompletion(["Run the parser tests", "Ship it"]);
+    }) as CompleteSeam,
+  });
+  await emit(harness, "session_start");
+  await emit(harness, "agent_start");
+  await emit(harness, "agent_settled");
+  await settle(() => responders.length === 1);
+  responders[0]?.();
+  await settle(() => harness.editorTexts.length > 0);
+  assert.deepEqual(harness.editorTexts, ["Run the parser tests"]);
+  assert.match(requests[0] ?? "", /Current draft is empty/);
+  assert.match(requests[0] ?? "", /up to 1 ranked full next prompts/);
+
+  // A new turn makes the pending prediction stale.
+  await emit(harness, "agent_settled");
+  await settle(() => responders.length === 2);
+  await emit(harness, "agent_start");
+  responders[1]?.();
+  await settle(() => harness.getProviderCalls() === 2);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.editorTexts, ["Run the parser tests"]);
+
+  // The conversation moved on while the prediction was pending.
+  await emit(harness, "agent_settled");
+  await settle(() => responders.length === 3);
+  harness.appendBranchEntry({ type: "message", id: "other-branch", message: { role: "user", content: "Something else" } });
+  responders[2]?.();
+  await settle(() => harness.getProviderCalls() === 3);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.editorTexts, ["Run the parser tests"]);
+
+  // Pi marks a new run busy before `agent_start` reaches extensions.
+  let idle = true;
+  const busy = createHarness({
+    mode: "rpc",
+    nextPrompt: true,
+    branch: conversationBranch,
+    isIdle: () => idle,
+    completeSimple: (async () => {
+      idle = false;
+      return makeCompletion(["Run the parser tests"]);
+    }) as CompleteSeam,
+  });
+  await emit(busy, "session_start");
+  await emit(busy, "agent_settled");
+  await settle(() => busy.getProviderCalls() === 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(busy.editorTexts, []);
+
+  // The interactive editor keeps its ghost text; the flag is for RPC hosts.
+  const tui = createHarness({ mode: "tui", nextPrompt: true, branch: conversationBranch });
+  await emit(tui, "session_start");
+  await emit(tui, "agent_settled");
+  assert.equal(tui.getProviderCalls(), 0);
+  assert.deepEqual(tui.editorTexts, []);
 });
 
 test("an enabled extension on a non-interactive host says once per process that it cannot issue requests", async () => {
