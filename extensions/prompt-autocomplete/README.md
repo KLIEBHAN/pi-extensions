@@ -178,7 +178,7 @@ The extension makes no autocomplete request while disabled. Automatic empty-draf
 ## Compatibility and editor ownership
 
 - Supported baseline: Pi `0.80.6`, Node.js `22.19.0` or newer.
-- Every release is verified against Pi `0.80.6`, `0.83.0`, and `1.2.0`. Pi 1.x draws the editor cursor through fake-cursor markers instead of inverse video; ghost text supports both forms.
+- Every release is verified against Pi `0.80.6`, `0.83.0`, `1.2.0`, and `1.5.2`. Pi 1.x draws the editor cursor through fake-cursor markers instead of inverse video; ghost text supports both forms.
 - On hosts that expose Pi's model-visible session projection (Pi 1.x), autocomplete context follows it: a message that `context_edit` omitted or replaced, for example to redact it, is omitted or replaced in autocomplete requests too. If that projection fails, requests carry no conversation context rather than the raw history. Besides user and assistant message text, autocomplete sends only the newest compaction summary, so suggestions keep the summarized background after a compaction; custom messages, tool results, and the compaction's system checkpoint are not sent.
 - Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor and never reach a provider, except RPC mode with [`--prompt-autocomplete-next-prompt`](#next-prompt-for-rpc-hosts-t3-code).
 - The read-only commands `status`, `stats`, and `inspect` also work on hosts that can show notifications, such as RPC; there `status` reports `host=non-interactive` and `editor=unavailable`. Every command that changes state or touches the editor stays TUI-only. If the extension is enabled on such a host, it says once per process that no autocomplete request will be issued.

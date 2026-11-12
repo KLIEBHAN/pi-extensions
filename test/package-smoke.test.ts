@@ -319,11 +319,20 @@ test("the supported Pi version still maps the pi-ai root specifier to the simple
   // Pi 1.x moved the bundled module table out of loader.js into virtual-modules.js.
   const virtualModulesPath = join(extensionsDir, "virtual-modules.js");
   const bundledTableSource = existsSync(virtualModulesPath) ? readFileSync(virtualModulesPath, "utf8") : loaderSource;
+  // Pi 1.5 maps the root to an extension view, which re-exports compat and adds TypeBox's `Type`.
   assert.match(
     bundledTableSource,
-    /"@earendil-works\/pi-ai":\s*_?bundledPiAiCompat/,
+    /"@earendil-works\/pi-ai":\s*(?:_?bundledPiAiCompat|bundledPiAiExtensionView)\b/,
     "Pi must also map the pi-ai root specifier to compat in its bundled module table",
   );
+  const extensionViewPath = join(extensionsDir, "pi-ai-extension-view.js");
+  if (existsSync(extensionViewPath)) {
+    assert.match(
+      readFileSync(extensionViewPath, "utf8"),
+      /export \* from "@earendil-works\/pi-ai\/compat"/,
+      "Pi's extension view must re-export the compat entrypoint",
+    );
+  }
 
   const compat = await import("@earendil-works/pi-ai/compat");
   assert.equal(typeof compat.completeSimple, "function");
