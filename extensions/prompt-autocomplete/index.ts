@@ -2671,7 +2671,7 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
     const context = "context" in value ? value.context : undefined;
     const branch: unknown[] = [];
     if (context !== undefined) {
-      if (!context || typeof context !== "object") {
+      if (!context || typeof context !== "object" || Array.isArray(context)) {
         reply(null, "Invalid completion context");
         return;
       }

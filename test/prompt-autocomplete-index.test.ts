@@ -1092,18 +1092,29 @@ test("RPC draft completion works while busy and disabled, bounds context, and ca
 });
 
 test("RPC completion validates requests and returns null for minimum, empty, budget, and sanitized errors", async () => {
-  const harness = createHarness({ mode: "rpc", completeSimple: async () => makeCompletion([]) });
+  let providerCalls = 0;
+  const harness = createHarness({
+    mode: "rpc",
+    completeSimple: async () => {
+      providerCalls += 1;
+      return makeCompletion([]);
+    },
+  });
   await emit(harness, "session_start");
   for (const payload of ['broken', '{}', '{"id":2}', '{"id":"bad","draft":2}',
     '{"id":"context","draft":"hello","context":{"lastUser":2}}',
+    '{"id":"array","draft":"hello","context":[]}',
     '{"id":"short","draft":""}', '{"id":"empty","draft":"hello"}']) {
     await command(harness, `complete ${payload}`);
   }
   assert.deepEqual(harness.completionReplies, [
     { id: "bad", completion: null, error: "Invalid completion request" },
     { id: "context", completion: null, error: "Invalid completion context" },
+    { id: "array", completion: null, error: "Invalid completion context" },
     { id: "short", completion: null }, { id: "empty", completion: null },
   ]);
+  // Only the valid, long-enough draft reached the provider.
+  assert.equal(providerCalls, 1);
   const budget = createHarness({ mode: "rpc", branch: [{
     type: "custom", customType: "prompt-autocomplete-stats",
     data: { schemaVersion: 1, physicalSessionId: "session-1", limit: 1, used: 1 },
