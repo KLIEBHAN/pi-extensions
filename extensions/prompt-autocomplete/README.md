@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.4.0/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.5.0/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -147,6 +147,20 @@ Budget: 4/25 (session)
 - Without draft text the report covers the conversation sections only. The slash command replaced the editor text when you submitted it, so the draft a real request would carry cannot be recovered and is not invented; pass one explicitly to preview a complete request. Pi trims trailing whitespace from submitted commands.
 - `Shared policy` evaluates only the gates every editor shares — enabled state, editor ownership, the main-agent gate, model and auth, `min-chars` and slash/path detection for the given draft, and the session budget — separately for automatic requests and the manual `Ctrl+.` one-shot. Cursor position, the built-in autocomplete menu, Escape dismissal, the per-editor error cooldown, and cached responses belong to the live editor and are not evaluated.
 
+### Draft completion for RPC hosts
+
+An RPC host can request a continuation even while the agent is busy, without enabling ghost text or next-prompt suggestions:
+
+```sh
+pi --mode rpc --no-session --no-tools --prompt-autocomplete-model provider/model
+```
+
+Send an RPC `prompt` with message `/prompt-autocomplete complete <json>`. The JSON is `{"id":"unique-request-id","draft":"Write","context":{"lastUser":"…","lastAssistant":"…"}}`; `context` and both of its fields are optional. Supply the host thread's latest messages when the sidecar has no session. They use the existing bounded conversation snapshot, not the sidecar's conversation.
+
+Each request receives one fire-and-forget `ctx.ui.setWidget("prompt-autocomplete-completion", [JSON.stringify(result)])`, where `result` is `{"id":"unique-request-id","completion":" the tests"}`. The completion is text to **append**, normalized like ghost text, first alternative only and bounded by `max-chars`. It is `null` for short drafts, exhausted budgets, unusable output, superseded requests, or errors; errors also carry a short, sanitized `error` string. Malformed requests with a string `id` receive an error; invalid JSON or missing/non-string ids cannot be correlated and receive no widget.
+
+Use a unique id per request. A new request aborts the previous one and immediately replies `null` for its id, even if the provider is slow to stop. Requests share model selection, result cache, request budget, and stats with the existing path. This command does not write editor text or cancel next-prompt requests. It is RPC-only and omitted from argument completions.
+
 ### Next prompt for RPC hosts (T3 Code)
 
 With `--prompt-autocomplete-next-prompt`, Pi in RPC mode predicts your next prompt after each settled turn and sends it to the host with `set_editor_text` (`ctx.ui.setEditorText`). The host decides what to do with it. Upstream T3 Code ignores the call; the T3 Code branch [`KLIEBHAN/t3code@pi-prompt-suggestions`](https://github.com/KLIEBHAN/t3code/tree/pi-prompt-suggestions) shows it as the suggested next prompt when **Suggest next prompt** is on in Settings > Labs.
@@ -180,8 +194,8 @@ The extension makes no autocomplete request while disabled. Automatic empty-draf
 - Supported baseline: Pi `0.80.6`, Node.js `22.19.0` or newer.
 - Every release is verified against Pi `0.80.6`, `0.83.0`, `1.2.0`, and `1.5.2`. Pi 1.x draws the editor cursor through fake-cursor markers instead of inverse video; ghost text supports both forms.
 - On hosts that expose Pi's model-visible session projection (Pi 1.x), autocomplete context follows it: a message that `context_edit` omitted or replaced, for example to redact it, is omitted or replaced in autocomplete requests too. If that projection fails, requests carry no conversation context rather than the raw history. Besides user and assistant message text, autocomplete sends only the newest compaction summary, so suggestions keep the summarized background after a compaction; custom messages, tool results, and the compaction's system checkpoint are not sent.
-- Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor and never reach a provider, except RPC mode with [`--prompt-autocomplete-next-prompt`](#next-prompt-for-rpc-hosts-t3-code).
-- The read-only commands `status`, `stats`, and `inspect` also work on hosts that can show notifications, such as RPC; there `status` reports `host=non-interactive` and `editor=unavailable`. Every command that changes state or touches the editor stays TUI-only. If the extension is enabled on such a host, it says once per process that no autocomplete request will be issued.
+- Interactive ghost text requires Pi's TUI mode. RPC, JSON, and print modes do not install a custom editor and never reach a provider, except RPC [draft completion](#draft-completion-for-rpc-hosts) and [`--prompt-autocomplete-next-prompt`](#next-prompt-for-rpc-hosts-t3-code).
+- The read-only commands `status`, `stats`, and `inspect` also work on hosts that can show notifications, such as RPC; there `status` reports `host=non-interactive` and `editor=unavailable`. Except for RPC draft completion, every command that changes state or touches the editor stays TUI-only. If the extension is enabled on such a host, it says once per process that no autocomplete request will be issued.
 - Forks of Pi's extension API whose `ExtensionContext` predates `mode`, such as [prime-agent](https://www.npmjs.com/package/prime-agent), are supported. For those hosts the extension first requires UI availability and a custom-editor slot, and then verifies that the host actually installed the editor. A front-end that accepts an editor factory without installing it, as forked RPC and daemon modes do, is detected on the first attempt and stays inactive: it is not retried, not left enabled, and can neither render ghost text nor issue a provider request.
 - On Pi 1.x, requests go through the session's model registry, which resolves each provider's stored credential itself. Models from providers that other extensions register therefore work as well, as do OAuth credentials that derive their own endpoint (such as GitHub Copilot Enterprise) and header-only or ambient credentials. Older hosts use the simple completion API below and need an API key.
 - The simple completion API is imported from the `@earendil-works/pi-ai` root specifier, which Pi maps to its compat entrypoint and such forks export directly. If a host exposes that module without `streamSimple`, the extension uses the completion path instead of failing requests.

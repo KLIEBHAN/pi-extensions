@@ -79,6 +79,7 @@ function createHarness(options: HarnessOptions = {}) {
   const autocompleteProviders: unknown[] = [];
   const editorSetCalls: Array<EditorFactory | undefined> = [];
   const editorTexts: string[] = [];
+  const completionReplies: Array<{ id: string; completion: string | null; error?: string }> = [];
   let editorFactory = options.existingEditorFactory;
 
   const ui = {
@@ -87,7 +88,9 @@ function createHarness(options: HarnessOptions = {}) {
       editorFactory = factory;
       editorSetCalls.push(factory);
     },
-    setWidget: () => undefined,
+    setWidget: (key: string, lines?: string[]) => {
+      if (key === "prompt-autocomplete-completion" && lines) completionReplies.push(JSON.parse(lines[0]!));
+    },
     setEditorText: (text: string) => editorTexts.push(text),
     notify: (message: string, type?: string) => notifications.push({ message, type }),
     // Spy: argument completion must use the command API, never a global provider.
@@ -186,6 +189,7 @@ function createHarness(options: HarnessOptions = {}) {
     ctx,
     editorSetCalls,
     editorTexts,
+    completionReplies,
     flags,
     handlers,
     notifications,
@@ -1060,6 +1064,119 @@ function makeCompletion(completions: string[]): Awaited<ReturnType<CompleteSeam>
     stopReason: "stop",
   } as unknown as Awaited<ReturnType<CompleteSeam>>;
 }
+
+test("RPC draft completion works while busy and disabled, bounds context, and caches by context", async () => {
+  const requests: string[] = [];
+  const harness = createHarness({ mode: "rpc", isIdle: () => false,
+    completeSimple: async (_model, context) => {
+      requests.push(JSON.stringify(context));
+      return makeCompletion(["Write the tests", "ignored"]);
+    },
+  });
+  await emit(harness, "session_start");
+  await emit(harness, "agent_start");
+  const request = { draft: "Write", context: { lastUser: "user-context", lastAssistant: "assistant-context" } };
+  await command(harness, `complete ${JSON.stringify({ id: "a", ...request })}`);
+  await command(harness, `complete ${JSON.stringify({ id: "b", ...request })}`);
+  assert.deepEqual(harness.completionReplies, [
+    { id: "a", completion: " the tests" }, { id: "b", completion: " the tests" },
+  ]);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0]!, /user-context/);
+  assert.match(requests[0]!, /assistant-context/);
+  await command(harness, `complete ${JSON.stringify({ id: "c", draft: "Write", context: { lastUser: "x".repeat(10000) } })}`);
+  assert.equal(requests.length, 2);
+  assert.ok(requests[1]!.length < 10000);
+  assert.deepEqual(harness.editorTexts, []);
+  assert.deepEqual(harness.editorSetCalls, []);
+});
+
+test("RPC completion validates requests and returns null for minimum, empty, budget, and sanitized errors", async () => {
+  const harness = createHarness({ mode: "rpc", completeSimple: async () => makeCompletion([]) });
+  await emit(harness, "session_start");
+  for (const payload of ['broken', '{}', '{"id":2}', '{"id":"bad","draft":2}',
+    '{"id":"context","draft":"hello","context":{"lastUser":2}}',
+    '{"id":"short","draft":""}', '{"id":"empty","draft":"hello"}']) {
+    await command(harness, `complete ${payload}`);
+  }
+  assert.deepEqual(harness.completionReplies, [
+    { id: "bad", completion: null, error: "Invalid completion request" },
+    { id: "context", completion: null, error: "Invalid completion context" },
+    { id: "short", completion: null }, { id: "empty", completion: null },
+  ]);
+  const budget = createHarness({ mode: "rpc", branch: [{
+    type: "custom", customType: "prompt-autocomplete-stats",
+    data: { schemaVersion: 1, physicalSessionId: "session-1", limit: 1, used: 1 },
+  }] });
+  await emit(budget, "session_start");
+  await command(budget, 'complete {"id":"budget","draft":"hello"}');
+  assert.deepEqual(budget.completionReplies, [{ id: "budget", completion: null }]);
+  assert.equal(budget.getProviderCalls(), 0);
+  const failure = createHarness({ mode: "rpc", completeSimple: async () => { throw new Error("secret-token"); } });
+  await emit(failure, "session_start");
+  await command(failure, 'complete {"id":"error","draft":"hello"}');
+  assert.deepEqual(failure.completionReplies, [{ id: "error", completion: null, error: "Completion request failed" }]);
+  for (const mode of ["tui", "print", "json"] as const) {
+    const other = createHarness({ mode });
+    await emit(other, "session_start");
+    await command(other, 'complete {"id":"no","draft":"hello"}');
+    assert.equal(other.getProviderCalls(), 0);
+    assert.deepEqual(other.completionReplies, []);
+  }
+});
+
+test("RPC completion honors the dedicated model and max-chars, independently of next-prompt work", async () => {
+  const models: string[] = [];
+  const responders: Array<() => void> = [];
+  const signals: Array<AbortSignal | undefined> = [];
+  const harness = createHarness({ mode: "rpc", nextPrompt: true,
+    completeSimple: async (model, _context, options) => {
+      models.push(`${model.provider}/${model.id}`);
+      signals.push(options?.signal);
+      await new Promise<void>((resolve) => responders.push(resolve));
+      return makeCompletion(["Write " + "some tests ".repeat(100)]);
+    },
+  });
+  harness.flags.set("prompt-autocomplete-model", "test-provider/dedicated");
+  harness.flags.set("prompt-autocomplete-max-chars", "40");
+  await emit(harness, "session_start");
+  await emit(harness, "agent_settled");
+  await settle(() => responders.length === 1);
+  const draft = command(harness, 'complete {"id":"draft","draft":"Write"}');
+  await settle(() => responders.length === 2);
+  assert.equal(signals[0]?.aborted, false);
+  responders[1]!();
+  await draft;
+  assert.ok(harness.completionReplies[0]!.completion!.length <= 40);
+  assert.deepEqual(models, ["test-provider/dedicated", "test-provider/dedicated"]);
+  assert.deepEqual(harness.editorTexts, []);
+  responders[0]!();
+  await settle(() => harness.editorTexts.length === 1);
+});
+
+test("RPC completion aborts superseded work and replies exactly once even if the provider ignores abort", async () => {
+  const signals: Array<AbortSignal | undefined> = [];
+  const responders: Array<() => void> = [];
+  const harness = createHarness({ mode: "rpc", completeSimple: async (_model, _context, options) => {
+    signals.push(options?.signal);
+    await new Promise<void>((resolve) => responders.push(resolve));
+    return makeCompletion(["Write the tests"]);
+  } });
+  await emit(harness, "session_start");
+  const first = command(harness, 'complete {"id":"first","draft":"Write"}');
+  await settle(() => responders.length === 1);
+  const second = command(harness, 'complete {"id":"second","draft":"Write"}');
+  await settle(() => responders.length === 2);
+  assert.equal(signals[0]?.aborted, true);
+  assert.deepEqual(harness.completionReplies, [{ id: "first", completion: null }]);
+  responders[1]!();
+  await second;
+  responders[0]!();
+  await first;
+  assert.deepEqual(harness.completionReplies, [
+    { id: "first", completion: null }, { id: "second", completion: " the tests" },
+  ]);
+});
 
 test("--prompt-autocomplete-next-prompt hands an RPC host one predicted prompt per settled turn", async () => {
   const requests: string[] = [];
