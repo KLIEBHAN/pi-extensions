@@ -210,7 +210,7 @@ If you want to tune the internal auto-mode prompts, edit `extensions/auto-mode/s
 
 `extensions/prompt-autocomplete/` adds inline AI autocomplete while you type your next prompt. It is also packaged independently as [`@kliebhan/pi-prompt-autocomplete`](extensions/prompt-autocomplete/README.md), so users can install it without loading the rest of this collection.
 
-[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.4.0/prompt-autocomplete-demo.mp4)
+[Watch the Prompt Autocomplete demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.5.0/prompt-autocomplete-demo.mp4)
 
 ```bash
 pi install npm:@kliebhan/pi-prompt-autocomplete
@@ -287,6 +287,8 @@ pi -e ./extensions/prompt-autocomplete \
 ```
 
 ### Privacy and provider usage
+
+RPC hosts can request draft continuations with `/prompt-autocomplete complete <json>`; see [Draft completion for RPC hosts](extensions/prompt-autocomplete/README.md#draft-completion-for-rpc-hosts).
 
 Prompt autocomplete makes additional model requests. Streaming changes when the first suggestion becomes visible, not what one request sends. Toggling response streaming cancels active autocomplete work but does not start a replacement request; the selected path applies to the next edit or manual one-shot. Each request can include the current draft, the latest user and assistant messages, a bounded recent-conversation summary, and on Pi 1.x the newest compaction summary, bounded to 1,500 characters. By default it uses the active model; `--prompt-autocomplete-model provider/model` may send that context to a different provider. Requests may incur token costs and consume provider rate limits. Successful results are cached in memory for up to 60 seconds. Typing an exact prefix of a still-valid terminal suggestion can reuse its remaining suffix locally; any change to context, model, context-relevant conversation, output configuration, or expiry—or divergent text—forces a fresh request. Custom, label, and session-info entries that only move the raw leaf do not. The bounded caches are cleared when the session resets or the extension is disabled.
 

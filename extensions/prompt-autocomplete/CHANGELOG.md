@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - Unreleased
+
+### Added
+
+- RPC-only `/prompt-autocomplete complete <json>` returns a normalized draft continuation through the `prompt-autocomplete-completion` widget. Host-supplied conversation context uses the existing bounds; requests reuse model selection, cache, budget, and stats. Superseded requests are aborted and receive one null reply. Neither ghost text nor next-prompt mode needs to be enabled.
+
 ## [0.4.0] - 2026-11-12
 
 ### Added

@@ -583,6 +583,7 @@ interface PromptAutocompleteSharedState {
   cancelScheduledRequest?: () => void;
   /** The running next-prompt request; a new turn or session makes it stale. */
   nextPromptAbort?: AbortController;
+  draftCompletionAbort?: AbortController;
   setStatusText?: (text: string | undefined) => void;
   setSpinnerActive?: (owner: string, active: boolean) => void;
   clearSpinner?: () => void;
@@ -2497,13 +2498,19 @@ function buildSuggestionRequest(
   draft: string,
   activationId: number,
   maxAlternatives = shared.config.maxAlternatives,
+  contextBranch?: unknown[],
 ): SuggestionRequest | undefined {
   const model = resolveSuggestionModel(shared);
   if (!model) return undefined;
 
   const conversationId = resolveCurrentConversationId(shared);
   shared.lastConversationId = conversationId;
-  const snapshot = buildCurrentRequestSnapshot(shared, draft, conversationId, maxAlternatives);
+  const snapshot = contextBranch === undefined
+    ? buildCurrentRequestSnapshot(shared, draft, conversationId, maxAlternatives)
+    : buildPromptAutocompleteRequestSnapshot({
+        draft, branch: contextBranch, maxAlternatives,
+        maxSuggestionChars: shared.config.maxSuggestionChars,
+      });
   const modelLabel = formatModelLabel(model);
 
   const prefixContextIdentity = {
@@ -2632,6 +2639,72 @@ async function suggestNextPrompt(ctx: ExtensionContext, shared: PromptAutocomple
     if (!controller.signal.aborted) shared.lastError = error instanceof Error ? error.message : String(error);
   } finally {
     if (shared.nextPromptAbort === controller) shared.nextPromptAbort = undefined;
+  }
+}
+
+/** RPC-only request/reply adapter; provider errors never cross the host boundary. */
+async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocompleteSharedState, payload: string): Promise<void> {
+  if (ctx.mode !== "rpc") {
+    ctx.ui.notify("prompt-autocomplete complete is for RPC hosts", "warning");
+    return;
+  }
+  shared.draftCompletionAbort?.abort();
+  let value: unknown;
+  try { value = JSON.parse(payload); } catch { return; }
+  if (!value || typeof value !== "object" || !("id" in value) || typeof value.id !== "string") return;
+  const id = value.id;
+  const controller = new AbortController();
+  shared.draftCompletionAbort = controller;
+  let replied = false;
+  const reply = (completion: string | null, error?: string) => {
+    if (replied) return;
+    replied = true;
+    ctx.ui.setWidget("prompt-autocomplete-completion", [JSON.stringify({ id, completion, ...(error ? { error } : {}) })]);
+  };
+  const onAbort = () => reply(null);
+  controller.signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    if (!("draft" in value) || typeof value.draft !== "string") {
+      reply(null, "Invalid completion request");
+      return;
+    }
+    const context = "context" in value ? value.context : undefined;
+    const branch: unknown[] = [];
+    if (context !== undefined) {
+      if (!context || typeof context !== "object" || Array.isArray(context)) {
+        reply(null, "Invalid completion context");
+        return;
+      }
+      for (const [key, role] of [["lastUser", "user"], ["lastAssistant", "assistant"]] as const) {
+        const text = key === "lastUser"
+          ? ("lastUser" in context ? context.lastUser : undefined)
+          : ("lastAssistant" in context ? context.lastAssistant : undefined);
+        if (text !== undefined && typeof text !== "string") {
+          reply(null, "Invalid completion context");
+          return;
+        }
+        if (text) branch.push({ type: "message", message: { role, content: text } });
+      }
+    }
+    if (value.draft.trim().length < shared.config.minPromptChars) {
+      reply(null);
+      return;
+    }
+    const request = buildSuggestionRequest(shared, value.draft, shared.activationId, 1, branch);
+    if (!request) {
+      reply(null, "Completion model unavailable");
+      return;
+    }
+    let entry = getCachedRequest(shared, request.cacheKey);
+    if (entry) shared.usageStats.cacheHits += 1;
+    else entry = await fetchSuggestionUncached(shared, { ...request, useStreaming: false }, controller.signal, () => undefined);
+    reply(controller.signal.aborted ? null : entry.suggestions[0] ?? null);
+  } catch (error) {
+    reply(null, controller.signal.aborted || error instanceof PromptAutocompleteBudgetExhaustedError
+      ? undefined : "Completion request failed");
+  } finally {
+    controller.signal.removeEventListener("abort", onAbort);
+    if (shared.draftCompletionAbort === controller) shared.draftCompletionAbort = undefined;
   }
 }
 
@@ -3557,6 +3630,8 @@ export function createPromptAutocompleteExtension(
 
   pi.on("session_shutdown", async (_event, ctx) => {
     // Teardown, not a user decision: leave runtimeOverrides untouched.
+    shared.draftCompletionAbort?.abort();
+    shared.draftCompletionAbort = undefined;
     shared.enabled = false;
     shared.cancelActiveRequest?.();
     cancelNextPrompt(shared);
@@ -3613,6 +3688,10 @@ export function createPromptAutocompleteExtension(
       // must keep its leading and trailing whitespace to match production.
       const payload = space < 0 ? "" : commandStart.slice(space + 1);
       const rest = payload.trim();
+      if (name === "complete") {
+        await completeRpcDraft(ctx, shared, payload);
+        return;
+      }
       const spec = findPromptAutocompleteCommand(name);
 
       // Reporting works wherever a notification can be shown; anything that
