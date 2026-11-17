@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.8.0/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.9.0/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -145,7 +145,7 @@ Budget: 4/25 (session)
 
 `/prompt-autocomplete inspect [draft text]` shows locally what an autocomplete request would send. It makes no provider request, persists nothing, and never shows credentials or headers; at most it warms the in-memory context cache that the next request in the same conversation reuses.
 
-- The report renders the same request snapshot the provider path uses: the resolved and requested model, the latest assistant and user messages, the recent-conversation summary, the compaction summary, the transmitted draft tail, the exact request size, and the output and token ceilings. Long sections appear as character counts with short sanitized excerpts.
+- The report renders the same request snapshot the provider path uses: the resolved and requested model, the latest assistant and user messages, the earlier messages, the compaction summary, the transmitted draft tail, the exact request size, and the output and token ceilings. Long sections appear as character counts with short sanitized excerpts.
 - Without draft text the report covers the conversation sections only. The slash command replaced the editor text when you submitted it, so the draft a real request would carry cannot be recovered and is not invented; pass one explicitly to preview a complete request. Pi trims trailing whitespace from submitted commands.
 - `Shared policy` evaluates only the gates every editor shares — enabled state, editor ownership, the main-agent gate, model and auth, `min-chars` and slash/path detection for the given draft, and the session budget — separately for automatic requests and the manual `Ctrl+.` one-shot. Cursor position, the built-in autocomplete menu, Escape dismissal, the per-editor error cooldown, and cached responses belong to the live editor and are not evaluated.
 
@@ -159,7 +159,7 @@ pi --mode rpc --no-session --no-tools --prompt-autocomplete-model provider/model
 
 Send an RPC `prompt` with message `/prompt-autocomplete complete <json>`. The JSON is `{"id":"unique-request-id","draft":"Write","context":{"lastUser":"…","lastAssistant":"…"}}`; `context` and both of its fields are optional. Supply the host thread's latest messages when the sidecar has no session. They use the existing bounded conversation snapshot, not the sidecar's conversation.
 
-Optional request fields: `alternatives` (finite number, default `1`, rounded down and clamped to `1..max-alternatives`; configured by `--prompt-autocomplete-max-alternatives`, default `3`) asks for distinct alternatives in one model request. `manual` (boolean, default `false`) bypasses `min-chars`; with an empty draft, alternatives are complete prompts predicted from `context`. Cache entries distinguish alternative counts and manual mode; budget and cancellation rules are unchanged. `fresh` (boolean, default `false`) asks the model again instead of reusing a cached result for the same request, and the new result replaces the cached one. `thinking` (`off`, `minimal`, `low`, `medium`, or `high`; default from `--prompt-autocomplete-thinking`) sets the thinking for this request; cache entries distinguish levels.
+Optional request fields: `alternatives` (finite number, default `1`, rounded down and clamped to `1..max-alternatives`; configured by `--prompt-autocomplete-max-alternatives`, default `3`) asks for distinct alternatives in one model request. `manual` (boolean, default `false`) bypasses `min-chars`; with an empty draft, alternatives are complete prompts predicted from `context`. Cache entries distinguish alternative counts and manual mode; budget and cancellation rules are unchanged. `fresh` (boolean, default `false`) asks the model again instead of reusing a cached result for the same request, and the new result replaces the cached one. `thinking` (`off`, `minimal`, `low`, `medium`, or `high`; default from `--prompt-autocomplete-thinking`) sets the thinking for this request; cache entries distinguish levels; a model that cannot think gets no level. `context.recent` (array of `{"role":"user"|"assistant","text":"…"}`, oldest first) supplies the earlier messages before `lastUser` and `lastAssistant`; the newest 6 are used, and none of them is taken as the latest user message.
 
 Each request receives one fire-and-forget `ctx.ui.setWidget("prompt-autocomplete-completion", [JSON.stringify(result)])`, where `result` is `{"id":"unique-request-id","completion":" the tests","completions":[" the tests"]}`. `completions` contains all distinct normalized alternatives in order, each bounded by `max-chars` and ready to **append**. `completion` always equals `completions[0]` or `null`. Every reply includes `completions`, empty for short automatic drafts, exhausted budgets, unusable output, superseded requests, or errors; errors also carry a short, sanitized `error` string, such as `Thinking used up the output tokens before an answer`. Requests without the new fields still return at most one alternative. Malformed requests with a string `id` receive an error; invalid JSON or missing/non-string ids cannot be correlated and receive no widget.
 
@@ -180,7 +180,7 @@ Enabling Prompt Autocomplete permits additional model requests. Streaming change
 
 - the current prompt draft or its bounded tail,
 - the latest user and assistant messages,
-- a bounded recent-conversation summary,
+- up to 6 earlier user and assistant messages, each cut to its first 600 characters; the latest user and assistant messages are not repeated there,
 - on hosts with Pi's model-visible session projection (Pi 1.x), the newest compaction summary, bounded to 1,500 characters with the middle elided.
 
 The newest conversation entry that affects autocomplete context is used only in the local in-memory cache key and is not sent to the provider. Custom, label, and session-info entries can move Pi's raw leaf without invalidating that key.

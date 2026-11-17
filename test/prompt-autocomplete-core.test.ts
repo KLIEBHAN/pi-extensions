@@ -1630,6 +1630,34 @@ test("budget resolution ranks session over flag over restored value", () => {
   });
 });
 
+test("the recent conversation leaves out the messages sent as the latest ones", () => {
+  const message = (role: string, content: string) => ({ type: "message", message: { role, content } });
+  const branch = [
+    message("user", "First question"),
+    message("assistant", "First answer"),
+    message("user", "Second question"),
+    message("assistant", "Working on it"),
+    message("assistant", "Second answer"),
+  ];
+  const snapshot = buildPromptAutocompleteRequestSnapshot({
+    draft: "", branch, maxAlternatives: 1, maxSuggestionChars: 160,
+  });
+  assert.equal(snapshot.latestAssistantContext, "Second answer");
+  assert.equal(snapshot.latestUserContext, "Second question");
+  assert.equal(
+    snapshot.recentContext,
+    "User: First question\n\nAssistant: First answer\n\nAssistant: Working on it",
+  );
+  assert.match(renderPromptAutocompleteUserText(snapshot), /Earlier messages \(oldest first, before the latest ones\):\nUser: First question/);
+
+  const separate = buildPromptAutocompleteRequestSnapshot({
+    draft: "", branch: [message("assistant", "Latest")], recentBranch: [message("user", "Older")],
+    maxAlternatives: 1, maxSuggestionChars: 160,
+  });
+  assert.equal(separate.latestUserContext, "", "a recent message never becomes the latest user message");
+  assert.equal(separate.recentContext, "User: Older");
+});
+
 test("the request snapshot renders the transmitted user message", () => {
   const empty = buildPromptAutocompleteRequestSnapshot({
     draft: "",

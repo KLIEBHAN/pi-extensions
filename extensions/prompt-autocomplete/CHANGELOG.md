@@ -2,6 +2,20 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - Unreleased
+
+### Added
+
+- RPC draft completion accepts `context.recent`, the earlier user and assistant messages, oldest first. They fill the earlier conversation and never become the latest user message.
+
+### Changed
+
+- The earlier conversation leaves out the latest user and assistant messages, which each request already sends in full, so it shows up to 6 messages before them instead of repeating them. Requests get shorter, and longer conversations keep more of their history. The section is now titled "Earlier messages (oldest first, before the latest ones)", in requests and in `inspect`.
+
+### Fixed
+
+- A thinking level is no longer sent to a model that cannot think; Pi added a thinking budget to its output cap anyway.
+
 ## [0.8.0] - 2026-11-17
 
 ### Added
