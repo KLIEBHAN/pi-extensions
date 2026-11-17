@@ -10,7 +10,7 @@ All notable changes to this package are documented here. This project follows [S
 
 ### Fixed
 
-- A model that thinks before answering got only the answer's output budget, so its thinking often used it up and the request returned no suggestion. Thinking models now get extra output tokens for it, also with `off` when the model cannot switch thinking off. A response whose thinking still used up the budget reports `Thinking used up the output tokens before an answer` instead of an empty result.
+- A model that thinks before answering got only the answer's output budget, so its thinking often used it up and the request returned no suggestion. Reasoning models now get extra output tokens for it, capped at their output limit, also with `off` unless the model names how to switch thinking off, and higher levels get more time. A response whose thinking still used up the budget before any answer text reports `Thinking used up the output tokens before an answer` instead of an empty result.
 
 ## [0.7.0] - 2026-11-17
 

@@ -11,6 +11,7 @@ import {
   buildPromptAutocompleteCacheKey,
   parsePromptAutocompleteThinking,
   thinkingHeadroomTokens,
+  thinkingTimeoutMs,
   buildPromptAutocompleteDismissalContext,
   buildPromptAutocompletePrefixContextKey,
   buildRecentConversationContext,
@@ -274,7 +275,7 @@ test("prompt-autocomplete requests cap provider retries and timeouts for inline 
   const source = readFileSync(new URL("../extensions/prompt-autocomplete/index.ts", import.meta.url), "utf8");
   assert.match(source, /REQUEST_TIMEOUT_MS\s*=\s*8_000/);
   assert.match(source, /REQUEST_MAX_RETRIES\s*=\s*0/);
-  assert.match(source, /timeoutMs:\s*REQUEST_TIMEOUT_MS/);
+  assert.match(source, /timeoutMs:\s*thinkingTimeoutMs\(request\.thinking, REQUEST_TIMEOUT_MS\)/);
   assert.match(source, /maxRetries:\s*REQUEST_MAX_RETRIES/);
 });
 
@@ -2025,9 +2026,11 @@ test("thinking headroom covers models that think, and none that can switch it of
   assert.equal(thinkingHeadroomTokens("off", { reasoning: false }), 0);
   assert.equal(thinkingHeadroomTokens("high", { reasoning: false }), 0);
   assert.equal(thinkingHeadroomTokens("off", { reasoning: true, thinkingLevelMap: { off: "none" } }), 0);
-  assert.equal(thinkingHeadroomTokens("off", { reasoning: true }), 0);
+  assert.equal(thinkingHeadroomTokens("off", { reasoning: true }), 1_024);
   assert.equal(thinkingHeadroomTokens("off", { reasoning: true, thinkingLevelMap: { off: null } }), 1_024);
   assert.equal(thinkingHeadroomTokens("low", { reasoning: true, thinkingLevelMap: { off: "none" } }), 2_048);
+  assert.equal(thinkingTimeoutMs("off", 8_000), 8_000);
+  assert.equal(thinkingTimeoutMs("high", 8_000), 60_000);
   assert.equal(parsePromptAutocompleteThinking(" HIGH "), "high");
   assert.equal(parsePromptAutocompleteThinking("xhigh"), undefined);
   assert.equal(parsePromptAutocompleteThinking(3), undefined);

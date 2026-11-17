@@ -135,16 +135,30 @@ const THINKING_HEADROOM_TOKENS: Record<PromptAutocompleteThinking, number> = {
 
 /**
  * Output tokens to add to the answer budget for thinking. None for a model that does not reason,
- * or that can switch it off when `off` is asked; a model that always thinks gets room for it, or
- * its thinking would use up the budget and leave no answer.
+ * or whose `thinkingLevelMap.off` names how to switch it off when `off` is asked; any other
+ * reasoning model may think anyway and gets room for it, or would use up the budget.
  */
 export function thinkingHeadroomTokens(
   thinking: PromptAutocompleteThinking,
   model: { reasoning?: boolean; thinkingLevelMap?: Partial<Record<string, string | null>> },
 ): number {
   if (!model.reasoning) return 0;
-  if (thinking === "off" && model.thinkingLevelMap?.off !== null) return 0;
+  if (thinking === "off" && typeof model.thinkingLevelMap?.off === "string") return 0;
   return THINKING_HEADROOM_TOKENS[thinking];
+}
+
+// Extra time a request may take for the thinking it asks for.
+const THINKING_EXTRA_TIMEOUT_MS: Record<PromptAutocompleteThinking, number> = {
+  off: 0,
+  minimal: 0,
+  low: 7_000,
+  medium: 22_000,
+  high: 52_000,
+};
+
+/** The response deadline for a request asking for `thinking`, from the deadline without it. */
+export function thinkingTimeoutMs(thinking: PromptAutocompleteThinking, baseMs: number): number {
+  return baseMs + THINKING_EXTRA_TIMEOUT_MS[thinking];
 }
 
 export interface ModelRef {

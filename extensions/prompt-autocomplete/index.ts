@@ -34,6 +34,7 @@ import {
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
   thinkingHeadroomTokens,
+  thinkingTimeoutMs,
   parsePromptAutocompleteThinking,
   type PromptAutocompleteThinking,
   DEFAULT_PROMPT_AUTOCOMPLETE_THINKING,
@@ -641,6 +642,7 @@ async function consumeAssistantStream(
   signal: AbortSignal,
   abortProvider: () => void,
   onPartial: (message: AssistantMessage) => void,
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<AssistantMessage> {
   const iterator = stream[Symbol.asyncIterator]();
   let hardTimer: ReturnType<typeof setTimeout> | undefined;
@@ -655,7 +657,7 @@ async function consumeAssistantStream(
       // accidentally ignore their timeout option.
       abortProvider();
       reject(new Error("Provider stream exceeded the local response deadline"));
-    }, REQUEST_TIMEOUT_MS + STREAM_HARD_TIMEOUT_GRACE_MS);
+    }, timeoutMs + STREAM_HARD_TIMEOUT_GRACE_MS);
   });
   const abortDeadline = new Promise<never>((_resolve, reject) => {
     rejectAbortDrain = reject;
@@ -2171,11 +2173,15 @@ async function fetchSuggestionUncached(
     // so credentials are only passed to the compat functions and to seams.
     ...(viaRegistry ? {} : { apiKey: auth.apiKey, headers: auth.headers }),
     signal,
-    maxTokens: computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars)
-      + thinkingHeadroomTokens(request.thinking, request.model),
+    // Never above what the model can emit; providers reject a larger cap.
+    maxTokens: Math.min(
+      computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars)
+        + thinkingHeadroomTokens(request.thinking, request.model),
+      request.model.maxTokens > 0 ? request.model.maxTokens : Number.POSITIVE_INFINITY,
+    ),
     // Unset asks for no thinking where the model can switch it off.
     ...(request.thinking === "off" ? {} : { reasoning: request.thinking }),
-    timeoutMs: REQUEST_TIMEOUT_MS,
+    timeoutMs: thinkingTimeoutMs(request.thinking, REQUEST_TIMEOUT_MS),
     maxRetries: REQUEST_MAX_RETRIES,
     maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
   };
@@ -2204,7 +2210,7 @@ async function fetchSuggestionUncached(
         if (lastPublished && !suggestion.startsWith(lastPublished)) return;
         lastPublished = suggestion;
         publish(suggestion);
-      });
+      }, requestOptions.timeoutMs);
     } else {
       response = await shared.completeSimple(request.model, context, requestOptions);
     }
@@ -2241,7 +2247,10 @@ async function fetchSuggestionUncached(
     request.maxAlternatives,
   );
   // Thinking that used up the output budget leaves no answer; say so instead of suggesting nothing.
-  if (normalized.length === 0 && response.stopReason === "length" && contentTypes.includes("thinking")) {
+  if (
+    normalized.length === 0 && text.trim().length === 0
+    && response.stopReason === "length" && contentTypes.includes("thinking")
+  ) {
     stats.failedRequests += 1;
     throw new ThinkingExhaustedError();
   }
