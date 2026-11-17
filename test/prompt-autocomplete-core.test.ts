@@ -2008,3 +2008,11 @@ test("line acceptance takes the first line with its line break", () => {
   assert.equal(extractSuggestionLine(" first line\n  second"), " first line\n");
   assert.equal(extractSuggestionLine(" only line"), " only line");
 });
+
+test("alternatives keep a direct word extension next to a new word", () => {
+  // Whitespace on one alternative does not prove a word boundary for the others.
+  assert.deepEqual(
+    normalizePromptSuggestions("Write test", JSON.stringify(["s for the parser", " cases for the parser"]), 240, 3),
+    ["s for the parser", " cases for the parser"],
+  );
+});

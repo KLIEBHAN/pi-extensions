@@ -2349,6 +2349,7 @@ export function renderPromptAutocompleteUserText(snapshot: PromptAutocompleteReq
         `Task: propose up to ${snapshot.maxAlternatives} ranked continuations to insert at the cursor.`,
         "Each item must be only the text after the cursor; never restate text the user already typed.",
         "If the draft ends inside a partially typed word, complete that word directly without a leading space.",
+        "If the draft ends with a complete word, start each item with the single space that separates it from that word.",
       ].join("\n"),
     );
   }

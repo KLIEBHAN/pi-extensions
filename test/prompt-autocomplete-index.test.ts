@@ -79,7 +79,7 @@ function createHarness(options: HarnessOptions = {}) {
   const autocompleteProviders: unknown[] = [];
   const editorSetCalls: Array<EditorFactory | undefined> = [];
   const editorTexts: string[] = [];
-  const completionReplies: Array<{ id: string; completion: string | null; error?: string }> = [];
+  const completionReplies: Array<{ id: string; completion: string | null; completions: string[]; error?: string }> = [];
   let editorFactory = options.existingEditorFactory;
 
   const ui = {
@@ -1079,7 +1079,8 @@ test("RPC draft completion works while busy and disabled, bounds context, and ca
   await command(harness, `complete ${JSON.stringify({ id: "a", ...request })}`);
   await command(harness, `complete ${JSON.stringify({ id: "b", ...request })}`);
   assert.deepEqual(harness.completionReplies, [
-    { id: "a", completion: " the tests" }, { id: "b", completion: " the tests" },
+    { id: "a", completion: " the tests", completions: [" the tests"] },
+    { id: "b", completion: " the tests", completions: [" the tests"] },
   ]);
   assert.equal(requests.length, 1);
   assert.match(requests[0]!, /user-context/);
@@ -1089,6 +1090,55 @@ test("RPC draft completion works while busy and disabled, bounds context, and ca
   assert.ok(requests[1]!.length < 10000);
   assert.deepEqual(harness.editorTexts, []);
   assert.deepEqual(harness.editorSetCalls, []);
+});
+
+test("RPC alternatives are clamped, distinct, ordered, and cached separately by count and manual mode", async () => {
+  const requests: string[] = [];
+  const harness = createHarness({ mode: "rpc", completeSimple: async (_model, context) => {
+    requests.push(JSON.stringify(context));
+    return makeCompletion(["Write tests", "Write tests", "Write docs", "Write code", "Write more"]);
+  } });
+  await emit(harness, "session_start");
+  for (const alternatives of [1, 3, 3, 99, 0, 2.9]) {
+    await command(harness, `complete ${JSON.stringify({ id: String(alternatives), draft: "Write", alternatives })}`);
+  }
+  assert.deepEqual(harness.completionReplies.map((reply) => reply.completions), [
+    [" tests"], [" tests", " docs", " code"], [" tests", " docs", " code"],
+    [" tests", " docs", " code"], [" tests"], [" tests", " docs"],
+  ]);
+  assert.equal(requests.length, 3);
+  assert.match(requests[1]!, /up to 3 ranked continuations/);
+  for (const reply of harness.completionReplies) assert.equal(reply.completion, reply.completions[0]);
+  await command(harness, 'complete {"id":"manual","draft":"Write","manual":true}');
+  await command(harness, 'complete {"id":"manual-cached","draft":"Write","manual":true}');
+  assert.equal(requests.length, 4);
+
+  harness.flags.set("prompt-autocomplete-max-alternatives", "2");
+  await emit(harness, "session_start");
+  await command(harness, 'complete {"id":"configured","draft":"Write","alternatives":99}');
+  assert.deepEqual(harness.completionReplies.at(-1)?.completions, [" tests", " docs"]);
+});
+
+test("RPC manual empty drafts predict full prompts from context; automatic empty drafts make no call", async () => {
+  const requests: string[] = [];
+  const prompts = ["Write tests", "Review the changes"];
+  const harness = createHarness({ mode: "rpc", completeSimple: async (_model, context) => {
+    requests.push(JSON.stringify(context));
+    return makeCompletion(prompts);
+  } });
+  await emit(harness, "session_start");
+  await command(harness, 'complete {"id":"auto","draft":""}');
+  assert.equal(requests.length, 0);
+  assert.deepEqual(harness.completionReplies, [{ id: "auto", completion: null, completions: [] }]);
+  await command(harness, `complete ${JSON.stringify({
+    id: "manual", draft: "", manual: true, alternatives: 2,
+    context: { lastUser: "Add validation", lastAssistant: "Validation added" },
+  })}`);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0]!, /up to 2 ranked full next prompts/);
+  assert.match(requests[0]!, /Add validation/);
+  assert.match(requests[0]!, /Validation added/);
+  assert.deepEqual(harness.completionReplies.at(-1), { id: "manual", completion: prompts[0], completions: prompts });
 });
 
 test("RPC completion validates requests and returns null for minimum, empty, budget, and sanitized errors", async () => {
@@ -1104,14 +1154,20 @@ test("RPC completion validates requests and returns null for minimum, empty, bud
   for (const payload of ['broken', '{}', '{"id":2}', '{"id":"bad","draft":2}',
     '{"id":"context","draft":"hello","context":{"lastUser":2}}',
     '{"id":"array","draft":"hello","context":[]}',
+    '{"id":"count","draft":"hello","alternatives":"3"}',
+    '{"id":"infinite","draft":"hello","alternatives":1e999}',
+    '{"id":"manual","draft":"hello","manual":"true"}',
     '{"id":"short","draft":""}', '{"id":"empty","draft":"hello"}']) {
     await command(harness, `complete ${payload}`);
   }
   assert.deepEqual(harness.completionReplies, [
-    { id: "bad", completion: null, error: "Invalid completion request" },
-    { id: "context", completion: null, error: "Invalid completion context" },
-    { id: "array", completion: null, error: "Invalid completion context" },
-    { id: "short", completion: null }, { id: "empty", completion: null },
+    { id: "bad", completion: null, completions: [], error: "Invalid completion request" },
+    { id: "context", completion: null, completions: [], error: "Invalid completion context" },
+    { id: "array", completion: null, completions: [], error: "Invalid completion context" },
+    { id: "count", completion: null, completions: [], error: "Invalid completion request" },
+    { id: "infinite", completion: null, completions: [], error: "Invalid completion request" },
+    { id: "manual", completion: null, completions: [], error: "Invalid completion request" },
+    { id: "short", completion: null, completions: [] }, { id: "empty", completion: null, completions: [] },
   ]);
   // Only the valid, long-enough draft reached the provider.
   assert.equal(providerCalls, 1);
@@ -1121,12 +1177,12 @@ test("RPC completion validates requests and returns null for minimum, empty, bud
   }] });
   await emit(budget, "session_start");
   await command(budget, 'complete {"id":"budget","draft":"hello"}');
-  assert.deepEqual(budget.completionReplies, [{ id: "budget", completion: null }]);
+  assert.deepEqual(budget.completionReplies, [{ id: "budget", completion: null, completions: [] }]);
   assert.equal(budget.getProviderCalls(), 0);
   const failure = createHarness({ mode: "rpc", completeSimple: async () => { throw new Error("secret-token"); } });
   await emit(failure, "session_start");
   await command(failure, 'complete {"id":"error","draft":"hello"}');
-  assert.deepEqual(failure.completionReplies, [{ id: "error", completion: null, error: "Completion request failed" }]);
+  assert.deepEqual(failure.completionReplies, [{ id: "error", completion: null, completions: [], error: "Completion request failed" }]);
   for (const mode of ["tui", "print", "json"] as const) {
     const other = createHarness({ mode });
     await emit(other, "session_start");
@@ -1179,13 +1235,14 @@ test("RPC completion aborts superseded work and replies exactly once even if the
   const second = command(harness, 'complete {"id":"second","draft":"Write"}');
   await settle(() => responders.length === 2);
   assert.equal(signals[0]?.aborted, true);
-  assert.deepEqual(harness.completionReplies, [{ id: "first", completion: null }]);
+  assert.deepEqual(harness.completionReplies, [{ id: "first", completion: null, completions: [] }]);
   responders[1]!();
   await second;
   responders[0]!();
   await first;
   assert.deepEqual(harness.completionReplies, [
-    { id: "first", completion: null }, { id: "second", completion: " the tests" },
+    { id: "first", completion: null, completions: [] },
+    { id: "second", completion: " the tests", completions: [" the tests"] },
   ]);
 });
 
