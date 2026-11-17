@@ -2656,10 +2656,13 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
   const controller = new AbortController();
   shared.draftCompletionAbort = controller;
   let replied = false;
-  const reply = (completion: string | null, error?: string) => {
+  const reply = (suggestions: string[] | null, error?: string) => {
     if (replied) return;
     replied = true;
-    ctx.ui.setWidget("prompt-autocomplete-completion", [JSON.stringify({ id, completion, ...(error ? { error } : {}) })]);
+    const completions = suggestions ?? [];
+    ctx.ui.setWidget("prompt-autocomplete-completion", [JSON.stringify({
+      id, completion: completions[0] ?? null, completions, ...(error ? { error } : {}),
+    })]);
   };
   const onAbort = () => reply(null);
   controller.signal.addEventListener("abort", onAbort, { once: true });
@@ -2668,6 +2671,13 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
       reply(null, "Invalid completion request");
       return;
     }
+    const alternatives = "alternatives" in value ? value.alternatives : 1;
+    const manual = "manual" in value ? value.manual : false;
+    if (typeof alternatives !== "number" || !Number.isFinite(alternatives) || typeof manual !== "boolean") {
+      reply(null, "Invalid completion request");
+      return;
+    }
+    const maxAlternatives = Math.max(1, Math.min(shared.config.maxAlternatives, Math.floor(alternatives)));
     const context = "context" in value ? value.context : undefined;
     const branch: unknown[] = [];
     if (context !== undefined) {
@@ -2686,19 +2696,21 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
         if (text) branch.push({ type: "message", message: { role, content: text } });
       }
     }
-    if (value.draft.trim().length < shared.config.minPromptChars) {
+    if (!manual && value.draft.trim().length < shared.config.minPromptChars) {
       reply(null);
       return;
     }
-    const request = buildSuggestionRequest(shared, value.draft, shared.activationId, 1, branch);
+    const request = buildSuggestionRequest(shared, value.draft, shared.activationId, maxAlternatives, branch);
     if (!request) {
       reply(null, "Completion model unavailable");
       return;
     }
+    // Count and context are already in the key; keep manual results separate too.
+    request.cacheKey = JSON.stringify([request.cacheKey, manual]);
     let entry = getCachedRequest(shared, request.cacheKey);
     if (entry) shared.usageStats.cacheHits += 1;
     else entry = await fetchSuggestionUncached(shared, { ...request, useStreaming: false }, controller.signal, () => undefined);
-    reply(controller.signal.aborted ? null : entry.suggestions[0] ?? null);
+    reply(controller.signal.aborted ? null : entry.suggestions);
   } catch (error) {
     reply(null, controller.signal.aborted || error instanceof PromptAutocompleteBudgetExhaustedError
       ? undefined : "Completion request failed");

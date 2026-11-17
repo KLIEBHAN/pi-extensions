@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - Unreleased
+
+### Added
+
+- RPC draft completion accepts `alternatives` for ranked, distinct continuations in one model request and `manual` to bypass minimum draft length, including full prompt predictions from an empty draft. Every reply includes `completions`; `completion` remains the first alternative or null. Cache entries separate alternative counts and manual mode.
+
 ## [0.5.0] - 2026-11-17
 
 ### Added
