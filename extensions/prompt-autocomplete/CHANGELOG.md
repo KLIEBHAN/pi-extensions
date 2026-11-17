@@ -10,7 +10,7 @@ All notable changes to this package are documented here. This project follows [S
 
 ### Changed
 
-- The earlier conversation leaves out the latest user and assistant messages, which each request already sends in full, so it shows up to 6 messages before them instead of repeating them. Requests get shorter, and longer conversations keep more of their history. The section is now titled "Earlier messages (oldest first, before the latest ones)", in requests and in `inspect`.
+- The earlier conversation leaves out the latest user and assistant messages, which each request already sends in their own sections, so it shows up to 6 messages before them instead of repeating them. Requests get shorter, and longer conversations keep more of their history. The section is now titled "Earlier messages (oldest first, before the latest ones)", in requests and in `inspect`.
 
 ### Fixed
 

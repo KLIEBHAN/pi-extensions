@@ -1208,9 +1208,17 @@ test("RPC recent messages become the earlier conversation, never the latest user
   })}`);
   assert.equal(requests.length, 1);
   assert.match(requests[0]!, /Earlier messages \(oldest first, before the latest ones\):\\nUser: Points 48 to 50 later/);
+  assert.match(requests[0]!, /Assistant: Old answer/);
   assert.doesNotMatch(requests[0]!, /Latest user message/);
   // The test model cannot think, so no level goes out.
   assert.deepEqual(reasoning, [undefined]);
+  // Blank messages take no slot.
+  const many = Array.from({ length: 6 }, (_, index) => ({ role: "user", text: `m${index}` }));
+  await command(harness, `complete ${JSON.stringify({
+    id: "blank", draft: "Write", fresh: true,
+    context: { lastAssistant: "A", recent: [...many, { role: "assistant", text: " \n" }] },
+  })}`);
+  assert.match(requests.at(-1)!, /User: m0/);
   for (const bad of [{ recent: "x" }, { recent: [{ role: "system", text: "x" }] }, { recent: [{ role: "user" }] }]) {
     await command(harness, `complete ${JSON.stringify({ id: "bad", draft: "Write", context: bad })}`);
     assert.equal(harness.completionReplies.at(-1)?.error, "Invalid completion context");

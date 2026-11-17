@@ -2676,18 +2676,20 @@ async function suggestNextPrompt(ctx: ExtensionContext, shared: PromptAutocomple
 
 /**
  * The session entries for an RPC request's `recent` messages, oldest first, or undefined when
- * the value is malformed. Only the newest messages the recent conversation uses are kept.
+ * the value is malformed. Only the newest messages with text that the recent conversation uses
+ * are kept, and a long array is read only from its end.
  */
 function parseRecentContext(value: unknown): unknown[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const entries: unknown[] = [];
-  for (const item of value) {
+  for (let index = value.length - 1; index >= 0 && entries.length < MAX_CONTEXT_MESSAGES; index -= 1) {
+    const item: unknown = value[index];
     if (!item || typeof item !== "object" || !("role" in item) || !("text" in item)) return undefined;
     const { role, text } = item;
     if ((role !== "user" && role !== "assistant") || typeof text !== "string") return undefined;
-    if (text) entries.push({ type: "message", message: { role, content: text } });
+    if (text.trim()) entries.push({ type: "message", message: { role, content: text } });
   }
-  return entries.slice(-MAX_CONTEXT_MESSAGES);
+  return entries.reverse();
 }
 
 /** A response whose thinking used up the output tokens; its message is safe to show a host. */
