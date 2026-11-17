@@ -1239,7 +1239,7 @@ function formatPromptAutocompleteInspection(
     ),
     formatInspectionSection("Latest user message", snapshot.latestUserContext, `cap ${MAX_LATEST_USER_MESSAGE_CHARS}`),
     formatInspectionSection(
-      "Recent conversation",
+      "Earlier messages",
       snapshot.recentContext,
       `up to ${MAX_CONTEXT_MESSAGES} messages × ${MAX_CONTEXT_MESSAGE_CHARS} chars`,
     ),
@@ -2180,7 +2180,8 @@ async function fetchSuggestionUncached(
       request.model.maxTokens > 0 ? request.model.maxTokens : Number.POSITIVE_INFINITY,
     ),
     // Unset asks for no thinking where the model can switch it off.
-    ...(request.thinking === "off" ? {} : { reasoning: request.thinking }),
+    // A model that cannot think gets no level; Pi would still add a thinking budget for it.
+    ...(request.thinking === "off" || !request.model.reasoning ? {} : { reasoning: request.thinking }),
     timeoutMs: thinkingTimeoutMs(request.thinking, REQUEST_TIMEOUT_MS),
     maxRetries: REQUEST_MAX_RETRIES,
     maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
@@ -2526,7 +2527,7 @@ function buildSuggestionRequest(
   draft: string,
   activationId: number,
   maxAlternatives = shared.config.maxAlternatives,
-  contextBranch?: unknown[],
+  contextBranch?: { branch: unknown[]; recentBranch?: unknown[] },
   thinking = shared.config.thinking,
 ): SuggestionRequest | undefined {
   const model = resolveSuggestionModel(shared);
@@ -2537,7 +2538,7 @@ function buildSuggestionRequest(
   const snapshot = contextBranch === undefined
     ? buildCurrentRequestSnapshot(shared, draft, conversationId, maxAlternatives)
     : buildPromptAutocompleteRequestSnapshot({
-        draft, branch: contextBranch, maxAlternatives,
+        draft, ...contextBranch, maxAlternatives,
         maxSuggestionChars: shared.config.maxSuggestionChars,
       });
   const modelLabel = formatModelLabel(model);
@@ -2673,6 +2674,24 @@ async function suggestNextPrompt(ctx: ExtensionContext, shared: PromptAutocomple
   }
 }
 
+/**
+ * The session entries for an RPC request's `recent` messages, oldest first, or undefined when
+ * the value is malformed. Only the newest messages with text that the recent conversation uses
+ * are kept, and a long array is read only from its end.
+ */
+function parseRecentContext(value: unknown): unknown[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const entries: unknown[] = [];
+  for (let index = value.length - 1; index >= 0 && entries.length < MAX_CONTEXT_MESSAGES; index -= 1) {
+    const item: unknown = value[index];
+    if (!item || typeof item !== "object" || !("role" in item) || !("text" in item)) return undefined;
+    const { role, text } = item;
+    if ((role !== "user" && role !== "assistant") || typeof text !== "string") return undefined;
+    if (text.trim()) entries.push({ type: "message", message: { role, content: text } });
+  }
+  return entries.reverse();
+}
+
 /** A response whose thinking used up the output tokens; its message is safe to show a host. */
 class ThinkingExhaustedError extends Error {
   constructor() {
@@ -2728,6 +2747,7 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
     const maxAlternatives = Math.max(1, Math.min(shared.config.maxAlternatives, Math.floor(alternatives)));
     const context = "context" in value ? value.context : undefined;
     const branch: unknown[] = [];
+    let recentBranch: unknown[] | undefined;
     if (context !== undefined) {
       if (!context || typeof context !== "object" || Array.isArray(context)) {
         reply(null, "Invalid completion context");
@@ -2743,12 +2763,20 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
         }
         if (text) branch.push({ type: "message", message: { role, content: text } });
       }
+      const recent = "recent" in context ? parseRecentContext(context.recent) : [];
+      if (recent === undefined) {
+        reply(null, "Invalid completion context");
+        return;
+      }
+      recentBranch = recent;
     }
     if (!manual && value.draft.trim().length < shared.config.minPromptChars) {
       reply(null);
       return;
     }
-    const request = buildSuggestionRequest(shared, value.draft, shared.activationId, maxAlternatives, branch, thinking);
+    const request = buildSuggestionRequest(
+      shared, value.draft, shared.activationId, maxAlternatives, { branch, recentBranch }, thinking,
+    );
     if (!request) {
       reply(null, "Completion model unavailable");
       return;

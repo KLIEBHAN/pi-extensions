@@ -1190,6 +1190,41 @@ test("RPC thinking: the level is sent, a thinking model gets room for it, and a 
   assert.equal(harness.completionReplies.at(-1)?.error, undefined);
 });
 
+test("RPC recent messages become the earlier conversation, never the latest user message", async () => {
+  const requests: string[] = [];
+  const reasoning: Array<string | undefined> = [];
+  const harness = createHarness({ mode: "rpc", completeSimple: async (_model, context, options) => {
+    requests.push(JSON.stringify(context));
+    reasoning.push(options?.reasoning);
+    return makeCompletion(["Write tests"]);
+  } });
+  await emit(harness, "session_start");
+  const recent = [
+    { role: "user", text: "Points 48 to 50 later" },
+    { role: "assistant", text: "Old answer" },
+  ];
+  await command(harness, `complete ${JSON.stringify({
+    id: "r", draft: "Write", thinking: "low", context: { lastAssistant: "Decide 50 to 52", recent },
+  })}`);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0]!, /Earlier messages \(oldest first, before the latest ones\):\\nUser: Points 48 to 50 later/);
+  assert.match(requests[0]!, /Assistant: Old answer/);
+  assert.doesNotMatch(requests[0]!, /Latest user message/);
+  // The test model cannot think, so no level goes out.
+  assert.deepEqual(reasoning, [undefined]);
+  // Blank messages take no slot.
+  const many = Array.from({ length: 6 }, (_, index) => ({ role: "user", text: `m${index}` }));
+  await command(harness, `complete ${JSON.stringify({
+    id: "blank", draft: "Write", fresh: true,
+    context: { lastAssistant: "A", recent: [...many, { role: "assistant", text: " \n" }] },
+  })}`);
+  assert.match(requests.at(-1)!, /User: m0/);
+  for (const bad of [{ recent: "x" }, { recent: [{ role: "system", text: "x" }] }, { recent: [{ role: "user" }] }]) {
+    await command(harness, `complete ${JSON.stringify({ id: "bad", draft: "Write", context: bad })}`);
+    assert.equal(harness.completionReplies.at(-1)?.error, "Invalid completion context");
+  }
+});
+
 test("RPC manual empty drafts predict full prompts from context; automatic empty drafts make no call", async () => {
   const requests: string[] = [];
   const prompts = ["Write tests", "Review the changes"];
@@ -1426,7 +1461,8 @@ test("inspection without a draft reports conversation sections and never invents
   assert.match(report, /Draft: not available — the slash command replaced the editor text/);
   assert.match(report, /one user message whose size depends on the draft/);
   assert.match(report, /Latest user message: 24 chars sent/);
-  assert.match(report, /Recent conversation: \d+ chars sent \(up to 6 messages × 600 chars\)/);
+  // Both messages are sent as the latest ones, so none is left for the earlier conversation.
+  assert.match(report, /Earlier messages: none/);
   assert.match(report, /Output: up to 3 alternatives × 160 chars, at most \d+ output tokens/);
   assert.match(report, /Not evaluated here \(live editor state\)/);
   assert.match(report, /never sent; credentials and headers are never shown/);

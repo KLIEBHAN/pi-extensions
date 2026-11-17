@@ -2192,15 +2192,21 @@ export function extractMessageText(content: unknown, maxChars = Number.POSITIVE_
   return truncated ? truncateWithForcedEllipsis(joined, maxChars) : joined;
 }
 
+/**
+ * The last `maxMessages` user and assistant messages, oldest first, each cut to its start.
+ * Entries in `exclude`, such as those already sent as the latest messages, are skipped.
+ */
 export function buildRecentConversationContext(
   branch: unknown[],
   maxMessages = MAX_CONTEXT_MESSAGES,
   maxCharsPerMessage = MAX_CONTEXT_MESSAGE_CHARS,
+  exclude: ReadonlySet<unknown> = new Set(),
 ): string {
   const collected: string[] = [];
 
   for (let i = branch.length - 1; i >= 0 && collected.length < maxMessages; i -= 1) {
     const entry = branch[i];
+    if (exclude.has(entry)) continue;
     if (!isRecord(entry) || entry.type !== "message") continue;
 
     const message = entry.message;
@@ -2220,11 +2226,12 @@ export function buildRecentConversationContext(
   return collected.reverse().join("\n\n");
 }
 
-function buildLatestRoleMessageContext(
+/** The newest message entry of `role` with text, and that text cut to `maxChars`. */
+function findLatestRoleMessage(
   branch: unknown[],
   role: "user" | "assistant",
   maxChars: number,
-): string {
+): { entry: unknown; text: string } | undefined {
   for (let i = branch.length - 1; i >= 0; i -= 1) {
     const entry = branch[i];
     if (!isRecord(entry) || entry.type !== "message") continue;
@@ -2235,10 +2242,18 @@ function buildLatestRoleMessageContext(
     const text = extractMessageText(message.content, maxChars * 2);
     if (!text) continue;
 
-    return truncateMiddle(text.trim(), maxChars);
+    return { entry, text: truncateMiddle(text.trim(), maxChars) };
   }
 
-  return "";
+  return undefined;
+}
+
+function buildLatestRoleMessageContext(
+  branch: unknown[],
+  role: "user" | "assistant",
+  maxChars: number,
+): string {
+  return findLatestRoleMessage(branch, role, maxChars)?.text ?? "";
 }
 
 export function buildLatestAssistantMessageContext(
@@ -2335,18 +2350,30 @@ export interface PromptAutocompleteRequestSnapshot {
   maxSuggestionChars: number;
 }
 
+/**
+ * The context of one request. The recent conversation leaves out the messages already sent as
+ * the latest ones; `recentBranch`, when given, supplies it instead of `branch`.
+ */
 export function buildPromptAutocompleteRequestSnapshot(input: {
   draft: string;
   branch: unknown[];
+  recentBranch?: unknown[];
   maxAlternatives: number;
   maxSuggestionChars: number;
 }): PromptAutocompleteRequestSnapshot {
+  const latestAssistant = findLatestRoleMessage(input.branch, "assistant", MAX_LATEST_ASSISTANT_MESSAGE_CHARS);
+  const latestUser = findLatestRoleMessage(input.branch, "user", MAX_LATEST_USER_MESSAGE_CHARS);
   return {
     draft: input.draft,
     draftTail: truncateDraftTail(input.draft, MAX_DRAFT_CONTEXT_CHARS),
-    latestAssistantContext: buildLatestAssistantMessageContext(input.branch),
-    latestUserContext: buildLatestUserMessageContext(input.branch),
-    recentContext: buildRecentConversationContext(input.branch),
+    latestAssistantContext: latestAssistant?.text ?? "",
+    latestUserContext: latestUser?.text ?? "",
+    recentContext: input.recentBranch === undefined
+      ? buildRecentConversationContext(
+        input.branch, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_MESSAGE_CHARS,
+        new Set([latestAssistant?.entry, latestUser?.entry].filter((entry) => entry !== undefined)),
+      )
+      : buildRecentConversationContext(input.recentBranch),
     compactionSummaryContext: buildCompactionSummaryContext(input.branch),
     maxAlternatives: input.maxAlternatives,
     maxSuggestionChars: input.maxSuggestionChars,
@@ -2369,7 +2396,7 @@ export function renderPromptAutocompleteUserText(snapshot: PromptAutocompleteReq
     sections.push(`Latest user message:\n${snapshot.latestUserContext}`);
   }
   if (snapshot.recentContext) {
-    sections.push(`Recent conversation summary:\n${snapshot.recentContext}`);
+    sections.push(`Earlier messages (oldest first, before the latest ones):\n${snapshot.recentContext}`);
   }
   if (snapshot.compactionSummaryContext) {
     sections.push(`Earlier conversation summary (compacted background):\n${snapshot.compactionSummaryContext}`);
