@@ -2673,7 +2673,11 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
     }
     const alternatives = "alternatives" in value ? value.alternatives : 1;
     const manual = "manual" in value ? value.manual : false;
-    if (typeof alternatives !== "number" || !Number.isFinite(alternatives) || typeof manual !== "boolean") {
+    const fresh = "fresh" in value ? value.fresh : false;
+    if (
+      typeof alternatives !== "number" || !Number.isFinite(alternatives)
+      || typeof manual !== "boolean" || typeof fresh !== "boolean"
+    ) {
       reply(null, "Invalid completion request");
       return;
     }
@@ -2707,7 +2711,8 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
     }
     // Count and context are already in the key; keep manual results separate too.
     request.cacheKey = JSON.stringify([request.cacheKey, manual]);
-    let entry = getCachedRequest(shared, request.cacheKey);
+    // `fresh` asks the model again instead of reusing a cached result for the same request.
+    let entry = fresh ? undefined : getCachedRequest(shared, request.cacheKey);
     if (entry) shared.usageStats.cacheHits += 1;
     else entry = await fetchSuggestionUncached(shared, { ...request, useStreaming: false }, controller.signal, () => undefined);
     reply(controller.signal.aborted ? null : entry.suggestions);

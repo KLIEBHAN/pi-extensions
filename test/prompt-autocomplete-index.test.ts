@@ -1119,6 +1119,23 @@ test("RPC alternatives are clamped, distinct, ordered, and cached separately by 
   assert.deepEqual(harness.completionReplies.at(-1)?.completions, [" tests", " docs"]);
 });
 
+test("RPC fresh requests ask the model again and refresh the cache", async () => {
+  const answers = [["Write tests"], ["Write docs"], ["Write code"]];
+  let calls = 0;
+  const harness = createHarness({ mode: "rpc", completeSimple: async () => makeCompletion(answers[calls++] ?? []) });
+  await emit(harness, "session_start");
+  await command(harness, 'complete {"id":"first","draft":"Write"}');
+  await command(harness, 'complete {"id":"cached","draft":"Write"}');
+  await command(harness, 'complete {"id":"fresh","draft":"Write","fresh":true}');
+  await command(harness, 'complete {"id":"after","draft":"Write"}');
+  await command(harness, 'complete {"id":"bad","draft":"Write","fresh":"yes"}');
+  assert.equal(calls, 2);
+  assert.deepEqual(harness.completionReplies.map((reply) => [reply.id, reply.completion, reply.error]), [
+    ["first", " tests", undefined], ["cached", " tests", undefined], ["fresh", " docs", undefined],
+    ["after", " docs", undefined], ["bad", null, "Invalid completion request"],
+  ]);
+});
+
 test("RPC manual empty drafts predict full prompts from context; automatic empty drafts make no call", async () => {
   const requests: string[] = [];
   const prompts = ["Write tests", "Review the changes"];

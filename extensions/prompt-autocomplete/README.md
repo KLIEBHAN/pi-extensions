@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.6.0/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.7.0/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -157,7 +157,7 @@ pi --mode rpc --no-session --no-tools --prompt-autocomplete-model provider/model
 
 Send an RPC `prompt` with message `/prompt-autocomplete complete <json>`. The JSON is `{"id":"unique-request-id","draft":"Write","context":{"lastUser":"…","lastAssistant":"…"}}`; `context` and both of its fields are optional. Supply the host thread's latest messages when the sidecar has no session. They use the existing bounded conversation snapshot, not the sidecar's conversation.
 
-Optional request fields: `alternatives` (finite number, default `1`, rounded down and clamped to `1..max-alternatives`; configured by `--prompt-autocomplete-max-alternatives`, default `3`) asks for distinct alternatives in one model request. `manual` (boolean, default `false`) bypasses `min-chars`; with an empty draft, alternatives are complete prompts predicted from `context`. Cache entries distinguish alternative counts and manual mode; budget and cancellation rules are unchanged.
+Optional request fields: `alternatives` (finite number, default `1`, rounded down and clamped to `1..max-alternatives`; configured by `--prompt-autocomplete-max-alternatives`, default `3`) asks for distinct alternatives in one model request. `manual` (boolean, default `false`) bypasses `min-chars`; with an empty draft, alternatives are complete prompts predicted from `context`. Cache entries distinguish alternative counts and manual mode; budget and cancellation rules are unchanged. `fresh` (boolean, default `false`) asks the model again instead of reusing a cached result for the same request, and the new result replaces the cached one.
 
 Each request receives one fire-and-forget `ctx.ui.setWidget("prompt-autocomplete-completion", [JSON.stringify(result)])`, where `result` is `{"id":"unique-request-id","completion":" the tests","completions":[" the tests"]}`. `completions` contains all distinct normalized alternatives in order, each bounded by `max-chars` and ready to **append**. `completion` always equals `completions[0]` or `null`. Every reply includes `completions`, empty for short automatic drafts, exhausted budgets, unusable output, superseded requests, or errors; errors also carry a short, sanitized `error` string. Requests without the new fields still return at most one alternative. Malformed requests with a string `id` receive an error; invalid JSON or missing/non-string ids cannot be correlated and receive no widget.
 
