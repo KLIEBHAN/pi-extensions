@@ -2008,3 +2008,12 @@ test("line acceptance takes the first line with its line break", () => {
   assert.equal(extractSuggestionLine(" first line\n  second"), " first line\n");
   assert.equal(extractSuggestionLine(" only line"), " only line");
 });
+
+test("alternatives after a complete word all get the separating space", () => {
+  assert.deepEqual(
+    normalizePromptSuggestions("Erstelle eine Funktion, die", JSON.stringify([" prüft", "fängt", "(x)"]), 240, 3),
+    [" prüft", " fängt", " (x)"],
+  );
+  // A partially typed word keeps its completion when no alternative signals a boundary.
+  assert.deepEqual(normalizePromptSuggestions("Schrei", JSON.stringify(["be", "bt"]), 240, 3), ["be", "bt"]);
+});

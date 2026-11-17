@@ -2349,6 +2349,7 @@ export function renderPromptAutocompleteUserText(snapshot: PromptAutocompleteReq
         `Task: propose up to ${snapshot.maxAlternatives} ranked continuations to insert at the cursor.`,
         "Each item must be only the text after the cursor; never restate text the user already typed.",
         "If the draft ends inside a partially typed word, complete that word directly without a leading space.",
+        "If the draft ends with a complete word, start each item with the single space that separates it from that word.",
       ].join("\n"),
     );
   }
@@ -2413,7 +2414,21 @@ export function normalizePromptSuggestions(
     if (normalized.length >= maxAlternatives) break;
   }
 
-  return normalized;
+  return alignAlternativeBoundaries(draft, normalized);
+}
+
+/**
+ * When some alternatives start with whitespace after a draft that ends in a
+ * word character, the draft ends at a word boundary; the model then dropped
+ * the separating space from the others, so they get it back.
+ */
+function alignAlternativeBoundaries(draft: string, suggestions: string[]): string[] {
+  if (suggestions.length < 2 || !/[\p{L}\p{N}]$/u.test(draft)) return suggestions;
+  if (!suggestions.some((suggestion) => /^\s/.test(suggestion))) return suggestions;
+  const aligned = suggestions.map((suggestion) =>
+    /^[\p{L}\p{N}]/u.test(suggestion) ? ` ${suggestion}` : suggestion,
+  );
+  return aligned.filter((suggestion, index) => aligned.indexOf(suggestion) === index);
 }
 
 export interface PromptAutocompletePrefixReuseResult {
