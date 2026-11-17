@@ -2,6 +2,12 @@
 
 All notable changes to this package are documented here. This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - Unreleased
+
+### Added
+
+- RPC draft completion accepts `fresh` to ask the model again instead of reusing a cached result for the same request; the new result replaces the cached one.
+
 ## [0.6.0] - 2026-11-17
 
 ### Added
