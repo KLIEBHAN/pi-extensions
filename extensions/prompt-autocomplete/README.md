@@ -2,7 +2,7 @@
 
 Inline AI completions for the [Pi coding agent](https://github.com/earendil-works/pi-mono), rendered as unobtrusive ghost text in the prompt editor.
 
-[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.7.0/prompt-autocomplete-demo.mp4)
+[Watch the demo](https://github.com/KLIEBHAN/pi-extensions/releases/download/pi-prompt-autocomplete-v0.8.0/prompt-autocomplete-demo.mp4)
 
 ## Install
 
@@ -78,6 +78,7 @@ pi \
   --prompt-autocomplete-debounce-ms 250 \
   --prompt-autocomplete-max-chars 240 \
   --prompt-autocomplete-max-alternatives 3 \
+  --prompt-autocomplete-thinking off \
   --prompt-autocomplete-max-requests off
 ```
 
@@ -90,6 +91,7 @@ pi \
 - Suggestions pause while the **main agent** is working by default, and stay paused until `agent_settled` on hosts that emit it. This is separate from streamed autocomplete responses. Use `--prompt-autocomplete-while-streaming` or `/prompt-autocomplete while-streaming on` to change that behavior.
 - `Escape` dismissal lasts while the draft extends the dismissed text: further typing starts no request and does not bring the suggestion back. It ends for good when the draft stops extending it (`Backspace`, submit, clear, history), when the conversation, autocomplete model, `max-chars`, or `max-alternatives` changes, or on the one-shot key (`cycle-next`, `Ctrl+.` by default), accept, or cycling. Dismissing an empty-draft suggestion lasts only while the draft stays empty.
 - `Ctrl+.` with no active suggestion is an explicit one-shot request and may bypass the main-agent-streaming, cooldown, and minimum-length gates. Model, authentication, slash-command, and path safety checks still apply.
+- `--prompt-autocomplete-thinking <off|minimal|low|medium|high>` sets the thinking each request asks for; the default `off` asks for none where the model can switch it off. A model that thinks gets extra output tokens for it (1,024 for `off` and `minimal`, 2,048 for `low`, 4,096 for `medium`, 8,192 for `high`) on top of the answer's budget; a model that cannot think gets none. Thinking adds latency, so `off` with a fast model suits suggestions best. `status` shows the level.
 - Use `--prompt-autocomplete-debug` or `/prompt-autocomplete debug-on` for troubleshooting.
 
 Slash-command decisions outrank the CLI flags. `on`, `off`, `min-chars`, and `set` are also saved for later sessions and processes (see [Persistent settings](#persistent-settings)). `stream`, `while-streaming`, and `debug-*` live only in the current extension runtime: Pi replaces that runtime on `/new`, `/resume`, `/fork`, and `/reload`, after which their flags apply again. `status` labels each value with its source, `(flag)`, `(saved)`, or `(session)`. Settings you never toggled keep following their flag. Interactive `set` values outside the documented range are rejected rather than clamped; CLI flags still clamp.
@@ -157,9 +159,9 @@ pi --mode rpc --no-session --no-tools --prompt-autocomplete-model provider/model
 
 Send an RPC `prompt` with message `/prompt-autocomplete complete <json>`. The JSON is `{"id":"unique-request-id","draft":"Write","context":{"lastUser":"…","lastAssistant":"…"}}`; `context` and both of its fields are optional. Supply the host thread's latest messages when the sidecar has no session. They use the existing bounded conversation snapshot, not the sidecar's conversation.
 
-Optional request fields: `alternatives` (finite number, default `1`, rounded down and clamped to `1..max-alternatives`; configured by `--prompt-autocomplete-max-alternatives`, default `3`) asks for distinct alternatives in one model request. `manual` (boolean, default `false`) bypasses `min-chars`; with an empty draft, alternatives are complete prompts predicted from `context`. Cache entries distinguish alternative counts and manual mode; budget and cancellation rules are unchanged. `fresh` (boolean, default `false`) asks the model again instead of reusing a cached result for the same request, and the new result replaces the cached one.
+Optional request fields: `alternatives` (finite number, default `1`, rounded down and clamped to `1..max-alternatives`; configured by `--prompt-autocomplete-max-alternatives`, default `3`) asks for distinct alternatives in one model request. `manual` (boolean, default `false`) bypasses `min-chars`; with an empty draft, alternatives are complete prompts predicted from `context`. Cache entries distinguish alternative counts and manual mode; budget and cancellation rules are unchanged. `fresh` (boolean, default `false`) asks the model again instead of reusing a cached result for the same request, and the new result replaces the cached one. `thinking` (`off`, `minimal`, `low`, `medium`, or `high`; default from `--prompt-autocomplete-thinking`) sets the thinking for this request; cache entries distinguish levels.
 
-Each request receives one fire-and-forget `ctx.ui.setWidget("prompt-autocomplete-completion", [JSON.stringify(result)])`, where `result` is `{"id":"unique-request-id","completion":" the tests","completions":[" the tests"]}`. `completions` contains all distinct normalized alternatives in order, each bounded by `max-chars` and ready to **append**. `completion` always equals `completions[0]` or `null`. Every reply includes `completions`, empty for short automatic drafts, exhausted budgets, unusable output, superseded requests, or errors; errors also carry a short, sanitized `error` string. Requests without the new fields still return at most one alternative. Malformed requests with a string `id` receive an error; invalid JSON or missing/non-string ids cannot be correlated and receive no widget.
+Each request receives one fire-and-forget `ctx.ui.setWidget("prompt-autocomplete-completion", [JSON.stringify(result)])`, where `result` is `{"id":"unique-request-id","completion":" the tests","completions":[" the tests"]}`. `completions` contains all distinct normalized alternatives in order, each bounded by `max-chars` and ready to **append**. `completion` always equals `completions[0]` or `null`. Every reply includes `completions`, empty for short automatic drafts, exhausted budgets, unusable output, superseded requests, or errors; errors also carry a short, sanitized `error` string, such as `Thinking used up the output tokens before an answer`. Requests without the new fields still return at most one alternative. Malformed requests with a string `id` receive an error; invalid JSON or missing/non-string ids cannot be correlated and receive no widget.
 
 Use a unique id per request. A new request aborts the previous one and immediately replies `null` for its id, even if the provider is slow to stop. Requests share model selection, result cache, request budget, and stats with the existing path. This command does not write editor text or cancel next-prompt requests. It is RPC-only and omitted from argument completions.
 

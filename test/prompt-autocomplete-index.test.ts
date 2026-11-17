@@ -1136,6 +1136,49 @@ test("RPC fresh requests ask the model again and refresh the cache", async () =>
   ]);
 });
 
+test("RPC thinking: the level is sent, a thinking model gets room for it, and a used-up budget is reported", async () => {
+  const calls: Array<{ reasoning?: string; maxTokens?: number }> = [];
+  let answer: Awaited<ReturnType<CompleteSeam>> = makeCompletion(["Write tests"]);
+  const harness = createHarness({
+    mode: "rpc",
+    // A model that always thinks: Pi cannot switch its thinking off.
+    findModel: (provider, id) => ({ provider, id, reasoning: true, thinkingLevelMap: { off: null } }) as never,
+    completeSimple: async (_model, _context, options) => {
+      calls.push({ reasoning: options?.reasoning, maxTokens: options?.maxTokens });
+      return answer;
+    },
+  });
+  harness.flags.set("prompt-autocomplete-model", "test-provider/thinker");
+  await emit(harness, "session_start");
+  await command(harness, 'complete {"id":"default","draft":"Write"}');
+  await command(harness, 'complete {"id":"low","draft":"Write","thinking":"low"}');
+  await command(harness, 'complete {"id":"bad","draft":"Write","thinking":"lots"}');
+  assert.deepEqual(calls, [
+    { reasoning: undefined, maxTokens: 192 + 1_024 },
+    { reasoning: "low", maxTokens: 192 + 2_048 },
+  ]);
+  assert.equal(harness.completionReplies.at(-1)?.error, "Invalid completion request");
+
+  answer = {
+    role: "assistant",
+    content: [{ type: "thinking", thinking: "…" }],
+    stopReason: "length",
+  } as unknown as Awaited<ReturnType<CompleteSeam>>;
+  await command(harness, 'complete {"id":"exhausted","draft":"Write","fresh":true}');
+  assert.deepEqual(harness.completionReplies.at(-1), {
+    id: "exhausted",
+    completion: null,
+    completions: [],
+    error: "Thinking used up the output tokens before an answer",
+  });
+
+  harness.flags.set("prompt-autocomplete-thinking", "Medium");
+  await emit(harness, "session_start");
+  answer = makeCompletion(["Write docs"]);
+  await command(harness, 'complete {"id":"flag","draft":"Write"}');
+  assert.deepEqual(calls.at(-1), { reasoning: "medium", maxTokens: 192 + 4_096 });
+});
+
 test("RPC manual empty drafts predict full prompts from context; automatic empty drafts make no call", async () => {
   const requests: string[] = [];
   const prompts = ["Write tests", "Review the changes"];
