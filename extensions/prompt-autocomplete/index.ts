@@ -33,6 +33,12 @@ import {
   BUDGET_REQUESTS_MIN,
   cancelAllCoalescedRequests,
   computeRequestMaxTokens,
+  thinkingHeadroomTokens,
+  thinkingTimeoutMs,
+  parsePromptAutocompleteThinking,
+  type PromptAutocompleteThinking,
+  DEFAULT_PROMPT_AUTOCOMPLETE_THINKING,
+  PROMPT_AUTOCOMPLETE_THINKING_LEVELS,
   createOwnerRefCounter,
   createPromptAutocompleteUsageStats,
   DEFAULT_BUDGET_REQUESTS_FLAG,
@@ -196,6 +202,8 @@ interface PromptAutocompleteConfig {
   maxSuggestionChars: number;
   maxAlternatives: number;
   modelSelection: PromptAutocompleteModelSelection;
+  /** Thinking every request asks for; an RPC completion may ask for another. */
+  thinking: PromptAutocompleteThinking;
   /** Effective provider-request ceiling; undefined means off. */
   budgetLimit?: number;
   /** RPC hosts only: send a predicted next prompt through `setEditorText` after each settled turn. */
@@ -595,6 +603,7 @@ interface SuggestionRequest extends PromptAutocompleteRequestSnapshot {
   conversationId: string;
   model: Model<Api>;
   modelLabel: string;
+  thinking: PromptAutocompleteThinking;
   cacheKey: string;
   prefixContextKey: string;
   /** Context an Escape dismissal of this request's suggestions is bound to. */
@@ -633,6 +642,7 @@ async function consumeAssistantStream(
   signal: AbortSignal,
   abortProvider: () => void,
   onPartial: (message: AssistantMessage) => void,
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<AssistantMessage> {
   const iterator = stream[Symbol.asyncIterator]();
   let hardTimer: ReturnType<typeof setTimeout> | undefined;
@@ -647,7 +657,7 @@ async function consumeAssistantStream(
       // accidentally ignore their timeout option.
       abortProvider();
       reject(new Error("Provider stream exceeded the local response deadline"));
-    }, REQUEST_TIMEOUT_MS + STREAM_HARD_TIMEOUT_GRACE_MS);
+    }, timeoutMs + STREAM_HARD_TIMEOUT_GRACE_MS);
   });
   const abortDeadline = new Promise<never>((_resolve, reject) => {
     rejectAbortDrain = reject;
@@ -911,6 +921,8 @@ function parseConfig(pi: ExtensionAPI): PromptAutocompleteConfig {
       MAX_ALTERNATIVES_MAX,
     ),
     modelSelection: parsePromptAutocompleteModelSelection(pi.getFlag("prompt-autocomplete-model")),
+    thinking: parsePromptAutocompleteThinking(pi.getFlag("prompt-autocomplete-thinking"))
+      ?? DEFAULT_PROMPT_AUTOCOMPLETE_THINKING,
     budgetLimit: parsePromptAutocompleteBudgetFlag(pi.getFlag("prompt-autocomplete-max-requests")),
     nextPrompt: pi.getFlag("prompt-autocomplete-next-prompt") === true,
   };
@@ -1105,6 +1117,7 @@ function formatStatus(shared: PromptAutocompleteSharedState, interactiveHost = t
         DEFAULT_MAX_ALTERNATIVES,
       ).source
     })`,
+    `thinking=${shared.config.thinking}(flag)`,
     `cache-size=${shared.requestCache.size}`,
     `budget=${formatBudget(shared)}`,
     `usage=${formatUsageStats(shared.usageStats)}`,
@@ -2160,8 +2173,15 @@ async function fetchSuggestionUncached(
     // so credentials are only passed to the compat functions and to seams.
     ...(viaRegistry ? {} : { apiKey: auth.apiKey, headers: auth.headers }),
     signal,
-    maxTokens: computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars),
-    timeoutMs: REQUEST_TIMEOUT_MS,
+    // Never above what the model can emit; providers reject a larger cap.
+    maxTokens: Math.min(
+      computeRequestMaxTokens(request.maxAlternatives, request.maxSuggestionChars)
+        + thinkingHeadroomTokens(request.thinking, request.model),
+      request.model.maxTokens > 0 ? request.model.maxTokens : Number.POSITIVE_INFINITY,
+    ),
+    // Unset asks for no thinking where the model can switch it off.
+    ...(request.thinking === "off" ? {} : { reasoning: request.thinking }),
+    timeoutMs: thinkingTimeoutMs(request.thinking, REQUEST_TIMEOUT_MS),
     maxRetries: REQUEST_MAX_RETRIES,
     maxRetryDelayMs: REQUEST_MAX_RETRY_DELAY_MS,
   };
@@ -2190,7 +2210,7 @@ async function fetchSuggestionUncached(
         if (lastPublished && !suggestion.startsWith(lastPublished)) return;
         lastPublished = suggestion;
         publish(suggestion);
-      });
+      }, requestOptions.timeoutMs);
     } else {
       response = await shared.completeSimple(request.model, context, requestOptions);
     }
@@ -2226,6 +2246,14 @@ async function fetchSuggestionUncached(
     request.maxSuggestionChars,
     request.maxAlternatives,
   );
+  // Thinking that used up the output budget leaves no answer; say so instead of suggesting nothing.
+  if (
+    normalized.length === 0 && text.trim().length === 0
+    && response.stopReason === "length" && contentTypes.includes("thinking")
+  ) {
+    stats.failedRequests += 1;
+    throw new ThinkingExhaustedError();
+  }
 
   const debugState =
     normalized.length === 0
@@ -2499,6 +2527,7 @@ function buildSuggestionRequest(
   activationId: number,
   maxAlternatives = shared.config.maxAlternatives,
   contextBranch?: unknown[],
+  thinking = shared.config.thinking,
 ): SuggestionRequest | undefined {
   const model = resolveSuggestionModel(shared);
   if (!model) return undefined;
@@ -2518,6 +2547,7 @@ function buildSuggestionRequest(
     modelLabel,
     maxAlternatives: snapshot.maxAlternatives,
     maxSuggestionChars: snapshot.maxSuggestionChars,
+    thinking,
     latestAssistantContext: snapshot.latestAssistantContext,
     latestUserContext: snapshot.latestUserContext,
     recentContext: snapshot.recentContext,
@@ -2530,6 +2560,7 @@ function buildSuggestionRequest(
     conversationId,
     model,
     modelLabel,
+    thinking,
     cacheKey: buildPromptAutocompleteCacheKey({ ...prefixContextIdentity, draft: snapshot.draft }),
     prefixContextKey: buildPromptAutocompletePrefixContextKey(prefixContextIdentity),
     dismissalContext: buildDismissalContext(shared, conversationId),
@@ -2642,6 +2673,14 @@ async function suggestNextPrompt(ctx: ExtensionContext, shared: PromptAutocomple
   }
 }
 
+/** A response whose thinking used up the output tokens; its message is safe to show a host. */
+class ThinkingExhaustedError extends Error {
+  constructor() {
+    super("Thinking used up the output tokens before an answer");
+    this.name = "ThinkingExhaustedError";
+  }
+}
+
 /** RPC-only request/reply adapter; provider errors never cross the host boundary. */
 async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocompleteSharedState, payload: string): Promise<void> {
   if (ctx.mode !== "rpc") {
@@ -2681,6 +2720,11 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
       reply(null, "Invalid completion request");
       return;
     }
+    const thinking = "thinking" in value ? parsePromptAutocompleteThinking(value.thinking) : shared.config.thinking;
+    if (thinking === undefined) {
+      reply(null, "Invalid completion request");
+      return;
+    }
     const maxAlternatives = Math.max(1, Math.min(shared.config.maxAlternatives, Math.floor(alternatives)));
     const context = "context" in value ? value.context : undefined;
     const branch: unknown[] = [];
@@ -2704,7 +2748,7 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
       reply(null);
       return;
     }
-    const request = buildSuggestionRequest(shared, value.draft, shared.activationId, maxAlternatives, branch);
+    const request = buildSuggestionRequest(shared, value.draft, shared.activationId, maxAlternatives, branch, thinking);
     if (!request) {
       reply(null, "Completion model unavailable");
       return;
@@ -2718,7 +2762,8 @@ async function completeRpcDraft(ctx: ExtensionContext, shared: PromptAutocomplet
     reply(controller.signal.aborted ? null : entry.suggestions);
   } catch (error) {
     reply(null, controller.signal.aborted || error instanceof PromptAutocompleteBudgetExhaustedError
-      ? undefined : "Completion request failed");
+      ? undefined
+      : error instanceof ThinkingExhaustedError ? error.message : "Completion request failed");
   } finally {
     controller.signal.removeEventListener("abort", onAbort);
     if (shared.draftCompletionAbort === controller) shared.draftCompletionAbort = undefined;
@@ -3554,6 +3599,11 @@ export function createPromptAutocompleteExtension(
     description: "Optional provider/model override for prompt autocomplete, e.g. openai/gpt-5.4-mini",
     type: "string",
     default: DEFAULT_PREFERRED_MODEL,
+  });
+  pi.registerFlag("prompt-autocomplete-thinking", {
+    description: `Thinking each suggestion request asks for (${PROMPT_AUTOCOMPLETE_THINKING_LEVELS.join("|")})`,
+    type: "string",
+    default: DEFAULT_PROMPT_AUTOCOMPLETE_THINKING,
   });
   pi.registerFlag("prompt-autocomplete-while-streaming", {
     description: "Allow prompt autocomplete while the main agent is still working",

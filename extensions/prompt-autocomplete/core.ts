@@ -112,6 +112,55 @@ export const MAX_COMPACTION_SUMMARY_CHARS = 1_500;
 export const MIN_REQUEST_MAX_TOKENS = 192;
 export const MAX_REQUEST_MAX_TOKENS = 1_024;
 
+/** Thinking a suggestion request asks for; `off` asks for none where the model allows it. */
+export const PROMPT_AUTOCOMPLETE_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;
+export type PromptAutocompleteThinking = (typeof PROMPT_AUTOCOMPLETE_THINKING_LEVELS)[number];
+export const DEFAULT_PROMPT_AUTOCOMPLETE_THINKING: PromptAutocompleteThinking = "off";
+
+/** The thinking level `value` names, case-insensitively, or undefined. */
+export function parsePromptAutocompleteThinking(value: unknown): PromptAutocompleteThinking | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return PROMPT_AUTOCOMPLETE_THINKING_LEVELS.find((level) => level === normalized);
+}
+
+// Output tokens a model may spend thinking before its answer, on top of the answer budget.
+const THINKING_HEADROOM_TOKENS: Record<PromptAutocompleteThinking, number> = {
+  off: 1_024,
+  minimal: 1_024,
+  low: 2_048,
+  medium: 4_096,
+  high: 8_192,
+};
+
+/**
+ * Output tokens to add to the answer budget for thinking. None for a model that does not reason,
+ * or whose `thinkingLevelMap.off` names how to switch it off when `off` is asked; any other
+ * reasoning model may think anyway and gets room for it, or would use up the budget.
+ */
+export function thinkingHeadroomTokens(
+  thinking: PromptAutocompleteThinking,
+  model: { reasoning?: boolean; thinkingLevelMap?: Partial<Record<string, string | null>> },
+): number {
+  if (!model.reasoning) return 0;
+  if (thinking === "off" && typeof model.thinkingLevelMap?.off === "string") return 0;
+  return THINKING_HEADROOM_TOKENS[thinking];
+}
+
+// Extra time a request may take for the thinking it asks for.
+const THINKING_EXTRA_TIMEOUT_MS: Record<PromptAutocompleteThinking, number> = {
+  off: 0,
+  minimal: 0,
+  low: 7_000,
+  medium: 22_000,
+  high: 52_000,
+};
+
+/** The response deadline for a request asking for `thinking`, from the deadline without it. */
+export function thinkingTimeoutMs(thinking: PromptAutocompleteThinking, baseMs: number): number {
+  return baseMs + THINKING_EXTRA_TIMEOUT_MS[thinking];
+}
+
 export interface ModelRef {
   provider: string;
   id: string;
@@ -122,6 +171,7 @@ export interface PromptAutocompleteCacheIdentity {
   modelLabel: string;
   maxAlternatives: number;
   maxSuggestionChars: number;
+  thinking: PromptAutocompleteThinking;
   draft: string;
   latestAssistantContext: string;
   latestUserContext: string;

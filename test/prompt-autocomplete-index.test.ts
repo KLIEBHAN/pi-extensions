@@ -1136,6 +1136,60 @@ test("RPC fresh requests ask the model again and refresh the cache", async () =>
   ]);
 });
 
+test("RPC thinking: the level is sent, a thinking model gets room for it, and a used-up budget is reported", async () => {
+  const calls: Array<{ reasoning?: string; maxTokens?: number; timeoutMs?: number }> = [];
+  let answer: Awaited<ReturnType<CompleteSeam>> = makeCompletion(["Write tests"]);
+  const harness = createHarness({
+    mode: "rpc",
+    // A model that always thinks: Pi cannot switch its thinking off.
+    findModel: (provider, id) =>
+      ({ provider, id, reasoning: true, thinkingLevelMap: { off: null }, maxTokens: 4_000 }) as never,
+    completeSimple: async (_model, _context, options) => {
+      calls.push({ reasoning: options?.reasoning, maxTokens: options?.maxTokens, timeoutMs: options?.timeoutMs });
+      return answer;
+    },
+  });
+  harness.flags.set("prompt-autocomplete-model", "test-provider/thinker");
+  await emit(harness, "session_start");
+  await command(harness, 'complete {"id":"default","draft":"Write"}');
+  await command(harness, 'complete {"id":"low","draft":"Write","thinking":"low"}');
+  await command(harness, 'complete {"id":"bad","draft":"Write","thinking":"lots"}');
+  assert.deepEqual(calls, [
+    { reasoning: undefined, maxTokens: 192 + 1_024, timeoutMs: 8_000 },
+    { reasoning: "low", maxTokens: 192 + 2_048, timeoutMs: 15_000 },
+  ]);
+  assert.equal(harness.completionReplies.at(-1)?.error, "Invalid completion request");
+
+  answer = {
+    role: "assistant",
+    content: [{ type: "thinking", thinking: "…" }],
+    stopReason: "length",
+  } as unknown as Awaited<ReturnType<CompleteSeam>>;
+  await command(harness, 'complete {"id":"exhausted","draft":"Write","fresh":true}');
+  assert.deepEqual(harness.completionReplies.at(-1), {
+    id: "exhausted",
+    completion: null,
+    completions: [],
+    error: "Thinking used up the output tokens before an answer",
+  });
+
+  harness.flags.set("prompt-autocomplete-thinking", "Medium");
+  await emit(harness, "session_start");
+  answer = makeCompletion(["Write docs"]);
+  await command(harness, 'complete {"id":"flag","draft":"Write"}');
+  // Capped at what the model can emit.
+  assert.deepEqual(calls.at(-1), { reasoning: "medium", maxTokens: 4_000, timeoutMs: 30_000 });
+
+  // Answer text cut off by the limit is not reported as thinking that left no answer.
+  answer = {
+    role: "assistant",
+    content: [{ type: "thinking", thinking: "…" }, { type: "text", text: "{\"completions\":[\"Wr" }],
+    stopReason: "length",
+  } as unknown as Awaited<ReturnType<CompleteSeam>>;
+  await command(harness, 'complete {"id":"cut","draft":"Write","fresh":true}');
+  assert.equal(harness.completionReplies.at(-1)?.error, undefined);
+});
+
 test("RPC manual empty drafts predict full prompts from context; automatic empty drafts make no call", async () => {
   const requests: string[] = [];
   const prompts = ["Write tests", "Review the changes"];
