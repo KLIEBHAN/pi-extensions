@@ -2414,21 +2414,7 @@ export function normalizePromptSuggestions(
     if (normalized.length >= maxAlternatives) break;
   }
 
-  return alignAlternativeBoundaries(draft, normalized);
-}
-
-/**
- * When some alternatives start with whitespace after a draft that ends in a
- * word character, the draft ends at a word boundary; the model then dropped
- * the separating space from the others, so they get it back.
- */
-function alignAlternativeBoundaries(draft: string, suggestions: string[]): string[] {
-  if (suggestions.length < 2 || !/[\p{L}\p{N}]$/u.test(draft)) return suggestions;
-  if (!suggestions.some((suggestion) => /^\s/.test(suggestion))) return suggestions;
-  const aligned = suggestions.map((suggestion) =>
-    /^[\p{L}\p{N}]/u.test(suggestion) ? ` ${suggestion}` : suggestion,
-  );
-  return aligned.filter((suggestion, index) => aligned.indexOf(suggestion) === index);
+  return normalized;
 }
 
 export interface PromptAutocompletePrefixReuseResult {

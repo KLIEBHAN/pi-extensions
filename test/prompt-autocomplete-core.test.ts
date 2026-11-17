@@ -2009,11 +2009,10 @@ test("line acceptance takes the first line with its line break", () => {
   assert.equal(extractSuggestionLine(" only line"), " only line");
 });
 
-test("alternatives after a complete word all get the separating space", () => {
+test("alternatives keep a direct word extension next to a new word", () => {
+  // Whitespace on one alternative does not prove a word boundary for the others.
   assert.deepEqual(
-    normalizePromptSuggestions("Erstelle eine Funktion, die", JSON.stringify([" prüft", "fängt", "(x)"]), 240, 3),
-    [" prüft", " fängt", " (x)"],
+    normalizePromptSuggestions("Write test", JSON.stringify(["s for the parser", " cases for the parser"]), 240, 3),
+    ["s for the parser", " cases for the parser"],
   );
-  // A partially typed word keeps its completion when no alternative signals a boundary.
-  assert.deepEqual(normalizePromptSuggestions("Schrei", JSON.stringify(["be", "bt"]), 240, 3), ["be", "bt"]);
 });
